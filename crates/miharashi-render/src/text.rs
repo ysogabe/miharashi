@@ -1,4 +1,5 @@
 use crate::Canvas;
+use cosmic_text::fontdb;
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
 
 pub struct TextEngine {
@@ -11,6 +12,18 @@ impl TextEngine {
     /// `family` は日本語対応フォント名(例: "Noto Sans CJK JP")。
     pub fn new(family: &str) -> Self {
         Self { fonts: FontSystem::new(), swash: SwashCache::new(), family: family.to_string() }
+    }
+
+    /// フォントファイルをヒープへ読み込んで使う。システムフォント(mmap)には依存しないので、
+    /// ページキャッシュが破棄されても描画時間が揺れない。
+    pub fn from_font_file(family: &str, path: &std::path::Path) -> std::io::Result<Self> {
+        let mut db = fontdb::Database::new();
+        db.load_font_data(std::fs::read(path)?);
+        Ok(Self {
+            fonts: FontSystem::new_with_locale_and_db("ja-JP".to_string(), db),
+            swash: SwashCache::new(),
+            family: family.to_string(),
+        })
     }
 
     fn buffer(&mut self, text: &str, size: f32) -> Buffer {

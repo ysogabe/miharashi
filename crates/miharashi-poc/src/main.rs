@@ -10,6 +10,7 @@ struct Args {
     cache: PathBuf,
     seconds: u64,
     connector: Option<String>,
+    font: Option<PathBuf>,
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
@@ -21,6 +22,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         cache: "work/cache/photo.jpg".into(),
         seconds: 10,
         connector: None,
+        font: None,
     };
     let mut it = argv.into_iter();
     while let Some(k) = it.next() {
@@ -32,6 +34,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             "--cache" => a.cache = v()?.into(),
             "--seconds" => a.seconds = v()?.parse().map_err(|_| "bad --seconds")?,
             "--connector" => a.connector = Some(v()?),
+            "--font" => a.font = Some(v()?.into()),
             "--size" => {
                 let s = v()?;
                 let (w, h) = s.split_once('x').ok_or("--size WxH")?;
@@ -77,6 +80,14 @@ fn fetch_geoframe(base: &str, cache: &Path) -> Result<(Vec<u8>, String), String>
     }
     std::fs::write(cache, &bytes).map_err(|e| e.to_string())?;
     Ok((bytes, caption))
+}
+
+/// --font があればヒープへ読み込み、なければシステムフォントを使う。
+fn text_engine(args: &Args) -> Result<TextEngine, String> {
+    match &args.font {
+        Some(p) => TextEngine::from_font_file("Noto Sans CJK JP", p).map_err(|e| format!("font {}: {e}", p.display())),
+        None => Ok(TextEngine::new("Noto Sans CJK JP")),
+    }
 }
 
 fn kms_info() {
@@ -167,7 +178,7 @@ fn kms_show(args: Args) -> Result<(), String> {
     let (w, h) = disp.size();
     println!("KMS {w}x{h}, run {}s (4/6 切替, Esc/q 終了)", args.seconds);
     let mut scene = load_scene(&args, (w, h))?;
-    let mut text = TextEngine::new("Noto Sans CJK JP");
+    let mut text = text_engine(&args)?;
     let mut c = Canvas::new(w, h);
 
     let start = Instant::now();
@@ -245,7 +256,7 @@ fn kms_show(_: Args) -> Result<(), String> {
 fn png(args: Args) -> Result<(), String> {
     let (w, h) = args.size;
     let Scene { snap, left, full } = load_scene(&args, args.size)?;
-    let mut text = TextEngine::new("Noto Sans CJK JP");
+    let mut text = text_engine(&args)?;
     std::fs::create_dir_all(&args.out).map_err(|e| e.to_string())?;
 
     let mut c = Canvas::new(w, h);
