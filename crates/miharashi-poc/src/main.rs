@@ -17,6 +17,7 @@ struct Args {
     live: bool,
     interval: u64,
     start_photo: bool,
+    caption: Option<String>,
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
@@ -32,6 +33,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         live: false,
         interval: 30,
         start_photo: false,
+        caption: None,
     };
     let mut it = argv.into_iter();
     while let Some(k) = it.next() {
@@ -45,6 +47,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             "--connector" => a.connector = Some(v()?),
             "--font" => a.font = Some(v()?.into()),
             "--dummy" => a.dummy = true,
+            "--caption" => a.caption = Some(v()?),
             "--screen" => a.start_photo = v()? == "photo",
             "--live" => a.live = true,
             "--size" => {
@@ -60,7 +63,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
 
 fn source(args: &Args) -> Source {
     match &args.photo {
-        Some(p) => Source::File(p.clone()),
+        Some(p) => Source::File(p.clone(), args.caption.clone()),
         None => Source::Geoframe(args.geoframe.clone()),
     }
 }
@@ -302,13 +305,15 @@ fn png(args: Args) -> Result<(), String> {
     let mut snap = dummy_snapshot(0.0);
     #[cfg(target_os = "linux")]
     if args.live {
-        let sp = miharashi_linux::metrics::Sampler::spawn(std::time::Duration::from_millis(500));
-        std::thread::sleep(std::time::Duration::from_millis(1200));
-        let m = sp.latest();
+        // --seconds 秒間、1 秒ごとに実測して時系列グラフを貯めてから描く。
+        let sp = miharashi_linux::metrics::Sampler::spawn(std::time::Duration::from_secs(1));
         snap.cpu_history = vec![0.0; 120];
         snap.gpu_history = vec![0.0; 120];
-        println!("live sample: {m:?}");
-        apply_sample(&mut snap, &m);
+        for _ in 0..args.seconds.max(2) {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            apply_sample(&mut snap, &sp.latest());
+        }
+        println!("live: cpu={:?} gpu={:?} ssd={:?} fans={:?}", snap.cpu, snap.gpu, snap.ssd_temps, snap.fans);
     }
     let item = Catalog::open(&source(&args), args.size)?.current()?;
     let mut text = text_engine(&args)?;

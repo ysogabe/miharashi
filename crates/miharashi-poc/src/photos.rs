@@ -6,7 +6,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 
 pub enum Source {
     Geoframe(String),
-    File(PathBuf),
+    /// (ファイル, 表示名)。表示名がなければファイル名を使う。
+    File(PathBuf, Option<String>),
 }
 
 enum Origin {
@@ -47,8 +48,9 @@ fn xorshift(state: &mut u64) -> u64 {
 impl Catalog {
     pub fn open(source: &Source, size: (u32, u32)) -> Result<Self, String> {
         let (entries, preferred) = match source {
-            Source::File(p) => {
-                let e = Entry { origin: Origin::File(p.clone()), place: p.display().to_string(), taken: String::new() };
+            Source::File(p, caption) => {
+                let name = p.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                let e = Entry { origin: Origin::File(p.clone()), place: caption.clone().unwrap_or(name), taken: String::new() };
                 (vec![e], vec![0])
             }
             Source::Geoframe(base) => Self::list_geoframe(base)?,
