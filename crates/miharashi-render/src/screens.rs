@@ -5,12 +5,13 @@ use tiny_skia::Pixmap;
 /// 画面に渡す(ダミー)データ。
 pub struct Snapshot {
     pub clock: String,
-    pub cpu: f32,
-    pub cpu_temp: f32,
-    pub gpu: f32,
-    pub gpu_temp: f32,
-    pub mem_used: f32,
-    pub mem_total: f32,
+    /// 取得できない項目は None(画面には "--" と表示する)。
+    pub cpu: Option<f32>,
+    pub cpu_temp: Option<f32>,
+    pub gpu: Option<f32>,
+    pub gpu_temp: Option<f32>,
+    pub mem_used: Option<f32>,
+    pub mem_total: Option<f32>,
     pub cpu_history: Vec<f32>,
     pub photo_caption: String,
 }
@@ -38,10 +39,16 @@ pub fn dashboard(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot, photo_left: O
     let (x, mut y) = (split + 32.0, head + 24.0);
     t.draw(c, "SYSTEM STATUS", x, y, 28.0, DIM);
     y += 56.0;
+    let pct = |v: Option<f32>| v.map_or("--".to_string(), |v| format!("{v:.0}%"));
+    let deg = |v: Option<f32>| v.map_or("--".to_string(), |v| format!("{v:.0}°C"));
+    let mem = match (s.mem_used, s.mem_total) {
+        (Some(u), Some(t)) => format!("{u:.1} / {t:.0} GB"),
+        _ => "--".to_string(),
+    };
     let rows = [
-        ("CPU", format!("{:>3.0}%", s.cpu), format!("{:.0}°C", s.cpu_temp)),
-        ("GPU", format!("{:>3.0}%", s.gpu), format!("{:.0}°C", s.gpu_temp)),
-        ("MEMORY", format!("{:.0} / {:.0} GB", s.mem_used, s.mem_total), String::new()),
+        ("CPU", pct(s.cpu), deg(s.cpu_temp)),
+        ("GPU", pct(s.gpu), deg(s.gpu_temp)),
+        ("MEMORY", mem, String::new()),
     ];
     for (name, val, extra) in rows {
         t.draw(c, name, x, y, 32.0, FG);

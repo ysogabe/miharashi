@@ -11,6 +11,8 @@ struct Args {
     seconds: u64,
     connector: Option<String>,
     font: Option<PathBuf>,
+    dummy: bool,
+    live: bool,
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Args, String> {
@@ -23,6 +25,8 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         seconds: 10,
         connector: None,
         font: None,
+        dummy: false,
+        live: false,
     };
     let mut it = argv.into_iter();
     while let Some(k) = it.next() {
@@ -35,6 +39,8 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             "--seconds" => a.seconds = v()?.parse().map_err(|_| "bad --seconds")?,
             "--connector" => a.connector = Some(v()?),
             "--font" => a.font = Some(v()?.into()),
+            "--dummy" => a.dummy = true,
+            "--live" => a.live = true,
             "--size" => {
                 let s = v()?;
                 let (w, h) = s.split_once('x').ok_or("--size WxH")?;
@@ -154,12 +160,12 @@ fn load_scene(args: &Args, (w, h): (u32, u32)) -> Result<Scene, String> {
         .collect();
     let snap = screens::Snapshot {
         clock: "2026/10/11 23:00".into(),
-        cpu: 32.0,
-        cpu_temp: 58.0,
-        gpu: 78.0,
-        gpu_temp: 65.0,
-        mem_used: 24.0,
-        mem_total: 64.0,
+        cpu: Some(32.0),
+        cpu_temp: Some(58.0),
+        gpu: Some(78.0),
+        gpu_temp: Some(65.0),
+        mem_used: Some(24.0),
+        mem_total: Some(64.0),
         cpu_history: history,
         photo_caption: caption,
     };
@@ -185,6 +191,10 @@ fn kms_show(args: Args) -> Result<(), String> {
     let (mut screen, mut presses, mut frames) = (0usize, 0u64, 0u64);
     let mut next_tick = Instant::now();
     let mut phase = 0.0f32;
+    let sampler = (!args.dummy).then(|| miharashi_linux::metrics::Sampler::spawn(Duration::from_secs(1)));
+    if sampler.is_some() {
+        scene.snap.cpu_history = vec![0.0; 120]; // 実測の履歴は空から貯める
+    }
     loop {
         for a in keys.poll() {
             presses += 1;
@@ -203,7 +213,10 @@ fn kms_show(args: Args) -> Result<(), String> {
         if Instant::now() >= next_tick {
             let t0 = Instant::now();
             phase += 1.0;
-            update_snapshot(&mut scene.snap, phase);
+            match &sampler {
+                Some(sp) => apply_sample(&mut scene.snap, &sp.latest()),
+                None => update_snapshot(&mut scene.snap, phase),
+            }
             match screen {
                 0 => screens::dashboard(&mut c, &mut text, &scene.snap, scene.left.as_ref()),
                 _ => screens::photo_frame(&mut c, &mut text, &scene.snap, scene.full.as_ref()),
@@ -229,15 +242,32 @@ fn kms_show(args: Args) -> Result<(), String> {
     }
 }
 
+/// 実測値を反映する。CPU 使用率が取れた回だけ履歴へ追加する。
+#[cfg(target_os = "linux")]
+fn apply_sample(s: &mut screens::Snapshot, m: &miharashi_linux::metrics::Sample) {
+    s.cpu = m.cpu_percent;
+    s.cpu_temp = m.cpu_temp;
+    s.gpu = m.gpu_percent;
+    s.gpu_temp = m.gpu_temp;
+    s.mem_used = m.mem_used_gb;
+    s.mem_total = m.mem_total_gb;
+    if let Some(v) = m.cpu_percent {
+        s.cpu_history.remove(0);
+        s.cpu_history.push(v);
+    }
+    s.clock = chrono::Local::now().format("%Y/%m/%d %H:%M:%S").to_string();
+}
+
 /// ダミーデータを 1 ステップ進める。
 fn update_snapshot(s: &mut screens::Snapshot, phase: f32) {
     let v = 45.0 + 25.0 * (phase * 0.21).sin() + 12.0 * (phase * 0.67).sin();
     s.cpu_history.remove(0);
     s.cpu_history.push(v);
-    s.cpu = v;
-    s.gpu = 60.0 + 20.0 * (phase * 0.13).sin();
-    s.cpu_temp = 50.0 + v * 0.15;
-    s.gpu_temp = 55.0 + s.gpu * 0.15;
+    let gpu = 60.0 + 20.0 * (phase * 0.13).sin();
+    s.cpu = Some(v);
+    s.gpu = Some(gpu);
+    s.cpu_temp = Some(50.0 + v * 0.15);
+    s.gpu_temp = Some(55.0 + gpu * 0.15);
     s.clock = chrono::Local::now().format("%Y/%m/%d %H:%M:%S").to_string();
 }
 
@@ -255,7 +285,16 @@ fn kms_show(_: Args) -> Result<(), String> {
 
 fn png(args: Args) -> Result<(), String> {
     let (w, h) = args.size;
-    let Scene { snap, left, full } = load_scene(&args, args.size)?;
+    let Scene { mut snap, left, full } = load_scene(&args, args.size)?;
+    #[cfg(target_os = "linux")]
+    if args.live {
+        let sp = miharashi_linux::metrics::Sampler::spawn(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let m = sp.latest();
+        snap.cpu_history = vec![0.0; 120];
+        println!("live sample: {m:?}");
+        apply_sample(&mut snap, &m);
+    }
     let mut text = text_engine(&args)?;
     std::fs::create_dir_all(&args.out).map_err(|e| e.to_string())?;
 
