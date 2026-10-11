@@ -92,6 +92,12 @@ impl Canvas {
         self.pixmap.draw_pixmap(x, y, src.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
     }
 
+    /// 不透明度 `opacity`(0.0..=1.0)で他の Pixmap を合成する(クロスフェード用)。
+    pub fn draw_pixmap_opacity(&mut self, src: &Pixmap, x: i32, y: i32, opacity: f32) {
+        let paint = PixmapPaint { opacity: opacity.clamp(0.0, 1.0), ..PixmapPaint::default() };
+        self.pixmap.draw_pixmap(x, y, src.as_ref(), &paint, Transform::identity(), None);
+    }
+
     /// 1 画素を src-over で合成する(文字描画用)。color は straight RGBA。
     pub fn blend_pixel(&mut self, x: i32, y: i32, r: u8, g: u8, b: u8, a: u8) {
         if x < 0 || y < 0 || x >= self.width() as i32 || y >= self.height() as i32 || a == 0 {

@@ -10,6 +10,10 @@ pub struct Sample {
     pub gpu_temp: Option<f32>,
     pub mem_used_gb: Option<f32>,
     pub mem_total_gb: Option<f32>,
+    /// (ドライブ名, 温度℃)。NVMe の hwmon Composite。
+    pub ssd_temps: Vec<(String, f32)>,
+    /// (ファン名, 表示文字列)。hwmon の回転数と、NVML の GPU ファン速度(%)。
+    pub fans: Vec<(String, String)>,
 }
 
 pub struct Sampler {
@@ -25,6 +29,8 @@ impl Sampler {
             let nvml = nvml_wrapper::Nvml::init().ok();
             let gpu = nvml.as_ref().and_then(|n| n.device_by_index(0).ok());
             let temp_path = find_cpu_temp_input();
+            let ssds = find_ssd_inputs();
+            let fan_inputs = find_fan_inputs();
             let mut prev = read_cpu_times();
             loop {
                 std::thread::sleep(interval);
@@ -45,6 +51,20 @@ impl Sampler {
                         .map(|t| t as f32),
                     mem_used_gb,
                     mem_total_gb,
+                    ssd_temps: ssds.iter().filter_map(|(n, p)| Some((n.clone(), read_milli_c(p)?))).collect(),
+                    fans: {
+                        let mut f: Vec<(String, String)> = fan_inputs
+                            .iter()
+                            .filter_map(|(n, p)| {
+                                let rpm: u32 = std::fs::read_to_string(p).ok()?.trim().parse().ok()?;
+                                Some((n.clone(), format!("{rpm} rpm")))
+                            })
+                            .collect();
+                        if let Some(pct) = gpu.as_ref().and_then(|d| d.fan_speed(0).ok()) {
+                            f.push(("GPU".to_string(), format!("{pct}%")));
+                        }
+                        f
+                    },
                 };
                 if let Ok(mut g) = shared.lock() {
                     *g = s;
@@ -107,4 +127,47 @@ fn find_cpu_temp_input() -> Option<std::path::PathBuf> {
         return fallback;
     }
     None
+}
+
+/// NVMe の Composite 温度入力。(短いドライブ名, パス)。
+fn find_ssd_inputs() -> Vec<(String, std::path::PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir("/sys/class/hwmon") else { return out };
+    for entry in rd.flatten() {
+        let dir = entry.path();
+        if std::fs::read_to_string(dir.join("name")).unwrap_or_default().trim() != "nvme" {
+            continue;
+        }
+        let model = std::fs::read_to_string(dir.join("device/model")).unwrap_or_default();
+        let name = model.split(|c: char| c.is_whitespace()).next().unwrap_or("NVMe").to_string();
+        for n in 1..=4 {
+            let label = std::fs::read_to_string(dir.join(format!("temp{n}_label"))).unwrap_or_default();
+            if label.trim() == "Composite" {
+                out.push((name.clone(), dir.join(format!("temp{n}_input"))));
+                break;
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// hwmon の fanN_input(マザーボードのセンサードライバーが読み込まれていれば見つかる)。
+fn find_fan_inputs() -> Vec<(String, std::path::PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir("/sys/class/hwmon") else { return out };
+    for entry in rd.flatten() {
+        let dir = entry.path();
+        let name = std::fs::read_to_string(dir.join("name")).unwrap_or_default().trim().to_string();
+        for n in 1..=8 {
+            let input = dir.join(format!("fan{n}_input"));
+            if input.exists() {
+                let label = std::fs::read_to_string(dir.join(format!("fan{n}_label"))).unwrap_or_default();
+                let label = if label.trim().is_empty() { format!("{name} {n}") } else { label.trim().to_string() };
+                out.push((label, input));
+            }
+        }
+    }
+    out.sort();
+    out
 }

@@ -3,7 +3,7 @@ use evdev::{Device, EventType, KeyCode};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Prev,
-    Details,
+    Switch,
     Next,
     Quit,
 }
@@ -43,7 +43,7 @@ impl Keys {
                 }
                 match KeyCode::new(ev.code()) {
                     KeyCode::KEY_KP4 | KeyCode::KEY_LEFT | KeyCode::KEY_4 => out.push(Action::Prev),
-                    KeyCode::KEY_KP5 | KeyCode::KEY_5 => out.push(Action::Details),
+                    KeyCode::KEY_KP5 | KeyCode::KEY_5 => out.push(Action::Switch),
                     KeyCode::KEY_KP6 | KeyCode::KEY_RIGHT | KeyCode::KEY_6 => out.push(Action::Next),
                     KeyCode::KEY_ESC | KeyCode::KEY_Q => out.push(Action::Quit),
                     _ => {}
