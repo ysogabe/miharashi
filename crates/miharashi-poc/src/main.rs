@@ -225,12 +225,15 @@ fn kms_show(args: Args) -> Result<(), String> {
             frames += 1;
             if frames % 5 == 0 {
                 eprintln!(
-                    "t={:>4}s frame={:>2}ms rss={}MB frames={} keys={}",
+                    "t={:>4}s frame={:>2}ms rss={}MB frames={} keys={} cpu={:?} gpu={:?} mem={:?}",
                     start.elapsed().as_secs(),
                     t0.elapsed().as_millis(),
                     rss_mb(),
                     frames,
-                    presses
+                    presses,
+                    scene.snap.cpu.map(|v| v.round()),
+                    scene.snap.gpu.map(|v| v.round()),
+                    scene.snap.mem_used.map(|v| (v * 10.0).round() / 10.0)
                 );
             }
             next_tick += Duration::from_secs(1);
