@@ -6,4 +6,7 @@ edition = "2024"
 [dependencies]
 drm = "0.15.0"
 evdev = "0.13.2"
+libc = "0.2.190"
+libseat = "0.2.4"
 nvml-wrapper = "0.13.0"
+signal-hook = "0.4.5"

@@ -16,18 +16,62 @@ pub struct Sample {
     pub fans: Vec<(String, String)>,
 }
 
+/// 監視する GPU(表示先 GPU とは独立)。NVML のインデックスか PCI アドレス。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GpuSel {
+    /// インデックス 0
+    Auto,
+    Index(u32),
+    /// "0000:01:00.0"
+    Pci(String),
+}
+
+impl GpuSel {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.is_empty() || s == "auto" {
+            return Ok(Self::Auto);
+        }
+        if let Some(p) = s.strip_prefix("pci:") {
+            return Ok(Self::Pci(p.to_string()));
+        }
+        s.parse::<u32>().map(Self::Index).map_err(|_| {
+            format!("gpu: auto / 数字(NVML インデックス)/ pci:0000:01:00.0 のいずれか(指定値: {s})")
+        })
+    }
+
+    /// NVML の PCI バス ID は 8 桁ドメイン("00000000:01:00.0")。
+    pub fn nvml_bus_id(addr: &str) -> String {
+        match addr.split_once(':') {
+            Some((dom, rest)) if dom.len() < 8 && addr.matches(':').count() == 2 => {
+                format!("{dom:0>8}:{rest}")
+            }
+            _ => addr.to_string(),
+        }
+    }
+}
+
 pub struct Sampler {
     latest: Arc<Mutex<Sample>>,
 }
 
 impl Sampler {
     /// バックグラウンドスレッドで `interval` ごとにサンプリングする。
-    pub fn spawn(interval: Duration) -> Self {
+    pub fn spawn(interval: Duration, gpu_sel: GpuSel) -> Self {
         let latest = Arc::new(Mutex::new(Sample::default()));
         let shared = latest.clone();
         std::thread::spawn(move || {
             let nvml = nvml_wrapper::Nvml::init().ok();
-            let gpu = nvml.as_ref().and_then(|n| n.device_by_index(0).ok());
+            let gpu = nvml.as_ref().and_then(|n| match &gpu_sel {
+                GpuSel::Auto => n.device_by_index(0).ok(),
+                GpuSel::Index(i) => n.device_by_index(*i).ok(),
+                GpuSel::Pci(a) => n.device_by_pci_bus_id(GpuSel::nvml_bus_id(a)).ok(),
+            });
+            if gpu.is_none() {
+                eprintln!(
+                    "metrics: 監視 GPU({gpu_sel:?})を NVML で開けない。GPU の値は -- と表示する"
+                );
+            }
             let temp_path = find_cpu_temp_input();
             let ssds = find_ssd_inputs();
             let fan_inputs = find_fan_inputs();
@@ -224,4 +268,26 @@ fn find_fan_inputs() -> Vec<(String, std::path::PathBuf)> {
     }
     out.sort();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_selector_parse() {
+        assert_eq!(GpuSel::parse("auto").unwrap(), GpuSel::Auto);
+        assert_eq!(GpuSel::parse("1").unwrap(), GpuSel::Index(1));
+        assert_eq!(
+            GpuSel::parse("pci:0000:01:00.0").unwrap(),
+            GpuSel::Pci("0000:01:00.0".into())
+        );
+        assert!(GpuSel::parse("rtx").is_err());
+    }
+
+    #[test]
+    fn nvml_bus_id_pads_domain() {
+        assert_eq!(GpuSel::nvml_bus_id("0000:01:00.0"), "00000000:01:00.0");
+        assert_eq!(GpuSel::nvml_bus_id("00000000:01:00.0"), "00000000:01:00.0");
+    }
 }
