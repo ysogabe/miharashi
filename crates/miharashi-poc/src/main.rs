@@ -157,17 +157,83 @@ fn load_scene(args: &Args, (w, h): (u32, u32)) -> Result<Scene, String> {
 
 #[cfg(target_os = "linux")]
 fn kms_show(args: Args) -> Result<(), String> {
+    use miharashi_linux::input::{Action, Keys};
     use miharashi_linux::kms::Display;
+    use std::time::{Duration, Instant};
+
+    let mut keys = Keys::open()?;
+    println!("input: {:?}", keys.device_names());
     let mut disp = Display::open(std::path::Path::new("/dev/dri/card0"), args.connector.as_deref())?;
     let (w, h) = disp.size();
-    println!("KMS {w}x{h}, showing {}s", args.seconds);
-    let scene = load_scene(&args, (w, h))?;
+    println!("KMS {w}x{h}, run {}s (4/6 切替, Esc/q 終了)", args.seconds);
+    let mut scene = load_scene(&args, (w, h))?;
     let mut text = TextEngine::new("Noto Sans CJK JP");
     let mut c = Canvas::new(w, h);
-    screens::dashboard(&mut c, &mut text, &scene.snap, scene.left.as_ref());
-    disp.present(|buf, pitch| c.write_xrgb8888(buf, pitch))?;
-    std::thread::sleep(std::time::Duration::from_secs(args.seconds));
-    Ok(()) // Drop で CRTC を復元
+
+    let start = Instant::now();
+    let (mut screen, mut presses, mut frames) = (0usize, 0u64, 0u64);
+    let mut next_tick = Instant::now();
+    let mut phase = 0.0f32;
+    loop {
+        for a in keys.poll() {
+            presses += 1;
+            match a {
+                Action::Next => screen = (screen + 1) % 2,
+                Action::Prev => screen = (screen + 1) % 2,
+                Action::Details => {}
+                Action::Quit => return Ok(()),
+            }
+            next_tick = Instant::now(); // 切替は即時反映
+        }
+        if start.elapsed() >= Duration::from_secs(args.seconds) {
+            return Ok(()); // Drop で CRTC を復元
+        }
+        if Instant::now() >= next_tick {
+            let t0 = Instant::now();
+            phase += 1.0;
+            update_snapshot(&mut scene.snap, phase);
+            match screen {
+                0 => screens::dashboard(&mut c, &mut text, &scene.snap, scene.left.as_ref()),
+                _ => screens::photo_frame(&mut c, &mut text, &scene.snap, scene.full.as_ref()),
+            }
+            disp.present(|buf, pitch| c.write_xrgb8888(buf, pitch))?;
+            frames += 1;
+            if frames % 5 == 0 {
+                eprintln!(
+                    "t={:>4}s frame={:>2}ms rss={}MB frames={} keys={}",
+                    start.elapsed().as_secs(),
+                    t0.elapsed().as_millis(),
+                    rss_mb(),
+                    frames,
+                    presses
+                );
+            }
+            next_tick += Duration::from_secs(1);
+            if next_tick < Instant::now() {
+                next_tick = Instant::now() + Duration::from_secs(1);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// ダミーデータを 1 ステップ進める。
+fn update_snapshot(s: &mut screens::Snapshot, phase: f32) {
+    let v = 45.0 + 25.0 * (phase * 0.21).sin() + 12.0 * (phase * 0.67).sin();
+    s.cpu_history.remove(0);
+    s.cpu_history.push(v);
+    s.cpu = v;
+    s.gpu = 60.0 + 20.0 * (phase * 0.13).sin();
+    s.cpu_temp = 50.0 + v * 0.15;
+    s.gpu_temp = 55.0 + s.gpu * 0.15;
+    s.clock = chrono::Local::now().format("%Y/%m/%d %H:%M:%S").to_string();
+}
+
+fn rss_mb() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map_or(0, |pages| pages * 4096 / 1024 / 1024)
 }
 
 #[cfg(not(target_os = "linux"))]

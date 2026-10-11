@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 drm = "0.15.0"
+evdev = "0.13.2"
