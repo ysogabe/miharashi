@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07131c">
+  <meta name="description" content="Linuxサーバーの状態、AIエージェント、写真をひとつの画面に。Rust製キオスクダッシュボードの画面構成・設計・想定FAQ。">
+  <title>Miharashi — サーバーの今を、ひとつの画面に。</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#screens">画面構成へ移動</a>
+  <header class="shell topbar">
+    <a class="brand" href="#top" aria-label="Miharashi トップ"><span class="brand-symbol" aria-hidden="true">▥</span>Miharashi<span class="brand-sub">RUST / LINUX</span></a>
+    <nav aria-label="ページ内ナビゲーション"><a href="#screens">画面構成</a><a href="#architecture">設計</a><a href="#faq">FAQ</a></nav>
+    <span class="stage-label"><span aria-hidden="true"></span>実装前の設計案</span>
+  </header>
+
+  <main id="top">
+    <section class="shell hero" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="eyebrow">A dedicated view of your Linux machine</p>
+        <h1 id="hero-title">サーバーの今を、<br><span>ひとつの画面に。</span></h1>
+        <p class="hero-lead">負荷を知る。エージェントを見守る。写真を楽しむ。<br class="wide-only">Linuxマシンのそばに置く、Rust製のキオスク・ダッシュボード。</p>
+        <div class="hero-actions"><a class="button primary" href="#screens">3つの画面を見る <span aria-hidden="true">↘</span></a><a class="text-link" href="#scope">MVPの範囲を確認する <span aria-hidden="true">→</span></a></div>
+        <p class="hero-status">実装前のコンセプトです。アプリの実装・実機検証はこれから進めます。</p>
+      </div>
+      <aside class="hero-note" aria-label="プロダクトの特徴">
+        <div class="note-heading"><span class="micro-label">DESIGNED FOR</span><span class="tiny-square" aria-hidden="true"></span></div>
+        <div class="note-item"><span class="note-index">01</span><div><strong>専用の全画面表示</strong><p>Linux DRM/KMSへ直接出力する構成</p></div></div>
+        <div class="note-item"><span class="note-index">02</span><div><strong>テンキーだけで操作</strong><p>NumLock状態を問わず4 / 6 / 0 / 5</p></div></div>
+        <div class="note-item"><span class="note-index">03</span><div><strong>実機がなくても画面づくり</strong><p>共通RGBAからPNGスナップショットへ</p></div></div>
+        <p class="note-disclaimer">これから実装する仕様です。下の画面は、構成を確認するためのプレビューです。</p>
+      </aside>
+    </section>
+
+    <section class="shell screen-section" id="screens" aria-labelledby="screens-title">
+      <div class="section-heading"><div><p class="eyebrow">01 / Screen composition</p><h2 id="screens-title">ひとつのディスプレイ、<br class="mobile-only">3つの見方。</h2></div><p class="section-aside">タブやテンキーボタンで<br>画面構成を切り替えられます。</p></div>
+
+      <div class="screen-tabs" role="tablist" aria-label="画面プレビュー">
+        <button id="tab-system" role="tab" aria-selected="true" aria-controls="panel-system" tabindex="0" data-screen="0"><span>01</span>システム監視</button>
+        <button id="tab-agents" role="tab" aria-selected="false" aria-controls="panel-agents" tabindex="-1" data-screen="1"><span>02</span>エージェント監視</button>
+        <button id="tab-photo" role="tab" aria-selected="false" aria-controls="panel-photo" tabindex="-1" data-screen="2"><span>03</span>フォトフレーム</button>
+        <span class="preview-tag">CONCEPT PREVIEW</span>
+      </div>
+
+      <div class="monitor-shell">
+        <div class="demo-surface" data-demo tabindex="0" aria-label="画面構成のデモ。4で前、6で次、0でメニュー、5で詳細">
+          <section id="panel-system" class="preview-panel system-panel" role="tabpanel" aria-labelledby="tab-system">
+            <div class="screen-heading"><div><span class="screen-number">01</span><strong>SYSTEM MONITOR</strong><span class="host-label">SAMPLE HOST</span></div><div class="screen-clock"><span class="demo-badge">DEMO</span><span>12:48 <small>LOCAL</small></span></div></div>
+            <div class="metrics">
+              <div class="metric"><span class="micro-label">CPU</span><p><strong>24</strong><span>%</span></p><div class="meter"><span style="width:24%"></span></div><span class="metric-foot">TEMP N/A <span>POWER N/A</span></span></div>
+              <div class="metric"><span class="micro-label">GPU / SELECTED DEVICE</span><p><strong>81</strong><span>%</span></p><div class="meter blue"><span style="width:81%"></span></div><span class="metric-foot">TEMP N/A <span>POWER N/A</span></span></div>
+              <div class="metric"><span class="micro-label">MEMORY</span><p><strong>38</strong><span>%</span></p><div class="meter"><span style="width:38%"></span></div><span class="metric-foot">USAGE <span>SAMPLE</span></span></div>
+              <div class="metric"><span class="micro-label">GPU MEMORY / VRAM</span><p><strong>71</strong><span>%</span></p><div class="meter blue"><span style="width:71%"></span></div><span class="metric-foot">USAGE <span>SAMPLE</span></span></div>
+            </div>
+            <div class="system-content">
+              <div class="chart-card"><div class="card-heading"><span class="micro-label">UTILIZATION / RECENT HISTORY</span><div class="chart-legend"><span class="legend-cpu">CPU</span><span class="legend-gpu">GPU</span></div></div>
+                <svg class="history-chart" viewBox="0 0 720 210" role="img" aria-label="CPUとGPU使用率の例示グラフ" preserveAspectRatio="none">
+                  <defs><linearGradient id="chart-fill" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#72e2c5" stop-opacity=".22"/><stop offset="1" stop-color="#72e2c5" stop-opacity="0"/></linearGradient></defs>
+                  <g stroke="#223747" stroke-width="1"><path d="M35 20H708 M35 72H708 M35 124H708 M35 176H708"/><path d="M35 20V176 M203 20V176 M371 20V176 M539 20V176 M708 20V176" stroke-dasharray="3 7"/></g>
+                  <g fill="#76909e" font-family="monospace" font-size="10"><text x="0" y="24">100</text><text x="8" y="76">66</text><text x="8" y="128">33</text><text x="16" y="180">0</text><text x="35" y="204">−120s</text><text x="347" y="204">−60s</text><text x="689" y="204">NOW</text></g>
+                  <path d="M35 149L62 147L89 156L116 144L143 150L170 137L197 141L224 123L251 136L278 129L305 134L332 113L359 118L386 131L413 112L440 126L467 116L494 130L521 123L548 135L575 115L602 120L629 112L656 126L683 132L708 137V176H35Z" fill="url(#chart-fill)"/>
+                  <path d="M35 62L62 72L89 58L116 69L143 51L170 64L197 47L224 56L251 45L278 57L305 42L332 51L359 32L386 43L413 28L440 40L467 31L494 39L521 30L548 42L575 33L602 47L629 35L656 45L683 38L708 50" fill="none" stroke="#77b6ff" stroke-width="2.5" stroke-linejoin="round"/>
+                  <path d="M35 149L62 147L89 156L116 144L143 150L170 137L197 141L224 123L251 136L278 129L305 134L332 113L359 118L386 131L413 112L440 126L467 116L494 130L521 123L548 135L575 115L602 120L629 112L656 126L683 132L708 137" fill="none" stroke="#72e2c5" stroke-width="2.5" stroke-linejoin="round"/>
+                  <circle cx="708" cy="137" r="4" fill="#72e2c5"/><circle cx="708" cy="50" r="4" fill="#77b6ff"/>
+                </svg>
+              </div>
+              <aside class="device-card"><span class="micro-label">DEVICE ROLES</span><div class="device-row"><span class="device-icon" aria-hidden="true">▣</span><div><strong>Display device</strong><p>設定した表示先</p></div><span class="small-badge">KMS</span></div><div class="device-row"><span class="device-icon blue-ink" aria-hidden="true">▥</span><div><strong>Monitored GPU</strong><p>設定した監視対象</p></div><span class="small-badge blue-ink">SELECT</span></div><div class="source-note"><span class="micro-label">DATA STATE</span><p>取得状態と更新時刻を表示。<br>未対応センサーは <b>N/A</b> に。</p></div></aside>
+            </div>
+            <div class="screen-footer"><span><b>4 / 6</b> PAGE <b>0</b> MENU <b>5</b> DETAILS</span><span>ILLUSTRATIVE DATA / CONFIGURABLE DEVICES</span></div>
+          </section>
+
+          <section id="panel-agents" class="preview-panel agents-panel" role="tabpanel" aria-labelledby="tab-agents" hidden>
+            <div class="screen-heading"><div><span class="screen-number">02</span><strong>AGENT STATUS</strong><span class="host-label">4 AGENTS</span></div><div class="screen-clock"><span class="demo-badge">MOCK ADAPTER</span><span>12:48 <small>LOCAL</small></span></div></div>
+            <div class="agent-summary"><div><strong>2</strong><span>RUNNING</span></div><div><strong>1</strong><span>IDLE</span></div><div><strong>1</strong><span>WAITING</span></div><p>名前・状態・取得時刻をひと目で。</p></div>
+            <div class="agents-content">
+              <div class="agent-list">
+                <div class="agent-row"><span class="agent-avatar">H</span><div class="agent-info"><strong>Hermes</strong><span>タスクの実行を監視する例</span></div><span class="state-badge running">● RUNNING</span><span class="agent-time">2s ago</span></div>
+                <div class="agent-row"><span class="agent-avatar">O</span><div class="agent-info"><strong>OpenClaw</strong><span>次の作業を待っている例</span></div><span class="state-badge idle">○ IDLE</span><span class="agent-time">4s ago</span></div>
+                <div class="agent-row"><span class="agent-avatar">C</span><div class="agent-info"><strong>Codex</strong><span>コード作成中の状態例</span></div><span class="state-badge running">● RUNNING</span><span class="agent-time">1s ago</span></div>
+                <div class="agent-row"><span class="agent-avatar">CL</span><div class="agent-info"><strong>Claude Code</strong><span>応答待ちの状態例</span></div><span class="state-badge waiting">◌ WAITING</span><span class="agent-time">8s ago</span></div>
+              </div>
+              <aside class="adapter-card"><span class="micro-label">ADAPTER BOUNDARY</span><div class="adapter-diagram"><span>AgentAdapter</span><span aria-hidden="true">↓</span><span>Snapshot</span><span aria-hidden="true">↓</span><span>Screen</span></div><p>はじめはモック。<br>データ源を交換して<br>個別連携を追加します。</p></aside>
+            </div>
+            <div class="screen-footer"><span><b>4 / 6</b> PAGE <b>0</b> MENU <b>5</b> DETAILS</span><span>製品との実接続は未実装 / MOCK DATA</span></div>
+          </section>
+
+          <section id="panel-photo" class="preview-panel photo-panel" role="tabpanel" aria-labelledby="tab-photo" hidden>
+            <svg class="photo-scene" viewBox="0 0 1280 720" preserveAspectRatio="xMidYMid slice" role="img" aria-label="写真の配置を示す、山と湖のイラスト">
+              <defs><linearGradient id="sky" x1="0" x2="0" y1="0" y2="1"><stop stop-color="#182c4c"/><stop offset=".65" stop-color="#717586"/><stop offset="1" stop-color="#cca994"/></linearGradient><linearGradient id="lake" x1="0" x2="0" y1="0" y2="1"><stop stop-color="#8d999e"/><stop offset="1" stop-color="#244858"/></linearGradient><linearGradient id="shade" x1="0" x2="0" y1="0" y2="1"><stop stop-color="#07121c" stop-opacity=".5"/><stop offset=".4" stop-color="#07121c" stop-opacity="0"/><stop offset="1" stop-color="#07121c" stop-opacity=".8"/></linearGradient></defs>
+              <path fill="url(#sky)" d="M0 0H1280V720H0Z"/><g fill="#e0e4e7" opacity=".6"><circle cx="892" cy="109" r="2"/><circle cx="976" cy="59" r="1.5"/><circle cx="733" cy="71" r="1.5"/><circle cx="1190" cy="165" r="1.6"/><circle cx="593" cy="118" r="1.2"/><circle cx="1087" cy="198" r="1.3"/></g><circle cx="1048" cy="118" r="31" fill="#ebdccc" opacity=".74"/>
+              <path fill="#647180" d="M0 393L116 345L196 380L307 283L446 391L536 356L697 243L816 345L907 289L1103 407L1205 352L1280 397V537H0Z"/><path fill="#b8bdc1" opacity=".7" d="M281 309L307 283L356 330L319 314L305 333Z M663 276L697 243L753 290L713 276L697 288Z M881 316L907 289L951 326L915 311L903 324Z"/>
+              <path fill="#344e60" d="M0 430L136 400L246 452L359 372L449 431L570 397L701 446L849 389L963 461L1143 404L1280 448V553H0Z"/><path fill="url(#lake)" d="M0 489Q380 512 665 488T1280 502V720H0Z"/><path fill="#b6bab5" opacity=".15" d="M0 502L115 525L307 605L447 527L696 643L906 532L1103 588L1280 527V681L1097 630L905 594L696 690L446 585L306 658L117 567L0 554Z"/>
+              <g stroke="#ccd2cd" opacity=".2"><path d="M830 550H1118 M920 581H1158 M627 616H789 M370 576H508 M93 637H309 M956 658H1220"/></g><path fill="#17313f" d="M0 652Q106 643 198 679T482 713L610 720H0Z M1280 616Q1171 629 1129 678L1050 720H1280Z"/><path fill="url(#shade)" d="M0 0H1280V720H0Z"/>
+            </svg>
+            <div class="photo-top"><div><span class="micro-label">PHOTO / LOCAL TIME</span><p class="photo-time">12:48<span>LOCAL</span></p></div><span class="photo-marker">03 / PHOTO FRAME</span></div>
+            <div class="photo-bottom"><span class="micro-label">A QUIET VIEW, WITH CONTEXT</span><h3>写真のある時間に、<br>必要な情報をそっと。</h3><div class="photo-status"><span><b>CPU</b>24%</span><span><b>MEM</b>38%</span><span><b>AGENTS</b>2 RUNNING</span></div></div><span class="photo-illustration">写真枠のイラスト / 数値は例示</span>
+          </section>
+
+          <section class="demo-overlay menu-overlay" id="menu-panel" aria-label="画面メニュー" hidden><div class="overlay-heading"><div><span class="micro-label">0 / MENU</span><h3>表示する画面</h3></div><button class="close-button" data-close aria-label="メニューを閉じる">×</button></div><div class="menu-items"><button data-menu="0"><span>01</span>システム監視<span aria-hidden="true">→</span></button><button data-menu="1"><span>02</span>エージェント監視<span aria-hidden="true">→</span></button><button data-menu="2"><span>03</span>フォトフレーム<span aria-hidden="true">→</span></button></div><p>4 / 6で選択、5で決定。0またはEscapeで閉じます。</p></section>
+          <section class="demo-overlay detail-overlay" id="detail-panel" aria-label="画面構成の詳細" hidden><div class="overlay-heading"><div><span class="micro-label">5 / DETAILS</span><h3 id="detail-title">画面の構成</h3></div><button class="close-button" data-close aria-label="詳細を閉じる">×</button></div><p id="detail-description"></p><dl id="detail-list"></dl><p class="overlay-footnote">これは画面構成の説明です。サーバーへは接続していません。</p></section>
+        </div>
+        <div class="demo-controls"><span class="active-screen" id="active-label" aria-live="polite">01 / システム監視</span><div class="key-controls"><button data-action="prev"><kbd>4</kbd><span>前へ</span></button><button data-action="next"><kbd>6</kbd><span>次へ</span></button><button data-action="menu" aria-expanded="false" aria-controls="menu-panel"><kbd>0</kbd><span>メニュー</span></button><button data-action="detail" aria-expanded="false" aria-controls="detail-panel"><kbd>5</kbd><span>詳細</span></button></div></div>
+      </div>
+      <div class="preview-caption"><p><span class="caption-dot" aria-hidden="true"></span>画面・時刻・数値は例示。Rustアプリと実機KMSは未実装です。</p><span>プレビューを選択すると数字キーでも操作できます。</span></div>
+      <noscript><p class="noscript-note">JavaScriptを有効にすると3画面の切替を試せます。仕様とFAQはこのまま読めます。</p></noscript>
+      <div class="screen-description" id="screen-description"><span class="eyebrow" id="composition-index">01 / SYSTEM</span><div><h3 id="composition-title">数値と履歴を、同じ視線の中に。</h3><p id="composition-text">CPU・GPU・メモリ・VRAMのサマリーと時系列グラフ。温度や電力は取得元とともに表示し、欠損や古いデータを区別します。</p></div><ul id="composition-items"><li>サマリーカード</li><li>CPU / GPU履歴</li><li>温度・電力・データ状態</li></ul></div>
+    </section>
+
+    <section class="operation-section" aria-labelledby="operation-title"><div class="shell operation-grid"><div><p class="eyebrow">02 / Simple operation</p><h2 id="operation-title">小さなテンキーで、<br>画面を行き来する。</h2><p class="body-copy">4 / 6で画面を前後に切り替え、0で一覧、5で詳細へ。Linuxではevdevのキーコードを正規化して、NumLockオン・オフの両方に対応する設計です。</p></div><div class="keypad-illustration" aria-label="4、6、0、5を使うテンキー配置"><div class="keypad-cell muted-key">7</div><div class="keypad-cell muted-key">8</div><div class="keypad-cell muted-key">9</div><div class="keypad-cell active-key"><strong>4</strong><span>PREV</span></div><div class="keypad-cell active-key"><strong>5</strong><span>DETAIL</span></div><div class="keypad-cell active-key"><strong>6</strong><span>NEXT</span></div><div class="keypad-cell muted-key">1</div><div class="keypad-cell muted-key">2</div><div class="keypad-cell muted-key">3</div><div class="keypad-cell zero-key active-key"><strong>0</strong><span>MENU</span></div><div class="keypad-cell muted-key">.</div></div></div></section>
+
+    <section class="shell architecture-section" id="architecture" aria-labelledby="architecture-title"><div class="section-heading"><div><p class="eyebrow">03 / Architecture</p><h2 id="architecture-title">ひとつの描画面から、<br>ディスプレイにもPNGにも。</h2></div></div><div class="architecture-grid"><div class="render-flow"><div class="flow-source"><span>TEXT</span><span>PHOTO</span><span>GRAPH</span></div><div class="flow-arrow" aria-hidden="true">↓</div><div class="flow-canvas"><span class="micro-label">COMMON OFFSCREEN RENDERER</span><strong>RGBA Canvas</strong><span>Taffy / tiny-skia / cosmic-text / Plotters / image</span></div><div class="flow-branches"><div><span class="flow-arrow" aria-hidden="true">↓</span><strong>DRM / KMS</strong><span>Linuxのモニターへ</span></div><div><span class="flow-arrow" aria-hidden="true">↓</span><strong>PNG Snapshot</strong><span>ヘッドレスで確認</span></div></div></div><div class="architecture-copy"><article><span class="micro-label">CONFIGURABLE DEVICE ROLES</span><h3>表示先を、環境に合わせて。</h3><p>ソフトウェアレンダラーはCPUで描画し、選んだDRMデバイスから出力します。表示先と監視対象は設定可能。単一GPUの環境でも、複数GPUで表示と計算を分担する環境でも使える設計です。</p></article><article><span class="micro-label">SEAT & SESSION</span><h3>一般ユーザーで動く構成へ。</h3><p>logind / seatdによるデバイス管理と、VTを切り替えたときの解放・復帰を設計します。対応範囲はLinux実機で確認します。</p></article></div></div></section>
+
+    <section class="shell scope-section" id="scope" aria-labelledby="scope-title"><div class="section-heading"><div><p class="eyebrow">04 / MVP scope</p><h2 id="scope-title">まず画面を確かめ、<br>次に実機へつなぐ。</h2></div><p class="section-aside">実装と検証の段階を<br>明確にして進めます。</p></div><ol class="roadmap"><li class="current"><span class="roadmap-step">M0</span><div><span class="roadmap-state">現在地</span><h3>仕様・設計・画面案</h3><p>PRD、設計書、このLP。3画面の構成と想定問答を共有します。</p></div></li><li><span class="roadmap-step">M1</span><div><span class="roadmap-state">実装予定</span><h3>オフスクリーンMVP</h3><p>Rustをコンパイルし、日本語・グラフ・画像をPNGで確認します。</p></div></li><li><span class="roadmap-step">M2</span><div><span class="roadmap-state">実機で検証</span><h3>Linux KMS統合</h3><p>DRM、evdev、seat、VT、systemd起動を対象機で確かめます。</p></div></li></ol><p class="scope-note">実エージェントの接続やセンサーの追加は、取得元を確認したうえでAdapterを拡張します。</p></section>
+
+    <section class="faq-section" id="faq" aria-labelledby="faq-title"><div class="shell faq-grid"><div class="faq-intro"><p class="eyebrow">05 / Questions we expect</p><h2 id="faq-title">仮想FAQ</h2><p>仕様を知るための想定問答です。<br>実ユーザーから集めた質問や、<br>対応済みの実績ではありません。</p></div><div class="faq-list">
+      <details><summary>ターミナル上で動くTUIですか？</summary><p>TUI調の見た目を持つ、ピクセル単位の全画面GUIを設計しています。端末エミュレーターを経由せず、文字・写真・グラフを共通のRGBAバッファへ描きます。</p></details>
+      <details><summary>X11やWayland、ウィンドウマネージャーは必要ですか？</summary><p>アプリの表示経路はLinux DRM/KMSへ直接出力する設計です。X11・Wayland・ウィンドウマネージャーを動作依存に含めません。モニターの制御権とseat設定は別途必要です。</p></details>
+      <details><summary>日本語、写真、グラフを同時に表示できますか？</summary><p>同じ画面へ重ね合わせることをMVPの要件にしています。日本語にはcosmic-textと日本語を収録したフォント、写真にはimage、グラフにはPlottersを使う予定です。実際の文字や画質はPNG出力で確認します。</p></details>
+      <details><summary>GPUを表示用と計算用に分ける構成にも対応しますか？</summary><p>表示先と監視対象GPUを別々に設定する設計です。同じGPUを表示と監視に使う構成も、複数GPUで表示と計算を分担する構成も想定しています。特定のメーカー・型番・メモリ容量を前提にせず、配線とDRM/PCI識別を確認して選びます。</p></details>
+      <details><summary>CPUやGPUの温度・電力は、すべて取得できますか？</summary><p>取得できる値は、ドライバー・カーネル・権限・センサーに依存します。対応する取得元がある値だけを表示し、未対応はN/A、古い値はSTALEとして示します。CPUとGPUの電力をシステム全体の電力として扱いません。</p></details>
+      <details><summary>rootで常駐させる必要がありますか？</summary><p>アプリは一般ユーザーで動かす方針です。logind / seatdを扱うlibseat等を通して、表示・入力デバイスのアクセスとVT切替を管理する設計です。実際の権限と起動方法は対象Linux機で検証します。</p></details>
+      <details><summary>NumLockがオフでも操作できますか？</summary><p>オン・オフ両方への対応を要件にしています。evdevのkeypadコードと対応するナビゲーションキーを同じ操作へ正規化します。USBテンキーの実際のイベントは実機で確認します。</p></details>
+      <details><summary>Linux実機やモニターがなくても開発できますか？</summary><p>先に共通オフスクリーンレンダラーを作り、PNGスナップショットとヘッドレステストで開発する計画です。DRMが利用できないときのフォールバックも用意します。KMS・evdev・seat・VTの確認にはLinux実機が必要です。</p></details>
+      <details><summary>HermesやCodexとは、最初から接続されますか？</summary><p>初期AdapterはHermes・OpenClaw・Codex・Claude Codeのモック状態を返します。実際の製品への接続は未実装です。後続のAdapterで取得元と認証方法を決め、明示して追加します。</p></details>
+      <details><summary>写真のスライドショーやクラウド連携もできますか？</summary><p>MVPはローカルに設定した1枚のJPEG/PNG写真と情報オーバーレイを対象にします。スライドショーやクラウド写真連携は、初期範囲に含めていません。</p></details>
+      <details><summary>SSHから管理できますか？</summary><p>systemdの状態・ログ確認、設定変更、再起動をSSH経由で行う運用を想定しています。SSHログイン自体がローカルseatの制御権を与えるわけではないため、常駐アプリの起動経路を別に整えます。</p></details>
+      <details><summary>今すぐRustアプリを使えますか？</summary><p>現在は実装前の仕様・設計段階です。このLPは画面構成を確認するためのブラウザープレビューで、サーバーには接続しません。次にRustワークスペースとPNG出力MVPを実装します。</p></details>
+    </div></div></section>
+
+    <section class="shell docs-section" aria-labelledby="docs-title"><div><p class="eyebrow">Read the plan</p><h2 id="docs-title">仕様と設計を、ここから。</h2><p>画面の裏側にある要件と、実装・実機検証の順序をまとめています。</p></div><div class="doc-links"><a href="../docs/PRD.md"><span>01 / REQUIREMENTS</span><strong>PRD <span aria-hidden="true">↗</span></strong></a><a href="../docs/DESIGN.md"><span>02 / TECHNICAL DESIGN</span><strong>技術設計書 <span aria-hidden="true">↗</span></strong></a><a href="../README.md"><span>03 / PROJECT GUIDE</span><strong>README <span aria-hidden="true">↗</span></strong></a></div></section>
+  </main>
+  <footer class="shell footer"><span>Miharashi <span class="footer-separator">/</span> Rust Linux Kiosk Dashboard</span><span>DESIGN v0.2 · 2026.10.11 · LOCAL PREVIEW</span></footer>
+</body>
+</html>

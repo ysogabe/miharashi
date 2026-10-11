@@ -1,0 +1,12 @@
+# Rust build outputs
+/target/
+
+# Runtime snapshots and scratch files
+/snapshots/
+/work/
+
+# Local machine files and credentials
+.DS_Store
+.env
+.env.*
+!.env.example
