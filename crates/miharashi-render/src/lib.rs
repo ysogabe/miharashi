@@ -7,3 +7,4 @@ pub mod text;
 
 pub use canvas::Canvas;
 pub use text::TextEngine;
+pub use tiny_skia::Pixmap;

@@ -8,17 +8,21 @@ struct Args {
     photo: Option<PathBuf>,
     geoframe: Option<String>,
     cache: PathBuf,
+    seconds: u64,
+    connector: Option<String>,
 }
 
-fn parse_args() -> Result<Args, String> {
+fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     let mut a = Args {
         out: "work/out".into(),
         size: (1920, 1080),
         photo: None,
         geoframe: None,
         cache: "work/cache/photo.jpg".into(),
+        seconds: 10,
+        connector: None,
     };
-    let mut it = std::env::args().skip(1);
+    let mut it = argv.into_iter();
     while let Some(k) = it.next() {
         let mut v = || it.next().ok_or(format!("{k} requires a value"));
         match k.as_str() {
@@ -26,6 +30,8 @@ fn parse_args() -> Result<Args, String> {
             "--photo" => a.photo = Some(v()?.into()),
             "--geoframe" => a.geoframe = Some(v()?),
             "--cache" => a.cache = v()?.into(),
+            "--seconds" => a.seconds = v()?.parse().map_err(|_| "bad --seconds")?,
+            "--connector" => a.connector = Some(v()?),
             "--size" => {
                 let s = v()?;
                 let (w, h) = s.split_once('x').ok_or("--size WxH")?;
@@ -91,13 +97,26 @@ fn kms_info() {
 }
 
 fn main() -> Result<(), String> {
-    if std::env::args().nth(1).as_deref() == Some("kms-info") {
-        kms_info();
-        return Ok(());
+    let mut rest: Vec<String> = std::env::args().skip(1).collect();
+    let cmd = if rest.first().is_some_and(|c| !c.starts_with("--")) { rest.remove(0) } else { "png".into() };
+    match cmd.as_str() {
+        "kms-info" => {
+            kms_info();
+            Ok(())
+        }
+        "kms-show" => kms_show(parse_args(rest)?),
+        "png" => png(parse_args(rest)?),
+        other => Err(format!("unknown command {other}")),
     }
-    let args = parse_args()?;
-    let (w, h) = args.size;
+}
 
+struct Scene {
+    snap: screens::Snapshot,
+    left: Option<miharashi_render::Pixmap>,
+    full: Option<miharashi_render::Pixmap>,
+}
+
+fn load_scene(args: &Args, (w, h): (u32, u32)) -> Result<Scene, String> {
     let (photo_bytes, caption) = if let Some(p) = &args.photo {
         (Some(std::fs::read(p).map_err(|e| e.to_string())?), p.display().to_string())
     } else if let Some(url) = &args.geoframe {
@@ -133,7 +152,32 @@ fn main() -> Result<(), String> {
         cpu_history: history,
         photo_caption: caption,
     };
+    Ok(Scene { snap, left, full })
+}
 
+#[cfg(target_os = "linux")]
+fn kms_show(args: Args) -> Result<(), String> {
+    use miharashi_linux::kms::Display;
+    let mut disp = Display::open(std::path::Path::new("/dev/dri/card0"), args.connector.as_deref())?;
+    let (w, h) = disp.size();
+    println!("KMS {w}x{h}, showing {}s", args.seconds);
+    let scene = load_scene(&args, (w, h))?;
+    let mut text = TextEngine::new("Noto Sans CJK JP");
+    let mut c = Canvas::new(w, h);
+    screens::dashboard(&mut c, &mut text, &scene.snap, scene.left.as_ref());
+    disp.present(|buf, pitch| c.write_xrgb8888(buf, pitch))?;
+    std::thread::sleep(std::time::Duration::from_secs(args.seconds));
+    Ok(()) // Drop で CRTC を復元
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kms_show(_: Args) -> Result<(), String> {
+    Err("KMS is Linux only".into())
+}
+
+fn png(args: Args) -> Result<(), String> {
+    let (w, h) = args.size;
+    let Scene { snap, left, full } = load_scene(&args, args.size)?;
     let mut text = TextEngine::new("Noto Sans CJK JP");
     std::fs::create_dir_all(&args.out).map_err(|e| e.to_string())?;
 
