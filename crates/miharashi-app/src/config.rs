@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct Config {
     pub runtime: Runtime,
     pub display: Display,
@@ -37,6 +38,7 @@ pub struct Display {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct Input {
     /// デバイス名に含まれる文字列。空なら 4/6 か矢印キーを持つ全キーボード。
     pub devices: Vec<String>,
@@ -69,19 +71,6 @@ pub struct Ui {
     pub start_screen: String,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            runtime: Runtime::default(),
-            display: Display::default(),
-            input: Input::default(),
-            geoframe: Geoframe::default(),
-            metrics: Metrics::default(),
-            ui: Ui::default(),
-        }
-    }
-}
-
 impl Default for Runtime {
     fn default() -> Self {
         Self {
@@ -98,14 +87,6 @@ impl Default for Display {
             card: "auto".into(),
             connector: "auto".into(),
             mode: "preferred".into(),
-        }
-    }
-}
-
-impl Default for Input {
-    fn default() -> Self {
-        Self {
-            devices: Vec::new(),
         }
     }
 }

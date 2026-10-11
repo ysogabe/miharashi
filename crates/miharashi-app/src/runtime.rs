@@ -19,6 +19,10 @@ fn rss_mb() -> u64 {
         .map_or(0, |pages| pages * 4096 / 1024 / 1024)
 }
 
+fn fd_count() -> usize {
+    std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count())
+}
+
 /// 画面ロジックを作るために必要な、表示先が決まったあとの情報。
 pub struct Output {
     pub size: (u32, u32),
@@ -102,7 +106,8 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> KioskApp) -> Result<(
                     eprintln!("seat: 無効化(描画を停止)");
                 }
                 SessionEvent::Enabled => {
-                    keys.reopen(&mut session);
+                    let n = keys.reopen(&mut session);
+                    eprintln!("input: {n} デバイスを開き直した");
                     resume_pending = true;
                     eprintln!("seat: 有効化(復帰処理)");
                 }
@@ -158,9 +163,10 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> KioskApp) -> Result<(
         if Instant::now() >= next_stats {
             let s = app.snapshot();
             eprintln!(
-                "stats: t={}s rss={}MB frames={} worst_frame={}ms ticks={} keys={} screen={:?} photo={} feed={} cpu={:?} gpu={:?}",
+                "stats: t={}s rss={}MB fds={} frames={} worst_frame={}ms ticks={} keys={} screen={:?} photo={} feed={} cpu={:?} gpu={:?}",
                 start.elapsed().as_secs(),
                 rss_mb(),
+                fd_count(),
                 frames,
                 worst_ms,
                 app.ticks,

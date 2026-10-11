@@ -76,11 +76,19 @@ impl Session {
         match opened {
             Ok(mut seat) => {
                 // 最初の Enable を待つ(VT が非アクティブなら届かない)。
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + Duration::from_secs(3);
                 while !flags.enabled.get() && Instant::now() < deadline {
                     let _ = seat.dispatch(100);
                 }
                 if !flags.enabled.get() {
+                    // この VT/セッションが seat に属していない(SSH など)か、VT が非アクティブ。
+                    if mode == SeatMode::Auto {
+                        eprintln!(
+                            "seat: 有効にならない(seat 外のセッション?)。直接オープンにフォールバック"
+                        );
+                        drop(seat);
+                        return Ok(Self::direct());
+                    }
                     return Err("seat が有効にならない(この VT がアクティブか確認)".into());
                 }
                 flags.enabled_event.set(false);
@@ -144,7 +152,12 @@ impl Session {
 
     pub fn close_device(&mut self, opened: Opened) {
         if let (Some(seat), Some(dev)) = (self.seat.as_mut(), opened.dev) {
+            // libseat は device id を解放するだけで、open_device が返した fd は閉じない
+            // (閉じるのは呼び出し側。wlroots も close(fd) する)。閉じないと VT 往復のたびに fd が漏れる。
+            let raw = std::os::fd::AsRawFd::as_raw_fd(&std::os::fd::AsFd::as_fd(&dev));
             let _ = seat.close_device(dev);
+            // SAFETY: raw は libseat が返した fd で、複製(Opened.fd)とは別。ここでしか閉じない。
+            unsafe { libc::close(raw) };
         }
     }
 
