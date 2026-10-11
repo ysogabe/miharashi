@@ -275,6 +275,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_sampler_reports_cpu_and_memory() {
+        let sp = Sampler::spawn(Duration::from_millis(100), GpuSel::Auto);
+        std::thread::sleep(Duration::from_millis(450));
+        let s = sp.latest();
+        let cpu = s.cpu_percent.expect("CPU 使用率が取れる");
+        assert!((0.0..=100.0).contains(&cpu), "{cpu}");
+        let (used, total) = (s.mem_used_gb.unwrap(), s.mem_total_gb.unwrap());
+        assert!(total > 0.5 && used > 0.0 && used <= total, "{used}/{total}");
+    }
+
+    #[test]
     fn gpu_selector_parse() {
         assert_eq!(GpuSel::parse("auto").unwrap(), GpuSel::Auto);
         assert_eq!(GpuSel::parse("1").unwrap(), GpuSel::Index(1));
