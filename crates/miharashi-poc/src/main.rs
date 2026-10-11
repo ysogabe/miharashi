@@ -177,6 +177,7 @@ fn kms_show(args: Args) -> Result<(), String> {
     loop {
         for a in keys.poll() {
             presses += 1;
+            eprintln!("key: {a:?}");
             match a {
                 Action::Next => screen = (screen + 1) % 2,
                 Action::Prev => screen = (screen + 1) % 2,
