@@ -355,10 +355,10 @@ mod tests {
     fn wait_event(feed: &Feed, secs: u64, want: impl Fn(&FeedEvent) -> bool) -> bool {
         let end = std::time::Instant::now() + Duration::from_secs(secs);
         while std::time::Instant::now() < end {
-            if let Some(ev) = feed.try_recv() {
-                if want(&ev) {
-                    return true;
-                }
+            if let Some(ev) = feed.try_recv()
+                && want(&ev)
+            {
+                return true;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
