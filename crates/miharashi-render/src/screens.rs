@@ -216,6 +216,7 @@ fn photo_band(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot, info: Option<&Ph
 }
 
 /// 画面2: 全画面写真 + 半透明の情報帯。`fade` は切替中の (旧写真, 新写真の不透明度)。
+/// `notice` は写真の取得状態の案内(例: 再接続中)。写真が 1 枚もないときは中央に大きく出す。
 pub fn photo_frame(
     c: &mut Canvas,
     t: &mut TextEngine,
@@ -223,6 +224,7 @@ pub fn photo_frame(
     photo: Option<&Pixmap>,
     info: Option<&PhotoInfo>,
     fade: Option<(&Pixmap, f32)>,
+    notice: Option<&str>,
 ) {
     c.clear(rgba(0, 0, 0, 255));
     match (photo, fade) {
@@ -232,11 +234,18 @@ pub fn photo_frame(
         }
         (Some(new), None) => c.draw_pixmap(new, 0, 0),
         _ => {
-            let msg = "写真を読み込み中…";
+            let msg = notice.unwrap_or("写真を読み込み中…");
             let (w, h) = (c.width() as f32, c.height() as f32);
             let mw = t.measure(msg, 36.0);
             t.draw(c, msg, (w - mw) / 2.0, h / 2.0 - 20.0, 36.0, DIM);
         }
     }
     photo_band(c, t, s, info);
+    if let (Some(n), Some(_)) = (notice, photo) {
+        // 最後の写真を表示したまま、右上に小さく状態を出す。
+        let w = c.width() as f32;
+        let tw = t.measure(n, 24.0);
+        c.fill_rect(w - tw - 56.0, 24.0, tw + 32.0, 44.0, rgba(0, 0, 0, 150));
+        t.draw(c, n, w - tw - 40.0, 32.0, 24.0, [255, 200, 120, 255]);
+    }
 }
