@@ -365,6 +365,54 @@ mod tests {
         false
     }
 
+    fn write_png(path: &std::path::Path, rgb: [u8; 3]) {
+        let img = image::RgbaImage::from_pixel(64, 48, image::Rgba([rgb[0], rgb[1], rgb[2], 255]));
+        img.save(path).unwrap();
+    }
+
+    #[test]
+    fn catalog_next_prev_wrap_and_report_position() {
+        let dir = std::env::temp_dir().join(format!("miharashi-cat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let colors = [[200, 0, 0], [0, 200, 0], [0, 0, 200]];
+        let entries: Vec<Entry> = colors
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let p = dir.join(format!("{i}.png"));
+                write_png(&p, *c);
+                Entry {
+                    origin: Origin::File(p),
+                    place: format!("p{i}"),
+                    taken: String::new(),
+                }
+            })
+            .collect();
+        let mut cat = Catalog {
+            entries,
+            order: vec![0, 1, 2],
+            pos: 0,
+            size: (32, 18),
+        };
+        let red = |c: &Catalog| c.current().unwrap().pix.data()[0];
+        assert_eq!(
+            (red(&cat), cat.current().unwrap().info.position),
+            (200, (1, 3))
+        );
+        cat.advance(1);
+        assert_eq!(cat.current().unwrap().info.place, "p1");
+        cat.advance(1);
+        cat.advance(1);
+        assert_eq!(
+            cat.current().unwrap().info.position,
+            (1, 3),
+            "末尾の次は先頭へ戻る"
+        );
+        cat.advance(-1);
+        assert_eq!(cat.current().unwrap().info.place, "p2", "先頭の前は末尾へ");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn backoff_doubles_up_to_max_and_resets() {
         let mut b = Backoff::new(Duration::from_secs(1), Duration::from_secs(8));

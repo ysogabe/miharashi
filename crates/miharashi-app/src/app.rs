@@ -220,3 +220,120 @@ impl KioskApp {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::{DummyData, dummy_snapshot};
+
+    fn app_with_photo(size: (u32, u32)) -> (KioskApp, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "miharashi-app-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.png");
+        image::RgbaImage::from_pixel(64, 48, image::Rgba([30, 120, 60, 255]))
+            .save(&p)
+            .unwrap();
+        let cfg = Config::default();
+        let app = KioskApp::new(
+            &cfg,
+            size,
+            Source::File(p, Some("テスト".into())),
+            Box::new(DummyData::new()),
+            dummy_snapshot(0.0),
+        );
+        (app, dir)
+    }
+
+    fn pump_until(app: &mut KioskApp, cond: impl Fn(&KioskApp) -> bool) -> bool {
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            app.tick(Instant::now());
+            if cond(app) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn key_flow_between_status_and_photo() {
+        let (mut app, dir) = app_with_photo((320, 180));
+        assert_eq!(app.screen(), Screen::Status);
+        app.on_key(Key::Prev);
+        assert_eq!(app.screen(), Screen::Status, "状況画面の 4 は何もしない");
+        app.on_key(Key::Next);
+        assert_eq!(
+            app.screen(),
+            Screen::Photo,
+            "状況画面の 6 でフォトフレームへ"
+        );
+        app.on_key(Key::Switch);
+        assert_eq!(app.screen(), Screen::Status, "5 で状況画面へ戻る");
+        app.on_key(Key::Switch);
+        assert_eq!(app.screen(), Screen::Photo, "5 でフォトフレームへ");
+        assert!(
+            pump_until(&mut app, |a| a.photo_position() == 1),
+            "写真が読み込まれる"
+        );
+        app.on_key(Key::Next);
+        assert!(
+            pump_until(&mut app, |a| a.photo_position() == 1),
+            "写真切替後も位置が有効"
+        );
+        assert_eq!(app.keys, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn px(c: &Canvas, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * c.width() + x) * 4) as usize;
+        c.pixmap.data()[i..i + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn both_screens_render_expected_regions_at_1080p() {
+        let (mut app, dir) = app_with_photo((1920, 1080));
+        let mut c = Canvas::new(1920, 1080);
+        app.render(&mut c);
+        // 状況画面: CPU タイルの左端にアクセント色、背景は暗色。
+        assert_eq!(
+            px(&c, 34, 150),
+            [64, 200, 255, 255],
+            "CPU タイルのアクセント"
+        );
+        assert_eq!(px(&c, 5, 540), [8, 12, 20, 255], "背景");
+        // グラフ領域にシリーズ色(CPU のシアン)が描かれている。
+        let mut found = false;
+        for y in 440..1000 {
+            for x in 100..1880 {
+                if px(&c, x, y) == [64, 200, 255, 255] {
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "CPU 使用率の折れ線");
+
+        app.on_key(Key::Next);
+        assert!(pump_until(&mut app, |a| a.photo_position() == 1));
+        // 写真が拡大されて全面に出る。フェードが終わるまで待って確認する。
+        std::thread::sleep(Duration::from_millis(900));
+        app.tick(Instant::now());
+        let mut c2 = Canvas::new(1920, 1080);
+        app.render(&mut c2);
+        let center = px(&c2, 960, 400);
+        assert!(
+            center[1] > center[0] && center[1] > center[2],
+            "写真(緑)が表示される: {center:?}"
+        );
+        let band = px(&c2, 1000, 1070);
+        assert!(
+            band[1] < center[1] / 2 + 10,
+            "下部の半透明の帯で暗くなる: {band:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
