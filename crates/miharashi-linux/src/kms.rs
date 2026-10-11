@@ -1,5 +1,5 @@
-use drm::control::{connector, Device as ControlDevice, ModeTypeFlags};
 use drm::Device;
+use drm::control::{Device as ControlDevice, ModeTypeFlags, connector};
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
@@ -16,7 +16,11 @@ impl ControlDevice for Card {}
 
 impl Card {
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        OpenOptions::new().read(true).write(true).open(path).map(Card)
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map(Card)
     }
 }
 
@@ -45,10 +49,17 @@ pub fn probe() -> Vec<Result<CardInfo, String>> {
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("card")))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("card"))
+        })
         .collect();
     paths.sort();
-    paths.into_iter().map(|p| probe_card(&p).map_err(|e| format!("{}: {e}", p.display()))).collect()
+    paths
+        .into_iter()
+        .map(|p| probe_card(&p).map_err(|e| format!("{}: {e}", p.display())))
+        .collect()
 }
 
 fn probe_card(path: &Path) -> std::io::Result<CardInfo> {
@@ -72,11 +83,15 @@ fn probe_card(path: &Path) -> std::io::Result<CardInfo> {
                 .collect(),
         });
     }
-    Ok(CardInfo { path: path.to_path_buf(), driver, connectors })
+    Ok(CardInfo {
+        path: path.to_path_buf(),
+        driver,
+        connectors,
+    })
 }
 
 use drm::buffer::{Buffer, DrmFourcc};
-use drm::control::{crtc, framebuffer, Mode};
+use drm::control::{Mode, crtc, framebuffer};
 
 /// 1 コネクターへ dumb buffer で出力する Presenter。Drop で元の CRTC 状態を復元する。
 pub struct Display {
@@ -122,10 +137,22 @@ impl Display {
         let db = card
             .create_dumb_buffer((w as u32, h as u32), DrmFourcc::Xrgb8888, 32)
             .map_err(|e| format!("create_dumb_buffer: {e}"))?;
-        let fb = card.add_framebuffer(&db, 24, 32).map_err(|e| format!("add_framebuffer: {e}"))?;
+        let fb = card
+            .add_framebuffer(&db, 24, 32)
+            .map_err(|e| format!("add_framebuffer: {e}"))?;
         card.set_crtc(crtc, Some(fb), (0, 0), &[info.handle()], Some(mode))
-            .map_err(|e| format!("set_crtc: {e} (DRM master を他のプロセスが持っていないか確認)"))?;
-        Ok(Self { card, crtc, conn: info.handle(), mode, saved, fb, db })
+            .map_err(|e| {
+                format!("set_crtc: {e} (DRM master を他のプロセスが持っていないか確認)")
+            })?;
+        Ok(Self {
+            card,
+            crtc,
+            conn: info.handle(),
+            mode,
+            saved,
+            fb,
+            db,
+        })
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -136,7 +163,10 @@ impl Display {
     /// フレームを dumb buffer へ書く。`fill` は (バッファ, pitch) を受け取る。
     pub fn present(&mut self, fill: impl FnOnce(&mut [u8], usize)) -> Result<(), String> {
         let pitch = self.db.pitch() as usize;
-        let mut map = self.card.map_dumb_buffer(&mut self.db).map_err(|e| format!("map_dumb_buffer: {e}"))?;
+        let mut map = self
+            .card
+            .map_dumb_buffer(&mut self.db)
+            .map_err(|e| format!("map_dumb_buffer: {e}"))?;
         fill(map.as_mut(), pitch);
         Ok(())
     }

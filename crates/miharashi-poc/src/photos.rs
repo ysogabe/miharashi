@@ -1,8 +1,8 @@
 //! 写真の取得元(GEOFRAME か単一ファイル)、並び順、デコードを担当する。
 //! `Feed` は別スレッドで取得・縮小するので、描画ループをブロックしない。
-use miharashi_render::{photo, screens::PhotoInfo, Pixmap};
+use miharashi_render::{Pixmap, photo, screens::PhotoInfo};
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 pub enum Source {
     Geoframe(String),
@@ -35,7 +35,11 @@ pub struct Catalog {
 
 fn read_all(req: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>, String> {
     let mut req = req;
-    req.body_mut().with_config().limit(64 * 1024 * 1024).read_to_vec().map_err(|e| e.to_string())
+    req.body_mut()
+        .with_config()
+        .limit(64 * 1024 * 1024)
+        .read_to_vec()
+        .map_err(|e| e.to_string())
 }
 
 fn xorshift(state: &mut u64) -> u64 {
@@ -49,8 +53,14 @@ impl Catalog {
     pub fn open(source: &Source, size: (u32, u32)) -> Result<Self, String> {
         let (entries, preferred) = match source {
             Source::File(p, caption) => {
-                let name = p.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-                let e = Entry { origin: Origin::File(p.clone()), place: caption.clone().unwrap_or(name), taken: String::new() };
+                let name = p
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                let e = Entry {
+                    origin: Origin::File(p.clone()),
+                    place: caption.clone().unwrap_or(name),
+                    taken: String::new(),
+                };
                 (vec![e], vec![0])
             }
             Source::Geoframe(base) => Self::list_geoframe(base)?,
@@ -59,7 +69,11 @@ impl Catalog {
             return Err("写真が 1 枚もない".into());
         }
         // 推奨・お気に入りが 5 枚以上あればそれらだけ、なければ全件を対象にする。
-        let mut order = if preferred.len() >= 5 { preferred } else { (0..entries.len()).collect() };
+        let mut order = if preferred.len() >= 5 {
+            preferred
+        } else {
+            (0..entries.len()).collect()
+        };
         let mut seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0x9e3779b97f4a7c15, |d| d.as_nanos() as u64)
@@ -67,21 +81,36 @@ impl Catalog {
         for i in (1..order.len()).rev() {
             order.swap(i, (xorshift(&mut seed) % (i as u64 + 1)) as usize);
         }
-        Ok(Self { entries, order, pos: 0, size })
+        Ok(Self {
+            entries,
+            order,
+            pos: 0,
+            size,
+        })
     }
 
     fn list_geoframe(base: &str) -> Result<(Vec<Entry>, Vec<usize>), String> {
         let base = base.trim_end_matches('/');
-        let body = read_all(ureq::get(&format!("{base}/api/photos")).call().map_err(|e| format!("GEOFRAME: {e}"))?)?;
+        let body = read_all(
+            ureq::get(&format!("{base}/api/photos"))
+                .call()
+                .map_err(|e| format!("GEOFRAME: {e}"))?,
+        )?;
         let list: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
         let arr = list.as_array().ok_or("unexpected /api/photos")?;
         let (mut entries, mut preferred) = (Vec::new(), Vec::new());
         for p in arr {
-            let Some(file) = p["file"].as_str() else { continue };
+            let Some(file) = p["file"].as_str() else {
+                continue;
+            };
             if p["quality_recommended"] == true || p["fav"] == true {
                 preferred.push(entries.len());
             }
-            let place = format!("{} {}", p["pref"].as_str().unwrap_or(""), p["title"].as_str().unwrap_or(""));
+            let place = format!(
+                "{} {}",
+                p["pref"].as_str().unwrap_or(""),
+                p["title"].as_str().unwrap_or("")
+            );
             entries.push(Entry {
                 origin: Origin::Url(format!("{base}/{file}")),
                 place: place.trim().to_string(),
@@ -105,7 +134,11 @@ impl Catalog {
         let pix = photo::load_cover(&bytes, self.size.0, self.size.1)?;
         Ok(PhotoItem {
             pix,
-            info: PhotoInfo { place: e.place.clone(), taken: e.taken.clone(), position: (self.pos + 1, self.order.len()) },
+            info: PhotoInfo {
+                place: e.place.clone(),
+                taken: e.taken.clone(),
+                position: (self.pos + 1, self.order.len()),
+            },
         })
     }
 }

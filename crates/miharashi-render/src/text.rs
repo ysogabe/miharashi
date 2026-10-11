@@ -11,7 +11,11 @@ pub struct TextEngine {
 impl TextEngine {
     /// `family` は日本語対応フォント名(例: "Noto Sans CJK JP")。
     pub fn new(family: &str) -> Self {
-        Self { fonts: FontSystem::new(), swash: SwashCache::new(), family: family.to_string() }
+        Self {
+            fonts: FontSystem::new(),
+            swash: SwashCache::new(),
+            family: family.to_string(),
+        }
     }
 
     /// フォントファイルをヒープへ読み込んで使う。システムフォント(mmap)には依存しないので、
@@ -41,20 +45,48 @@ impl TextEngine {
     }
 
     /// (x, y) を左上として描画。color は straight RGBA。
-    pub fn draw(&mut self, canvas: &mut Canvas, text: &str, x: f32, y: f32, size: f32, color: [u8; 4]) {
+    pub fn draw(
+        &mut self,
+        canvas: &mut Canvas,
+        text: &str,
+        x: f32,
+        y: f32,
+        size: f32,
+        color: [u8; 4],
+    ) {
         let mut buf = self.buffer(text, size);
         let c = Color::rgba(color[0], color[1], color[2], color[3]);
         let (x, y) = (x as i32, y as i32);
-        buf.draw(&mut self.fonts, &mut self.swash, c, |gx, gy, gw, gh, col| {
-            for dy in 0..gh as i32 {
-                for dx in 0..gw as i32 {
-                    canvas.blend_pixel(x + gx + dx, y + gy + dy, col.r(), col.g(), col.b(), col.a());
+        buf.draw(
+            &mut self.fonts,
+            &mut self.swash,
+            c,
+            |gx, gy, gw, gh, col| {
+                for dy in 0..gh as i32 {
+                    for dx in 0..gw as i32 {
+                        canvas.blend_pixel(
+                            x + gx + dx,
+                            y + gy + dy,
+                            col.r(),
+                            col.g(),
+                            col.b(),
+                            col.a(),
+                        );
+                    }
                 }
-            }
-        });
+            },
+        );
     }
 
-    pub fn draw_right(&mut self, canvas: &mut Canvas, text: &str, right: f32, y: f32, size: f32, color: [u8; 4]) {
+    pub fn draw_right(
+        &mut self,
+        canvas: &mut Canvas,
+        text: &str,
+        right: f32,
+        y: f32,
+        size: f32,
+        color: [u8; 4],
+    ) {
         let w = self.measure(text, size);
         self.draw(canvas, text, right - w, y, size, color);
     }

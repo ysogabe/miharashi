@@ -1,7 +1,7 @@
 //! PoC-001: PC の状況表示とフォトフレームの 2 画面。`png`(ヘッドレス)と `kms-show`(実機)。
 mod photos;
 
-use miharashi_render::{screens, Canvas, Pixmap, TextEngine};
+use miharashi_render::{Canvas, Pixmap, TextEngine, screens};
 use photos::{Catalog, Feed, Source};
 use std::path::PathBuf;
 
@@ -53,7 +53,10 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             "--size" => {
                 let s = v()?;
                 let (w, h) = s.split_once('x').ok_or("--size WxH")?;
-                a.size = (w.parse().map_err(|_| "bad width")?, h.parse().map_err(|_| "bad height")?);
+                a.size = (
+                    w.parse().map_err(|_| "bad width")?,
+                    h.parse().map_err(|_| "bad height")?,
+                );
             }
             _ => return Err(format!("unknown option {k}")),
         }
@@ -71,7 +74,8 @@ fn source(args: &Args) -> Source {
 /// --font があればヒープへ読み込み、なければシステムフォントを使う。
 fn text_engine(args: &Args) -> Result<TextEngine, String> {
     match &args.font {
-        Some(p) => TextEngine::from_font_file("Noto Sans CJK JP", p).map_err(|e| format!("font {}: {e}", p.display())),
+        Some(p) => TextEngine::from_font_file("Noto Sans CJK JP", p)
+            .map_err(|e| format!("font {}: {e}", p.display())),
         None => Ok(TextEngine::new("Noto Sans CJK JP")),
     }
 }
@@ -79,7 +83,8 @@ fn text_engine(args: &Args) -> Result<TextEngine, String> {
 fn set_clock(s: &mut screens::Snapshot) {
     use chrono::Datelike;
     let now = chrono::Local::now();
-    let wd = ["月", "火", "水", "木", "金", "土", "日"][now.weekday().num_days_from_monday() as usize];
+    let wd =
+        ["月", "火", "水", "木", "金", "土", "日"][now.weekday().num_days_from_monday() as usize];
     s.date = format!("{} ({wd})", now.format("%Y/%m/%d"));
     s.time = now.format("%H:%M:%S").to_string();
 }
@@ -106,7 +111,10 @@ fn dummy_snapshot(phase: f32) -> screens::Snapshot {
         mem_used: Some(24.0),
         mem_total: Some(64.0),
         ssd_temps: vec![("SSD-A".into(), 41.0), ("SSD-B".into(), 39.0)],
-        fans: vec![("CPU".into(), "1200 rpm".into()), ("GPU".into(), "32%".into())],
+        fans: vec![
+            ("CPU".into(), "1200 rpm".into()),
+            ("GPU".into(), "32%".into()),
+        ],
         cpu_history,
         gpu_history,
         ..Default::default()
@@ -147,9 +155,22 @@ fn kms_info() {
             Ok(c) => {
                 println!("{} driver={}", c.path.display(), c.driver);
                 for k in c.connectors {
-                    println!("  {} {}", k.name, if k.connected { "connected" } else { "disconnected" });
+                    println!(
+                        "  {} {}",
+                        k.name,
+                        if k.connected {
+                            "connected"
+                        } else {
+                            "disconnected"
+                        }
+                    );
                     for m in k.modes.iter().take(5) {
-                        println!("    {} @{}Hz{}", m.name, m.refresh, if m.preferred { " (preferred)" } else { "" });
+                        println!(
+                            "    {} @{}Hz{}",
+                            m.name,
+                            m.refresh,
+                            if m.preferred { " (preferred)" } else { "" }
+                        );
                     }
                 }
             }
@@ -171,14 +192,21 @@ fn kms_show(args: Args) -> Result<(), String> {
 
     let mut keys = Keys::open()?;
     println!("input: {:?}", keys.device_names());
-    let mut disp = Display::open(std::path::Path::new("/dev/dri/card0"), args.connector.as_deref())?;
+    let mut disp = Display::open(
+        std::path::Path::new("/dev/dri/card0"),
+        args.connector.as_deref(),
+    )?;
     let (w, h) = disp.size();
-    println!("KMS {w}x{h}, run {}s, photo interval {}s (4/6 前後, 5 画面切替, Esc/q 終了)", args.seconds, args.interval);
+    println!(
+        "KMS {w}x{h}, run {}s, photo interval {}s (4/6 前後, 5 画面切替, Esc/q 終了)",
+        args.seconds, args.interval
+    );
 
     let mut text = text_engine(&args)?;
     let mut c = Canvas::new(w, h);
     let feed = Feed::spawn(source(&args), (w, h));
-    let sampler = (!args.dummy).then(|| miharashi_linux::metrics::Sampler::spawn(Duration::from_secs(1)));
+    let sampler =
+        (!args.dummy).then(|| miharashi_linux::metrics::Sampler::spawn(Duration::from_secs(1)));
     let mut snap = if sampler.is_some() {
         let mut s = dummy_snapshot(0.0);
         s.cpu_history = vec![0.0; 120]; // 実測の履歴は空から貯める
@@ -191,7 +219,11 @@ fn kms_show(args: Args) -> Result<(), String> {
     let interval = Duration::from_secs(args.interval);
     let fade_len = Duration::from_millis(800);
     let start = Instant::now();
-    let mut screen = if args.start_photo { Screen::Photo } else { Screen::Status };
+    let mut screen = if args.start_photo {
+        Screen::Photo
+    } else {
+        Screen::Status
+    };
     let mut current: Option<photos::PhotoItem> = None;
     let mut fade: Option<(Pixmap, Instant)> = None;
     let mut last_photo_change = Instant::now();
@@ -205,7 +237,9 @@ fn kms_show(args: Args) -> Result<(), String> {
             eprintln!("key: {a:?}");
             match (a, screen) {
                 (Action::Quit, _) => return Ok(()),
-                (Action::Switch, Screen::Status) | (Action::Next, Screen::Status) => screen = Screen::Photo,
+                (Action::Switch, Screen::Status) | (Action::Next, Screen::Status) => {
+                    screen = Screen::Photo
+                }
                 (Action::Switch, Screen::Photo) => screen = Screen::Status,
                 (Action::Next, Screen::Photo) => {
                     feed.next();
@@ -238,7 +272,9 @@ fn kms_show(args: Args) -> Result<(), String> {
         if start.elapsed() >= Duration::from_secs(args.seconds) {
             return Ok(()); // Drop で CRTC を復元
         }
-        let fade_alpha = fade.as_ref().map(|(_, t0)| t0.elapsed().as_secs_f32() / fade_len.as_secs_f32());
+        let fade_alpha = fade
+            .as_ref()
+            .map(|(_, t0)| t0.elapsed().as_secs_f32() / fade_len.as_secs_f32());
         if fade_alpha.is_some_and(|a| a >= 1.0) {
             fade = None;
         }
@@ -259,8 +295,20 @@ fn kms_show(args: Args) -> Result<(), String> {
             match screen {
                 Screen::Status => screens::status(&mut c, &mut text, &snap),
                 Screen::Photo => {
-                    let fade_arg = fade.as_ref().map(|(old, t0)| (old, (t0.elapsed().as_secs_f32() / fade_len.as_secs_f32()).min(1.0)));
-                    screens::photo_frame(&mut c, &mut text, &snap, current.as_ref().map(|p| &p.pix), current.as_ref().map(|p| &p.info), fade_arg)
+                    let fade_arg = fade.as_ref().map(|(old, t0)| {
+                        (
+                            old,
+                            (t0.elapsed().as_secs_f32() / fade_len.as_secs_f32()).min(1.0),
+                        )
+                    });
+                    screens::photo_frame(
+                        &mut c,
+                        &mut text,
+                        &snap,
+                        current.as_ref().map(|p| &p.pix),
+                        current.as_ref().map(|p| &p.info),
+                        fade_arg,
+                    )
                 }
             }
             disp.present(|buf, pitch| c.write_xrgb8888(buf, pitch))?;
@@ -278,7 +326,11 @@ fn kms_show(args: Args) -> Result<(), String> {
                         snap.cpu.map(|v| v.round()),
                         snap.gpu.map(|v| v.round()),
                         snap.mem_used.map(|v| (v * 10.0).round() / 10.0),
-                        if screen == Screen::Status { "status" } else { "photo" },
+                        if screen == Screen::Status {
+                            "status"
+                        } else {
+                            "photo"
+                        },
                         current.as_ref().map_or(0, |p| p.info.position.0),
                     );
                 }
@@ -313,7 +365,10 @@ fn png(args: Args) -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_secs(1));
             apply_sample(&mut snap, &sp.latest());
         }
-        println!("live: cpu={:?} gpu={:?} ssd={:?} fans={:?}", snap.cpu, snap.gpu, snap.ssd_temps, snap.fans);
+        println!(
+            "live: cpu={:?} gpu={:?} ssd={:?} fans={:?}",
+            snap.cpu, snap.gpu, snap.ssd_temps, snap.fans
+        );
     }
     let item = Catalog::open(&source(&args), args.size)?.current()?;
     let mut text = text_engine(&args)?;
@@ -321,15 +376,29 @@ fn png(args: Args) -> Result<(), String> {
     let mut c = Canvas::new(w, h);
     screens::status(&mut c, &mut text, &snap);
     c.save_png(&args.out.join("status.png"))?;
-    screens::photo_frame(&mut c, &mut text, &snap, Some(&item.pix), Some(&item.info), None);
+    screens::photo_frame(
+        &mut c,
+        &mut text,
+        &snap,
+        Some(&item.pix),
+        Some(&item.info),
+        None,
+    );
     c.save_png(&args.out.join("photo.png"))?;
-    println!("wrote {}/{{status,photo}}.png ({w}x{h})", args.out.display());
+    println!(
+        "wrote {}/{{status,photo}}.png ({w}x{h})",
+        args.out.display()
+    );
     Ok(())
 }
 
 fn main() -> Result<(), String> {
     let mut rest: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = if rest.first().is_some_and(|c| !c.starts_with("--")) { rest.remove(0) } else { "png".into() };
+    let cmd = if rest.first().is_some_and(|c| !c.starts_with("--")) {
+        rest.remove(0)
+    } else {
+        "png".into()
+    };
     match cmd.as_str() {
         "kms-info" => {
             kms_info();

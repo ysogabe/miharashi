@@ -1,5 +1,7 @@
 use std::path::Path;
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke, Transform};
+use tiny_skia::{
+    Color, FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke, Transform,
+};
 
 /// premultiplied RGBA8、上から下、stride = width * 4。
 pub struct Canvas {
@@ -19,7 +21,9 @@ fn paint(color: Color) -> Paint<'static> {
 
 impl Canvas {
     pub fn new(width: u32, height: u32) -> Self {
-        Self { pixmap: Pixmap::new(width, height).expect("invalid canvas size") }
+        Self {
+            pixmap: Pixmap::new(width, height).expect("invalid canvas size"),
+        }
     }
 
     pub fn width(&self) -> u32 {
@@ -36,7 +40,8 @@ impl Canvas {
 
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
         if let Some(r) = Rect::from_xywh(x, y, w, h) {
-            self.pixmap.fill_rect(r, &paint(color), Transform::identity(), None);
+            self.pixmap
+                .fill_rect(r, &paint(color), Transform::identity(), None);
         }
     }
 
@@ -46,8 +51,12 @@ impl Canvas {
             pb.push_rect(r);
         }
         if let Some(path) = pb.finish() {
-            let stroke = Stroke { width, ..Stroke::default() };
-            self.pixmap.stroke_path(&path, &paint(color), &stroke, Transform::identity(), None);
+            let stroke = Stroke {
+                width,
+                ..Stroke::default()
+            };
+            self.pixmap
+                .stroke_path(&path, &paint(color), &stroke, Transform::identity(), None);
         }
     }
 
@@ -65,8 +74,13 @@ impl Canvas {
             pb.line_to(p.0, p.1);
         }
         if let Some(path) = pb.finish() {
-            let stroke = Stroke { width, line_join: tiny_skia::LineJoin::Round, ..Stroke::default() };
-            self.pixmap.stroke_path(&path, &paint(color), &stroke, Transform::identity(), None);
+            let stroke = Stroke {
+                width,
+                line_join: tiny_skia::LineJoin::Round,
+                ..Stroke::default()
+            };
+            self.pixmap
+                .stroke_path(&path, &paint(color), &stroke, Transform::identity(), None);
         }
     }
 
@@ -83,19 +97,36 @@ impl Canvas {
         pb.line_to(points[points.len() - 1].0, baseline);
         pb.close();
         if let Some(path) = pb.finish() {
-            self.pixmap.fill_path(&path, &paint(color), FillRule::Winding, Transform::identity(), None);
+            self.pixmap.fill_path(
+                &path,
+                &paint(color),
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
         }
     }
 
     /// 他の Pixmap を (x, y) に合成する。
     pub fn draw_pixmap(&mut self, src: &Pixmap, x: i32, y: i32) {
-        self.pixmap.draw_pixmap(x, y, src.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        self.pixmap.draw_pixmap(
+            x,
+            y,
+            src.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
     }
 
     /// 不透明度 `opacity`(0.0..=1.0)で他の Pixmap を合成する(クロスフェード用)。
     pub fn draw_pixmap_opacity(&mut self, src: &Pixmap, x: i32, y: i32, opacity: f32) {
-        let paint = PixmapPaint { opacity: opacity.clamp(0.0, 1.0), ..PixmapPaint::default() };
-        self.pixmap.draw_pixmap(x, y, src.as_ref(), &paint, Transform::identity(), None);
+        let paint = PixmapPaint {
+            opacity: opacity.clamp(0.0, 1.0),
+            ..PixmapPaint::default()
+        };
+        self.pixmap
+            .draw_pixmap(x, y, src.as_ref(), &paint, Transform::identity(), None);
     }
 
     /// 1 画素を src-over で合成する(文字描画用)。color は straight RGBA。
@@ -123,9 +154,31 @@ impl Canvas {
         let w = self.width() as usize;
         for (y, row) in self.pixmap.data().chunks_exact(w * 4).enumerate() {
             let out = &mut dst[y * pitch..y * pitch + w * 4];
-            for (s, d) in row.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+            for (s, d) in row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(out.as_chunks_mut::<4>().0.iter_mut())
+            {
                 d.copy_from_slice(&[s[2], s[1], s[0], 0xff]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xrgb8888_swaps_to_bgrx_and_respects_pitch() {
+        let mut c = Canvas::new(2, 2);
+        c.clear(rgba(10, 20, 30, 255));
+        let pitch = 16; // width*4 より大きい pitch でも行頭が崩れない
+        let mut dst = vec![0u8; pitch * 2];
+        c.write_xrgb8888(&mut dst, pitch);
+        assert_eq!(&dst[0..4], &[30, 20, 10, 255]);
+        assert_eq!(&dst[pitch..pitch + 4], &[30, 20, 10, 255]);
+        assert_eq!(&dst[8..pitch], &[0; 8], "パディングは触らない");
     }
 }

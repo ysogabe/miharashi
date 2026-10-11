@@ -67,7 +67,14 @@ pub fn status(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot) {
     let (head, foot) = (72.0, 64.0);
 
     t.draw(c, "SERVER STATUS", 32.0, 16.0, 36.0, FG);
-    t.draw_right(c, &format!("{}  {}", s.date, s.time), w - 32.0, 22.0, 30.0, DIM);
+    t.draw_right(
+        c,
+        &format!("{}  {}", s.date, s.time),
+        w - 32.0,
+        22.0,
+        30.0,
+        DIM,
+    );
     c.hline(0.0, head, w, line());
 
     let (gap, pad) = (20.0, 32.0);
@@ -76,20 +83,33 @@ pub fn status(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot) {
     let tx = |i: usize| pad + (tw + gap) * i as f32;
 
     // CPU / GPU: 使用率 + 温度
-    for (i, (name, usage, temp, color)) in
-        [("CPU", s.cpu, s.cpu_temp, CPU_COLOR), ("GPU", s.gpu, s.gpu_temp, GPU_COLOR)].into_iter().enumerate()
+    for (i, (name, usage, temp, color)) in [
+        ("CPU", s.cpu, s.cpu_temp, CPU_COLOR),
+        ("GPU", s.gpu, s.gpu_temp, GPU_COLOR),
+    ]
+    .into_iter()
+    .enumerate()
     {
         tile(c, t, tx(i), ty, tw, th, name);
         c.fill_rect(tx(i), ty, 6.0, th, rgba(color[0], color[1], color[2], 255));
         t.draw(c, &pct(usage), tx(i) + 20.0, ty + 56.0, 72.0, FG);
-        t.draw(c, &deg(temp), tx(i) + 20.0, ty + 150.0, 36.0, temp.map_or(DIM, temp_color));
+        t.draw(
+            c,
+            &deg(temp),
+            tx(i) + 20.0,
+            ty + 150.0,
+            36.0,
+            temp.map_or(DIM, temp_color),
+        );
     }
 
     // MEMORY
     tile(c, t, tx(2), ty, tw, th, "MEMORY");
     let used = s.mem_used.map_or("--".to_string(), |v| format!("{v:.1}"));
     t.draw(c, &used, tx(2) + 20.0, ty + 56.0, 72.0, FG);
-    let total = s.mem_total.map_or("--".to_string(), |v| format!("/ {v:.0} GB"));
+    let total = s
+        .mem_total
+        .map_or("--".to_string(), |v| format!("/ {v:.0} GB"));
     t.draw(c, &total, tx(2) + 20.0, ty + 150.0, 36.0, DIM);
 
     // SSD: ドライブごとの温度
@@ -100,7 +120,14 @@ pub fn status(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot) {
     for (i, (name, temp)) in s.ssd_temps.iter().take(3).enumerate() {
         let ry = ty + 60.0 + i as f32 * 50.0;
         t.draw(c, name, tx(3) + 20.0, ry + 6.0, 26.0, DIM);
-        t.draw_right(c, &format!("{temp:.0}°C"), tx(3) + tw - 20.0, ry, 38.0, temp_color(*temp));
+        t.draw_right(
+            c,
+            &format!("{temp:.0}°C"),
+            tx(3) + tw - 20.0,
+            ry,
+            38.0,
+            temp_color(*temp),
+        );
     }
 
     // FAN
@@ -124,8 +151,16 @@ pub fn status(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot) {
         h - foot - 24.0 - cy,
         "USAGE (直近2分)",
         &[
-            Series { name: "CPU", data: &s.cpu_history, color: CPU_COLOR },
-            Series { name: "GPU", data: &s.gpu_history, color: GPU_COLOR },
+            Series {
+                name: "CPU",
+                data: &s.cpu_history,
+                color: CPU_COLOR,
+            },
+            Series {
+                name: "GPU",
+                data: &s.gpu_history,
+                color: GPU_COLOR,
+            },
         ],
         100.0,
     );
@@ -143,12 +178,40 @@ fn photo_band(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot, info: Option<&Ph
     let band = 130.0;
     c.fill_rect(0.0, h - band, w, band, rgba(0, 0, 0, 150));
     t.draw(c, &s.time, 40.0, h - band + 8.0, 60.0, [255, 255, 255, 255]);
-    t.draw(c, &s.date, 40.0, h - band + 80.0, 30.0, [215, 222, 230, 255]);
+    t.draw(
+        c,
+        &s.date,
+        40.0,
+        h - band + 80.0,
+        30.0,
+        [215, 222, 230, 255],
+    );
     if let Some(i) = info {
-        t.draw_right(c, &i.place, w - 40.0, h - band + 14.0, 38.0, [255, 255, 255, 255]);
-        t.draw_right(c, &i.taken, w - 40.0, h - band + 66.0, 28.0, [215, 222, 230, 255]);
+        t.draw_right(
+            c,
+            &i.place,
+            w - 40.0,
+            h - band + 14.0,
+            38.0,
+            [255, 255, 255, 255],
+        );
+        t.draw_right(
+            c,
+            &i.taken,
+            w - 40.0,
+            h - band + 66.0,
+            28.0,
+            [215, 222, 230, 255],
+        );
         let pos = format!("{} / {}", i.position.0, i.position.1);
-        t.draw_right(c, &pos, w - 40.0, h - band + 98.0, 22.0, [160, 170, 182, 255]);
+        t.draw_right(
+            c,
+            &pos,
+            w - 40.0,
+            h - band + 98.0,
+            22.0,
+            [160, 170, 182, 255],
+        );
     }
 }
 
