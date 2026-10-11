@@ -1,0 +1,7 @@
+[package]
+name = "miharashi-linux"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+drm = "0.15.0"

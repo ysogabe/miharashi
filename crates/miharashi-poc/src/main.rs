@@ -73,7 +73,28 @@ fn fetch_geoframe(base: &str, cache: &Path) -> Result<(Vec<u8>, String), String>
     Ok((bytes, caption))
 }
 
+fn kms_info() {
+    for card in miharashi_linux::kms::probe() {
+        match card {
+            Err(e) => println!("ERROR {e}"),
+            Ok(c) => {
+                println!("{} driver={}", c.path.display(), c.driver);
+                for k in c.connectors {
+                    println!("  {} {}", k.name, if k.connected { "connected" } else { "disconnected" });
+                    for m in k.modes.iter().take(5) {
+                        println!("    {} @{}Hz{}", m.name, m.refresh, if m.preferred { " (preferred)" } else { "" });
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), String> {
+    if std::env::args().nth(1).as_deref() == Some("kms-info") {
+        kms_info();
+        return Ok(());
+    }
     let args = parse_args()?;
     let (w, h) = args.size;
 
