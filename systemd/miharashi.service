@@ -37,7 +37,8 @@ ExecStartPre=+/usr/bin/chvt 7
 ExecStart=@BINDIR@/miharashi run --config /etc/miharashi/config.toml
 ExecStopPost=+/usr/bin/chvt 1
 
-Restart=on-failure
+# Esc/q での終了(正常終了)も再起動する。止めるときは systemctl stop miharashi。
+Restart=always
 RestartSec=3
 KillSignal=SIGTERM
 TimeoutStopSec=15
