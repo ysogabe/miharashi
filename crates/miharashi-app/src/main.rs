@@ -134,7 +134,7 @@ fn png(cli: Cli) -> Result<(), String> {
         &mut c,
         &mut text,
         &snap,
-        Some(&item.pix),
+        Some((&item.frame, &item.layout)),
         Some(&item.info),
         None,
         None,

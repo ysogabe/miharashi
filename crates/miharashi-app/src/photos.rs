@@ -1,6 +1,7 @@
 //! 写真の取得元(GEOFRAME か単一ファイル)、並び順、デコードを担当する。
 //! `Feed` は別スレッドで取得・縮小するので、描画ループをブロックしない。
-use miharashi_render::{Pixmap, photo, screens::PhotoInfo};
+use chrono::{Datelike, NaiveDate};
+use miharashi_render::{Pixmap, photo, photo_layout::PhotoLayout, screens::PhotoInfo};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::Duration;
@@ -23,7 +24,9 @@ struct Entry {
 }
 
 pub struct PhotoItem {
-    pub pix: Pixmap,
+    /// 背景と写真を合成した、画面いっぱいの完成フレーム
+    pub frame: Pixmap,
+    pub layout: PhotoLayout,
     pub info: PhotoInfo,
 }
 
@@ -32,6 +35,54 @@ pub struct Catalog {
     order: Vec<usize>,
     pos: usize,
     size: (u32, u32),
+    /// 写真の配置を巡回させる次の候補(左 → 右 → 中央)
+    slot: usize,
+}
+
+/// 撮影日時の文字列("2026-03-08 13:22" など)を日付と時刻に分ける。
+fn parse_taken(s: &str) -> Option<(NaiveDate, Option<(u32, u32)>)> {
+    let date = NaiveDate::parse_from_str(s.get(..10)?, "%Y-%m-%d").ok()?;
+    let time = s.get(11..16).and_then(|t| {
+        let (h, m) = t.split_once(':')?;
+        Some((
+            h.parse().ok().filter(|h| *h < 24)?,
+            m.parse().ok().filter(|m| *m < 60)?,
+        ))
+    });
+    Some((date, time))
+}
+
+/// 撮影日からの経過を「今日」「3日前」「7か月前」「2年前」の形にする。
+pub fn relative_age(taken: NaiveDate, today: NaiveDate) -> String {
+    let days = (today - taken).num_days();
+    if days <= 0 {
+        return "今日".into();
+    }
+    let mut months =
+        (today.year() - taken.year()) * 12 + today.month() as i32 - taken.month() as i32;
+    if today.day() < taken.day() {
+        months -= 1;
+    }
+    match days {
+        1 => "昨日".into(),
+        2..=6 => format!("{days}日前"),
+        7..=29 => format!("{}週間前", days / 7),
+        _ if months < 1 => format!("{days}日前"),
+        _ if months < 12 => format!("{months}か月前"),
+        _ => format!("{}年前", months / 12),
+    }
+}
+
+/// 表示用の (撮影日時, 経過)。撮影日時が読めなければ空文字。
+fn taken_labels(raw: &str, today: NaiveDate) -> (String, String) {
+    let Some((date, time)) = parse_taken(raw) else {
+        return (String::new(), String::new());
+    };
+    let mut taken = format!("撮影 {}", date.format("%Y/%m/%d"));
+    if let Some((h, m)) = time {
+        taken.push_str(&format!(" {h:02}:{m:02}"));
+    }
+    (taken, relative_age(date, today))
 }
 
 fn read_all(req: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>, String> {
@@ -87,6 +138,7 @@ impl Catalog {
             order,
             pos: 0,
             size,
+            slot: 0,
         })
     }
 
@@ -126,20 +178,25 @@ impl Catalog {
         self.pos = (self.pos as isize + delta).rem_euclid(n) as usize;
     }
 
-    pub fn current(&self) -> Result<PhotoItem, String> {
+    pub fn current(&mut self) -> Result<PhotoItem, String> {
         let e = &self.entries[self.order[self.pos]];
         let bytes = match &e.origin {
             Origin::Url(u) => read_all(ureq::get(u).call().map_err(|err| format!("{u}: {err}"))?)?,
             Origin::File(p) => std::fs::read(p).map_err(|err| format!("{}: {err}", p.display()))?,
         };
-        let pix = photo::load_cover(&bytes, self.size.0, self.size.1)?;
+        let (taken, age) = taken_labels(&e.taken, chrono::Local::now().date_naive());
+        let info = PhotoInfo {
+            place: e.place.clone(),
+            taken,
+            age,
+            position: (self.pos + 1, self.order.len()),
+        };
+        // 背景と写真の合成は、新しい写真ごとにここ(取得スレッド)で 1 回だけ行う。
+        let (frame, layout) = photo::compose(&bytes, self.size.0, self.size.1, &mut self.slot)?;
         Ok(PhotoItem {
-            pix,
-            info: PhotoInfo {
-                place: e.place.clone(),
-                taken: e.taken.clone(),
-                position: (self.pos + 1, self.order.len()),
-            },
+            frame,
+            layout,
+            info,
         })
     }
 }
@@ -224,7 +281,7 @@ impl Feed {
                         catalog = Some(Catalog::open(&source, size)?);
                     }
                     catalog
-                        .as_ref()
+                        .as_mut()
                         .map_or_else(|| Err("catalog".to_string()), Catalog::current)
                 })();
                 match loaded {
@@ -393,10 +450,11 @@ mod tests {
             order: vec![0, 1, 2],
             pos: 0,
             size: (32, 18),
+            slot: 0,
         };
-        let red = |c: &Catalog| c.current().unwrap().pix.data()[0];
+        let red = |c: &mut Catalog| c.current().unwrap().frame.data()[0];
         assert_eq!(
-            (red(&cat), cat.current().unwrap().info.position),
+            (red(&mut cat), cat.current().unwrap().info.position),
             (200, (1, 3))
         );
         cat.advance(1);
@@ -411,6 +469,43 @@ mod tests {
         cat.advance(-1);
         assert_eq!(cat.current().unwrap().info.place, "p2", "先頭の前は末尾へ");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn relative_age_labels() {
+        let today = d(2026, 10, 12);
+        let age = |t: NaiveDate| relative_age(t, today);
+        assert_eq!(age(d(2026, 10, 12)), "今日");
+        assert_eq!(age(d(2026, 10, 11)), "昨日");
+        assert_eq!(age(d(2026, 10, 9)), "3日前");
+        assert_eq!(age(d(2026, 10, 1)), "1週間前");
+        assert_eq!(age(d(2026, 3, 8)), "7か月前");
+        assert_eq!(age(d(2026, 9, 12)), "1か月前");
+        assert_eq!(age(d(2026, 9, 13)), "4週間前");
+        assert_eq!(age(d(2024, 10, 12)), "2年前");
+        assert_eq!(age(d(2025, 10, 13)), "11か月前");
+        assert_eq!(age(d(2025, 10, 12)), "1年前");
+        assert_eq!(age(d(2026, 12, 1)), "今日", "未来の日付でも落ちない");
+    }
+
+    #[test]
+    fn taken_labels_parse_and_omit_when_missing() {
+        let today = d(2026, 10, 12);
+        assert_eq!(
+            taken_labels("2026-03-08 13:22", today),
+            ("撮影 2026/03/08 13:22".to_string(), "7か月前".to_string())
+        );
+        assert_eq!(
+            taken_labels("2026-03-08", today).0,
+            "撮影 2026/03/08",
+            "時刻なし"
+        );
+        assert_eq!(taken_labels("", today), (String::new(), String::new()));
+        assert_eq!(taken_labels("garbage-text", today).0, "");
     }
 
     #[test]

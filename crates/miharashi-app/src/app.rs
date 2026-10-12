@@ -164,7 +164,7 @@ impl KioskApp {
             match ev {
                 FeedEvent::Photo(item) => {
                     if let Some(old) = self.current.take() {
-                        self.fade = Some((old.pix, now));
+                        self.fade = Some((old.frame, now));
                     }
                     self.current = Some(item);
                     self.last_photo_change = now;
@@ -214,15 +214,15 @@ impl KioskApp {
                             .min(1.0),
                     )
                 });
-                let (pix, info) = (
-                    self.current.as_ref().map(|p| &p.pix),
+                let (photo, info) = (
+                    self.current.as_ref().map(|p| (&p.frame, &p.layout)),
                     self.current.as_ref().map(|p| &p.info),
                 );
                 screens::photo_frame(
                     canvas,
                     &mut self.text,
                     &self.snap,
-                    pix,
+                    photo,
                     info,
                     fade,
                     self.notice.as_deref(),
@@ -362,15 +362,13 @@ mod tests {
         app.tick(Instant::now());
         let mut c2 = Canvas::new(1920, 1080);
         app.render(&mut c2);
-        let center = px(&c2, 960, 400);
+        // テスト写真は 4:3 なので 1080p では左右どちらかに高さいっぱいで置かれる(中央 x=960 は必ず写真内)。
+        let center = px(&c2, 960, 300);
+        assert_eq!(center, [30, 120, 60, 255], "写真(緑)が表示される");
+        let outside = px(&c2, 1900, 1070).min(px(&c2, 20, 1070));
         assert!(
-            center[1] > center[0] && center[1] > center[2],
-            "写真(緑)が表示される: {center:?}"
-        );
-        let band = px(&c2, 1000, 1070);
-        assert!(
-            band[1] < center[1] / 2 + 10,
-            "下部の半透明の帯で暗くなる: {band:?}"
+            outside[1] < 70 && outside[1] > 20,
+            "余白は暗いぼかし背景: {outside:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -2,6 +2,8 @@
 pub mod canvas;
 pub mod chart;
 pub mod photo;
+pub mod photo_layout;
+pub mod photo_screen;
 pub mod screens;
 pub mod status;
 pub mod text;
