@@ -26,6 +26,15 @@
 # 監視する GPU。表示先 GPU とは独立に指定できる。
 # gpu = "auto"             # auto / 0(NVML インデックス)/ pci:0000:01:00.0
 
+[power]
+# 電力量(今日・累計)の保存先。書き込めない場合は起動中だけメモリ上で積算する。空なら保存しない。
+# state_file = "/var/lib/miharashi/energy.json"
+# CPU の RAPL 積算値。root のヘルパーが約 1 秒ごとに "<energy_uj> <max_energy_range_uj>" の 1 行を書く。
+# 無ければ /sys/class/powercap/intel-rapl:0 を直接読む(通常は root 限定で読めず、CPU の W は -- になる)。
+# rapl_helper_file = "/run/miharashi-rapl/energy"
+# 電気代の単価 [円/kWh]。0 なら電気代を表示しない。
+# price_per_kwh = 0
+
 [ui]
 # font = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 # start_screen = "status"  # status / photo
