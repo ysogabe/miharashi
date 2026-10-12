@@ -23,4 +23,4 @@ systemctl daemon-reload
 echo "導入しました(起動はしていません)。"
 echo "CPU 消費電力を表示する場合(任意・root で読む小さなヘルパー): systemctl enable --now miharashi-rapl"
 echo "キオスクの起動: systemctl start miharashi / 自動起動: systemctl enable miharashi"
-echo "ログ: journalctl -u miharashi -f"
+echo "ログ: journalctl -t miharashi -f"
