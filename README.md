@@ -9,7 +9,7 @@ Miharashi（ミハラシ）は、Rustで実装するLinux専用キオスク・�
 | 区分 | 状況 |
 |---|---|
 | PoC-001 Direct Display | 完了。DRM/KMS直接描画、日本語・写真・グラフ、PC状況とフォトフレームの2画面。[検証記録](docs/poc/POC-001.md) |
-| PoC-002 Kiosk Runtime | 実装・実機検証あり(seat/VT、systemd、設定、GeoFrame再接続)。24時間試験の結果と未確認事項は[検証記録](docs/poc/POC-002.md) |
+| PoC-002 Kiosk Runtime | 実装・実機検証あり(seat/VT、systemd、設定、GeoFrame再接続)。長時間試験(12時間、合格)の結果と未確認事項は[検証記録](docs/poc/POC-002.md) |
 | PoC-003 以降 | 未着手(画面プラグイン、エージェント監視、MVP)。[ロードマップ](https://github.com/ysogabe/miharashi/issues/3) |
 
 LPの画面と数値はコンセプトプレビューで、実装の画面ではありません(実装の画面は検証記録の画像を参照してください)。AIエージェント監視・プラグイン・3画面構成は、LPの構想どおりにはまだ実装していません。
