@@ -86,6 +86,7 @@ fn data_source(
     let live = data::LiveData::new(
         std::time::Duration::from_secs(cfg.metrics.interval_secs),
         gpu,
+        &cfg.power,
     );
     Ok((Box::new(live), data::live_snapshot()))
 }

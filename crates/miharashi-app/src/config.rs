@@ -11,6 +11,7 @@ pub struct Config {
     pub input: Input,
     pub geoframe: Geoframe,
     pub metrics: Metrics,
+    pub power: Power,
     pub ui: Ui,
 }
 
@@ -64,6 +65,17 @@ pub struct Metrics {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
+pub struct Power {
+    /// 電力量(今日・累計)の保存先 JSON。空なら保存しない。
+    pub state_file: String,
+    /// root ヘルパーが書き出す CPU の RAPL 値("<energy_uj> <max_energy_range_uj>")。
+    pub rapl_helper_file: String,
+    /// 電気代の単価 [円/kWh]。0 なら電気代を表示しない。
+    pub price_per_kwh: f32,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
 pub struct Ui {
     /// 日本語フォントファイル。空ならシステムフォントを使う。
     pub font: String,
@@ -107,6 +119,16 @@ impl Default for Metrics {
         Self {
             interval_secs: 1,
             gpu: "auto".into(),
+        }
+    }
+}
+
+impl Default for Power {
+    fn default() -> Self {
+        Self {
+            state_file: "/var/lib/miharashi/energy.json".into(),
+            rapl_helper_file: "/run/miharashi-rapl/energy".into(),
+            price_per_kwh: 0.0,
         }
     }
 }
@@ -163,6 +185,9 @@ impl Config {
         }
         if self.geoframe.photo_interval_secs == 0 || self.metrics.interval_secs == 0 {
             return Err("geoframe.photo_interval_secs と metrics.interval_secs は 1 以上".into());
+        }
+        if !self.power.price_per_kwh.is_finite() || self.power.price_per_kwh < 0.0 {
+            return Err("power.price_per_kwh は 0 以上の数(0 = 電気代を表示しない)".into());
         }
         if !matches!(self.ui.start_screen.as_str(), "status" | "photo") {
             return Err("ui.start_screen は status か photo".into());
@@ -225,6 +250,28 @@ mod tests {
         );
         assert!(Config::parse("[ui]\nstart_screen = \"menu\"\n").is_err());
         assert!(Config::parse("[metrics]\ngpu = \"rtx\"\n").is_err());
+    }
+
+    #[test]
+    fn power_section_defaults_and_overrides() {
+        let d = Config::default().power;
+        assert_eq!(d.state_file, "/var/lib/miharashi/energy.json");
+        assert_eq!(d.rapl_helper_file, "/run/miharashi-rapl/energy");
+        assert_eq!(d.price_per_kwh, 0.0);
+        let c = Config::parse("[power]\nprice_per_kwh = 31.5\nstate_file = \"\"\n").unwrap();
+        assert_eq!(c.power.price_per_kwh, 31.5);
+        assert_eq!(c.power.state_file, "");
+        assert_eq!(c.power.rapl_helper_file, d.rapl_helper_file);
+    }
+
+    #[test]
+    fn power_section_rejects_bad_values() {
+        assert!(Config::parse("[power]\nprice_per_kwh = -1.0\n").is_err());
+        assert!(Config::parse("[power]\nprice_per_kwh = nan\n").is_err());
+        assert!(
+            Config::parse("[power]\nstatefile = \"x\"\n").is_err(),
+            "typo"
+        );
     }
 
     #[test]

@@ -941,11 +941,14 @@ dependencies = [
 name = "miharashi-linux"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "drm",
  "evdev",
  "libc",
  "libseat",
  "nvml-wrapper",
+ "serde",
+ "serde_json",
  "signal-hook",
 ]
 
