@@ -2,7 +2,7 @@
 //! 実行: cargo run --release -p miharashi-render --example photo_demo
 use image::{DynamicImage, Rgba, RgbaImage};
 use miharashi_render::photo::compose_image;
-use miharashi_render::photo_layout::{Mode, allowed, fitted_width, layout_for};
+use miharashi_render::photo_layout::{Mode, fit_size, layout_for};
 use miharashi_render::screens::{PhotoInfo, Snapshot, photo_frame};
 use miharashi_render::{Canvas, TextEngine};
 use std::time::Instant;
@@ -71,18 +71,17 @@ fn main() {
     for (cw, ch) in [(1920u32, 1080u32), (2560, 1080)] {
         for (name, pw0, ph0) in ratios {
             let img = synthetic(pw0, ph0);
-            let pw = fitted_width(ch, pw0, ph0);
-            let modes: Vec<Mode> = [Mode::Left, Mode::Right, Mode::Center]
+            let modes: Vec<(Mode, (u32, u32))> = [Mode::Left, Mode::Right, Mode::Center]
                 .into_iter()
-                .filter(|m| allowed(*m, cw, ch, pw))
+                .filter_map(|m| fit_size(m, cw, ch, pw0, ph0).map(|sz| (m, sz)))
                 .collect();
             let modes = if modes.is_empty() {
-                vec![Mode::Cover]
+                vec![(Mode::Cover, (cw, ch))]
             } else {
                 modes
             };
-            for m in modes {
-                let layout = layout_for(m, cw, ch, pw);
+            for (m, (pw, ph)) in modes {
+                let layout = layout_for(m, cw, ch, pw, ph);
                 let t0 = Instant::now();
                 let frame = compose_image(&img, cw, ch, &layout).unwrap();
                 let compose_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -109,7 +108,7 @@ fn main() {
     }
     // 通知バッジ(再接続中)つき
     let img = synthetic(2000, 1500);
-    let layout = layout_for(Mode::Left, 1920, 1080, fitted_width(1080, 2000, 1500));
+    let layout = layout_for(Mode::Left, 1920, 1080, 1440, 1080);
     let frame = compose_image(&img, 1920, 1080, &layout).unwrap();
     let mut c = Canvas::new(1920, 1080);
     photo_frame(

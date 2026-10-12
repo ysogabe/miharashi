@@ -121,7 +121,7 @@ pub fn compose_image(
     let mut c = Canvas::new(w, h);
     c.pixmap = to_pixmap(&blurred_background(img, w, h))?;
     let k = photo_layout::scale(h);
-    drop_shadow(&mut c, p.x as f32, 0.0, p.w as f32, h as f32, k);
+    drop_shadow(&mut c, p.x as f32, p.y as f32, p.w as f32, p.h as f32, k);
     let fitted = img.resize_exact(p.w, p.h, FilterType::Lanczos3).to_rgba8();
     c.draw_pixmap(&to_pixmap(&fitted)?, p.x as i32, p.y as i32);
     Ok(c.pixmap)
