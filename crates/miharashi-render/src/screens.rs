@@ -1,6 +1,5 @@
-use crate::canvas::rgba;
-use crate::{Canvas, TextEngine};
-use tiny_skia::Pixmap;
+pub use crate::photo_screen::{PhotoInfo, photo_frame};
+pub use crate::status::{CPU_COLOR, GPU_COLOR, StatusPage, status};
 
 /// 画面に渡すデータ。取得できない項目は None(画面には "--" と表示する)。
 #[derive(Default)]
@@ -70,94 +69,4 @@ pub struct Snapshot {
     pub feed_status: Option<String>,
     /// 今日のピーク: (項目名, 値の表示文字列, 時刻 "HH:MM")
     pub peaks_today: Vec<(String, String, String)>,
-}
-
-/// フォトフレームに表示する写真の情報。
-pub struct PhotoInfo {
-    pub place: String,
-    pub taken: String,
-    /// (現在位置 1 始まり, 総数)
-    pub position: (usize, usize),
-}
-
-pub use crate::status::{CPU_COLOR, GPU_COLOR, StatusPage, status};
-
-const DIM: [u8; 4] = [140, 160, 180, 255];
-
-/// 写真の下に敷く半透明の情報帯(日時・場所・撮影日時・位置)。
-fn photo_band(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot, info: Option<&PhotoInfo>) {
-    let (w, h) = (c.width() as f32, c.height() as f32);
-    let band = 130.0;
-    c.fill_rect(0.0, h - band, w, band, rgba(0, 0, 0, 150));
-    t.draw(c, &s.time, 40.0, h - band + 8.0, 60.0, [255, 255, 255, 255]);
-    t.draw(
-        c,
-        &s.date,
-        40.0,
-        h - band + 80.0,
-        30.0,
-        [215, 222, 230, 255],
-    );
-    if let Some(i) = info {
-        t.draw_right(
-            c,
-            &i.place,
-            w - 40.0,
-            h - band + 14.0,
-            38.0,
-            [255, 255, 255, 255],
-        );
-        t.draw_right(
-            c,
-            &i.taken,
-            w - 40.0,
-            h - band + 66.0,
-            28.0,
-            [215, 222, 230, 255],
-        );
-        let pos = format!("{} / {}", i.position.0, i.position.1);
-        t.draw_right(
-            c,
-            &pos,
-            w - 40.0,
-            h - band + 98.0,
-            22.0,
-            [160, 170, 182, 255],
-        );
-    }
-}
-
-/// 画面2: 全画面写真 + 半透明の情報帯。`fade` は切替中の (旧写真, 新写真の不透明度)。
-/// `notice` は写真の取得状態の案内(例: 再接続中)。写真が 1 枚もないときは中央に大きく出す。
-pub fn photo_frame(
-    c: &mut Canvas,
-    t: &mut TextEngine,
-    s: &Snapshot,
-    photo: Option<&Pixmap>,
-    info: Option<&PhotoInfo>,
-    fade: Option<(&Pixmap, f32)>,
-    notice: Option<&str>,
-) {
-    c.clear(rgba(0, 0, 0, 255));
-    match (photo, fade) {
-        (Some(new), Some((old, alpha))) => {
-            c.draw_pixmap(old, 0, 0);
-            c.draw_pixmap_opacity(new, 0, 0, alpha);
-        }
-        (Some(new), None) => c.draw_pixmap(new, 0, 0),
-        _ => {
-            let msg = notice.unwrap_or("写真を読み込み中…");
-            let (w, h) = (c.width() as f32, c.height() as f32);
-            let mw = t.measure(msg, 36.0);
-            t.draw(c, msg, (w - mw) / 2.0, h / 2.0 - 20.0, 36.0, DIM);
-        }
-    }
-    photo_band(c, t, s, info);
-    if let (Some(n), Some(_)) = (notice, photo) {
-        // 最後の写真を表示したまま、右上に小さく状態を出す。
-        let w = c.width() as f32;
-        let tw = t.measure(n, 24.0);
-        c.fill_rect(w - tw - 56.0, 24.0, tw + 32.0, 44.0, rgba(0, 0, 0, 150));
-        t.draw(c, n, w - tw - 40.0, 32.0, 24.0, [255, 200, 120, 255]);
-    }
 }
