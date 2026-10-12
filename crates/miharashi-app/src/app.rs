@@ -1,7 +1,8 @@
 //! 画面ロジック(PC 状況 + フォトフレーム)。実行ループ(runtime)からは `App` として見える。
 use crate::config::Config;
 use crate::photos::{Feed, FeedEvent, FeedStatus, PhotoItem, Source};
-use miharashi_render::{Canvas, Pixmap, TextEngine, screens};
+use miharashi_render::screens::{self, StatusPage};
+use miharashi_render::{Canvas, Pixmap, TextEngine};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,7 +14,8 @@ pub enum Key {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
-    Status,
+    /// 状況画面(OVERVIEW / DETAILS)
+    Status(StatusPage),
     Photo,
 }
 
@@ -25,6 +27,8 @@ pub trait DataSource {
 
 pub struct KioskApp {
     screen: Screen,
+    /// フォトフレームから戻るときの、最後に見ていた状況ページ
+    status_page: StatusPage,
     snap: screens::Snapshot,
     data: Box<dyn DataSource>,
     feed: Feed,
@@ -90,8 +94,9 @@ impl KioskApp {
             screen: if cfg.ui.start_screen == "photo" {
                 Screen::Photo
             } else {
-                Screen::Status
+                Screen::Status(StatusPage::Overview)
             },
+            status_page: StatusPage::Overview,
             snap,
             data,
             feed,
@@ -129,10 +134,16 @@ impl KioskApp {
     pub fn on_key(&mut self, key: Key) -> bool {
         self.keys += 1;
         match (key, self.screen) {
-            (Key::Switch, Screen::Status) | (Key::Next, Screen::Status) => {
-                self.screen = Screen::Photo
+            // 状況画面: 5 でページ切替、6 / → でフォトフレームへ。
+            (Key::Switch, Screen::Status(p)) => {
+                self.status_page = p.toggled();
+                self.screen = Screen::Status(self.status_page);
             }
-            (Key::Switch, Screen::Photo) => self.screen = Screen::Status,
+            (Key::Next, Screen::Status(p)) => {
+                self.status_page = p;
+                self.screen = Screen::Photo;
+            }
+            (Key::Switch, Screen::Photo) => self.screen = Screen::Status(self.status_page),
             (Key::Next, Screen::Photo) => {
                 self.feed.next();
                 self.last_photo_change = Instant::now();
@@ -141,7 +152,7 @@ impl KioskApp {
                 self.feed.prev();
                 self.last_photo_change = Instant::now();
             }
-            (Key::Prev, Screen::Status) => {}
+            (Key::Prev, Screen::Status(_)) => {}
         }
         true
     }
@@ -193,7 +204,7 @@ impl KioskApp {
 
     pub fn render(&mut self, canvas: &mut Canvas) {
         match self.screen {
-            Screen::Status => screens::status(canvas, &mut self.text, &self.snap),
+            Screen::Status(page) => screens::status(canvas, &mut self.text, &self.snap, page),
             Screen::Photo => {
                 let now = Instant::now();
                 let fade = self.fade.as_ref().map(|(old, t0)| {
@@ -260,12 +271,15 @@ mod tests {
         false
     }
 
+    const OVERVIEW: Screen = Screen::Status(StatusPage::Overview);
+    const DETAILS: Screen = Screen::Status(StatusPage::Details);
+
     #[test]
     fn key_flow_between_status_and_photo() {
         let (mut app, dir) = app_with_photo((320, 180));
-        assert_eq!(app.screen(), Screen::Status);
+        assert_eq!(app.screen(), OVERVIEW);
         app.on_key(Key::Prev);
-        assert_eq!(app.screen(), Screen::Status, "状況画面の 4 は何もしない");
+        assert_eq!(app.screen(), OVERVIEW, "状況画面の 4 は何もしない");
         app.on_key(Key::Next);
         assert_eq!(
             app.screen(),
@@ -273,19 +287,43 @@ mod tests {
             "状況画面の 6 でフォトフレームへ"
         );
         app.on_key(Key::Switch);
-        assert_eq!(app.screen(), Screen::Status, "5 で状況画面へ戻る");
+        assert_eq!(app.screen(), OVERVIEW, "5 で状況画面へ戻る");
         app.on_key(Key::Switch);
-        assert_eq!(app.screen(), Screen::Photo, "5 でフォトフレームへ");
+        assert_eq!(app.screen(), DETAILS, "状況画面の 5 でページ切替");
         assert!(
             pump_until(&mut app, |a| a.photo_position() == 1),
             "写真が読み込まれる"
         );
         app.on_key(Key::Next);
+        assert_eq!(app.screen(), Screen::Photo);
+        app.on_key(Key::Switch);
+        assert_eq!(app.screen(), DETAILS, "最後に見ていたページへ戻る");
+        app.on_key(Key::Next);
+        app.on_key(Key::Next);
         assert!(
             pump_until(&mut app, |a| a.photo_position() == 1),
             "写真切替後も位置が有効"
         );
-        assert_eq!(app.keys, 5);
+        assert_eq!(app.keys, 8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_page_toggles_with_switch_key() {
+        let (mut app, dir) = app_with_photo((320, 180));
+        app.on_key(Key::Switch);
+        assert_eq!(app.screen(), DETAILS);
+        app.on_key(Key::Prev);
+        assert_eq!(app.screen(), DETAILS, "4 は何もしない");
+        app.on_key(Key::Switch);
+        assert_eq!(app.screen(), OVERVIEW);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn start_screen_status_starts_on_overview() {
+        let (app, dir) = app_with_photo((320, 180));
+        assert_eq!(app.screen(), OVERVIEW);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -308,7 +346,7 @@ mod tests {
         assert_eq!(px(&c, 5, 540), [8, 12, 20, 255], "背景");
         // グラフ領域にシリーズ色(CPU のシアン)が描かれている。
         let mut found = false;
-        for y in 440..1000 {
+        for y in 400..900 {
             for x in 100..1880 {
                 if px(&c, x, y) == [64, 200, 255, 255] {
                     found = true;
@@ -335,5 +373,48 @@ mod tests {
             "下部の半透明の帯で暗くなる: {band:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn has_color(
+        c: &Canvas,
+        color: [u8; 4],
+        x: std::ops::Range<u32>,
+        y: std::ops::Range<u32>,
+    ) -> bool {
+        y.into_iter()
+            .any(|y| x.clone().any(|x| px(c, x, y) == color))
+    }
+
+    #[test]
+    fn status_pages_render_at_1080p_and_21_9() {
+        for size in [(1920u32, 1080u32), (2560, 1080)] {
+            let (mut app, dir) = app_with_photo(size);
+            for page in [OVERVIEW, DETAILS] {
+                assert_eq!(app.screen(), page);
+                let mut c = Canvas::new(size.0, size.1);
+                app.render(&mut c);
+                assert_eq!(px(&c, 5, 540), [8, 12, 20, 255], "背景 {size:?}");
+                if page == OVERVIEW {
+                    // CPU / GPU タイルの左端のアクセント色。
+                    assert_eq!(px(&c, 3 + 32, 150), [64, 200, 255, 255], "CPU {size:?}");
+                    let gx = 32 + ((size.0 - 64 - 80) / 5 + 20) + 3;
+                    assert_eq!(px(&c, gx, 150), [255, 170, 60, 255], "GPU {size:?}");
+                    assert!(has_color(
+                        &c,
+                        [64, 200, 255, 255],
+                        100..size.0 - 100,
+                        400..900
+                    ));
+                } else {
+                    // DETAILS にはアクセント色の帯がない。タイル枠内は暗色のまま。
+                    assert_ne!(px(&c, 35, 150), [64, 200, 255, 255], "{size:?}");
+                    assert_eq!(px(&c, 40, 330), [16, 24, 36, 255], "タイル背景 {size:?}");
+                    // ページ指示のシアン色の文字が見出しにある。
+                    assert!(has_color(&c, [64, 200, 255, 255], 300..700, 20..60));
+                }
+                app.on_key(Key::Switch);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

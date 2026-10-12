@@ -126,8 +126,10 @@ fn png(cli: Cli) -> Result<(), String> {
     let mut text = app::text_engine(&cfg.ui.font);
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     let mut c = Canvas::new(size.0, size.1);
-    screens::status(&mut c, &mut text, &snap);
+    screens::status(&mut c, &mut text, &snap, screens::StatusPage::Overview);
     c.save_png(&out.join("status.png"))?;
+    screens::status(&mut c, &mut text, &snap, screens::StatusPage::Details);
+    c.save_png(&out.join("status-details.png"))?;
     screens::photo_frame(
         &mut c,
         &mut text,
@@ -139,7 +141,7 @@ fn png(cli: Cli) -> Result<(), String> {
     );
     c.save_png(&out.join("photo.png"))?;
     println!(
-        "wrote {}/{{status,photo}}.png ({}x{})",
+        "wrote {}/{{status,status-details,photo}}.png ({}x{})",
         out.display(),
         size.0,
         size.1
