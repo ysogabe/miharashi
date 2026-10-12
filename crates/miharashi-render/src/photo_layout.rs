@@ -56,10 +56,41 @@ pub fn allowed(mode: Mode, canvas_w: u32, canvas_h: u32, pw: u32) -> bool {
     }
 }
 
-/// 配置 `mode` の矩形を作る(`allowed` を満たすこと)。
-pub fn layout_for(mode: Mode, canvas_w: u32, canvas_h: u32, pw: u32) -> PhotoLayout {
+/// 側面配置で、写真を縮めて余白を作るときに保つ高さの下限(画面の高さに対する割合)。
+pub const MIN_SIDE_FILL: f32 = 0.85;
+
+/// 配置 `mode` での写真の表示寸法 (幅, 高さ)。選べなければ None。
+/// まず高さに合わせ、側面配置で余白が足りないときは、高さの 85% までなら縮めて上下に背景を見せる
+/// (1920×1080 の 3:2 写真は 1500×1000 になる)。中央配置と Cover は縮めない。
+pub fn fit_size(
+    mode: Mode,
+    canvas_w: u32,
+    canvas_h: u32,
+    photo_w: u32,
+    photo_h: u32,
+) -> Option<(u32, u32)> {
+    let pw = fitted_width(canvas_h, photo_w, photo_h);
+    if allowed(mode, canvas_w, canvas_h, pw) {
+        return Some((pw, canvas_h));
+    }
+    if !matches!(mode, Mode::Left | Mode::Right) {
+        return None;
+    }
+    let max_w = canvas_w as f32 - (420.0 * scale(canvas_h)).ceil();
+    if max_w < 1.0 {
+        return None;
+    }
+    let ph = (max_w as f64 * photo_h as f64 / photo_w.max(1) as f64).floor() as u32;
+    (ph as f32 >= canvas_h as f32 * MIN_SIDE_FILL).then_some((max_w as u32, ph))
+}
+
+/// 配置 `mode` の矩形を作る(`fit_size` の寸法を使うこと)。写真は上下中央に置く。
+pub fn layout_for(mode: Mode, canvas_w: u32, canvas_h: u32, pw: u32, ph: u32) -> PhotoLayout {
     let (w, h) = (canvas_w, canvas_h);
+    let ph = ph.min(h);
+    let py = (h - ph) / 2;
     let rect = |x, w| IRect { x, y: 0, w, h };
+    let photo = |x, w| IRect { x, y: py, w, h: ph };
     match mode {
         Mode::Cover => {
             let band = ((130.0 * scale(h)).round() as u32).min(h);
@@ -77,13 +108,13 @@ pub fn layout_for(mode: Mode, canvas_w: u32, canvas_h: u32, pw: u32) -> PhotoLay
         }
         Mode::Left => PhotoLayout {
             mode,
-            photo: rect(0, pw),
+            photo: photo(0, pw),
             info: rect(pw, w - pw),
             info2: None,
         },
         Mode::Right => PhotoLayout {
             mode,
-            photo: rect(w - pw, pw),
+            photo: photo(w - pw, pw),
             info: rect(0, w - pw),
             info2: None,
         },
@@ -91,7 +122,7 @@ pub fn layout_for(mode: Mode, canvas_w: u32, canvas_h: u32, pw: u32) -> PhotoLay
             let left = (w - pw) / 2;
             PhotoLayout {
                 mode,
-                photo: rect(left, pw),
+                photo: photo(left, pw),
                 info: rect(0, left),
                 info2: Some(rect(left + pw, w - pw - left)),
             }
@@ -108,15 +139,14 @@ pub fn plan(
     photo_w: u32,
     photo_h: u32,
 ) -> PhotoLayout {
-    let pw = fitted_width(canvas_h, photo_w, photo_h);
     for k in 0..CYCLE.len() {
         let i = (*slot + k) % CYCLE.len();
-        if allowed(CYCLE[i], canvas_w, canvas_h, pw) {
+        if let Some((pw, ph)) = fit_size(CYCLE[i], canvas_w, canvas_h, photo_w, photo_h) {
             *slot = (i + 1) % CYCLE.len();
-            return layout_for(CYCLE[i], canvas_w, canvas_h, pw);
+            return layout_for(CYCLE[i], canvas_w, canvas_h, pw, ph);
         }
     }
-    layout_for(Mode::Cover, canvas_w, canvas_h, pw)
+    layout_for(Mode::Cover, canvas_w, canvas_h, canvas_w, canvas_h)
 }
 
 #[cfg(test)]
@@ -134,8 +164,8 @@ mod tests {
         assert_eq!(modes(1920, 1080, 4, 3, 4), [Left, Right, Left, Right]);
         assert_eq!(
             modes(1920, 1080, 3, 2, 2),
-            [Cover, Cover],
-            "3:2 は空き 300px"
+            [Left, Right],
+            "3:2 は高さ 1000 に縮めて側面配置"
         );
         assert_eq!(modes(1920, 1080, 16, 9, 2), [Cover, Cover]);
         assert_eq!(modes(1920, 1080, 21, 9, 1), [Cover], "幅が画面を超える");
@@ -178,6 +208,21 @@ mod tests {
         assert_eq!((a.mode, slot), (Mode::Right, 2));
         let b = plan(&mut slot, 2560, 1080, 16, 9);
         assert_eq!((b.mode, slot), (Mode::Left, 1));
+    }
+
+    #[test]
+    fn side_mode_shrinks_3x2_but_not_16x9() {
+        let mut s = 0;
+        let l = plan(&mut s, 1920, 1080, 2560, 1707);
+        assert_eq!(l.mode, Mode::Left);
+        assert_eq!((l.photo.w, l.photo.h, l.photo.y), (1500, 1000, 40));
+        assert_eq!((l.info.x, l.info.w, l.info.h), (1500, 420, 1080));
+        // 16:9 は 1500×843(78%)になるので縮めず Cover
+        assert_eq!(fit_size(Mode::Left, 1920, 1080, 16, 9), None);
+        // 中央配置は縮めない
+        assert_eq!(fit_size(Mode::Center, 1920, 1080, 3, 2), None);
+        // 4:3 は今まで通り高さいっぱい
+        assert_eq!(fit_size(Mode::Left, 1920, 1080, 4, 3), Some((1440, 1080)));
     }
 
     #[test]
