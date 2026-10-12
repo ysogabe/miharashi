@@ -18,6 +18,9 @@ else
     echo "既存の設定は変更しません: /etc/miharashi/config.toml"
 fi
 sed -e "s|@USER@|$USER_NAME|" -e "s|@BINDIR@|$BINDIR|" systemd/miharashi.service > /etc/systemd/system/miharashi.service
+install -m 0644 systemd/miharashi-rapl.service /etc/systemd/system/miharashi-rapl.service
 systemctl daemon-reload
-echo "導入しました。起動: systemctl start miharashi / 自動起動: systemctl enable miharashi"
+echo "導入しました(起動はしていません)。"
+echo "CPU 消費電力を表示する場合(任意・root で読む小さなヘルパー): systemctl enable --now miharashi-rapl"
+echo "キオスクの起動: systemctl start miharashi / 自動起動: systemctl enable miharashi"
 echo "ログ: journalctl -u miharashi -f"
