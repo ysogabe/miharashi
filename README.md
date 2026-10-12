@@ -33,6 +33,7 @@ cargo test
 |---|---|
 | [PRD](docs/PRD.md) | 利用目的、合意した要件、MVP範囲、受け入れ条件、未確定事項 |
 | [技術設計書](docs/DESIGN.md) | Rustワークスペース案、描画・データ・入力・DRM/seat管理、設定、検証順序 |
+| [画面管理インターフェース](docs/DESIGN-screen-interface.md) | 画面を追加するための最小契約(Screen / Provider / World / App)、共通操作の優先順位、遷移、PoC-003 への引き継ぎ(Issue #9) |
 | [LP構成書](docs/LP.md) | LPの役割、3画面の構成、想定FAQ、表示上の約束 |
 | [LP](site/index.html) | 3画面を切り替えられるローカルのHTMLページ |
 
