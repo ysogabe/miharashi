@@ -168,10 +168,20 @@ impl KioskApp {
                     }
                     self.current = Some(item);
                     self.last_photo_change = now;
+                    if self.notice.is_none() {
+                        self.snap.feed_status = Some("online".into());
+                    }
                     redraw = true;
                 }
                 FeedEvent::Status(s) => {
                     self.notice = describe(&s);
+                    // 状況画面の HEALTH にも同じ状態を出す
+                    let state = if self.notice.is_some() {
+                        "再接続中"
+                    } else {
+                        "online"
+                    };
+                    self.snap.feed_status = Some(state.into());
                     redraw = true;
                 }
             }
