@@ -69,3 +69,7 @@
 - 連絡フォーム、アカウント作成、アナリティクス、外部APIを追加しない。
 - モバイルではプレビューを読みやすい積層配置にし、水平スクロールを発生させない。
 - Tab操作、画面タブの矢印キー、目立つフォーカス表示、reduce-motionに対応する。
+
+## 付録: 操作パネルの LP(`site/panel/`)
+
+2026-10-13 追加。Android 化した Echo Show 5 を手元の操作盤にする構想のページ。`../styles.css` の色と部品を使い、`panel.css` / `panel.js` でパネルのプレビュー(4 / 6 で画面の巡回、5 でページ切替)と接続方式の比較を足している。設計は [panel/DESIGN.md](panel/DESIGN.md)。公開先は `https://ysogabe.github.io/miharashi/panel/`。
