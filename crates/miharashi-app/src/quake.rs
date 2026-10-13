@@ -7,14 +7,16 @@
 //! 気象庁の地域定義(area.json)の順にたどって決める。どこかで失敗したら全国の条件だけで動く。
 //! ネットワークの応答はすべて欠けうるものとして扱い、読めない項目は飛ばす(パニックさせない)。
 use crate::config::{Alerts, HomeAssistant};
-use miharashi_render::alert::{Intensity, QuakeView, SHINDO_4, SHINDO_5_LOWER, parse_intensity};
+use miharashi_render::alert::{
+    AlertView, Intensity, QuakeView, SHINDO_4, SHINDO_5_LOWER, parse_intensity,
+};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 const LIST_URL: &str = "https://www.jma.go.jp/bosai/quake/data/list.json";
-const AREA_URL: &str = "https://www.jma.go.jp/bosai/common/const/area.json";
+pub const AREA_URL: &str = "https://www.jma.go.jp/bosai/common/const/area.json";
 const GSI_RGEO: &str = "https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress";
 /// 起動時に、これより古い発表はアラートにしない(再起動のたびに出さない)
 const STARTUP_MAX_AGE_MIN: i64 = 10;
@@ -186,7 +188,7 @@ fn region_from_area(area: &Value, pref: &str) -> Option<Region> {
     })
 }
 
-fn get_json(agent: &ureq::Agent, url: &str, auth: Option<&str>) -> Result<Value, String> {
+pub fn get_json(agent: &ureq::Agent, url: &str, auth: Option<&str>) -> Result<Value, String> {
     let mut req = agent.get(url);
     if let Some(a) = auth {
         req = req.header("Authorization", a);
@@ -202,8 +204,8 @@ fn get_json(agent: &ureq::Agent, url: &str, auth: Option<&str>) -> Result<Value,
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
-/// 自宅の位置から住んでいる地方を決める。
-fn detect_region(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<Region, String> {
+/// Home Assistant に登録された自宅の (緯度, 経度)。
+pub fn home_location(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<(f64, f64), String> {
     if ha.url.is_empty() {
         return Err("home_assistant.url が未設定".into());
     }
@@ -214,13 +216,18 @@ fn detect_region(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<Region, Stri
         &format!("{base}/api/config"),
         Some(&format!("Bearer {token}")),
     )?;
-    let (lat, lon) = match (
+    match (
         conf.get("latitude").and_then(Value::as_f64),
         conf.get("longitude").and_then(Value::as_f64),
     ) {
-        (Some(a), Some(b)) => (a, b),
-        _ => return Err("HA の設定に自宅の緯度経度がない".into()),
-    };
+        (Some(a), Some(b)) => Ok((a, b)),
+        _ => Err("HA の設定に自宅の緯度経度がない".into()),
+    }
+}
+
+/// 自宅の位置から住んでいる地方を決める。
+fn detect_region(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<Region, String> {
+    let (lat, lon) = home_location(agent, ha)?;
     let rg = get_json(agent, &format!("{GSI_RGEO}?lat={lat}&lon={lon}"), None)?;
     let muni = rg
         .get("results")
@@ -261,12 +268,11 @@ pub fn demo_view() -> QuakeView {
     }
 }
 
-/// 地震アラートの問い合わせを始める。無効なら None。
-pub fn start(alerts: &Alerts, ha: &HomeAssistant) -> Option<Receiver<QuakeView>> {
+/// 地震アラートの問い合わせを始める。アラートは `tx` へ送る。
+pub fn start(alerts: &Alerts, ha: &HomeAssistant, tx: Sender<AlertView>) {
     if !alerts.quake {
-        return None;
+        return;
     }
-    let (tx, rx) = channel();
     if alerts.demo_after_secs > 0 {
         let (tx, delay) = (tx.clone(), Duration::from_secs(alerts.demo_after_secs));
         let _ = std::thread::Builder::new()
@@ -274,7 +280,7 @@ pub fn start(alerts: &Alerts, ha: &HomeAssistant) -> Option<Receiver<QuakeView>>
             .spawn(move || {
                 std::thread::sleep(delay);
                 eprintln!("quake: テスト表示を送る");
-                let _ = tx.send(demo_view());
+                let _ = tx.send(AlertView::Quake(demo_view()));
             });
     }
     let (ha, poll) = (ha.clone(), Duration::from_secs(alerts.quake_poll_secs));
@@ -283,12 +289,10 @@ pub fn start(alerts: &Alerts, ha: &HomeAssistant) -> Option<Receiver<QuakeView>>
         .spawn(move || run(tx, ha, poll));
     if let Err(e) = spawned {
         eprintln!("quake: スレッドを起動できない: {e}");
-        return None;
     }
-    Some(rx)
 }
 
-fn run(tx: Sender<QuakeView>, ha: HomeAssistant, poll: Duration) {
+fn run(tx: Sender<AlertView>, ha: HomeAssistant, poll: Duration) {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
         .build()
@@ -337,7 +341,7 @@ fn run(tx: Sender<QuakeView>, ha: HomeAssistant, poll: Duration) {
                             r.max.map_or("-", miharashi_render::alert::intensity_label),
                             r.view.place
                         );
-                        if tx.send(r.view).is_err() {
+                        if tx.send(AlertView::Quake(r.view)).is_err() {
                             return; // 画面ロジックが終わった
                         }
                     }

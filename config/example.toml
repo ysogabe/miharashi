@@ -59,8 +59,14 @@
 # または「全国で震度 5 弱以上」。住んでいる地方を決められないときは全国の条件だけで動く。
 # quake = true
 # quake_poll_secs = 30     # 気象庁の地震情報を読む間隔(10 以上)
+# 災害アラート。自宅から半径 disaster_radius_km の市町村に、特別警報(レベル 5)か
+# 土砂災害危険警報(レベル 4。以前の土砂災害警戒情報)が新しく出たら、地震と同じように重ねる。
+# 大雨・高潮の危険警報(レベル 4)と、氾濫(指定河川洪水予報)は対象外。
+# disaster = true
+# disaster_poll_secs = 60  # 気象庁の警報を読む間隔(30 以上)。変わっていなければ 304 で済む
+# disaster_radius_km = 50.0
 # show_minutes = 5         # 表示を続ける分数。キーを押せば先に閉じる
-# demo_after_secs = 0      # 0 より大きければ、起動からこの秒数後にテスト表示を 1 回出す(動作確認用)
+# demo_after_secs = 0      # 0 より大きければ、起動からこの秒数後に地震、その 30 秒後に災害のテスト表示を出す
 
 [ui]
 # font = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
