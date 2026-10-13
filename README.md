@@ -13,6 +13,7 @@ Miharashi（ミハラシ）は、Rustで実装するLinux専用キオスク・�
 | [PRD](docs/PRD.md) | 利用目的、合意した要件、MVP範囲、受け入れ条件、未確定事項 |
 | [技術設計書](docs/DESIGN.md) | Rustワークスペース案、描画・データ・入力・DRM/seat管理、設定、検証順序 |
 | [LP構成書](docs/LP.md) | LPの役割、3画面の構成、想定FAQ、表示上の約束 |
+| [操作パネルの設計](docs/panel/DESIGN.md) | Android 化した Echo Show 5 を手元の操作盤にする設計。接続方式(BLE キーボード / ネットワーク API)の比較、API 案、段階。LP は [site/panel/](site/panel/index.html) |
 | [LP](site/index.html) | 3画面を切り替えられるローカルのHTMLページ |
 
 ## LPの表示
