@@ -259,6 +259,17 @@ impl App for KioskApp {
             ("feed", self.feed_notice().unwrap_or("online").to_string()),
             ("cpu", format!("{:?}", s.cpu.map(|v| v.round()))),
             ("gpu", format!("{:?}", s.gpu.map(|v| v.round()))),
+            (
+                "gpus",
+                s.gpus
+                    .iter()
+                    .map(|g| {
+                        let u = g.usage.map_or("--".to_string(), |v| format!("{v:.0}"));
+                        format!("{}:{u}", g.label)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
         ]
     }
 }

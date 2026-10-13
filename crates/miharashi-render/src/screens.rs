@@ -1,5 +1,15 @@
 pub use crate::photo_screen::{PhotoInfo, photo_frame};
-pub use crate::status::{CPU_COLOR, GPU_COLOR, StatusPage, status};
+pub use crate::status::{CPU_COLOR, GPU_COLOR, StatusPage, gpu_color, status};
+
+/// GPU 1 台分の負荷。ラベルは "GPU0" のように番号付き(NVML の番号順、その後ろに内蔵 GPU)。
+#[derive(Default, Clone, Debug)]
+pub struct GpuLoad {
+    pub label: String,
+    pub usage: Option<f32>,
+    pub temp: Option<f32>,
+    /// 使用率の時系列 [%](cpu_history と同じ長さ・間隔)
+    pub history: Vec<f32>,
+}
 
 /// 画面に渡すデータ。取得できない項目は None(画面には "--" と表示する)。
 #[derive(Default)]
@@ -16,6 +26,9 @@ pub struct Snapshot {
     pub fans: Vec<(String, String)>,
     pub cpu_history: Vec<f32>,
     pub gpu_history: Vec<f32>,
+    /// GPU ごとの負荷。2 台以上なら GPU タイルと USAGE % のグラフを GPU ごとに分ける。
+    /// 空か 1 台なら gpu / gpu_temp / gpu_history を表示する。
+    pub gpus: Vec<GpuLoad>,
 
     // --- 電力(OVERVIEW)。docs/poc/DESIGN-next-screens.md 3.1 ---
     /// CPU パッケージの消費電力 [W](RAPL による推定)
