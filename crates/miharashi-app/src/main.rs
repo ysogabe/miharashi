@@ -1,5 +1,7 @@
-//! Miharashi: Linux キオスク・ダッシュボード。`run`(実機)、`png`(ヘッドレス)、`kms-info`。
+//! Miharashi: Linux キオスク・ダッシュボード。`run`(実機)、`png`(ヘッドレス)、`kms-info`、
+//! `bench`(CPU 描画のベースライン)。
 mod app;
+mod bench;
 mod config;
 mod data;
 mod photos;
@@ -20,6 +22,7 @@ struct Cli {
     photo: Option<PathBuf>,
     caption: Option<String>,
     seconds: Option<u64>,
+    frames: Option<usize>,
     screen: Option<String>,
     dummy: bool,
     live: bool,
@@ -36,6 +39,7 @@ fn parse_cli(argv: Vec<String>) -> Result<Cli, String> {
             "--photo" => c.photo = Some(v()?.into()),
             "--caption" => c.caption = Some(v()?),
             "--seconds" => c.seconds = Some(v()?.parse().map_err(|_| "bad --seconds")?),
+            "--frames" => c.frames = Some(v()?.parse().map_err(|_| "bad --frames")?),
             "--screen" => c.screen = Some(v()?),
             "--dummy" => c.dummy = true,
             "--live" => c.live = true,
@@ -150,6 +154,24 @@ fn png(cli: Cli) -> Result<(), String> {
     Ok(())
 }
 
+/// CPU 描画のベースライン。`--size` を省くと 1920x1080 と 2560x1080 の両方を測る。
+/// `--photo` を省くと 4032x3024 の合成画像を使う(ネットワークに依存しない)。
+fn bench(cli: Cli) -> Result<(), String> {
+    let cfg = load_config(&cli)?;
+    let sizes = match cli.size {
+        Some(s) => vec![s],
+        None => vec![(1920, 1080), (2560, 1080)],
+    };
+    let photo = match &cli.photo {
+        Some(p) => Some(std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?),
+        None => None,
+    };
+    let mut text = app::text_engine(&cfg.ui.font);
+    let rows = bench::run(&mut text, &sizes, cli.frames.unwrap_or(30), photo)?;
+    print!("{}", bench::format(&rows));
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn kms_info(cli: Cli) -> Result<(), String> {
     use miharashi_linux::drm_select::{CardSel, choose_card, choose_connector, scan};
@@ -207,10 +229,11 @@ fn main() -> Result<(), String> {
     match cmd.as_str() {
         "run" => run(cli),
         "png" => png(cli),
+        "bench" => bench(cli),
         "kms-info" => kms_info(cli),
         "check-config" => load_config(&cli).map(|_| println!("OK")),
         other => Err(format!(
-            "unknown command {other}(run / png / kms-info / check-config)"
+            "unknown command {other}(run / png / bench / kms-info / check-config)"
         )),
     }
 }
