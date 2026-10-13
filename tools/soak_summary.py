@@ -13,6 +13,10 @@ LINE = re.compile(
     r"worst_frame=(?P<worst>\d+)ms ticks=(?P<ticks>\d+) keys=(?P<keys>\d+) screen=(?P<screen>\S+) "
     r"photo=(?P<photo>\d+) feed=(?P<feed>.*?) cpu="
 )
+# PoC-005 で追加した計測値(古いログには無い)
+CPU_SELF = re.compile(r" cpu_self=(?P<v>[\d.]+)")
+RENDER = re.compile(r" render_ms=(?P<avg>[\d.]+)/(?P<p95>[\d.]+)")
+PRESENT = re.compile(r" present_ms=(?P<avg>[\d.]+)/(?P<p95>[\d.]+)")
 
 
 def main() -> int:
@@ -21,7 +25,13 @@ def main() -> int:
         m = LINE.match(line)
         if m:
             d = m.groupdict()
-            rows.append({k: (int(v) if v.isdigit() else v) for k, v in d.items()})
+            row = {k: (int(v) if v.isdigit() else v) for k, v in d.items()}
+            c = CPU_SELF.search(line)
+            row["cpu_self"] = float(c["v"]) if c else None
+            for key, pat in (("render", RENDER), ("present", PRESENT)):
+                g = pat.search(line)
+                row[key] = (float(g["avg"]), float(g["p95"])) if g else None
+            rows.append(row)
             continue
         if "seat: 無効化" in line:
             events["seat_disabled"] += 1
@@ -50,6 +60,13 @@ def main() -> int:
     print(f"fd 数: 最小 {min(fds)} / 最大 {max(fds)}(開始 {first['fds']} → 終了 {last['fds']})")
     worst = [r["worst"] for r in rows]
     print(f"フレーム時間(区間最大, ms): 中央値 {med(worst)} / 最大 {max(worst)} / 100ms 超の区間 {sum(w > 100 for w in worst)}")
+    cpu = [r["cpu_self"] for r in rows if r["cpu_self"] is not None]
+    if cpu:
+        print(f"CPU(自プロセス, %): 平均 {sum(cpu) / len(cpu):.2f} / 中央値 {med(cpu):.2f} / 最大 {max(cpu):.2f}(1 コア = 100%)")
+    for key, label in (("render", "描画"), ("present", "転送")):
+        v = [r[key] for r in rows if r[key] is not None]
+        if v:
+            print(f"{label}(ms, 区間平均の中央値 / 区間 p95 の最大): {med([a for a, _ in v]):.1f} / {max(p for _, p in v):.1f}")
 
     stalls, prev = [], rows[0]
     for r in rows[1:]:
