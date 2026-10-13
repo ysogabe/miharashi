@@ -29,15 +29,25 @@ impl Keys {
     /// 4/6(テンキー、矢印、メイン列)を持つ evdev デバイスを seat 経由で開く(非ブロッキング)。
     /// `names` が空でなければ、デバイス名にそのいずれかを含むものだけを使う。
     pub fn open(session: &mut Session, names: &[String]) -> Result<Self, String> {
+        let keys = Self::open_any(session, names);
+        if keys.devices.is_empty() {
+            return Err("対象のキーボードが見つからない(input グループ/seat の権限を確認)".into());
+        }
+        Ok(keys)
+    }
+
+    /// `open` と同じだが、1 台も無くてもよい(操作パネルから操作できるとき)。後から `reopen` で拾い直す。
+    pub fn open_any(session: &mut Session, names: &[String]) -> Self {
         let mut keys = Self {
             devices: Vec::new(),
             name_filter: names.to_vec(),
         };
         keys.reopen(session);
-        if keys.devices.is_empty() {
-            return Err("対象のキーボードが見つからない(input グループ/seat の権限を確認)".into());
-        }
-        Ok(keys)
+        keys
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
     }
 
     /// 開いているデバイスを閉じる(VT が非アクティブになるとき)。
