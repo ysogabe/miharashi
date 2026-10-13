@@ -86,6 +86,8 @@ pub trait Presenter {
 }
 ```
 
+画面管理の契約(`Screen` / `Provider` / `World` / `App`)は、実装後のコードを基準に [DESIGN-screen-interface.md](DESIGN-screen-interface.md)(Issue #9)で決め直した。上の trait 例はそれに置き換える。
+
 各画面はRustコードとしてコンパイルし、`ScreenRegistry`へ明示登録する。trait objectでの実行時dispatchは使えるが、共有ライブラリを動的ロードするプラグイン方式は採用しない。
 
 ## 5. UIレイアウトと文字
