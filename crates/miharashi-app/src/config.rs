@@ -15,6 +15,7 @@ pub struct Config {
     pub home_assistant: HomeAssistant,
     pub screen_power: ScreenPower,
     pub alerts: Alerts,
+    pub aircraft: Aircraft,
     pub ui: Ui,
     pub panel: Panel,
 }
@@ -238,6 +239,35 @@ impl Default for Alerts {
     }
 }
 
+/// 航空機の画面(写真の合間に挟む)。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Aircraft {
+    pub enabled: bool,
+    /// readsb/tar1090 の aircraft.json(受信機の位置は同じ場所の receiver.json)
+    pub url: String,
+    pub poll_secs: u64,
+    /// 受信機からこの距離(km)以内の機体を出す
+    pub radius_km: f64,
+    /// 写真をこの枚数出すごとに、半径内に機体がいれば航空機の画面を挟む
+    pub every_photos: u32,
+    /// 航空機の画面を出す秒数
+    pub show_secs: u64,
+}
+
+impl Default for Aircraft {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            url: "https://ads-b.dam-lab.work/tar1090/data/aircraft.json".into(),
+            poll_secs: 5,
+            radius_km: 50.0,
+            every_photos: 10,
+            show_secs: 30,
+        }
+    }
+}
+
 impl Default for Ui {
     fn default() -> Self {
         Self {
@@ -297,6 +327,17 @@ impl Config {
         {
             return Err(
                 "geoframe: reconnect_min_secs は 1 以上、reconnect_max_secs は min 以上".into(),
+            );
+        }
+        let a = &self.aircraft;
+        if a.poll_secs < 2
+            || a.every_photos == 0
+            || a.show_secs == 0
+            || !(1.0..=400.0).contains(&a.radius_km)
+        {
+            return Err(
+                "aircraft.poll_secs は 2 以上、every_photos と show_secs は 1 以上、radius_km は 1〜400"
+                    .into(),
             );
         }
         if self.geoframe.card_secs == 0 || !(1.0..=1000.0).contains(&self.geoframe.home_radius_km) {

@@ -1,5 +1,6 @@
 //! Miharashi: Linux キオスク・ダッシュボード。`run`(実機)、`png`(ヘッドレス)、`kms-info`、
 //! `bench`(CPU 描画のベースライン)。
+mod aircraft;
 mod album;
 mod app;
 mod bench;
@@ -117,10 +118,12 @@ fn run(cli: Cli) -> Result<(), String> {
     let (alert_tx, alerts) = std::sync::mpsc::channel();
     quake::start(&cfg.alerts, &cfg.home_assistant, alert_tx.clone());
     disaster::start(&cfg.alerts, &cfg.home_assistant, alert_tx);
+    let planes = aircraft::start(&cfg.aircraft);
     runtime::run(&cfg, |out| {
         Box::new(
             app::KioskApp::new(&cfg, out.size, out.gpu_max_texture, src, data, snap)
-                .with_alerts(Some(alerts)),
+                .with_alerts(Some(alerts))
+                .with_aircraft(planes),
         )
     })
 }
@@ -232,8 +235,10 @@ fn png(cli: Cli) -> Result<(), String> {
         miharashi_render::trip_card::trip_card(&mut c, &mut text, &card);
         save(&c, Some((&item, &overlay)), name)?;
     }
+    miharashi_render::aircraft::aircraft_screen(&mut c, &mut text, &aircraft::demo_view());
+    save(&c, None, "aircraft")?;
     println!(
-        "wrote {}/{{status,status-details,photo,alert-quake,alert-disaster,trip-card,everyday-card}}.png ({}x{})",
+        "wrote {}/{{status,status-details,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft}}.png ({}x{})",
         out.display(),
         size.0,
         size.1
