@@ -11,7 +11,8 @@
 use crate::config::{HomeAssistant, ScreenPower as Settings};
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
 /// 手動オーバーライドの実効値。
@@ -20,6 +21,23 @@ pub enum Mode {
     Auto,
     ForceOn,
     ForceOff,
+}
+
+impl Mode {
+    /// HA の input_select の選択肢の名前。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Auto => "auto",
+            Mode::ForceOn => "force_on",
+            Mode::ForceOff => "force_off",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [Mode::Auto, Mode::ForceOn, Mode::ForceOff]
+            .into_iter()
+            .find(|m| m.as_str() == s)
+    }
 }
 
 /// HA の生の値を実効モードにする。値は厳密一致だけを受け付け、それ以外(タイポ・unknown・
@@ -185,6 +203,20 @@ impl Client {
             .map(str::to_string)
             .ok_or_else(|| "state がない応答".into())
     }
+
+    /// input_select の選択肢を切り替える(`input_select.select_option`)。
+    fn select_option(&self, entity: &str, option: &str) -> Result<(), String> {
+        self.agent
+            .post(&format!(
+                "{}/api/services/input_select/select_option",
+                self.url
+            ))
+            .header("Authorization", &self.auth)
+            .content_type("application/json")
+            .send(serde_json::json!({ "entity_id": entity, "option": option }).to_string())
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// 問い合わせスレッドと実行ループで共有する状態。
@@ -195,11 +227,17 @@ struct Shared {
     forced: AtomicBool,
     /// 前回の問い合わせ以降にキー操作があった
     key_pressed: AtomicBool,
+    /// 実効モード(`Mode` の並び順の番号)。操作パネルの表示用
+    mode: AtomicU8,
 }
 
 /// 画面を点けるべきかを別スレッドで判定し続ける。
 pub struct ScreenPower {
     shared: Arc<Shared>,
+    client: Arc<Client>,
+    mode_entity: String,
+    /// 問い合わせスレッドを待たずに起こす(手動オーバーライドを切り替えた直後)
+    wake: Sender<()>,
 }
 
 impl ScreenPower {
@@ -223,11 +261,11 @@ impl ScreenPower {
             .timeout_global(Some(Duration::from_secs(5)))
             .build()
             .into();
-        let client = Client {
+        let client = Arc::new(Client {
             agent,
             url: ha.url.trim_end_matches('/').to_string(),
             auth: format!("Bearer {token}"),
-        };
+        });
         eprintln!(
             "screen: Home Assistant 連携 ON({} / 在宅={} / 手動={} / 不在{}分で消灯)",
             client.url,
@@ -238,16 +276,52 @@ impl ScreenPower {
         let shared = Arc::new(Shared::default());
         shared.want_on.store(true, Ordering::Relaxed);
         let for_thread = shared.clone();
+        let client_for_thread = client.clone();
+        let mode_entity = settings.mode_entity.clone();
         let settings = settings.clone();
+        let (wake, woken) = channel();
         // スレッドに名前を付ける(状態ログや試験でスレッドごとの CPU 時間を追えるように)
         let spawned = std::thread::Builder::new()
             .name("screen-power".into())
-            .spawn(move || poll(client, settings, for_thread));
+            .spawn(move || poll(&client_for_thread, settings, for_thread, woken));
         if let Err(e) = spawned {
             eprintln!("screen: スレッドを起動できない: {e}(画面は常に点灯)");
             return None;
         }
-        Some(Self { shared })
+        Some(Self {
+            shared,
+            client,
+            mode_entity,
+            wake,
+        })
+    }
+
+    /// 手動オーバーライドの実効値。mode エンティティが未設定なら None。
+    pub fn mode(&self) -> Option<Mode> {
+        if self.mode_entity.is_empty() {
+            return None;
+        }
+        Some(match self.shared.mode.load(Ordering::Relaxed) {
+            1 => Mode::ForceOn,
+            2 => Mode::ForceOff,
+            _ => Mode::Auto,
+        })
+    }
+
+    /// 手動オーバーライドを HA 上で切り替え(操作パネルから)、すぐ問い合わせ直して反映する。
+    /// HA の画面とキオスクの表示が食い違わないよう、キオスクの中だけでは切り替えない。
+    pub fn set_override(&self, mode: Mode) -> Result<(), String> {
+        if self.mode_entity.is_empty() {
+            return Err("screen_power.mode_entity が未設定".into());
+        }
+        self.client
+            .select_option(&self.mode_entity, mode.as_str())?;
+        eprintln!(
+            "screen: 手動オーバーライドを {} にした(パネル)",
+            mode.as_str()
+        );
+        let _ = self.wake.send(());
+        Ok(())
     }
 
     pub fn want_on(&self) -> bool {
@@ -265,6 +339,13 @@ impl ScreenPower {
     }
 }
 
+impl crate::panel::DisplayControl for ScreenPower {
+    fn set_mode(&self, mode: &str) -> Result<(), String> {
+        let m = Mode::parse(mode).ok_or_else(|| format!("未知のモード {mode:?}"))?;
+        self.set_override(m)
+    }
+}
+
 /// 長期アクセストークンをファイルから読む(前後の空白は落とす)。
 pub fn read_token(path: &str) -> Result<String, String> {
     match std::fs::read_to_string(path) {
@@ -278,7 +359,7 @@ fn or_dash(s: &str) -> &str {
     if s.is_empty() { "-" } else { s }
 }
 
-fn poll(client: Client, s: Settings, shared: Arc<Shared>) {
+fn poll(client: &Client, s: Settings, shared: Arc<Shared>, woken: Receiver<()>) {
     let mut policy = Policy::new(&s, Instant::now());
     let (mut presence_warned, mut mode_warned) = (false, false);
     let mut prev_mode = Mode::Auto;
@@ -301,6 +382,7 @@ fn poll(client: Client, s: Settings, shared: Arc<Shared>) {
         }
         let mode = policy.mode(now);
         shared.forced.store(mode != Mode::Auto, Ordering::Relaxed);
+        shared.mode.store(mode as u8, Ordering::Relaxed);
         let on = policy.want_on(now);
         if on != shared.want_on.load(Ordering::Relaxed) {
             let what = if on { "点灯" } else { "消灯" };
@@ -317,7 +399,10 @@ fn poll(client: Client, s: Settings, shared: Arc<Shared>) {
             shared.want_on.store(on, Ordering::Relaxed);
         }
         prev_mode = mode;
-        std::thread::sleep(Duration::from_secs(s.poll_secs));
+        match woken.recv_timeout(Duration::from_secs(s.poll_secs)) {
+            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
     }
 }
 
@@ -341,6 +426,20 @@ mod tests {
     use super::*;
 
     const MIN: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn mode_names_match_the_ha_input_select() {
+        for m in [Mode::Auto, Mode::ForceOn, Mode::ForceOff] {
+            assert_eq!(Mode::parse(m.as_str()), Some(m));
+            assert_eq!(effective_mode(m.as_str(), MIN, 5 * MIN), m);
+        }
+        assert_eq!(Mode::parse("off"), None);
+        // 共有の番号(AtomicU8)は宣言順
+        assert_eq!(
+            (Mode::Auto as u8, Mode::ForceOn as u8, Mode::ForceOff as u8),
+            (0, 1, 2)
+        );
+    }
 
     #[test]
     fn effective_mode_accepts_only_exact_values() {

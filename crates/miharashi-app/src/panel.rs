@@ -6,6 +6,9 @@
 //!
 //! P1 の範囲: `prev` / `next` / `select` の 3 つ(今の `KeyPress` の Prev / Next / Switch)。
 //! `up` / `down` / `menu` は #5(PoC-003)で `KeyPress` が増えてから受け付ける。`/api/v1/screen` も #5 の後。
+//!
+//! モニターの消灯・点灯(`POST /api/v1/display`)は、HA の手動オーバーライド(input_select)を書き換える。
+//! キオスクの中だけで切り替えると HA の画面と食い違うので、実際の切り替えは `DisplayControl` に任せる。
 use crate::config;
 use crate::screen::{KeyPress, PanelView};
 use serde_json::{Value, json};
@@ -51,6 +54,20 @@ fn parse_key(name: &str) -> Result<KeyPress, String> {
             "未知のキー {name:?}。使えるのは prev / next / select"
         )),
     }
+}
+
+/// モニターの手動オーバーライド(auto / force_on / force_off)を切り替える先。実体は `ScreenPower`。
+pub trait DisplayControl: Send + Sync {
+    fn set_mode(&self, mode: &str) -> Result<(), String>;
+}
+
+/// `/api/v1/status` の `display`。実行ループが知っている、モニターの今の状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DisplayStatus {
+    /// 点いているか(DPMS)
+    pub on: bool,
+    /// 手動オーバーライドの実効値。HA の mode エンティティが未設定なら None
+    pub mode: Option<&'static str>,
 }
 
 /// 長さに依らない比較(トークンを 1 文字ずつ当てられないように)。
@@ -114,6 +131,7 @@ impl RateLimit {
 
 struct State {
     view: Option<PanelView>,
+    display: DisplayStatus,
     /// `view` が変わるたびに 1 増える。SSE はこれで変化を知る
     generation: u64,
 }
@@ -126,10 +144,12 @@ struct Shared {
     started: Instant,
     sse: AtomicUsize,
     last_request: Mutex<Option<Instant>>,
+    /// モニターを切り替えられるか(HA の mode エンティティが設定してあるか)
+    display_control: bool,
 }
 
 impl Shared {
-    fn status_json(&self, view: &PanelView) -> Value {
+    fn status_json(&self, view: &PanelView, display: DisplayStatus) -> Value {
         let screen = view.screens.get(view.current).map(|s| {
             json!({
                 "id": s.id,
@@ -146,6 +166,11 @@ impl Shared {
             "screens": view.screens.iter().map(|s| json!({"id": s.id, "title": s.title})).collect::<Vec<_>>(),
             "photo": view.photo.map(|(position, total)| json!({"position": position, "total": total})),
             "feed": if view.feed_online { "online" } else { "retrying" },
+            "display": {
+                "on": display.on,
+                "mode": display.mode,
+                "control": self.display_control && display.mode.is_some(),
+            },
             "uptime_s": self.started.elapsed().as_secs(),
             "generated_at": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
         })
@@ -154,7 +179,10 @@ impl Shared {
     /// 今の状態の JSON と世代。まだ一度も置かれていなければ None。
     fn snapshot(&self) -> (Option<Value>, u64) {
         let st = self.state.lock().unwrap();
-        (st.view.as_ref().map(|v| self.status_json(v)), st.generation)
+        (
+            st.view.as_ref().map(|v| self.status_json(v, st.display)),
+            st.generation,
+        )
     }
 }
 
@@ -167,18 +195,28 @@ pub struct Panel {
 
 impl Panel {
     /// 設定どおりに待ち受けを始める。失敗したら Err(キオスクはパネルなしで動き続ける)。
-    pub fn start(cfg: &config::Panel) -> Result<Self, String> {
+    /// `display` はモニターの切り替え先(HA 連携が無ければ None。`/api/v1/display` は 409)。
+    pub fn start(
+        cfg: &config::Panel,
+        display: Option<Arc<dyn DisplayControl>>,
+    ) -> Result<Self, String> {
         let addr = check_listen(&cfg.listen)?;
         let token = read_token(&cfg.token_file)?;
         let server = Server::http(addr).map_err(|e| format!("{addr} で待ち受けられない: {e}"))?;
-        Ok(Self::spawn(server, token, cfg.max_rate_per_sec))
+        Ok(Self::spawn(server, token, cfg.max_rate_per_sec, display))
     }
 
-    fn spawn(server: Server, token: String, max_rate_per_sec: u32) -> Self {
+    fn spawn(
+        server: Server,
+        token: String,
+        max_rate_per_sec: u32,
+        display: Option<Arc<dyn DisplayControl>>,
+    ) -> Self {
         let addr = server.server_addr().to_ip().expect("TCP で待ち受けている");
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 view: None,
+                display: DisplayStatus::default(),
                 generation: 0,
             }),
             changed: Condvar::new(),
@@ -186,12 +224,16 @@ impl Panel {
             started: Instant::now(),
             sse: AtomicUsize::new(0),
             last_request: Mutex::new(None),
+            display_control: display.is_some(),
         });
         let (tx, keys) = channel();
         let s = shared.clone();
         std::thread::Builder::new()
             .name("panel".into())
-            .spawn(move || serve(server, token, RateLimit::new(max_rate_per_sec), tx, s))
+            .spawn(move || {
+                let rate = RateLimit::new(max_rate_per_sec);
+                serve(server, token, rate, tx, display, s)
+            })
             .expect("panel スレッドを起動できる");
         Self { keys, shared, addr }
     }
@@ -205,11 +247,12 @@ impl Panel {
         self.keys.try_iter()
     }
 
-    /// 画面の状態を置く。前と同じなら何もしない(SSE には変わったときだけ送る)。
-    pub fn publish(&self, view: Option<PanelView>) {
+    /// 画面とモニターの状態を置く。前と同じなら何もしない(SSE には変わったときだけ送る)。
+    pub fn publish(&self, view: Option<PanelView>, display: DisplayStatus) {
         let mut st = self.shared.state.lock().unwrap();
-        if st.view != view {
+        if st.view != view || st.display != display {
             st.view = view;
+            st.display = display;
             st.generation += 1;
             self.shared.changed.notify_all();
         }
@@ -265,6 +308,7 @@ fn serve(
     token: String,
     mut rate: RateLimit,
     keys: Sender<KeyPress>,
+    display: Option<Arc<dyn DisplayControl>>,
     shared: Arc<Shared>,
 ) {
     for mut req in server.incoming_requests() {
@@ -314,7 +358,20 @@ fn serve(
                     }
                 }
             }
-            (_, "/api/v1/status" | "/api/v1/events" | "/api/v1/input") => {
+            (Method::Post, "/api/v1/display") => {
+                if !rate.allow(Instant::now()) {
+                    error(429, "操作が速すぎる")
+                } else {
+                    let (mode, result) = set_display(&mut req, display.as_deref());
+                    let code = result.as_ref().map_or_else(|(c, _)| *c, |_| 204);
+                    eprintln!("panel: {} display {mode:?} -> {code}", peer(&req));
+                    match result {
+                        Ok(()) => Response::from_data(Vec::new()).with_status_code(204),
+                        Err((code, msg)) => error(code, &msg),
+                    }
+                }
+            }
+            (_, "/api/v1/status" | "/api/v1/events" | "/api/v1/input" | "/api/v1/display") => {
                 error(405, "メソッドが違う")
             }
             _ => error(404, "ない"),
@@ -323,21 +380,58 @@ fn serve(
     }
 }
 
-/// `POST /api/v1/input` の本文を読んでキーを送る。戻り値: (キーの名前(ログ用), 結果)。Err は (状態コード, 本文)。
-fn input(req: &mut Request, keys: &Sender<KeyPress>) -> (String, Result<(), (u16, String)>) {
-    let shape = || (400, r#"本文は {"key": "next"} の形の JSON"#.to_string());
+type HttpError = (u16, String);
+
+/// 本文 `{"<field>": "<値>"}` の値を読む。
+fn read_field(req: &mut Request, field: &str, example: &str) -> Result<String, HttpError> {
     let mut body = Vec::new();
-    if let Err(e) = req.as_reader().take(MAX_BODY + 1).read_to_end(&mut body) {
-        return ("-".into(), Err((400, format!("本文を読めない: {e}"))));
-    }
+    req.as_reader()
+        .take(MAX_BODY + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| (400, format!("本文を読めない: {e}")))?;
     if body.len() as u64 > MAX_BODY {
-        return ("-".into(), Err((413, "本文が大きすぎる".into())));
+        return Err((413, "本文が大きすぎる".into()));
     }
-    let Some(name) = serde_json::from_slice::<Value>(&body)
+    serde_json::from_slice::<Value>(&body)
         .ok()
-        .and_then(|v| v.get("key").and_then(Value::as_str).map(str::to_string))
-    else {
-        return ("-".into(), Err(shape()));
+        .and_then(|v| v.get(field).and_then(Value::as_str).map(str::to_string))
+        .ok_or_else(|| {
+            (
+                400,
+                format!(r#"本文は {{"{field}": "{example}"}} の形の JSON"#),
+            )
+        })
+}
+
+/// `POST /api/v1/display` の本文を読んで、モニターの手動オーバーライドを切り替える。
+fn set_display(
+    req: &mut Request,
+    display: Option<&dyn DisplayControl>,
+) -> (String, Result<(), HttpError>) {
+    let mode = match read_field(req, "mode", "force_off") {
+        Ok(m) => m,
+        Err(e) => return ("-".into(), Err(e)),
+    };
+    let result = if !matches!(mode.as_str(), "auto" | "force_on" | "force_off") {
+        Err((400, "mode は auto / force_on / force_off".into()))
+    } else if let Some(d) = display {
+        d.set_mode(&mode)
+            .map_err(|e| (502, format!("Home Assistant を切り替えられない: {e}")))
+    } else {
+        Err((
+            409,
+            "モニターを切り替えられない(home_assistant と screen_power.mode_entity が未設定)"
+                .into(),
+        ))
+    };
+    (mode, result)
+}
+
+/// `POST /api/v1/input` の本文を読んでキーを送る。戻り値: (キーの名前(ログ用), 結果)。Err は (状態コード, 本文)。
+fn input(req: &mut Request, keys: &Sender<KeyPress>) -> (String, Result<(), HttpError>) {
+    let name = match read_field(req, "key", "next") {
+        Ok(n) => n,
+        Err(e) => return ("-".into(), Err(e)),
     };
     let result = parse_key(&name).map_err(|msg| (400, msg)).and_then(|key| {
         keys.send(key)
@@ -413,10 +507,103 @@ mod tests {
     }
 
     fn start(rate: u32) -> (Panel, String) {
+        start_with(rate, None)
+    }
+
+    fn start_with(rate: u32, display: Option<Arc<dyn DisplayControl>>) -> (Panel, String) {
         let server = Server::http("127.0.0.1:0").unwrap();
-        let p = Panel::spawn(server, TOKEN.into(), rate);
+        let p = Panel::spawn(server, TOKEN.into(), rate, display);
         let base = format!("http://{}", p.addr());
         (p, base)
+    }
+
+    /// HA の代わり。受け取ったモードを記録し、`fail` なら失敗する。
+    #[derive(Default)]
+    struct FakeDisplay {
+        modes: Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    impl DisplayControl for FakeDisplay {
+        fn set_mode(&self, mode: &str) -> Result<(), String> {
+            if self.fail {
+                return Err("connection refused".into());
+            }
+            self.modes.lock().unwrap().push(mode.into());
+            Ok(())
+        }
+    }
+
+    fn post_display(base: &str, body: &str) -> u16 {
+        agent()
+            .post(format!("{base}/api/v1/display"))
+            .header("Authorization", format!("Bearer {TOKEN}"))
+            .content_type("application/json")
+            .send(body)
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    #[test]
+    fn display_mode_goes_to_the_control() {
+        let fake = Arc::new(FakeDisplay::default());
+        let (_p, base) = start_with(20, Some(fake.clone()));
+        assert_eq!(post_display(&base, r#"{"mode":"force_off"}"#), 204);
+        assert_eq!(post_display(&base, r#"{"mode":"auto"}"#), 204);
+        assert_eq!(post_display(&base, r#"{"mode":"off"}"#), 400);
+        assert_eq!(post_display(&base, r#"{"key":"next"}"#), 400);
+        assert_eq!(*fake.modes.lock().unwrap(), ["force_off", "auto"]);
+
+        let failing = Arc::new(FakeDisplay {
+            fail: true,
+            ..Default::default()
+        });
+        let (_p, base) = start_with(20, Some(failing));
+        assert_eq!(
+            post_display(&base, r#"{"mode":"force_on"}"#),
+            502,
+            "HA に届かない"
+        );
+
+        let (_p, base) = start(20);
+        assert_eq!(
+            post_display(&base, r#"{"mode":"force_on"}"#),
+            409,
+            "HA 連携なし"
+        );
+    }
+
+    #[test]
+    fn status_reports_the_monitor() {
+        let (p, base) = start_with(20, Some(Arc::new(FakeDisplay::default())));
+        p.publish(
+            Some(view(1)),
+            DisplayStatus {
+                on: false,
+                mode: Some("force_off"),
+            },
+        );
+        let v: Value = serde_json::from_str(&get(&base, "/api/v1/status", true).1).unwrap();
+        assert_eq!(
+            v["display"],
+            json!({"on": false, "mode": "force_off", "control": true})
+        );
+
+        // HA 連携が無ければ切り替えられない
+        let (p, base) = start(20);
+        p.publish(
+            Some(view(1)),
+            DisplayStatus {
+                on: true,
+                mode: None,
+            },
+        );
+        let v: Value = serde_json::from_str(&get(&base, "/api/v1/status", true).1).unwrap();
+        assert_eq!(
+            v["display"],
+            json!({"on": true, "mode": null, "control": false})
+        );
     }
 
     fn agent() -> ureq::Agent {
@@ -558,7 +745,7 @@ mod tests {
             503,
             "まだ置かれていない"
         );
-        p.publish(Some(view(1)));
+        p.publish(Some(view(1)), DisplayStatus::default());
         let (code, body) = get(&base, "/api/v1/status", true);
         assert_eq!(code, 200);
         let v: Value = serde_json::from_str(&body).unwrap();
@@ -570,7 +757,7 @@ mod tests {
         assert_eq!(v["photo"]["position"], 12);
         assert_eq!(v["photo"]["total"], 187);
         assert_eq!(v["feed"], "online");
-        p.publish(Some(view(0)));
+        p.publish(Some(view(0)), DisplayStatus::default());
         let v: Value = serde_json::from_str(&get(&base, "/api/v1/status", true).1).unwrap();
         assert_eq!(v["screen"]["id"], "status");
         assert_eq!(v["screen"]["page"], "OVERVIEW");
@@ -579,7 +766,7 @@ mod tests {
     #[test]
     fn events_send_the_current_status_then_each_change() {
         let (p, base) = start(20);
-        p.publish(Some(view(0)));
+        p.publish(Some(view(0)), DisplayStatus::default());
         let mut s = std::net::TcpStream::connect(p.addr()).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         write!(
@@ -596,9 +783,15 @@ mod tests {
             }
         };
         assert_eq!(data()["screen"]["id"], "status");
-        p.publish(Some(view(0)));
-        p.publish(Some(view(1)));
+        p.publish(Some(view(0)), DisplayStatus::default());
+        p.publish(Some(view(1)), DisplayStatus::default());
         assert_eq!(data()["screen"]["id"], "photo", "同じ状態は送らない");
+        let on = DisplayStatus {
+            on: true,
+            mode: Some("auto"),
+        };
+        p.publish(Some(view(1)), on);
+        assert_eq!(data()["display"]["on"], true, "モニターだけ変わっても送る");
         assert_eq!(p.stat(), "connected");
         let _ = base;
     }
