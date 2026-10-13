@@ -1,0 +1,48 @@
+[Unit]
+Description=Miharashi CPU package power helper (RAPL energy counter, root)
+Documentation=https://github.com/ysogabe/miharashi
+# 任意機能(CPU の W を画面に出す場合のみ)。キオスク本体はこのサービスに依存しない。
+# 使い方: systemctl enable --now miharashi-rapl
+
+[Service]
+Type=simple
+# energy_uj は root 限定(0400)。電力解析攻撃(Platypus)対策のため、読むのはこの root プロセスだけにする。
+# キオスクは一般ユーザーのまま /run/miharashi-rapl/energy を読む(キオスクは Wants= で参照するだけで、停止しても動く)。
+#
+# 1 秒粒度で公開する理由: 電力値を 1 秒ごとの積算として出すだけなら、サイドチャネルで得られる
+# 情報は粗く、細かい時間分解能の電力波形は得られない。読み出し頻度をこれ以上上げないこと。
+#
+# 終了コード 3 は「RAPL が無い」。再起動しても無意味なので RestartPreventExitStatus で再試行を止める。
+# それ以外の失敗は Restart=on-failure で再試行する。
+ExecStart=/bin/sh -c 'umask 022; d=/sys/class/powercap/intel-rapl:0; out=/run/miharashi-rapl/energy; if [ ! -r $$d/energy_uj ] || [ ! -r $$d/max_energy_range_uj ]; then echo "miharashi-rapl: $$d is not readable (RAPL unavailable); CPU power is disabled" >&2; exit 3; fi; while :; do read -r e < $$d/energy_uj || exit 1; read -r m < $$d/max_energy_range_uj || exit 1; echo "$$e $$m" > $$out.tmp && chmod 0644 $$out.tmp && mv -f $$out.tmp $$out || exit 1; sleep 1; done'
+# /run/miharashi-rapl は root 所有 0755。キオスク(一般ユーザー)は読むだけ。
+RuntimeDirectory=miharashi-rapl
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=3
+
+# 権限の縮小。/sys/class/powercap の読み取りと /run/miharashi-rapl への書き込みは妨げない。
+# root が所有する 0400 ファイルは「所有者の読み取りビット」で読めるため CAP_DAC_OVERRIDE は不要。
+# 書き込みも root 所有ディレクトリへの所有者書き込みなので、ケーパビリティを空にしても動く。
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

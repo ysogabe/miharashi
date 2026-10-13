@@ -1,0 +1,40 @@
+# Miharashi 設定例。コメントアウトした行は既定値。
+# 置き場所の検索順: --config → ~/.config/miharashi/config.toml → /etc/miharashi/config.toml
+
+[runtime]
+# seat = "auto"            # auto / libseat / direct(libseat を使わず、video・input グループで直接開く)
+# max_seconds = 0          # 0 = 無期限。試験用に自動終了させる秒数
+# stats_interval_secs = 60 # 状態ログ(RSS・フレーム時間など)の間隔。systemd では journal に残る
+
+[display]
+# 表示先 GPU。/dev/dri/cardN は固定しない。
+# card = "auto"            # auto / /dev/dri/card1 / pci:0000:0e:00.0 / driver:amdgpu
+# connector = "auto"       # auto / HDMI-A-1 / DP-1 ...
+# mode = "preferred"       # preferred / 1920x1080 / 1920x1080@60
+
+[input]
+# devices = []             # デバイス名に含む文字列。空なら 4/6 か矢印キーを持つ全キーボード
+
+[geoframe]
+# url = "http://127.0.0.1:8080"
+# photo_interval_secs = 30
+# reconnect_min_secs = 1   # 接続失敗時の再接続は指数バックオフ(min から倍々で max まで)
+# reconnect_max_secs = 60
+
+[metrics]
+# interval_secs = 1
+# 監視する GPU。表示先 GPU とは独立に指定できる。
+# gpu = "auto"             # auto / 0(NVML インデックス)/ pci:0000:01:00.0
+
+[power]
+# 電力量(今日・累計)の保存先。書き込めない場合は起動中だけメモリ上で積算する。空なら保存しない。
+# state_file = "/var/lib/miharashi/energy.json"
+# CPU の RAPL 積算値。root のヘルパーが約 1 秒ごとに "<energy_uj> <max_energy_range_uj>" の 1 行を書く。
+# 無ければ /sys/class/powercap/intel-rapl:0 を直接読む(通常は root 限定で読めず、CPU の W は -- になる)。
+# rapl_helper_file = "/run/miharashi-rapl/energy"
+# 電気代の単価 [円/kWh]。0 なら電気代を表示しない。
+# price_per_kwh = 0
+
+[ui]
+# font = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+# start_screen = "status"  # status / photo
