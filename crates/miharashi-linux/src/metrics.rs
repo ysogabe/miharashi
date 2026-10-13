@@ -11,6 +11,8 @@ pub struct Sample {
     pub cpu_temp: Option<f32>,
     pub gpu_percent: Option<f32>,
     pub gpu_temp: Option<f32>,
+    /// GPU ごとの使用率・温度。NVML の番号順(nvidia-smi と同じ)、その後ろに amdgpu(PCI アドレス順)。
+    pub gpus: Vec<GpuReading>,
     pub mem_used_gb: Option<f32>,
     pub mem_total_gb: Option<f32>,
     /// (ドライブ名, 温度℃)。NVMe の hwmon Composite。
@@ -45,6 +47,69 @@ pub struct Sample {
     pub failed_units: Option<u32>,
     /// (項目名, 値の表示文字列, "HH:MM")
     pub peaks_today: Vec<(String, String, String)>,
+}
+
+/// GPU 1 台分の使用率と温度。
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct GpuReading {
+    /// "GPU0", "GPU1", ...
+    pub label: String,
+    pub usage: Option<f32>,
+    pub temp: Option<f32>,
+}
+
+/// amdgpu の GPU(内蔵 Radeon など)。sysfs から使用率と温度を読む。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SysfsGpu {
+    pci: String,
+    /// /sys/class/drm/cardN/device
+    device: PathBuf,
+}
+
+impl SysfsGpu {
+    fn usage(&self) -> Option<f32> {
+        std::fs::read_to_string(self.device.join("gpu_busy_percent"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    fn temp(&self) -> Option<f32> {
+        let rd = std::fs::read_dir(self.device.join("hwmon")).ok()?;
+        rd.flatten()
+            .find_map(|e| read_milli_c(&e.path().join("temp1_input")))
+    }
+}
+
+/// `drm_dir`(通常 /sys/class/drm)の cardN のうち、`gpu_busy_percent` を持つもの(amdgpu)。
+/// NVIDIA は NVML で読むので除く。cardN の番号は起動ごとに変わるので PCI アドレス順に並べる。
+fn find_sysfs_gpus(drm_dir: &std::path::Path) -> Vec<SysfsGpu> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(drm_dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_card = name
+            .strip_prefix("card")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        if !is_card {
+            continue;
+        }
+        let device = entry.path().join("device");
+        if !device.join("gpu_busy_percent").exists() {
+            continue;
+        }
+        let pci = std::fs::canonicalize(&device)
+            .ok()
+            .and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
+            .unwrap_or(name);
+        out.push(SysfsGpu { pci, device });
+    }
+    out.sort_by(|a, b| a.pci.cmp(&b.pci));
+    out.dedup_by(|a, b| a.pci == b.pci);
+    out
 }
 
 /// サンプラーに渡す設定(電力まわりのパス)。
@@ -185,6 +250,30 @@ impl Sampler {
                     "metrics: 監視 GPU({gpu_sel:?})を NVML で開けない。GPU の値は -- と表示する"
                 );
             }
+            // GPU ごとの表示用: NVML の全 GPU(番号順)+ amdgpu
+            let nvml_all: Vec<nvml_wrapper::Device> = nvml
+                .as_ref()
+                .map(|n| {
+                    (0..n.device_count().unwrap_or(0))
+                        .filter_map(|i| n.device_by_index(i).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let sysfs_gpus = find_sysfs_gpus(std::path::Path::new("/sys/class/drm"));
+            let mut names: Vec<String> = nvml_all
+                .iter()
+                .map(|d| d.name().unwrap_or_else(|_| "NVIDIA".into()))
+                .collect();
+            names.extend(sysfs_gpus.iter().map(|g| format!("amdgpu {}", g.pci)));
+            eprintln!(
+                "metrics: GPU 一覧: {}",
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| format!("GPU{i}={n}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             let temp_path = find_cpu_temp_input();
             let ssds = find_ssd_inputs();
             let fan_inputs = find_fan_inputs();
@@ -278,6 +367,24 @@ impl Sampler {
                         .as_ref()
                         .and_then(|d| d.utilization_rates().ok())
                         .map(|u| u.gpu as f32),
+                    gpus: {
+                        use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
+                        let nv = nvml_all.iter().map(|d| {
+                            (
+                                d.utilization_rates().ok().map(|u| u.gpu as f32),
+                                d.temperature(TemperatureSensor::Gpu).ok().map(|t| t as f32),
+                            )
+                        });
+                        let amd = sysfs_gpus.iter().map(|g| (g.usage(), g.temp()));
+                        nv.chain(amd)
+                            .enumerate()
+                            .map(|(i, (usage, temp))| GpuReading {
+                                label: format!("GPU{i}"),
+                                usage,
+                                temp,
+                            })
+                            .collect()
+                    },
                     mem_used_gb,
                     mem_total_gb,
                     ssd_temps: ssds
@@ -473,6 +580,40 @@ mod tests {
             GpuSel::Pci("0000:01:00.0".into())
         );
         assert!(GpuSel::parse("rtx").is_err());
+    }
+
+    #[test]
+    fn sysfs_gpus_are_amdgpu_cards_sorted_by_pci() {
+        let root = std::env::temp_dir().join(format!("miharashi-drm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mk_dev = |pci: &str, busy: Option<&str>| {
+            let d = root.join("devices").join(pci);
+            std::fs::create_dir_all(d.join("hwmon/hwmon3")).unwrap();
+            if let Some(b) = busy {
+                std::fs::write(d.join("gpu_busy_percent"), b).unwrap();
+                std::fs::write(d.join("hwmon/hwmon3/temp1_input"), "38000\n").unwrap();
+            }
+            d
+        };
+        let drm = root.join("drm");
+        let link = |card: &str, dev: &std::path::Path| {
+            std::fs::create_dir_all(drm.join(card)).unwrap();
+            std::os::unix::fs::symlink(dev, drm.join(card).join("device")).unwrap();
+        };
+        // card0 = 内蔵(10:00.0)、card1 = NVIDIA(gpu_busy_percent なし)、card2 = 別の amdgpu(03:00.0)
+        link("card0", &mk_dev("0000:10:00.0", Some("7\n")));
+        link("card1", &mk_dev("0000:01:00.0", None));
+        link("card2", &mk_dev("0000:03:00.0", Some("55\n")));
+        // コネクター(card0-HDMI-A-1)は対象外
+        std::fs::create_dir_all(drm.join("card0-HDMI-A-1")).unwrap();
+
+        let g = find_sysfs_gpus(&drm);
+        let pcis: Vec<&str> = g.iter().map(|x| x.pci.as_str()).collect();
+        assert_eq!(pcis, ["0000:03:00.0", "0000:10:00.0"]);
+        assert_eq!(g[1].usage(), Some(7.0));
+        assert_eq!(g[1].temp(), Some(38.0));
+        assert!(find_sysfs_gpus(&root.join("none")).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

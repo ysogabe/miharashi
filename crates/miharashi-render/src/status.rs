@@ -10,6 +10,18 @@ const WARN: [u8; 4] = [255, 170, 60, 255];
 const CRIT: [u8; 4] = [255, 90, 80, 255];
 pub const CPU_COLOR: [u8; 4] = [64, 200, 255, 255];
 pub const GPU_COLOR: [u8; 4] = [255, 170, 60, 255];
+/// GPU ごとの色。GPU0 は GPU_COLOR、以降は順に使う。
+const GPU_COLORS: [[u8; 4]; 4] = [
+    GPU_COLOR,
+    [255, 110, 170, 255],
+    [140, 220, 110, 255],
+    [190, 150, 255, 255],
+];
+
+/// `i` 番目の GPU の色。
+pub fn gpu_color(i: usize) -> [u8; 4] {
+    GPU_COLORS[i % GPU_COLORS.len()]
+}
 
 const HEAD: f32 = 72.0;
 const FOOT: f32 = 64.0;
@@ -280,6 +292,75 @@ fn power_tile(
     fit_left(c, t, &e, x + 20.0, y + 192.0, 30.0, w - 40.0, DIM);
 }
 
+/// GPU が 2 台以上のときの GPU タイル: GPU ごとに使用率と温度を 1 行ずつ、最後に監視 GPU の W と今日の kWh。
+fn multi_gpu_tile(c: &mut Canvas, t: &mut TextEngine, rect: Rect, s: &Snapshot) {
+    tile(c, t, rect, "GPU");
+    let (x, y, w, h) = rect;
+    c.fill_rect(
+        x,
+        y,
+        6.0,
+        h,
+        rgba(GPU_COLOR[0], GPU_COLOR[1], GPU_COLOR[2], 255),
+    );
+    // 行の領域は y+50..y+176。台数が多ければ行の間隔と文字を縮める
+    let step = (126.0 / s.gpus.len() as f32).min(46.0);
+    let k = step / 46.0;
+    for (i, g) in s.gpus.iter().enumerate() {
+        let ry = y + 50.0 + i as f32 * step;
+        let right = x + w - 20.0;
+        let tw = fit_right(
+            c,
+            t,
+            &deg(g.temp),
+            right,
+            ry + 4.0 * k,
+            30.0 * k,
+            w * 0.3,
+            g.temp.map_or(DIM, temp_color),
+        );
+        let uw = fit_right(
+            c,
+            t,
+            &pct(g.usage),
+            right - tw - 20.0,
+            ry,
+            36.0 * k,
+            w * 0.3,
+            FG,
+        );
+        fit_left(
+            c,
+            t,
+            &g.label,
+            x + 20.0,
+            ry + 6.0 * k,
+            26.0 * k,
+            (w - 40.0 - tw - uw - 40.0).max(20.0),
+            gpu_color(i),
+        );
+    }
+    let e = format!(
+        "{}  今日 {}",
+        watt(s.gpu_power_w),
+        kwh(s.gpu_energy_today_wh)
+    );
+    fit_left(c, t, &e, x + 20.0, y + 192.0, 30.0, w - 40.0, DIM);
+}
+
+/// USAGE % のグラフの系列。GPU が 2 台以上なら GPU ごとに分ける。
+fn usage_series(s: &Snapshot) -> Vec<Series<'_>> {
+    let mut v = vec![series("CPU", &s.cpu_history, CPU_COLOR)];
+    if s.gpus.len() >= 2 {
+        for (i, g) in s.gpus.iter().enumerate() {
+            v.push(series(&g.label, &g.history, gpu_color(i)));
+        }
+    } else {
+        v.push(series("GPU", &s.gpu_history, GPU_COLOR));
+    }
+    v
+}
+
 fn overview(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot) {
     let (w, h) = (c.width() as f32, c.height() as f32);
 
@@ -295,17 +376,21 @@ fn overview(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot) {
         s.cpu_energy_today_wh,
         CPU_COLOR,
     );
-    power_tile(
-        c,
-        t,
-        tile_rect(w, 1),
-        "GPU",
-        s.gpu,
-        s.gpu_temp,
-        watt(s.gpu_power_w),
-        s.gpu_energy_today_wh,
-        GPU_COLOR,
-    );
+    if s.gpus.len() >= 2 {
+        multi_gpu_tile(c, t, tile_rect(w, 1), s);
+    } else {
+        power_tile(
+            c,
+            t,
+            tile_rect(w, 1),
+            "GPU",
+            s.gpu,
+            s.gpu_temp,
+            watt(s.gpu_power_w),
+            s.gpu_energy_today_wh,
+            GPU_COLOR,
+        );
+    }
 
     // MEMORY: 使用量 / 全体、使用率、スワップ
     let rect = tile_rect(w, 2);
@@ -362,10 +447,7 @@ fn overview(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot) {
         l.1,
         ch,
         "USAGE %",
-        &[
-            series("CPU", &s.cpu_history, CPU_COLOR),
-            series("GPU", &s.gpu_history, GPU_COLOR),
-        ],
+        &usage_series(s),
         Scale::Fixed(100.0),
         "%",
     );
