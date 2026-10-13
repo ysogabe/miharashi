@@ -92,6 +92,12 @@ impl GlesDisplay {
         Ok(())
     }
 
+    /// 画面の電源を切り替える(DPMS)。消している間は page flip が終わらないことがあるので、
+    /// 呼び出し側は `present_frame` を呼ばないこと。
+    pub fn set_power(&mut self, on: bool) -> Result<(), String> {
+        self.out.set_power(&self.card, on)
+    }
+
     /// RGBA8(上から下、stride = 幅 × 4)の完成画面を表示する。
     pub fn present(&mut self, rgba: &[u8]) -> Result<(), String> {
         self.present_frame(&Frame::Image(rgba))

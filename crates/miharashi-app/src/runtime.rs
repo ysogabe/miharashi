@@ -1,8 +1,9 @@
 //! キオスクの実行ループ。画面ロジックとは `screen::App` だけでつながり、具体的な型は知らない。
-//! seat/VT の有効・無効、SIGINT/SIGTERM、入力、描画、状態ログを扱う。
+//! seat/VT の有効・無効、SIGINT/SIGTERM、入力、描画、画面の電源(DPMS)、状態ログを扱う。
 //! 状態ログは共通部分(t / rss / fds / frames / worst_frame)に `App::stats()` の `k=v` を続けて出す。
 use crate::config::Config;
 use crate::screen::{App, Composite, KeyPress, PhotoData, PhotoRef};
+use crate::screen_power::ScreenPower;
 use miharashi_gpu::{Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, SourceImage};
 use miharashi_linux::drm_select::{self, CardSel, ModeSel};
 use miharashi_linux::input::{Action, Keys};
@@ -65,7 +66,12 @@ pub fn photo_layer(p: PhotoRef<'_>, screen_h: u32) -> PhotoLayer<'_> {
             channels: image.color().channel_count() as u32,
             place: Placement {
                 cover: layout.mode == Mode::Cover,
-                rect: (layout.photo.x, layout.photo.y, layout.photo.w, layout.photo.h),
+                rect: (
+                    layout.photo.x,
+                    layout.photo.y,
+                    layout.photo.w,
+                    layout.photo.h,
+                ),
                 scale: photo_layout::scale(screen_h),
             },
         }),
@@ -149,6 +155,13 @@ impl Presenter {
         match self {
             Self::Cpu(d) => d.resume(),
             Self::Gles(d) => d.resume(),
+        }
+    }
+
+    fn set_power(&mut self, on: bool) -> Result<(), String> {
+        match self {
+            Self::Cpu(d) => d.set_power(on),
+            Self::Gles(d) => d.set_power(on),
         }
     }
 
@@ -262,6 +275,11 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     let mut photo_ms = Vec::new();
     let mut redraw = true;
     let mut resume_pending = false;
+    // 画面の電源。消している間は描かない(GLES は page flip が終わらないことがある)。
+    // `power_tried` は最後に切り替えを試みた値。失敗しても同じ値では 20ms ごとに再試行しない
+    let power = ScreenPower::start(&cfg.home_assistant, &cfg.screen_power);
+    let mut screen_on = true;
+    let mut power_tried = true;
 
     let reason = loop {
         if term.load(Ordering::Relaxed) {
@@ -298,12 +316,32 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                     resume_pending = false;
                     redraw = true;
                     eprintln!("seat: 表示を復元");
+                    // CRTC を設定し直すと画面が点くので、消しておくべきなら消し直す
+                    if !screen_on {
+                        screen_on = true;
+                        power_tried = true;
+                    }
                 }
                 Err(e) => {
                     eprintln!("{e}(再試行)");
                     std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
+            }
+        }
+
+        let want_on = power.as_ref().is_none_or(ScreenPower::want_on);
+        if want_on == screen_on {
+            power_tried = screen_on;
+        } else if want_on != power_tried {
+            power_tried = want_on;
+            match display.set_power(want_on) {
+                Ok(()) => {
+                    screen_on = want_on;
+                    redraw |= want_on;
+                    eprintln!("display: {}", if want_on { "点灯" } else { "消灯" });
+                }
+                Err(e) => eprintln!("display: 電源を切り替えられない: {e}"),
             }
         }
 
@@ -319,14 +357,20 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                 Action::Next => KeyPress::Next,
             };
             eprintln!("key: {a:?}");
-            redraw |= app.on_key(key);
+            if let Some(p) = &power {
+                p.on_key();
+            }
+            // 消えている画面へのキーは点けるだけにする(見えないまま画面を切り替えない)
+            if screen_on {
+                redraw |= app.on_key(key);
+            }
         }
         if quit {
             break "キー操作(Esc/q)";
         }
         redraw |= app.tick(Instant::now());
 
-        if redraw {
+        if redraw && screen_on {
             let t0 = Instant::now();
             let (r, p) = display.draw(app.as_mut(), &mut canvas)?;
             render_ms.push(r);
@@ -367,6 +411,10 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     };
 
     eprintln!("終了: {reason}");
+    // 消したまま終わると、元のコンソールも見えなくなる
+    if !screen_on && session.is_enabled() {
+        let _ = display.set_power(true);
+    }
     // 表示(元の CRTC を復元)→ 入力 → デバイスの順に解放する。VT は VtGuard が TEXT に戻す。
     drop(display);
     keys.close(&mut session);

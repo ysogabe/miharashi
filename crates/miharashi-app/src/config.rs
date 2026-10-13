@@ -12,6 +12,8 @@ pub struct Config {
     pub geoframe: Geoframe,
     pub metrics: Metrics,
     pub power: Power,
+    pub home_assistant: HomeAssistant,
+    pub screen_power: ScreenPower,
     pub ui: Ui,
 }
 
@@ -78,6 +80,31 @@ pub struct Power {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
+pub struct HomeAssistant {
+    /// 接続先(例: http://192.0.2.10:8123)。空なら連携しない。
+    /// 平文 http はトークンが盗まれないよう IP アドレスか localhost に限る。
+    pub url: String,
+    /// 長期アクセストークンを 1 行で書いたファイル。設定ファイルには書かない。
+    pub token_file: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScreenPower {
+    /// 在宅・人感のエンティティ(person.xxx / binary_sensor.xxx)。state が home か on なら在宅。
+    pub presence_entity: String,
+    /// 手動オーバーライド用の input_select(auto / force_on / force_off)。空なら auto 固定。
+    pub mode_entity: String,
+    /// 不在がこの分数を超えたら画面を消す。
+    pub idle_minutes: u64,
+    /// HA と通信できない状態がこの分数を超えたら、オーバーライドを捨てて auto に戻す。
+    pub override_decay_minutes: u64,
+    /// HA に問い合わせる間隔(秒)。
+    pub poll_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
 pub struct Ui {
     /// 日本語フォントファイル。空ならシステムフォントを使う。
     pub font: String,
@@ -132,6 +159,27 @@ impl Default for Power {
             state_file: "/var/lib/miharashi/energy.json".into(),
             rapl_helper_file: "/run/miharashi-rapl/energy".into(),
             price_per_kwh: 0.0,
+        }
+    }
+}
+
+impl Default for HomeAssistant {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            token_file: "/etc/miharashi/ha-token".into(),
+        }
+    }
+}
+
+impl Default for ScreenPower {
+    fn default() -> Self {
+        Self {
+            presence_entity: String::new(),
+            mode_entity: String::new(),
+            idle_minutes: 10,
+            override_decay_minutes: 5,
+            poll_secs: 10,
         }
     }
 }
@@ -197,6 +245,16 @@ impl Config {
         }
         if !matches!(self.ui.start_screen.as_str(), "status" | "photo") {
             return Err("ui.start_screen は status か photo".into());
+        }
+        if !self.home_assistant.url.is_empty() {
+            crate::screen_power::check_url(&self.home_assistant.url)
+                .map_err(|e| format!("home_assistant.url: {e}"))?;
+        }
+        let sp = &self.screen_power;
+        if sp.idle_minutes == 0 || sp.override_decay_minutes == 0 || sp.poll_secs == 0 {
+            return Err(
+                "screen_power の idle_minutes・override_decay_minutes・poll_secs は 1 以上".into(),
+            );
         }
         Ok(())
     }
@@ -277,6 +335,38 @@ mod tests {
         assert!(Config::parse("[power]\nprice_per_kwh = nan\n").is_err());
         assert!(
             Config::parse("[power]\nstatefile = \"x\"\n").is_err(),
+            "typo"
+        );
+    }
+
+    #[test]
+    fn screen_power_defaults_and_overrides() {
+        let d = Config::default();
+        assert_eq!(d.home_assistant.url, "");
+        assert_eq!(d.home_assistant.token_file, "/etc/miharashi/ha-token");
+        assert_eq!(d.screen_power.idle_minutes, 10);
+        assert_eq!(d.screen_power.override_decay_minutes, 5);
+        let c = Config::parse(
+            "[home_assistant]\nurl = \"http://192.0.2.10:8123\"\n\
+             [screen_power]\npresence_entity = \"person.me\"\nidle_minutes = 3\n",
+        )
+        .unwrap();
+        assert_eq!(c.home_assistant.url, "http://192.0.2.10:8123");
+        assert_eq!(c.screen_power.presence_entity, "person.me");
+        assert_eq!(c.screen_power.idle_minutes, 3);
+        assert_eq!(c.screen_power.poll_secs, 10);
+    }
+
+    #[test]
+    fn screen_power_rejects_bad_values() {
+        // 平文 http でホスト名宛てにトークンを送る設定は拒否する
+        assert!(
+            Config::parse("[home_assistant]\nurl = \"http://homeassistant.local:8123\"\n").is_err()
+        );
+        assert!(Config::parse("[home_assistant]\nurl = \"https://ha.example.test\"\n").is_ok());
+        assert!(Config::parse("[screen_power]\nidle_minutes = 0\n").is_err());
+        assert!(
+            Config::parse("[screen_power]\npresense_entity = \"x\"\n").is_err(),
             "typo"
         );
     }
