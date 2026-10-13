@@ -4,6 +4,7 @@ mod app;
 mod bench;
 mod config;
 mod data;
+mod disaster;
 mod photos;
 mod quake;
 #[cfg(target_os = "linux")]
@@ -111,11 +112,13 @@ fn run(cli: Cli) -> Result<(), String> {
     let cfg = load_config(&cli)?;
     let src = source(&cfg, &cli);
     let (data, snap) = data_source(&cfg, cli.dummy)?;
-    let alerts = quake::start(&cfg.alerts, &cfg.home_assistant);
+    let (alert_tx, alerts) = std::sync::mpsc::channel();
+    quake::start(&cfg.alerts, &cfg.home_assistant, alert_tx.clone());
+    disaster::start(&cfg.alerts, &cfg.home_assistant, alert_tx);
     runtime::run(&cfg, |out| {
         Box::new(
             app::KioskApp::new(&cfg, out.size, out.gpu_max_texture, src, data, snap)
-                .with_alerts(alerts),
+                .with_alerts(Some(alerts)),
         )
     })
 }
@@ -190,8 +193,22 @@ fn png(cli: Cli) -> Result<(), String> {
     miharashi_render::alert::quake_overlay(&mut overlay, &mut text, &quake::demo_view());
     miharashi_render::alert::quake_overlay(&mut c, &mut text, &quake::demo_view());
     save(&c, Some((&item, &overlay)), "alert-quake")?;
+    // 災害アラート(テスト表示)。不透明に近い幕で覆うので地震の上に重ねてよい
+    let dv = disaster::demo_view();
+    overlay.clear(miharashi_render::canvas::rgba(0, 0, 0, 0));
+    screens::photo_overlay(
+        &mut overlay,
+        &mut text,
+        &snap,
+        &item.layout,
+        Some(&item.info),
+        None,
+    );
+    miharashi_render::alert::disaster_overlay(&mut overlay, &mut text, &dv);
+    miharashi_render::alert::disaster_overlay(&mut c, &mut text, &dv);
+    save(&c, Some((&item, &overlay)), "alert-disaster")?;
     println!(
-        "wrote {}/{{status,status-details,photo,alert-quake}}.png ({}x{})",
+        "wrote {}/{{status,status-details,photo,alert-quake,alert-disaster}}.png ({}x{})",
         out.display(),
         size.0,
         size.1

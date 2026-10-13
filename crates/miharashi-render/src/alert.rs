@@ -1,4 +1,4 @@
-//! 全画面の上に重ねるアラート(地震)。左に震源と各地の震度の地図、右に要点を大きく出す。
+//! 全画面の上に重ねるアラート(地震・災害)。左に地図、右に要点を大きく出す。
 //! 画面の種類に依存しないので、状況画面でも写真画面(GPU の重ね絵)でも同じ関数で描く。
 use crate::canvas::{Canvas, rgba};
 use crate::photo_layout::scale;
@@ -268,7 +268,14 @@ fn draw_map(c: &mut Canvas, view: &QuakeView, rect: (f32, f32, f32, f32), k: f32
     m.clear(rgba(10, 22, 38, 255));
     draw_map_body(&mut m, view, k);
     c.draw_pixmap(&m.pixmap, rect.0 as i32, rect.1 as i32);
-    c.stroke_rect(rect.0, rect.1, rect.2, rect.3, 2.0 * k, rgba(70, 90, 115, 255));
+    c.stroke_rect(
+        rect.0,
+        rect.1,
+        rect.2,
+        rect.3,
+        2.0 * k,
+        rgba(70, 90, 115, 255),
+    );
 }
 
 fn draw_map_body(c: &mut Canvas, view: &QuakeView, k: f32) {
@@ -316,6 +323,263 @@ fn draw_map_body(c: &mut Canvas, view: &QuakeView, k: f32) {
             rgba(230, 20, 20, 255),
         );
     }
+}
+
+/// 画面に重ねるアラート。新しいものが前のものを置き換える。
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlertView {
+    Quake(QuakeView),
+    Disaster(DisasterView),
+}
+
+/// アラートを画面全体に重ねる。
+pub fn overlay(c: &mut Canvas, t: &mut TextEngine, view: &AlertView) {
+    match view {
+        AlertView::Quake(v) => quake_overlay(c, t, v),
+        AlertView::Disaster(v) => disaster_overlay(c, t, v),
+    }
+}
+
+/// 災害アラートの 1 種類(例: 大雨特別警報)と、それが出ている市町村。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisasterKind {
+    /// "大雨特別警報" など
+    pub name: String,
+    /// 警戒レベル(4 か 5)
+    pub level: u8,
+    pub areas: Vec<String>,
+}
+
+/// 地図に塗る市町村(気象庁の市町村の外接矩形)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisasterArea {
+    pub level: u8,
+    /// 南西 (緯度, 経度)
+    pub sw: (f64, f64),
+    /// 北東 (緯度, 経度)
+    pub ne: (f64, f64),
+}
+
+/// 災害アラートに出す内容。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisasterView {
+    /// レベルの高い順
+    pub kinds: Vec<DisasterKind>,
+    pub areas: Vec<DisasterArea>,
+    /// 自宅 (緯度, 経度)
+    pub home: (f64, f64),
+    /// 対象にしている半径(km)
+    pub radius_km: f64,
+    /// 発表時刻("10/13 21:30 発表" など)
+    pub time: String,
+}
+
+/// 警戒レベルの色(気象庁: レベル 5 は黒、レベル 4 は紫)。暗い背景で見えるよう縁取りで補う。
+fn level_color(level: u8) -> [u8; 3] {
+    if level >= 5 {
+        [12, 0, 12]
+    } else {
+        [170, 0, 170]
+    }
+}
+
+/// 災害アラートを重ねる。左に自宅まわりの地図、右に種類と市町村。
+pub fn disaster_overlay(c: &mut Canvas, t: &mut TextEngine, view: &DisasterView) {
+    let (w, h) = (c.width() as f32, c.height() as f32);
+    let k = scale(c.height());
+    c.fill_rect(0.0, 0.0, w, h, rgba(4, 8, 14, 250));
+    let top = view.kinds.iter().map(|d| d.level).max().unwrap_or(4);
+    let accent = if top >= 5 {
+        [235, 70, 235]
+    } else {
+        [200, 90, 220]
+    };
+    c.fill_rect(
+        0.0,
+        0.0,
+        w,
+        12.0 * k,
+        rgba(accent[0], accent[1], accent[2], 255),
+    );
+
+    let margin = 48.0 * k;
+    let map_rect = (
+        margin,
+        margin,
+        (h - 2.0 * margin).min(w * 0.5),
+        h - 2.0 * margin,
+    );
+    {
+        let (mw, mh) = (map_rect.2.max(1.0) as u32, map_rect.3.max(1.0) as u32);
+        let mut m = Canvas::new(mw, mh);
+        m.clear(rgba(10, 22, 38, 255));
+        draw_disaster_map(&mut m, view, k);
+        c.draw_pixmap(&m.pixmap, map_rect.0 as i32, map_rect.1 as i32);
+        c.stroke_rect(
+            map_rect.0,
+            map_rect.1,
+            map_rect.2,
+            map_rect.3,
+            2.0 * k,
+            rgba(70, 90, 115, 255),
+        );
+    }
+
+    let x = map_rect.0 + map_rect.2 + 64.0 * k;
+    let right = w - margin;
+    let mut y = margin + 8.0 * k;
+    let fg = [235, 240, 248, 255];
+    let dim = [150, 165, 185, 255];
+    let acc = [accent[0], accent[1], accent[2], 255];
+    t.draw(
+        c,
+        &format!("災害  自宅から半径{}km", view.radius_km.round()),
+        x,
+        y,
+        44.0 * k,
+        acc,
+    );
+    y += 90.0 * k;
+    let bottom = h - margin - 100.0 * k;
+    for kind in &view.kinds {
+        if y + 140.0 * k > bottom {
+            break;
+        }
+        // レベルの札と種類の名前
+        let badge = format!("レベル{}", kind.level);
+        let bw = t.measure(&badge, 40.0 * k) + 32.0 * k;
+        let [r, g, b] = level_color(kind.level);
+        c.fill_rect(x, y + 6.0 * k, bw, 64.0 * k, rgba(r, g, b, 255));
+        c.stroke_rect(
+            x,
+            y + 6.0 * k,
+            bw,
+            64.0 * k,
+            2.0 * k,
+            rgba(235, 240, 248, 255),
+        );
+        t.draw(
+            c,
+            &badge,
+            x + 16.0 * k,
+            y + 10.0 * k,
+            40.0 * k,
+            [255, 255, 255, 255],
+        );
+        // 長い名前は右端に収まるよう字を小さくする
+        let nx = x + bw + 24.0 * k;
+        let full = t.measure(&kind.name, 60.0 * k).max(1.0);
+        let size = (60.0 * k * ((right - nx) / full).min(1.0)).max(28.0 * k);
+        t.draw(c, &kind.name, nx, y + (60.0 * k - size) / 2.0, size, fg);
+        y += 96.0 * k;
+        // 市町村を折り返して並べる(入りきらなければ「ほか N」)
+        let size = 34.0 * k;
+        let line_h = 50.0 * k;
+        let max_lines = (((bottom - y) / line_h).floor() as usize).clamp(1, 4);
+        for line in wrap_names(t, &kind.areas, right - x, size, max_lines) {
+            t.draw(c, &line, x, y, size, fg);
+            y += line_h;
+        }
+        y += 28.0 * k;
+    }
+    if !view.time.is_empty() {
+        t.draw(c, &view.time, x, bottom + 20.0 * k, 36.0 * k, fg);
+    }
+    t.draw(
+        c,
+        "気象庁の情報    キーを押すと閉じます",
+        x,
+        h - margin - 36.0 * k,
+        28.0 * k,
+        dim,
+    );
+}
+
+/// 名前を「、」でつなぎ、幅に収まるよう最大 `max_lines` 行に折り返す。あふれた分は「ほか N」。
+fn wrap_names(
+    t: &mut TextEngine,
+    names: &[String],
+    width: f32,
+    size: f32,
+    max_lines: usize,
+) -> Vec<String> {
+    let mut lines: Vec<String> = vec![String::new()];
+    for (i, name) in names.iter().enumerate() {
+        let rest = names.len() - i;
+        let last_line = lines.len() >= max_lines;
+        let Some(cur) = lines.last_mut() else {
+            break;
+        };
+        let piece = if cur.is_empty() {
+            name.clone()
+        } else {
+            format!("、{name}")
+        };
+        // 最後の行では「ほか N」が入る余地を残す
+        let reserve = if last_line && rest > 1 {
+            t.measure(&format!("  ほか{}", rest - 1), size)
+        } else {
+            0.0
+        };
+        if cur.is_empty() || t.measure(&format!("{cur}{piece}"), size) + reserve <= width {
+            cur.push_str(&piece);
+            continue;
+        }
+        if last_line {
+            cur.push_str(&format!("  ほか{rest}"));
+            return lines;
+        }
+        lines.push(name.clone());
+    }
+    lines
+}
+
+fn draw_disaster_map(c: &mut Canvas, view: &DisasterView, k: f32) {
+    let rect = (0.0, 0.0, c.width() as f32, c.height() as f32);
+    let (lat, lon) = view.home;
+    // 半径の 1.6 倍を南北の半分にとる(円と周りの市町村が収まる)
+    let half = (view.radius_km * 1.6 / 111.0).max(0.3);
+    let half_lon = half / lat.to_radians().cos().max(0.2);
+    let proj = projector(
+        (lon - half_lon, lon + half_lon, lat - half, lat + half),
+        rect,
+    );
+    let pref_rings: Vec<Vec<Vec<(f32, f32)>>> = prefs()
+        .iter()
+        .map(|p| {
+            p.rings
+                .iter()
+                .map(|r| r.iter().map(|&(lon, lat)| proj(lon, lat)).collect())
+                .collect()
+        })
+        .collect();
+    for rings in &pref_rings {
+        c.fill_rings(rings, rgba(44, 58, 76, 255));
+    }
+    // 市町村は外接矩形で示す(低いレベルを先に塗り、高いレベルを上に重ねる)
+    let mut areas: Vec<&DisasterArea> = view.areas.iter().collect();
+    areas.sort_by_key(|a| a.level);
+    for a in areas {
+        let (x0, y0) = proj(a.sw.1, a.ne.0);
+        let (x1, y1) = proj(a.ne.1, a.sw.0);
+        let [r, g, b] = level_color(a.level);
+        c.fill_rect(x0, y0, x1 - x0, y1 - y0, rgba(r, g, b, 200));
+        // レベル 5 の黒は背景に沈むので白で縁取る
+        let (edge, ew) = if a.level >= 5 {
+            (rgba(255, 255, 255, 255), 3.0 * k)
+        } else {
+            (rgba(235, 120, 235, 255), 1.5 * k)
+        };
+        c.stroke_rect(x0, y0, x1 - x0, y1 - y0, ew, edge);
+    }
+    for rings in &pref_rings {
+        c.stroke_rings(rings, 1.5 * k, rgba(110, 130, 150, 255));
+    }
+    let (hx, hy) = proj(lon, lat);
+    let (_, ry) = proj(lon, lat + view.radius_km / 111.0);
+    c.stroke_circle(hx, hy, hy - ry, 2.0 * k, rgba(200, 215, 235, 200));
+    c.fill_circle(hx, hy, 12.0 * k, rgba(255, 255, 255, 255));
+    c.fill_circle(hx, hy, 7.0 * k, rgba(30, 140, 255, 255));
 }
 
 /// 都道府県コード(2 桁)から名前。

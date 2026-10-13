@@ -111,6 +111,12 @@ pub struct Alerts {
     pub quake: bool,
     /// 気象庁の地震情報を読む間隔(秒)。
     pub quake_poll_secs: u64,
+    /// 災害アラート(自宅から半径 disaster_radius_km の市町村に特別警報・土砂災害危険警報)。
+    pub disaster: bool,
+    /// 気象庁の警報を読む間隔(秒)。変わっていなければ 304 で済む。
+    pub disaster_poll_secs: u64,
+    /// 災害アラートの対象にする半径(km)。
+    pub disaster_radius_km: f64,
     /// アラートを出し続ける分数。キーを押せば先に閉じる。
     pub show_minutes: u64,
     /// 0 より大きければ、起動からこの秒数後にテスト表示を 1 回出す(動作確認用)。
@@ -203,6 +209,9 @@ impl Default for Alerts {
         Self {
             quake: true,
             quake_poll_secs: 30,
+            disaster: true,
+            disaster_poll_secs: 60,
+            disaster_radius_km: 50.0,
             show_minutes: 5,
             demo_after_secs: 0,
         }
@@ -277,6 +286,13 @@ impl Config {
         }
         if self.alerts.quake_poll_secs < 10 || self.alerts.show_minutes == 0 {
             return Err("alerts.quake_poll_secs は 10 以上、show_minutes は 1 以上".into());
+        }
+        if self.alerts.disaster_poll_secs < 30
+            || !(1.0..=300.0).contains(&self.alerts.disaster_radius_km)
+        {
+            return Err(
+                "alerts.disaster_poll_secs は 30 以上、disaster_radius_km は 1〜300".into(),
+            );
         }
         let sp = &self.screen_power;
         if sp.idle_minutes == 0 || sp.override_decay_minutes == 0 || sp.poll_secs == 0 {
@@ -413,6 +429,10 @@ mod tests {
         );
         assert!(Config::parse("[alerts]\nshow_minutes = 0\n").is_err());
         assert!(Config::parse("[alerts]\nquake = false\n").is_ok());
+        assert!(a.disaster && a.disaster_poll_secs == 60 && a.disaster_radius_km == 50.0);
+        assert!(Config::parse("[alerts]\ndisaster_poll_secs = 5\n").is_err());
+        assert!(Config::parse("[alerts]\ndisaster_radius_km = 0.0\n").is_err());
+        assert!(Config::parse("[alerts]\ndisaster_radius_km = 30.0\n").is_ok());
     }
 
     #[test]
