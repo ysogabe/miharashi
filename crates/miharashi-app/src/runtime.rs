@@ -3,6 +3,7 @@
 //! 状態ログは共通部分(t / rss / fds / frames / worst_frame)に `App::stats()` の `k=v` を続けて出す。
 use crate::config::Config;
 use crate::screen::{App, KeyPress};
+use miharashi_gpu::GlesDisplay;
 use miharashi_linux::drm_select::{self, CardSel, ModeSel};
 use miharashi_linux::input::{Action, Keys};
 use miharashi_linux::kms::Display;
@@ -53,6 +54,76 @@ fn summarize_ms(samples: &mut Vec<f32>) -> String {
     format!("{avg:.1}/{p95:.1}")
 }
 
+/// 表示経路。CPU は Canvas を dumb buffer へ変換コピーし、GLES は表示カードの GPU で
+/// テクスチャとして描いて page flip する(PoC-005 PR2。見た目は同じ)。
+// 1 つしか作らないので、variant の大きさの差(glow のコンテキストが約 6KB)は気にしない
+#[allow(clippy::large_enum_variant)]
+enum Presenter {
+    Cpu(Display),
+    Gles(GlesDisplay),
+}
+
+impl Presenter {
+    /// `renderer` は auto / cpu / gles。auto で GLES が使えなければ理由をログに出して CPU に戻る。
+    fn open(
+        fd: &std::os::fd::OwnedFd,
+        renderer: &str,
+        connector: &str,
+        mode: ModeSel,
+    ) -> Result<Self, String> {
+        let dup = || fd.try_clone().map_err(|e| e.to_string());
+        if renderer != "cpu" {
+            match GlesDisplay::open(dup()?, connector, mode) {
+                Ok(d) => {
+                    eprintln!("renderer: gles ({})", d.describe());
+                    return Ok(Self::Gles(d));
+                }
+                Err(e) if renderer == "auto" => {
+                    eprintln!("renderer: GLES が使えない: {e}(cpu に戻る)")
+                }
+                Err(e) => return Err(format!("renderer=gles: {e}")),
+            }
+        }
+        eprintln!("renderer: cpu (dumb buffer)");
+        Ok(Self::Cpu(Display::open(dup()?, connector, mode)?))
+    }
+
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Cpu(d) => d.size(),
+            Self::Gles(d) => d.size(),
+        }
+    }
+
+    fn refresh(&self) -> u32 {
+        match self {
+            Self::Cpu(d) => d.refresh(),
+            Self::Gles(d) => d.refresh(),
+        }
+    }
+
+    fn suspend(&mut self) {
+        match self {
+            Self::Cpu(d) => d.suspend(),
+            Self::Gles(d) => d.suspend(),
+        }
+    }
+
+    fn resume(&mut self) -> Result<(), String> {
+        match self {
+            Self::Cpu(d) => d.resume(),
+            Self::Gles(d) => d.resume(),
+        }
+    }
+
+    fn present(&mut self, canvas: &Canvas) -> Result<(), String> {
+        match self {
+            Self::Cpu(d) => d.present(|buf, pitch| canvas.write_xrgb8888(buf, pitch)),
+            Self::Gles(d) => d.present(canvas.pixmap.data()),
+        }
+    }
+}
+
 /// 画面ロジックを作るために必要な、表示先が決まったあとの情報。
 pub struct Output {
     pub size: (u32, u32),
@@ -89,9 +160,8 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
         connector.name
     );
     let drm_dev = session.open_device(&card.path)?;
-    let drm_fd = drm_dev.fd.try_clone().map_err(|e| e.to_string())?;
     let mode = ModeSel::parse(&cfg.display.mode)?;
-    let mut display = Display::open(drm_fd, &connector.name, mode)?;
+    let mut display = Presenter::open(&drm_dev.fd, &cfg.display.renderer, &connector.name, mode)?;
     let (w, h) = display.size();
     eprintln!("mode: {w}x{h}@{}Hz", display.refresh());
 
@@ -115,7 +185,7 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     let stats_every = Duration::from_secs(cfg.runtime.stats_interval_secs.max(1));
     let mut next_stats = Instant::now() + stats_every;
     let (mut worst_ms, mut frames) = (0u128, 0u64);
-    // 区間ごとの CPU 使用率と、描画(app.render)・転送(dumb buffer への変換コピー)の時間
+    // 区間ごとの CPU 使用率と、描画(app.render)・転送(CPU: dumb buffer への変換コピー、GLES: テクスチャ転送と page flip の完了待ち)の時間
     let mut self_cpu = miharashi_linux::sysinfo::SelfCpu::default();
     self_cpu.poll(Instant::now());
     let (mut render_ms, mut present_ms) = (Vec::new(), Vec::new());
@@ -189,7 +259,7 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             let t0 = Instant::now();
             app.render(&mut canvas);
             let t1 = Instant::now();
-            display.present(|buf, pitch| canvas.write_xrgb8888(buf, pitch))?;
+            display.present(&canvas)?;
             render_ms.push(t1.duration_since(t0).as_secs_f32() * 1000.0);
             present_ms.push(t1.elapsed().as_secs_f32() * 1000.0);
             redraw = false;
