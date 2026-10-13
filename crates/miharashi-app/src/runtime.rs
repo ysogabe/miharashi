@@ -41,6 +41,18 @@ fn format_stats(
     line
 }
 
+/// 区間内のフレーム時間 [ms] を "平均/p95" にする(PoC-005 のベースライン用)。空なら "-"。
+fn summarize_ms(samples: &mut Vec<f32>) -> String {
+    if samples.is_empty() {
+        return "-".into();
+    }
+    samples.sort_by(f32::total_cmp);
+    let avg = samples.iter().sum::<f32>() / samples.len() as f32;
+    let p95 = samples[((samples.len() as f32 * 0.95).ceil() as usize).clamp(1, samples.len()) - 1];
+    samples.clear();
+    format!("{avg:.1}/{p95:.1}")
+}
+
 /// 画面ロジックを作るために必要な、表示先が決まったあとの情報。
 pub struct Output {
     pub size: (u32, u32),
@@ -103,6 +115,10 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     let stats_every = Duration::from_secs(cfg.runtime.stats_interval_secs.max(1));
     let mut next_stats = Instant::now() + stats_every;
     let (mut worst_ms, mut frames) = (0u128, 0u64);
+    // 区間ごとの CPU 使用率と、描画(app.render)・転送(dumb buffer への変換コピー)の時間
+    let mut self_cpu = miharashi_linux::sysinfo::SelfCpu::default();
+    self_cpu.poll(Instant::now());
+    let (mut render_ms, mut present_ms) = (Vec::new(), Vec::new());
     let mut redraw = true;
     let mut resume_pending = false;
 
@@ -172,13 +188,26 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
         if redraw {
             let t0 = Instant::now();
             app.render(&mut canvas);
+            let t1 = Instant::now();
             display.present(|buf, pitch| canvas.write_xrgb8888(buf, pitch))?;
+            render_ms.push(t1.duration_since(t0).as_secs_f32() * 1000.0);
+            present_ms.push(t1.elapsed().as_secs_f32() * 1000.0);
             redraw = false;
             frames += 1;
             worst_ms = worst_ms.max(t0.elapsed().as_millis());
         }
 
         if Instant::now() >= next_stats {
+            // 画面ロジックの値のあとに、PoC-005 の計測値を足す(既存の並びは変えない)
+            let mut extra = app.stats();
+            extra.push((
+                "cpu_self",
+                self_cpu
+                    .poll(Instant::now())
+                    .map_or("-".into(), |v| format!("{v:.1}")),
+            ));
+            extra.push(("render_ms", summarize_ms(&mut render_ms)));
+            extra.push(("present_ms", summarize_ms(&mut present_ms)));
             eprintln!(
                 "{}",
                 format_stats(
@@ -187,7 +216,7 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                     fd_count(),
                     frames,
                     worst_ms,
-                    &app.stats()
+                    &extra
                 )
             );
             worst_ms = 0;
@@ -233,6 +262,15 @@ mod tests {
     }
 
     #[test]
+    fn summarize_ms_gives_avg_and_p95() {
+        let mut v: Vec<f32> = (1..=20).map(|x| x as f32).collect();
+        assert_eq!(summarize_ms(&mut v), "10.5/19.0");
+        assert!(v.is_empty(), "区間ごとに空にする");
+        assert_eq!(summarize_ms(&mut v), "-");
+        assert_eq!(summarize_ms(&mut vec![4.0]), "4.0/4.0");
+    }
+
+    #[test]
     fn stats_lines_are_readable_by_soak_summary() {
         let script =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/soak_summary.py");
@@ -243,14 +281,15 @@ mod tests {
         let prefix = "2026-10-13T08:00:00+09:00 host miharashi[1]: ";
         let mut text = String::new();
         for i in 0..3u64 {
-            let line = format_stats(
-                60 * (i + 1),
-                81,
-                26,
-                62 + i,
-                19,
-                &extra(61 + 60 * i, "Some(13.0)"),
-            );
+            // 今の並び: 画面ロジックの値 + gpus + PoC-005 の計測値
+            let mut e = extra(61 + 60 * i, "Some(13.0)");
+            e.extend([
+                ("gpus", "GPU0:0,GPU1:0".to_string()),
+                ("cpu_self", format!("{}.5", i + 1)),
+                ("render_ms", "12.0/20.0".to_string()),
+                ("present_ms", "3.0/4.0".to_string()),
+            ]);
+            let line = format_stats(60 * (i + 1), 81, 26, 62 + i, 19, &e);
             text.push_str(&format!("{prefix}{line}\n"));
         }
         let path = std::env::temp_dir().join(format!("miharashi-soak-{}.log", std::process::id()));
@@ -268,5 +307,6 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(stdout.contains("stats 3 行"), "{stdout}");
+        assert!(stdout.contains("CPU(自プロセス, %)"), "{stdout}");
     }
 }

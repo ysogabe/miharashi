@@ -388,9 +388,61 @@ impl Peaks {
     }
 }
 
+/// `/proc/<pid>/stat` の utime + stime(クロックティック)。comm に空白や ")" が入っても
+/// 最後の ")" の後ろから数える。
+pub fn parse_proc_cpu_ticks(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // ")" の後ろは state(3 番目のフィールド)から始まる。utime = 14、stime = 15
+    let mut f = rest.split_whitespace().skip(11);
+    let utime: u64 = f.next()?.parse().ok()?;
+    let stime: u64 = f.next()?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// 自プロセスの CPU 使用率 [%](1 コア = 100%、全スレッドの合計)。`poll` の間隔で平均する。
+pub struct SelfCpu {
+    prev: Option<(u64, Instant)>,
+    hz: f64,
+}
+
+impl Default for SelfCpu {
+    fn default() -> Self {
+        // SAFETY: sysconf は引数を読むだけ
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        Self {
+            prev: None,
+            hz: if hz > 0 { hz as f64 } else { 100.0 },
+        }
+    }
+}
+
+impl SelfCpu {
+    /// 前回の `poll` からの CPU%。初回と読めなかったときは None。
+    pub fn poll(&mut self, now: Instant) -> Option<f32> {
+        let ticks = parse_proc_cpu_ticks(&std::fs::read_to_string("/proc/self/stat").ok()?)?;
+        let prev = self.prev.replace((ticks, now))?;
+        let dt = now.duration_since(prev.1).as_secs_f64();
+        (dt > 0.0).then(|| (ticks.saturating_sub(prev.0) as f64 / self.hz / dt * 100.0) as f32)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proc_cpu_ticks() {
+        let stat = "46025 (mi ha)ra) S 1 46025 46025 0 -1 4194560 3216 0 0 0 1043 372 0 0 20 0 4 0 100 0 0";
+        assert_eq!(parse_proc_cpu_ticks(stat), Some(1043 + 372));
+        assert_eq!(parse_proc_cpu_ticks("1 (x) S 1"), None);
+        let mut c = SelfCpu::default();
+        let t0 = Instant::now();
+        assert_eq!(c.poll(t0), None);
+        let v = c
+            .poll(t0 + Duration::from_secs(1))
+            .expect("2 回目は値が出る");
+        assert!((0.0..=100.0 * 64.0).contains(&v), "{v}");
+    }
 
     #[test]
     fn psi_some_avg10() {
