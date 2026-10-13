@@ -2,9 +2,9 @@
 //! seat/VT の有効・無効、SIGINT/SIGTERM、入力、描画、画面の電源(DPMS)、状態ログを扱う。
 //! 状態ログは共通部分(t / rss / fds / frames / worst_frame)に `App::stats()` の `k=v` を続けて出す。
 use crate::config::Config;
-use crate::panel::Panel;
+use crate::panel::{DisplayControl, DisplayStatus, Panel};
 use crate::screen::{App, Composite, KeyPress, PhotoData, PhotoRef};
-use crate::screen_power::ScreenPower;
+use crate::screen_power::{Mode as PowerMode, ScreenPower};
 use miharashi_gpu::{Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, SourceImage};
 use miharashi_linux::drm_select::{self, CardSel, ModeSel};
 use miharashi_linux::input::{Action, Keys};
@@ -205,6 +205,16 @@ impl Presenter {
 /// 画面ロジックを作るために必要な、表示先が決まったあとの情報。
 /// 操作パネルの待ち受けに失敗したとき、試し直すまでの間隔。
 const PANEL_RETRY: Duration = Duration::from_secs(30);
+/// キーボードが 1 台も無いとき、挿されていないか見直す間隔。
+const KEYS_RETRY: Duration = Duration::from_secs(10);
+
+/// 操作パネルに見せるモニターの状態。
+fn display_status(screen_on: bool, power: Option<&ScreenPower>) -> DisplayStatus {
+    DisplayStatus {
+        on: screen_on,
+        mode: power.and_then(ScreenPower::mode).map(PowerMode::as_str),
+    }
+}
 
 pub struct Output {
     pub size: (u32, u32),
@@ -257,8 +267,18 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             "標準入力は VT ではない"
         }
     );
-    let mut keys = Keys::open(&mut session, &cfg.input.devices)?;
-    eprintln!("input: {:?}", keys.device_names());
+    // 操作パネルがあればキーボードは無くてもよい(後から挿されたら KEYS_RETRY ごとに拾う)
+    let mut keys = if cfg.panel.enabled {
+        Keys::open_any(&mut session, &cfg.input.devices)
+    } else {
+        Keys::open(&mut session, &cfg.input.devices)?
+    };
+    if keys.is_empty() {
+        eprintln!("input: キーボードが無い(操作パネルで操作する)");
+    } else {
+        eprintln!("input: {:?}", keys.device_names());
+    }
+    let mut keys_retry = Instant::now() + KEYS_RETRY;
 
     let mut app = make_app(&Output {
         size: (w, h),
@@ -281,9 +301,11 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     let mut resume_pending = false;
     // 画面の電源。消している間は描かない(GLES は page flip が終わらないことがある)。
     // `power_tried` は最後に切り替えを試みた値。失敗しても同じ値では 20ms ごとに再試行しない
-    let power = ScreenPower::start(&cfg.home_assistant, &cfg.screen_power);
+    // 操作パネルのスレッドからも手動オーバーライドを切り替えるので共有する
+    let power = ScreenPower::start(&cfg.home_assistant, &cfg.screen_power).map(Arc::new);
     let mut screen_on = true;
     let mut power_tried = true;
+    let mut published_display = DisplayStatus::default();
     // 手元の操作パネルの API。待ち受けられなくてもキオスクは動かし続け(状態ログは panel=error)、
     // PANEL_RETRY ごとに試し直す(起動直後で LAN の IP がまだ無いときなど)。同じ失敗は 1 回だけログに出す
     let mut panel: Option<Panel> = None;
@@ -339,6 +361,12 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             }
         }
 
+        if keys.is_empty() && Instant::now() >= keys_retry {
+            keys_retry = Instant::now() + KEYS_RETRY;
+            if keys.reopen(&mut session) > 0 {
+                eprintln!("input: {:?}", keys.device_names());
+            }
+        }
         let mut quit = false;
         for a in keys.poll() {
             let key = match a {
@@ -364,10 +392,16 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
         }
         if cfg.panel.enabled && panel.is_none() && Instant::now() >= panel_retry {
             panel_retry = Instant::now() + PANEL_RETRY;
-            match Panel::start(&cfg.panel) {
+            // モニターの切り替えは、HA の手動オーバーライド(mode エンティティ)があるときだけ
+            let control = power
+                .clone()
+                .filter(|p| p.mode().is_some())
+                .map(|p| p as Arc<dyn DisplayControl>);
+            match Panel::start(&cfg.panel, control) {
                 Ok(p) => {
                     eprintln!("panel: {} で待ち受け", p.addr());
-                    p.publish(app.panel_view());
+                    published_display = display_status(screen_on, power.as_deref());
+                    p.publish(app.panel_view(), published_display);
                     panel = Some(p);
                     panel_err = None;
                 }
@@ -390,13 +424,9 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             }
         }
         redraw |= app.tick(Instant::now());
-        // 画面を消していてもパネルの表示は追従させる
-        if redraw && let Some(p) = &panel {
-            p.publish(app.panel_view());
-        }
 
         // アラートは画面を消していても点けて見せる(tick で届いたものを同じ周期で反映する)
-        let want_on = app.wants_screen() || power.as_ref().is_none_or(ScreenPower::want_on);
+        let want_on = app.wants_screen() || power.as_ref().is_none_or(|p| p.want_on());
         if want_on == screen_on {
             power_tried = screen_on;
         } else if want_on != power_tried {
@@ -408,6 +438,15 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                     eprintln!("display: {}", if want_on { "点灯" } else { "消灯" });
                 }
                 Err(e) => eprintln!("display: 電源を切り替えられない: {e}"),
+            }
+        }
+
+        // 画面を消していてもパネルの表示は追従させる(モニターの点灯・消灯も知らせる)
+        if let Some(p) = &panel {
+            let ds = display_status(screen_on, power.as_deref());
+            if redraw || ds != published_display {
+                p.publish(app.panel_view(), ds);
+                published_display = ds;
             }
         }
 
