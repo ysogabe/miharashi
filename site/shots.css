@@ -1,0 +1,34 @@
+/* 実機のスクリーンショットと、機能・段階の一覧(Miharashi の LP と操作パネルの LP で共用) */
+.shot{margin:0}
+.shot img{display:block;width:100%;height:auto;border:1px solid var(--line);border-radius:8px;background:#05080c}
+.shot figcaption{display:flex;justify-content:space-between;gap:16px;margin-top:10px;font-size:11px;line-height:1.7;color:var(--muted)}
+.shot figcaption strong{color:var(--ink);font-weight:650}
+.shot-main{margin-bottom:22px}
+.shot-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:22px}
+.shot-note{margin:18px 0 0;font-size:11px;color:#8ea4b0}
+.hero-shot{margin-top:6px}
+
+.feature-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.feature{padding:22px 22px 20px;border:1px solid var(--line);border-radius:8px;background:linear-gradient(145deg,#13272e80,#0b182260)}
+.feature h3{margin:8px 0 8px;font-size:15px;line-height:1.5}
+.feature p{margin:0;font-size:12px;line-height:1.9;color:#a9bcc6}
+.feature .micro-label{color:var(--mint)}
+
+.panel-feature{display:grid;grid-template-columns:1.05fr .95fr;gap:44px;align-items:center}
+.panel-feature .shot img{border-radius:14px;border:8px solid #1b232b}
+.panel-feature ul{margin:16px 0 0;padding-left:18px;font-size:13px;line-height:2;color:#b3c4ce}
+
+.roadmap .done .roadmap-step,.roadmap .done .roadmap-state{color:#9ad6a8}
+.roadmap.four{grid-template-columns:repeat(4,1fr)}
+
+.section-block{padding:70px 0}
+
+@media(max-width:1000px){
+  .feature-grid{grid-template-columns:repeat(2,1fr)}
+  .panel-feature{grid-template-columns:1fr;gap:26px}
+  .roadmap.four{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:620px){
+  .shot-grid,.feature-grid,.roadmap.four{grid-template-columns:1fr}
+  .shot figcaption{flex-direction:column;gap:2px}
+}
