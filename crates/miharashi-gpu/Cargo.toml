@@ -11,3 +11,8 @@ glow = "0.18.0"
 khronos-egl = { version = "6.0.0", features = ["dynamic"] }
 libc = "0.2.190"
 miharashi-linux = { path = "../miharashi-linux" }
+
+[dev-dependencies]
+# GPU で作った写真のフレームを CPU 経路(compose_image)と比べるテスト用
+image = "0.25.10"
+miharashi-render = { path = "../miharashi-render" }

@@ -1,10 +1,12 @@
 //! 画面ロジック(PC 状況 + フォトフレーム)。実行ループ(runtime)からは `App` として見える。
 use crate::config::Config;
-use crate::photos::{Feed, FeedEvent, FeedStatus, PhotoItem, Source};
-use crate::screen::{App, Composite, KeyPress, PhotoRef};
+use crate::photos::{Feed, FeedEvent, FeedStatus, PhotoItem, PhotoPixels, Source};
+use crate::screen::{App, Composite, KeyPress};
+#[cfg(test)]
+use crate::screen::PhotoData;
 use miharashi_render::canvas::rgba;
 use miharashi_render::screens::{self, StatusPage};
-use miharashi_render::{Canvas, Pixmap, TextEngine};
+use miharashi_render::{Canvas, TextEngine};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +33,7 @@ pub struct KioskApp {
     /// 表示中の写真の通し番号(GPU のテクスチャの識別に使う)
     current_id: u64,
     /// フェード中の (旧フレーム, その通し番号, 開始時刻)
-    fade: Option<(Pixmap, u64, Instant)>,
+    fade: Option<(PhotoItem, u64, Instant)>,
     /// GPU 経路で、重ね絵(時刻や写真の情報)を描き直す必要があるか。フェードの途中では描き直さない
     overlay_dirty: bool,
     notice: Option<String>,
@@ -76,9 +78,11 @@ fn describe(status: &FeedStatus) -> Option<String> {
 }
 
 impl KioskApp {
+    /// `gpu_max` は GPU 経路のとき Some(GPU で扱える写真の最大の幅と高さ)。写真の合成を GPU に任せる。
     pub fn new(
         cfg: &Config,
         size: (u32, u32),
+        gpu_max: Option<u32>,
         source: Source,
         data: Box<dyn DataSource>,
         snap: screens::Snapshot,
@@ -87,6 +91,7 @@ impl KioskApp {
         let feed = Feed::spawn(
             source,
             size,
+            gpu_max,
             Duration::from_secs(g.reconnect_min_secs),
             Duration::from_secs(g.reconnect_max_secs),
         );
@@ -167,7 +172,7 @@ impl KioskApp {
             match ev {
                 FeedEvent::Photo(item) => {
                     if let Some(old) = self.current.take() {
-                        self.fade = Some((old.frame, self.current_id, now));
+                        self.fade = Some((old, self.current_id, now));
                     }
                     self.current = Some(item);
                     self.current_id += 1;
@@ -231,6 +236,15 @@ impl KioskApp {
             self.overlay_dirty = true;
             return Composite::Canvas;
         }
+        // デコードしただけの写真は 1 回だけ GPU に渡し、次からは GPU 側の完成フレームを使う
+        // (CPU 側の画素は捨てる。12MP の写真で 1 枚約 36MB)
+        let fade_item = self.fade.as_mut().map(|f| &mut f.0);
+        for it in self.current.iter_mut().chain(fade_item) {
+            if it.sent && matches!(it.pixels, PhotoPixels::Source(_)) {
+                it.pixels = PhotoPixels::Resident;
+            }
+            it.sent = true;
+        }
         let overlay_changed = std::mem::take(&mut self.overlay_dirty);
         let item = self.current.as_ref().expect("上で確かめた");
         if overlay_changed {
@@ -244,20 +258,12 @@ impl KioskApp {
                 self.notice.as_deref(),
             );
         }
-        let old = self.fade.as_ref().map(|(px, id, t0)| {
-            (
-                PhotoRef {
-                    id: *id,
-                    pixmap: px,
-                },
-                self.fade_alpha(*t0),
-            )
-        });
+        let old = self
+            .fade
+            .as_ref()
+            .map(|(it, id, t0)| (it.photo_ref(*id), self.fade_alpha(*t0)));
         Composite::Photo {
-            photo: PhotoRef {
-                id: self.current_id,
-                pixmap: &item.frame,
-            },
+            photo: item.photo_ref(self.current_id),
             old,
             overlay_changed,
         }
@@ -267,12 +273,20 @@ impl KioskApp {
         match self.screen {
             Screen::Status(page) => screens::status(canvas, &mut self.text, &self.snap, page),
             Screen::Photo => {
+                // GPU 経路の写真(デコードしただけ)は、CPU で描くときにここで合成する
+                let size = (canvas.width(), canvas.height());
+                let fade_item = self.fade.as_mut().map(|f| &mut f.0);
+                for it in self.current.iter_mut().chain(fade_item) {
+                    it.ensure_frame(size);
+                }
                 let fade = self
                     .fade
                     .as_ref()
-                    .map(|(old, _, t0)| (old, self.fade_alpha(*t0)));
+                    .and_then(|(old, _, t0)| Some((old.frame()?, self.fade_alpha(*t0))));
                 let (photo, info) = (
-                    self.current.as_ref().map(|p| (&p.frame, &p.layout)),
+                    self.current
+                        .as_ref()
+                        .and_then(|p| Some((p.frame()?, &p.layout))),
                     self.current.as_ref().map(|p| &p.info),
                 );
                 screens::photo_frame(
@@ -337,6 +351,14 @@ mod tests {
     use crate::data::{DummyData, dummy_snapshot};
 
     fn app_with_photo(size: (u32, u32)) -> (KioskApp, std::path::PathBuf) {
+        app_with_photo_on(size, None)
+    }
+
+    /// `gpu_max` が Some なら GPU 経路(写真はデコードしただけで届く)。
+    fn app_with_photo_on(
+        size: (u32, u32),
+        gpu_max: Option<u32>,
+    ) -> (KioskApp, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "miharashi-app-{}-{:?}",
             std::process::id(),
@@ -351,6 +373,7 @@ mod tests {
         let app = KioskApp::new(
             &cfg,
             size,
+            gpu_max,
             Source::File(p, Some("テスト".into())),
             Box::new(DummyData::new()),
             dummy_snapshot(0.0),
@@ -498,7 +521,10 @@ mod tests {
                 overlay_changed,
             } => {
                 assert!(old.is_none(), "フェードは終わっている");
-                (photo.pixmap.data().to_vec(), overlay_changed)
+                let PhotoData::Frame(f) = photo.data else {
+                    panic!("CPU 経路の写真は完成フレーム");
+                };
+                (f.data().to_vec(), overlay_changed)
             }
             Composite::Canvas => panic!("写真画面は Photo になる"),
         };
@@ -537,6 +563,48 @@ mod tests {
                 ..
             }
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GPU 経路: 写真はデコードしただけで 1 回だけ渡し、次からは GPU 側のフレームを使う
+    /// (CPU 側の画素は捨てる)。CPU で描くときは、その場で完成フレームを作る。
+    #[test]
+    fn gpu_path_sends_source_once_then_resident() {
+        let size = (640u32, 270u32);
+        let kind = |app: &mut KioskApp| {
+            let mut c = Canvas::new(size.0, size.1);
+            match app.render_composite(&mut c) {
+                Composite::Photo { photo, .. } => match photo.data {
+                    PhotoData::Frame(_) => "frame",
+                    PhotoData::Source { .. } => "source",
+                    PhotoData::Resident => "resident",
+                },
+                Composite::Canvas => "canvas",
+            }
+        };
+        let (mut app, dir) = app_with_photo_on(size, Some(16384));
+        app.on_key(KeyPress::Next);
+        assert!(pump_until(&mut app, |a| a.photo_position() == 1));
+        assert_eq!(kind(&mut app), "source", "1 回目はデコードしただけの写真");
+        assert_eq!(kind(&mut app), "resident", "2 回目からは GPU 側のもの");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 上限より大きい写真は、取得スレッドで完成フレームまで作る
+        let (mut app, dir) = app_with_photo_on(size, Some(32));
+        app.on_key(KeyPress::Next);
+        assert!(pump_until(&mut app, |a| a.photo_position() == 1));
+        assert_eq!(kind(&mut app), "frame");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // GPU 経路の写真でも CPU の render は描ける
+        let (mut app, dir) = app_with_photo_on(size, Some(16384));
+        app.on_key(KeyPress::Next);
+        assert!(pump_until(&mut app, |a| a.photo_position() == 1));
+        std::thread::sleep(Duration::from_millis(900));
+        app.tick(Instant::now());
+        let mut c = Canvas::new(size.0, size.1);
+        app.render(&mut c);
+        assert_eq!(px(&c, 320, 100), [30, 120, 60, 255], "写真(緑)");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -112,7 +112,8 @@ pub fn diff_rgb(a: &[u8], b: &[u8], tol: u8) -> (usize, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compose::{Frame, PhotoLayer};
+    use crate::compose::{Frame, PhotoLayer, PhotoSource};
+    use crate::photo::{Placement, SourceImage};
 
     #[test]
     fn diff_counts_pixels_over_tolerance() {
@@ -175,7 +176,10 @@ mod tests {
                 });
             }
         }
-        let p = |id, rgba| PhotoLayer { id, rgba };
+        let p = |id, rgba| PhotoLayer {
+            id,
+            src: PhotoSource::Frame(rgba),
+        };
         let t = 0.25f32;
         let got = off
             .render_frames(
@@ -207,6 +211,84 @@ mod tests {
                     px[i]
                 );
             }
+        }
+    }
+
+    /// 写真から GPU で作った完成フレームが、CPU 経路の `compose_image` とほぼ同じになること。
+    /// 左寄せ(ぼかし背景と影あり)と、画面いっぱい(cover)の両方を比べる。
+    #[test]
+    fn offscreen_photo_build_matches_cpu_compose() {
+        use miharashi_render::photo::compose_image;
+        use miharashi_render::photo_layout::{self, Mode};
+        let Ok(off) = Offscreen::open(Path::new("/dev/dri/renderD128")) else {
+            eprintln!("GLES が使えないので skip");
+            return;
+        };
+        // 細かい模様の入ったグラデーション(縮小の重みの違いが差に出るように)
+        let photo = |w: u32, h: u32| {
+            let mut seed = 0x1234_5678u32;
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                let n = seed & 0x1f;
+                image::Rgb([
+                    ((x * 255 / w + n) % 256) as u8,
+                    ((y * 255 / h + n) % 256) as u8,
+                    (((x / 7 + y / 5) % 2) * 160 + n) as u8,
+                ])
+            }))
+        };
+        let size = (1920u32, 1080u32);
+        for (img, mode) in [(photo(1600, 1200), Mode::Left), (photo(2000, 1125), Mode::Cover)] {
+            let l = photo_layout::plan(&mut 0, size.0, size.1, img.width(), img.height());
+            assert_eq!(l.mode, mode);
+            let cpu = compose_image(&img, size.0, size.1, &l).unwrap();
+            let src = SourceImage {
+                pixels: img.as_bytes(),
+                size: (img.width(), img.height()),
+                channels: 3,
+                place: Placement {
+                    cover: l.mode == Mode::Cover,
+                    rect: (l.photo.x, l.photo.y, l.photo.w, l.photo.h),
+                    scale: photo_layout::scale(size.1),
+                },
+            };
+            let got = off
+                .render_frames(
+                    &[Frame::Photo {
+                        photo: PhotoLayer {
+                            id: 1,
+                            src: PhotoSource::Image(src),
+                        },
+                        old: None,
+                        overlay: None,
+                    }],
+                    size,
+                )
+                .unwrap();
+            // 写真の部分と背景の部分を分けて比べる
+            let (pw, rect) = (size.0 as usize, l.photo);
+            let (mut in_photo, mut in_bg) = ((0usize, 0u8), (0usize, 0u8));
+            for (i, (a, b)) in cpu
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(got.as_chunks::<4>().0)
+                .enumerate()
+            {
+                let (x, y) = ((i % pw) as u32, (i / pw) as u32);
+                let inside = l.mode == Mode::Cover
+                    || (x >= rect.x && x < rect.x + rect.w && y >= rect.y && y < rect.y + rect.h);
+                let d = (0..3).map(|k| a[k].abs_diff(b[k])).max().unwrap();
+                let s = if inside { &mut in_photo } else { &mut in_bg };
+                s.0 += (d > 1) as usize;
+                s.1 = s.1.max(d);
+            }
+            eprintln!("{mode:?}: 写真 {in_photo:?} / 背景 {in_bg:?}(差 >1 の画素数, 最大差)");
+            assert!(in_photo.1 <= 2, "{mode:?} 写真の部分: {in_photo:?}");
+            assert!(in_bg.1 <= 2, "{mode:?} 背景の部分: {in_bg:?}");
         }
     }
 }

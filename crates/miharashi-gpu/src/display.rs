@@ -63,6 +63,16 @@ impl GlesDisplay {
         self.out.mode.vrefresh()
     }
 
+    /// GPU で扱える写真の最大の幅と高さ。
+    pub fn max_texture(&self) -> u32 {
+        self.comp.max_texture()
+    }
+
+    /// 前回呼んでから今までに、写真から完成フレームを作った CPU 時間 [ms](1 枚ごと)。
+    pub fn take_build_ms(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.comp.build_ms)
+    }
+
     /// VT が非アクティブになるとき。以後 `present` は何もしない。DRM master は手放す。
     pub fn suspend(&mut self) {
         self.suspended = true;
