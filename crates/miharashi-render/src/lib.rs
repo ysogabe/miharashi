@@ -2,12 +2,14 @@
 pub mod alert;
 pub mod canvas;
 pub mod chart;
+pub mod geo;
 pub mod photo;
 pub mod photo_layout;
 pub mod photo_screen;
 pub mod screens;
 pub mod status;
 pub mod text;
+pub mod trip_card;
 
 pub use canvas::Canvas;
 pub use text::TextEngine;
