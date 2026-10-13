@@ -2,8 +2,8 @@
 //! seat/VT の有効・無効、SIGINT/SIGTERM、入力、描画、状態ログを扱う。
 //! 状態ログは共通部分(t / rss / fds / frames / worst_frame)に `App::stats()` の `k=v` を続けて出す。
 use crate::config::Config;
-use crate::screen::{App, KeyPress};
-use miharashi_gpu::GlesDisplay;
+use crate::screen::{App, Composite, KeyPress, PhotoRef};
+use miharashi_gpu::{Frame, GlesDisplay, PhotoLayer};
 use miharashi_linux::drm_select::{self, CardSel, ModeSel};
 use miharashi_linux::input::{Action, Keys};
 use miharashi_linux::kms::Display;
@@ -116,10 +116,43 @@ impl Presenter {
         }
     }
 
-    fn present(&mut self, canvas: &Canvas) -> Result<(), String> {
+    /// 1 枚描いて表示する。戻り値は (描画, 転送) の時間 [ms]。
+    /// CPU は Canvas に完成画面を描いて変換コピーする。GLES は写真の合成を GPU に任せ(PoC-005 PR3)、
+    /// Canvas には重ね絵だけを、変わったときだけ描く。
+    fn draw(&mut self, app: &mut dyn App, canvas: &mut Canvas) -> Result<(f32, f32), String> {
+        let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f32() * 1000.0;
+        let t0 = Instant::now();
         match self {
-            Self::Cpu(d) => d.present(|buf, pitch| canvas.write_xrgb8888(buf, pitch)),
-            Self::Gles(d) => d.present(canvas.pixmap.data()),
+            Self::Cpu(d) => {
+                app.render(canvas);
+                let t1 = Instant::now();
+                d.present(|buf, pitch| canvas.write_xrgb8888(buf, pitch))?;
+                Ok((ms(t0, t1), ms(t1, Instant::now())))
+            }
+            Self::Gles(d) => {
+                let comp = app.render_composite(canvas);
+                let t1 = Instant::now();
+                fn layer(p: PhotoRef<'_>) -> PhotoLayer<'_> {
+                    PhotoLayer {
+                        id: p.id,
+                        rgba: p.pixmap.data(),
+                    }
+                }
+                let frame = match comp {
+                    Composite::Canvas => Frame::Image(canvas.pixmap.data()),
+                    Composite::Photo {
+                        photo,
+                        old,
+                        overlay_changed,
+                    } => Frame::Photo {
+                        photo: layer(photo),
+                        old: old.map(|(p, t)| (layer(p), t)),
+                        overlay: overlay_changed.then(|| canvas.pixmap.data()),
+                    },
+                };
+                d.present_frame(&frame)?;
+                Ok((ms(t0, t1), ms(t1, Instant::now())))
+            }
         }
     }
 }
@@ -257,11 +290,9 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
 
         if redraw {
             let t0 = Instant::now();
-            app.render(&mut canvas);
-            let t1 = Instant::now();
-            display.present(&canvas)?;
-            render_ms.push(t1.duration_since(t0).as_secs_f32() * 1000.0);
-            present_ms.push(t1.elapsed().as_secs_f32() * 1000.0);
+            let (r, p) = display.draw(app.as_mut(), &mut canvas)?;
+            render_ms.push(r);
+            present_ms.push(p);
             redraw = false;
             frames += 1;
             worst_ms = worst_ms.max(t0.elapsed().as_millis());

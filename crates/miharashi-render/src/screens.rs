@@ -1,4 +1,4 @@
-pub use crate::photo_screen::{PhotoInfo, photo_frame};
+pub use crate::photo_screen::{PhotoInfo, photo_frame, photo_overlay};
 pub use crate::status::{CPU_COLOR, GPU_COLOR, StatusPage, gpu_color, status};
 
 /// GPU 1 台分の負荷。ラベルは "GPU0" のように番号付き(NVML の番号順、その後ろに内蔵 GPU)。

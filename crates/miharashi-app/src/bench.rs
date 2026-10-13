@@ -124,6 +124,12 @@ pub fn run(
                 None,
             )
         }));
+        // GPU 経路(PoC-005 PR3)で CPU に残る仕事: 透明な Canvas に重ね絵だけを描く。
+        // 写真の貼り付けとフェードの合成は GPU が行う
+        rows.push(measure("photo-overlay", size, frames, || {
+            c.clear(miharashi_render::canvas::rgba(0, 0, 0, 0));
+            screens::photo_overlay(&mut c, text, &snap, &layout, Some(&info), None)
+        }));
         // dumb buffer への変換コピー(runtime の present と同じ処理)
         let pitch = w as usize * 4;
         let mut buf = vec![0u8; pitch * h as usize];
@@ -187,6 +193,7 @@ mod tests {
                 "status-details",
                 "photo-static",
                 "photo-fade",
+                "photo-overlay",
                 "present-xrgb8888",
                 "photo-decode",
                 "photo-blur-bg",

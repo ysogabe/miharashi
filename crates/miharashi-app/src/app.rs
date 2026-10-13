@@ -1,7 +1,8 @@
 //! 画面ロジック(PC 状況 + フォトフレーム)。実行ループ(runtime)からは `App` として見える。
 use crate::config::Config;
 use crate::photos::{Feed, FeedEvent, FeedStatus, PhotoItem, Source};
-use crate::screen::{App, KeyPress};
+use crate::screen::{App, Composite, KeyPress, PhotoRef};
+use miharashi_render::canvas::rgba;
 use miharashi_render::screens::{self, StatusPage};
 use miharashi_render::{Canvas, Pixmap, TextEngine};
 use std::time::{Duration, Instant};
@@ -27,7 +28,12 @@ pub struct KioskApp {
     data: Box<dyn DataSource>,
     feed: Feed,
     current: Option<PhotoItem>,
-    fade: Option<(Pixmap, Instant)>,
+    /// 表示中の写真の通し番号(GPU のテクスチャの識別に使う)
+    current_id: u64,
+    /// フェード中の (旧フレーム, その通し番号, 開始時刻)
+    fade: Option<(Pixmap, u64, Instant)>,
+    /// GPU 経路で、重ね絵(時刻や写真の情報)を描き直す必要があるか。フェードの途中では描き直さない
+    overlay_dirty: bool,
     notice: Option<String>,
     last_photo_change: Instant,
     photo_interval: Duration,
@@ -95,7 +101,9 @@ impl KioskApp {
             data,
             feed,
             current: None,
+            current_id: 0,
             fade: None,
+            overlay_dirty: true,
             notice: None,
             last_photo_change: Instant::now(),
             photo_interval: Duration::from_secs(g.photo_interval_secs),
@@ -127,6 +135,7 @@ impl KioskApp {
     /// 戻り値: 再描画が必要か。
     pub fn on_key(&mut self, key: KeyPress) -> bool {
         self.keys += 1;
+        self.overlay_dirty = true;
         match (key, self.screen) {
             // 状況画面: 5 でページ切替、6 / → でフォトフレームへ。
             (KeyPress::Switch, Screen::Status(p)) => {
@@ -158,9 +167,10 @@ impl KioskApp {
             match ev {
                 FeedEvent::Photo(item) => {
                     if let Some(old) = self.current.take() {
-                        self.fade = Some((old.frame, now));
+                        self.fade = Some((old.frame, self.current_id, now));
                     }
                     self.current = Some(item);
+                    self.current_id += 1;
                     self.last_photo_change = now;
                     if self.notice.is_none() {
                         self.snap.feed_status = Some("online".into());
@@ -189,7 +199,7 @@ impl KioskApp {
         if self
             .fade
             .as_ref()
-            .is_some_and(|(_, t0)| now.duration_since(*t0) >= self.fade_len)
+            .is_some_and(|(_, _, t0)| now.duration_since(*t0) >= self.fade_len)
         {
             self.fade = None;
         }
@@ -203,21 +213,64 @@ impl KioskApp {
             }
             redraw = true;
         }
+        self.overlay_dirty |= redraw;
         redraw || (self.screen == Screen::Photo && self.fade.is_some())
+    }
+
+    /// フェードの進み具合(新フレームの不透明度 0〜1)。
+    fn fade_alpha(&self, t0: Instant) -> f32 {
+        (Instant::now().duration_since(t0).as_secs_f32() / self.fade_len.as_secs_f32()).min(1.0)
+    }
+
+    /// GPU 経路の描画。写真画面は写真と重ね絵に分け、重ね絵は変わったときだけ描き直す。
+    pub fn render_composite(&mut self, canvas: &mut Canvas) -> Composite<'_> {
+        if self.screen != Screen::Photo || self.current.is_none() {
+            // 状況画面と、写真がまだ 1 枚もないときは Canvas が完成画面
+            self.render(canvas);
+            // 次に写真画面になったら重ね絵を描き直す
+            self.overlay_dirty = true;
+            return Composite::Canvas;
+        }
+        let overlay_changed = std::mem::take(&mut self.overlay_dirty);
+        let item = self.current.as_ref().expect("上で確かめた");
+        if overlay_changed {
+            canvas.clear(rgba(0, 0, 0, 0));
+            screens::photo_overlay(
+                canvas,
+                &mut self.text,
+                &self.snap,
+                &item.layout,
+                Some(&item.info),
+                self.notice.as_deref(),
+            );
+        }
+        let old = self.fade.as_ref().map(|(px, id, t0)| {
+            (
+                PhotoRef {
+                    id: *id,
+                    pixmap: px,
+                },
+                self.fade_alpha(*t0),
+            )
+        });
+        Composite::Photo {
+            photo: PhotoRef {
+                id: self.current_id,
+                pixmap: &item.frame,
+            },
+            old,
+            overlay_changed,
+        }
     }
 
     pub fn render(&mut self, canvas: &mut Canvas) {
         match self.screen {
             Screen::Status(page) => screens::status(canvas, &mut self.text, &self.snap, page),
             Screen::Photo => {
-                let now = Instant::now();
-                let fade = self.fade.as_ref().map(|(old, t0)| {
-                    (
-                        old,
-                        (now.duration_since(*t0).as_secs_f32() / self.fade_len.as_secs_f32())
-                            .min(1.0),
-                    )
-                });
+                let fade = self
+                    .fade
+                    .as_ref()
+                    .map(|(old, _, t0)| (old, self.fade_alpha(*t0)));
                 let (photo, info) = (
                     self.current.as_ref().map(|p| (&p.frame, &p.layout)),
                     self.current.as_ref().map(|p| &p.info),
@@ -247,6 +300,10 @@ impl App for KioskApp {
 
     fn render(&mut self, canvas: &mut Canvas) {
         KioskApp::render(self, canvas)
+    }
+
+    fn render_composite(&mut self, canvas: &mut Canvas) -> Composite<'_> {
+        KioskApp::render_composite(self, canvas)
     }
 
     fn stats(&self) -> Vec<(&'static str, String)> {
@@ -412,6 +469,74 @@ mod tests {
             outside[1] < 70 && outside[1] > 20,
             "余白は暗いぼかし背景: {outside:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GPU 経路の合成(写真 + 透明背景の重ね絵)を CPU で再現し、CPU 経路の `render` と比べる。
+    /// 重ね絵は変わったときだけ描き直すことも確かめる。
+    #[test]
+    fn composite_photo_plus_overlay_matches_cpu_render() {
+        let size = (640u32, 270u32);
+        let (mut app, dir) = app_with_photo(size);
+        let mut c = Canvas::new(size.0, size.1);
+        assert!(
+            matches!(app.render_composite(&mut c), Composite::Canvas),
+            "状況画面は Canvas が完成画面"
+        );
+        app.on_key(KeyPress::Next);
+        assert!(pump_until(&mut app, |a| a.photo_position() == 1));
+        std::thread::sleep(Duration::from_millis(900));
+        app.tick(Instant::now());
+
+        let mut cpu = Canvas::new(size.0, size.1);
+        app.render(&mut cpu);
+        let mut overlay = Canvas::new(size.0, size.1);
+        let (frame, changed) = match app.render_composite(&mut overlay) {
+            Composite::Photo {
+                photo,
+                old,
+                overlay_changed,
+            } => {
+                assert!(old.is_none(), "フェードは終わっている");
+                (photo.pixmap.data().to_vec(), overlay_changed)
+            }
+            Composite::Canvas => panic!("写真画面は Photo になる"),
+        };
+        assert!(changed, "最初は重ね絵を描く");
+        // premultiplied の source-over: out = src + dst × (1 - src_a)
+        let mut max = 0u8;
+        for ((o, f), want) in overlay
+            .pixmap
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(frame.as_chunks::<4>().0)
+            .zip(cpu.pixmap.data().as_chunks::<4>().0)
+        {
+            for i in 0..3 {
+                let v = o[i] as f32 + f[i] as f32 * (1.0 - o[3] as f32 / 255.0);
+                max = max.max((v.round() as i32 - want[i] as i32).unsigned_abs() as u8);
+            }
+        }
+        assert!(max <= 2, "CPU 経路との差 {max}");
+
+        // 時刻などが変わらなければ描き直さない。キーを押すと描き直す
+        assert!(matches!(
+            app.render_composite(&mut overlay),
+            Composite::Photo {
+                overlay_changed: false,
+                ..
+            }
+        ));
+        app.on_key(KeyPress::Prev);
+        assert!(matches!(
+            app.render_composite(&mut overlay),
+            Composite::Photo {
+                overlay_changed: true,
+                ..
+            }
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
