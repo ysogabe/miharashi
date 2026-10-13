@@ -53,6 +53,15 @@
 # poll_secs = 10           # HA に問い合わせる間隔
 # HA と通信できないとき、auto では画面を点けたままにする。
 
+[alerts]
+# 地震アラート。全画面の上に震源と各地の震度の地図を重ね、画面を消していても点けて見せる。
+# 条件は「住んでいる地方(気象庁の地方区分。[home_assistant] の自宅の位置から決める)で震度 4 以上」
+# または「全国で震度 5 弱以上」。住んでいる地方を決められないときは全国の条件だけで動く。
+# quake = true
+# quake_poll_secs = 30     # 気象庁の地震情報を読む間隔(10 以上)
+# show_minutes = 5         # 表示を続ける分数。キーを押せば先に閉じる
+# demo_after_secs = 0      # 0 より大きければ、起動からこの秒数後にテスト表示を 1 回出す(動作確認用)
+
 [ui]
 # font = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 # start_screen = "status"  # status / photo

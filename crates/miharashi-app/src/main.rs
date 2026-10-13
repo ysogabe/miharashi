@@ -5,6 +5,7 @@ mod bench;
 mod config;
 mod data;
 mod photos;
+mod quake;
 #[cfg(target_os = "linux")]
 mod runtime;
 mod screen;
@@ -110,15 +111,12 @@ fn run(cli: Cli) -> Result<(), String> {
     let cfg = load_config(&cli)?;
     let src = source(&cfg, &cli);
     let (data, snap) = data_source(&cfg, cli.dummy)?;
+    let alerts = quake::start(&cfg.alerts, &cfg.home_assistant);
     runtime::run(&cfg, |out| {
-        Box::new(app::KioskApp::new(
-            &cfg,
-            out.size,
-            out.gpu_max_texture,
-            src,
-            data,
-            snap,
-        ))
+        Box::new(
+            app::KioskApp::new(&cfg, out.size, out.gpu_max_texture, src, data, snap)
+                .with_alerts(alerts),
+        )
     })
 }
 
@@ -188,8 +186,12 @@ fn png(cli: Cli) -> Result<(), String> {
         None,
     );
     save(&c, Some((&item, &overlay)), "photo")?;
+    // 地震アラート(テスト表示)を写真画面の重ね絵に足したもの
+    miharashi_render::alert::quake_overlay(&mut overlay, &mut text, &quake::demo_view());
+    miharashi_render::alert::quake_overlay(&mut c, &mut text, &quake::demo_view());
+    save(&c, Some((&item, &overlay)), "alert-quake")?;
     println!(
-        "wrote {}/{{status,status-details,photo}}.png ({}x{})",
+        "wrote {}/{{status,status-details,photo,alert-quake}}.png ({}x{})",
         out.display(),
         size.0,
         size.1
