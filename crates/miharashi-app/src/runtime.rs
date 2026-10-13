@@ -330,21 +330,6 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             }
         }
 
-        let want_on = power.as_ref().is_none_or(ScreenPower::want_on);
-        if want_on == screen_on {
-            power_tried = screen_on;
-        } else if want_on != power_tried {
-            power_tried = want_on;
-            match display.set_power(want_on) {
-                Ok(()) => {
-                    screen_on = want_on;
-                    redraw |= want_on;
-                    eprintln!("display: {}", if want_on { "点灯" } else { "消灯" });
-                }
-                Err(e) => eprintln!("display: 電源を切り替えられない: {e}"),
-            }
-        }
-
         let mut quit = false;
         for a in keys.poll() {
             let key = match a {
@@ -369,6 +354,22 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             break "キー操作(Esc/q)";
         }
         redraw |= app.tick(Instant::now());
+
+        // アラートは画面を消していても点けて見せる(tick で届いたものを同じ周期で反映する)
+        let want_on = app.wants_screen() || power.as_ref().is_none_or(ScreenPower::want_on);
+        if want_on == screen_on {
+            power_tried = screen_on;
+        } else if want_on != power_tried {
+            power_tried = want_on;
+            match display.set_power(want_on) {
+                Ok(()) => {
+                    screen_on = want_on;
+                    redraw |= want_on;
+                    eprintln!("display: {}", if want_on { "点灯" } else { "消灯" });
+                }
+                Err(e) => eprintln!("display: 電源を切り替えられない: {e}"),
+            }
+        }
 
         if redraw && screen_on {
             let t0 = Instant::now();

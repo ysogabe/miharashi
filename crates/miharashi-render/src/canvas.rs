@@ -19,6 +19,18 @@ fn paint(color: Color) -> Paint<'static> {
     p
 }
 
+fn rings_path(rings: &[Vec<(f32, f32)>]) -> Option<tiny_skia::Path> {
+    let mut pb = PathBuilder::new();
+    for ring in rings.iter().filter(|r| r.len() >= 3) {
+        pb.move_to(ring[0].0, ring[0].1);
+        for p in &ring[1..] {
+            pb.line_to(p.0, p.1);
+        }
+        pb.close();
+    }
+    pb.finish()
+}
+
 impl Canvas {
     pub fn new(width: u32, height: u32) -> Self {
         Self {
@@ -104,6 +116,55 @@ impl Canvas {
                 Transform::identity(),
                 None,
             );
+        }
+    }
+
+    /// 複数のリングからなる多角形を塗る(穴は even-odd で抜く)。地図用。
+    pub fn fill_rings(&mut self, rings: &[Vec<(f32, f32)>], color: Color) {
+        if let Some(path) = rings_path(rings) {
+            self.pixmap.fill_path(
+                &path,
+                &paint(color),
+                FillRule::EvenOdd,
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+
+    /// 複数のリングの輪郭を描く。
+    pub fn stroke_rings(&mut self, rings: &[Vec<(f32, f32)>], width: f32, color: Color) {
+        if let Some(path) = rings_path(rings) {
+            let stroke = Stroke {
+                width,
+                line_join: tiny_skia::LineJoin::Round,
+                ..Stroke::default()
+            };
+            self.pixmap
+                .stroke_path(&path, &paint(color), &stroke, Transform::identity(), None);
+        }
+    }
+
+    pub fn fill_circle(&mut self, x: f32, y: f32, r: f32, color: Color) {
+        if let Some(path) = PathBuilder::from_circle(x, y, r) {
+            self.pixmap.fill_path(
+                &path,
+                &paint(color),
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+
+    pub fn stroke_circle(&mut self, x: f32, y: f32, r: f32, width: f32, color: Color) {
+        if let Some(path) = PathBuilder::from_circle(x, y, r) {
+            let stroke = Stroke {
+                width,
+                ..Stroke::default()
+            };
+            self.pixmap
+                .stroke_path(&path, &paint(color), &stroke, Transform::identity(), None);
         }
     }
 

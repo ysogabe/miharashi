@@ -212,17 +212,10 @@ impl ScreenPower {
             eprintln!("screen: home_assistant.url はあるが、エンティティが未設定(画面は常に点灯)");
             return None;
         }
-        let token = match std::fs::read_to_string(&ha.token_file) {
-            Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-            Ok(_) => {
-                eprintln!("screen: {} が空(画面は常に点灯)", ha.token_file);
-                return None;
-            }
+        let token = match read_token(&ha.token_file) {
+            Ok(t) => t,
             Err(e) => {
-                eprintln!(
-                    "screen: トークンを読めない {}: {e}(画面は常に点灯)",
-                    ha.token_file
-                );
+                eprintln!("screen: {e}(画面は常に点灯)");
                 return None;
             }
         };
@@ -246,7 +239,14 @@ impl ScreenPower {
         shared.want_on.store(true, Ordering::Relaxed);
         let for_thread = shared.clone();
         let settings = settings.clone();
-        std::thread::spawn(move || poll(client, settings, for_thread));
+        // スレッドに名前を付ける(状態ログや試験でスレッドごとの CPU 時間を追えるように)
+        let spawned = std::thread::Builder::new()
+            .name("screen-power".into())
+            .spawn(move || poll(client, settings, for_thread));
+        if let Err(e) = spawned {
+            eprintln!("screen: スレッドを起動できない: {e}(画面は常に点灯)");
+            return None;
+        }
         Some(Self { shared })
     }
 
@@ -262,6 +262,15 @@ impl ScreenPower {
         {
             eprintln!("screen: 点灯(キー操作)");
         }
+    }
+}
+
+/// 長期アクセストークンをファイルから読む(前後の空白は落とす)。
+pub fn read_token(path: &str) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) if !t.trim().is_empty() => Ok(t.trim().to_string()),
+        Ok(_) => Err(format!("{path} が空")),
+        Err(e) => Err(format!("トークンを読めない {path}: {e}")),
     }
 }
 
