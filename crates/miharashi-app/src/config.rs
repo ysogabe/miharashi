@@ -140,7 +140,7 @@ pub struct Panel {
     pub enabled: bool,
     /// 待ち受けるアドレス。LAN のインターフェースの IP を指定する(0.0.0.0 / :: は不可)。
     pub listen: String,
-    /// Bearer トークンを 1 行で書いたファイル(0600)。
+    /// Bearer トークンを 1 行で書いたファイル(ha-token と同じく root:hermes 0640 か 0600)。
     pub token_file: String,
     /// `POST /api/v1/input` を 1 秒にこの回数まで受け付ける。超えたら 429。
     pub max_rate_per_sec: u32,

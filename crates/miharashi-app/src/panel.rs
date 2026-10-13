@@ -58,7 +58,7 @@ fn same_secret(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// トークンのファイルを読む。他人が読めるファイルは使わない。
+/// トークンのファイルを読む。誰でも読めるファイルは使わない(ha-token と同じ root:hermes 0640 か 0600)。
 fn read_token(path: &str) -> Result<String, String> {
     #[cfg(unix)]
     {
@@ -67,8 +67,11 @@ fn read_token(path: &str) -> Result<String, String> {
             .map_err(|e| format!("{path}: {e}"))?
             .permissions()
             .mode();
-        if mode & 0o077 != 0 {
-            return Err(format!("{path}: 権限が {:o}。0600 にする", mode & 0o777));
+        if mode & 0o007 != 0 {
+            return Err(format!(
+                "{path}: 権限が {:o}。0640(root:hermes)か 0600 にする",
+                mode & 0o777
+            ));
         }
     }
     let token = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
@@ -494,7 +497,9 @@ mod tests {
         std::fs::write(&p, format!("{TOKEN}\n")).unwrap();
         let path = p.to_str().unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_token(path).is_err(), "他人が読める");
+        assert!(read_token(path).is_err(), "誰でも読める");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(read_token(path).is_ok(), "グループ(hermes)には読ませてよい");
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(read_token(path).unwrap(), TOKEN, "末尾の改行は除く");
         std::fs::write(&p, "short\n").unwrap();

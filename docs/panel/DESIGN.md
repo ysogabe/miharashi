@@ -93,6 +93,8 @@ flowchart LR
 
 ### 5.2 API(案)
 
+> P1 で入っているのはこの一部です(キーは `prev` / `next` / `select` だけ、`/api/v1/screen` は未実装)。§6 の P1 を参照。
+
 | メソッド | パス | 内容 |
 |---|---|---|
 | GET | `/api/v1/status` | `{schema_version, host, screen: {id, title, index, count}, screens: [{id, title}], photo: {position, total} \| null, feed: "online" \| "retrying", uptime_s, generated_at}` |
@@ -101,7 +103,7 @@ flowchart LR
 | GET | `/api/v1/events` | SSE。画面が変わるたびに `status` と同じ JSON を 1 行。接続中は 15 秒ごとに `: keepalive` |
 | GET | `/api/v1/healthz` | 認証なし。`{"ok": true}` だけ |
 
-- 認証: `Authorization: Bearer <token>`。トークンは設定ファイルで指定したファイル(`/etc/miharashi/panel.token`、0600)から読む。不一致は `401`。`healthz` 以外は全て必須。
+- 認証: `Authorization: Bearer <token>`。トークンは設定ファイルで指定したファイル(`/etc/miharashi/panel.token`、`ha-token` と同じく root:<実行ユーザー> 0640 か 0600。誰でも読める権限なら起動しない)から読む。不一致は `401`。`healthz` 以外は全て必須。
 - 待ち受け: 設定の `[panel] listen = "192.168.x.x:8790"` のように**インターフェースを指定**する(`0.0.0.0` は拒否)。既定は無効(`enabled = false`)。
 - 実装: `tiny_http` のスレッド 1 本(写真の `Feed` と同じ形)。`KeyPress` は `std::sync::mpsc` で実行ループへ。`/status` はループが更新する `Arc<Mutex<PanelStatus>>` を読む。
 - レート: 1 秒に 20 操作を超えたら `429`(連打の暴走を止める)。
