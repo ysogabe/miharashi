@@ -91,6 +91,9 @@ pub struct Catalog {
     sched: Option<Scheduler>,
     queue: Vec<Slot>,
     pos: usize,
+    /// 表示履歴の保存先(systemd の StateDirectory。無ければ保存しない)と、未保存の表示数
+    state: Option<PathBuf>,
+    unsaved: u32,
     size: (u32, u32),
     /// 写真の配置を巡回させる次の候補(左 → 右 → 中央)
     slot: usize,
@@ -194,6 +197,8 @@ impl Catalog {
             sched: None,
             queue: Vec::new(),
             pos: 0,
+            state: None,
+            unsaved: 0,
             size,
             slot: 0,
             gpu_max: None,
@@ -233,9 +238,34 @@ impl Catalog {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0x9e3779b97f4a7c15, |d| d.as_nanos() as u64);
         let mut sched = Scheduler::new(seed);
+        cat.state = std::env::var_os("STATE_DIRECTORY")
+            .map(|d| PathBuf::from(d).join("play.json"));
+        if let Some(path) = &cat.state
+            && let Ok(text) = std::fs::read_to_string(path)
+        {
+            if sched.restore(&text) {
+                eprintln!("photos: 表示履歴を読み込んだ({})", path.display());
+            } else {
+                eprintln!("photos: 表示履歴を読めない(最初から): {}", path.display());
+            }
+        }
         cat.queue = sched.next_round(&cat.groups, &cat.metas, chrono::Local::now().naive_local());
         cat.sched = Some(sched);
         Ok(cat)
+    }
+
+    /// 表示履歴を保存する(一時ファイルに書いてから置き換える)。失敗しても表示は続ける。
+    fn save_state(&mut self) {
+        let (Some(path), Some(s)) = (&self.state, &self.sched) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        let r = std::fs::write(&tmp, s.to_json()).and_then(|_| std::fs::rename(&tmp, path));
+        if let Err(e) = r {
+            eprintln!("photos: 表示履歴を保存できない: {}: {e}", path.display());
+            self.state = None; // 何度も失敗を出さない
+        }
+        self.unsaved = 0;
     }
 
     /// GEOFRAME の一覧から、表示対象の写真と並べ方の情報を読む。
@@ -268,7 +298,13 @@ impl Catalog {
                 place: place.trim().to_string(),
                 taken: text(p, "time"),
             });
+            let id = match &p["id"] {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                _ => file.to_string(),
+            };
             metas.push(Meta {
+                id,
                 lat: p["lat"].as_f64(),
                 lon: p["lon"].as_f64(),
                 time: text(p, "time"),
@@ -295,6 +331,7 @@ impl Catalog {
         if self.pos >= self.queue.len() {
             let round = sched.next_round(&self.groups, &self.metas, chrono::Local::now().naive_local());
             self.queue.extend(round);
+            self.save_state();
         }
         // 戻れる範囲を残して古いコマを捨てる(増え続けないように)
         const KEEP_BACK: usize = 200;
@@ -314,8 +351,14 @@ impl Catalog {
             Some(Slot::Photo { entry, k, n }) => (entry, k, n),
             None => return Err("再生順が空".into()),
         };
-        if let Some(s) = self.sched.as_mut() {
-            s.mark(index);
+        if let Some(s) = self.sched.as_mut()
+            && let Some(m) = self.metas.get(index)
+        {
+            s.mark(&m.id);
+            self.unsaved += 1;
+            if self.unsaved >= 10 {
+                self.save_state();
+            }
         }
         let e = &self.entries[index];
         let bytes = match &e.origin {
@@ -703,6 +746,8 @@ mod tests {
                 })
                 .collect(),
             pos: 0,
+            state: None,
+            unsaved: 0,
             size: (32, 18),
             slot: 0,
             gpu_max: None,

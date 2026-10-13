@@ -30,6 +30,8 @@ const PRI_JITTER: f64 = 4.0;
 /// 写真 1 枚の、並べ方に使う情報。
 #[derive(Debug, Clone, Default)]
 pub struct Meta {
+    /// GEOFRAME の写真 ID(表示履歴の鍵。一覧の順番が変わっても変わらない)
+    pub id: String,
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     /// 撮影日時("2026-09-22 10:31" など。空もある)
@@ -321,8 +323,10 @@ pub enum Slot {
 }
 
 /// 1 周ずつ再生順を作る。表示した写真の周を覚え、長く出ていない写真を優先する。
+/// 覚えた内容は `to_json` / `restore` で保存・復元できる(再起動しても続きから流す)。
 pub struct Scheduler {
-    shown: HashMap<usize, u64>,
+    /// 写真 ID → 最後に表示した周
+    shown: HashMap<String, u64>,
     round: u64,
     rng: u64,
 }
@@ -363,12 +367,37 @@ impl Scheduler {
     }
 
     /// 表示した。
-    pub fn mark(&mut self, entry: usize) {
-        self.shown.insert(entry, self.round);
+    pub fn mark(&mut self, id: &str) {
+        self.shown.insert(id.to_string(), self.round);
     }
 
-    fn priority(&mut self, m: &Meta, entry: usize, now: NaiveDateTime) -> f64 {
-        let mut s = match self.shown.get(&entry) {
+    /// 保存用の JSON({"round": 周, "shown": {写真 ID: 周}})。
+    pub fn to_json(&self) -> String {
+        serde_json::json!({"round": self.round, "shown": self.shown}).to_string()
+    }
+
+    /// 保存した JSON から戻す。読めなければ何もしない(最初からになる)。
+    /// 一覧から消えた写真の履歴も残るが、数千件程度なので気にしない。
+    pub fn restore(&mut self, text: &str) -> bool {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+            return false;
+        };
+        let (Some(round), Some(shown)) = (
+            v.get("round").and_then(serde_json::Value::as_u64),
+            v.get("shown").and_then(serde_json::Value::as_object),
+        ) else {
+            return false;
+        };
+        self.round = round;
+        self.shown = shown
+            .iter()
+            .filter_map(|(k, r)| Some((k.clone(), r.as_u64()?.min(round))))
+            .collect();
+        true
+    }
+
+    fn priority(&mut self, m: &Meta, now: NaiveDateTime) -> f64 {
+        let mut s = match self.shown.get(&m.id) {
             None => PRI_NEVER,
             Some(r) => (self.round - r) as f64,
         };
@@ -404,7 +433,7 @@ impl Scheduler {
             let mut scored: Vec<(f64, usize)> = members
                 .iter()
                 .enumerate()
-                .map(|(pos, &e)| (self.priority(&metas[e], e, now), pos))
+                .map(|(pos, &e)| (self.priority(&metas[e], now), pos))
                 .collect();
             scored.sort_by(|a, b| b.0.total_cmp(&a.0));
             let mut chosen: Vec<usize> = scored.iter().take(PER_GROUP).map(|s| s.1).collect();
@@ -558,13 +587,15 @@ mod tests {
         for (gi, &n) in sizes.iter().enumerate() {
             let members: Vec<usize> = (metas.len()..metas.len() + n).collect();
             for j in 0..n {
-                metas.push(meta(
+                let mut m = meta(
                     HOME.0,
                     HOME.1,
                     &format!("20{:02}-05-01 {:02}:00", 10 + gi, j % 24),
                     "千葉県",
                     "千代田区",
-                ));
+                );
+                m.id = format!("p{}", metas.len());
+                metas.push(m);
             }
             groups.push(Group {
                 everyday: true,
@@ -624,11 +655,47 @@ mod tests {
                 assert_eq!(k, n);
             }
             for e in photos {
-                s.mark(e);
+                s.mark(&metas[e].id);
                 seen.insert(e);
             }
         }
         assert_eq!(seen.len(), metas.len(), "4 周ですべて出る");
+    }
+
+    #[test]
+    fn history_survives_a_restart() {
+        let (groups, metas) = groups_of(&[12]);
+        let now = parse_time("2026-10-13 22:00").unwrap();
+        let mut s = Scheduler::new(7);
+        let first: Vec<usize> = s
+            .next_round(&groups, &metas, now)
+            .iter()
+            .filter_map(|x| match x {
+                Slot::Photo { entry, .. } => Some(*entry),
+                _ => None,
+            })
+            .collect();
+        for &e in &first {
+            s.mark(&metas[e].id);
+        }
+        let saved = s.to_json();
+        // 再起動: 新しいスケジューラに戻すと、まだ出ていない 6 枚が次に出る
+        let mut t = Scheduler::new(99);
+        assert!(t.restore(&saved));
+        let second: Vec<usize> = t
+            .next_round(&groups, &metas, now)
+            .iter()
+            .filter_map(|x| match x {
+                Slot::Photo { entry, .. } => Some(*entry),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            second.iter().all(|e| !first.contains(e)),
+            "{first:?} {second:?}"
+        );
+        assert!(!t.restore("壊れた"));
+        assert!(!t.restore(r#"{"round": 1}"#));
     }
 
     #[test]

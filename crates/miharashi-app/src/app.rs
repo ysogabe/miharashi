@@ -4,6 +4,7 @@ use crate::photos::{Feed, FeedEvent, FeedStatus, HomeLookup, PhotoItem, PhotoPix
 #[cfg(test)]
 use crate::screen::PhotoData;
 use crate::screen::{App, Composite, KeyPress, PanelView, ScreenInfo};
+use miharashi_render::aircraft;
 use miharashi_render::alert::{self, AlertView};
 use miharashi_render::canvas::rgba;
 use miharashi_render::screens::{self, StatusPage};
@@ -49,6 +50,13 @@ pub struct KioskApp {
     next_tick: Instant,
     tick_len: Duration,
     text: TextEngine,
+    /// 航空機の最新の取得結果(無効なら None)
+    aircraft: Option<crate::aircraft::Shared>,
+    /// 前回の航空機の画面から出した写真の枚数と、航空機の画面を閉じる時刻
+    photos_since_air: u32,
+    air_until: Option<Instant>,
+    air_every: u32,
+    air_len: Duration,
     /// アラート(地震・災害)の受け口(無効なら None)
     alerts: Option<Receiver<AlertView>>,
     /// 表示中のアラートと、閉じる時刻
@@ -133,12 +141,35 @@ impl KioskApp {
             next_tick: Instant::now(),
             tick_len: Duration::from_secs(1),
             text: text_engine(&cfg.ui.font),
+            aircraft: None,
+            photos_since_air: 0,
+            air_until: None,
+            air_every: cfg.aircraft.every_photos,
+            air_len: Duration::from_secs(cfg.aircraft.show_secs),
             alerts: None,
             alert: None,
             alert_len: Duration::from_secs(cfg.alerts.show_minutes * 60),
             ticks: 0,
             keys: 0,
         }
+    }
+
+    /// 航空機の取得結果をつなぐ。
+    pub fn with_aircraft(mut self, shared: Option<crate::aircraft::Shared>) -> Self {
+        self.aircraft = shared;
+        self
+    }
+
+    /// 航空機の画面を出しているか。
+    pub fn showing_aircraft(&self) -> bool {
+        self.air_until.is_some()
+    }
+
+    /// 新しい(30 秒以内の)取得結果で、半径内に機体がいるときの内容。
+    fn aircraft_view(&self) -> Option<aircraft::AircraftView> {
+        let g = self.aircraft.as_ref()?.lock().ok()?;
+        let (at, view) = g.as_ref()?;
+        (at.elapsed() < Duration::from_secs(30) && !view.planes.is_empty()).then(|| view.clone())
     }
 
     /// アラートの受け口をつなぐ。
@@ -174,6 +205,11 @@ impl KioskApp {
         self.overlay_dirty = true;
         // アラート表示中のキーは閉じるだけにする
         if self.alert.take().is_some() {
+            return true;
+        }
+        // 航空機の画面のキーは写真へ戻るだけにする
+        if self.air_until.take().is_some() {
+            self.last_photo_change = Instant::now();
             return true;
         }
         match (key, self.screen) {
@@ -212,6 +248,7 @@ impl KioskApp {
                     self.current = Some(item);
                     self.current_id += 1;
                     self.card = None;
+                    self.photos_since_air += 1;
                     self.last_photo_change = now;
                     if self.notice.is_none() {
                         self.snap.feed_status = Some("online".into());
@@ -250,12 +287,36 @@ impl KioskApp {
             self.alert = None;
             redraw = true;
         }
+        // 写真画面で写真を every_photos 枚出したら、半径内に機体がいれば航空機の画面を挟む
+        if self.screen == Screen::Photo
+            && self.air_until.is_none()
+            && self.card.is_none()
+            && self.photos_since_air >= self.air_every
+            && now.duration_since(self.last_photo_change) >= self.photo_interval
+            && self.aircraft_view().is_some()
+        {
+            self.air_until = Some(now + self.air_len);
+            self.photos_since_air = 0;
+            redraw = true;
+        }
+        if let Some(until) = self.air_until {
+            if now >= until || self.screen != Screen::Photo {
+                self.air_until = None;
+                // 閉じたらすぐ次の写真へ
+                self.feed.next();
+                self.last_photo_change = now;
+            }
+            redraw = true;
+        }
         let dwell = if self.card.is_some() {
             self.card_len
         } else {
             self.photo_interval
         };
-        if self.screen == Screen::Photo && now.duration_since(self.last_photo_change) >= dwell {
+        if self.screen == Screen::Photo
+            && self.air_until.is_none()
+            && now.duration_since(self.last_photo_change) >= dwell
+        {
             self.feed.next();
             self.last_photo_change = now;
         }
@@ -287,7 +348,7 @@ impl KioskApp {
 
     /// GPU 経路の描画。写真画面は写真と重ね絵に分け、重ね絵は変わったときだけ描き直す。
     pub fn render_composite(&mut self, canvas: &mut Canvas) -> Composite<'_> {
-        if self.screen != Screen::Photo || self.current.is_none() {
+        if self.screen != Screen::Photo || self.current.is_none() || self.air_until.is_some() {
             // 状況画面と、写真がまだ 1 枚もないときは Canvas が完成画面
             self.render(canvas);
             // 次に写真画面になったら重ね絵を描き直す
@@ -334,6 +395,16 @@ impl KioskApp {
     }
 
     pub fn render(&mut self, canvas: &mut Canvas) {
+        if self.screen == Screen::Photo
+            && self.air_until.is_some()
+            && let Some(v) = self.aircraft_view()
+        {
+            aircraft::aircraft_screen(canvas, &mut self.text, &v);
+            if let Some((view, _)) = &self.alert {
+                alert::overlay(canvas, &mut self.text, view);
+            }
+            return;
+        }
         self.render_screen(canvas);
         if self.screen == Screen::Photo
             && let Some(card) = &self.card
@@ -407,6 +478,7 @@ impl App for KioskApp {
             ("keys", self.keys.to_string()),
             ("screen", format!("{:?}", self.screen())),
             ("photo", self.photo_position().to_string()),
+            ("aircraft", self.showing_aircraft().to_string()),
             ("feed", self.feed_notice().unwrap_or("online").to_string()),
             ("cpu", format!("{:?}", s.cpu.map(|v| v.round()))),
             ("gpu", format!("{:?}", s.gpu.map(|v| v.round()))),
@@ -723,6 +795,38 @@ mod tests {
         let mut c = Canvas::new(size.0, size.1);
         app.render(&mut c);
         assert_eq!(px(&c, 320, 100), [30, 120, 60, 255], "写真(緑)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写真を every_photos 枚出したら、半径内に機体がいるときだけ航空機の画面を挟み、時間で閉じる。
+    #[test]
+    fn aircraft_interlude_between_photos() {
+        let (mut app, dir) = app_with_photo((640, 270));
+        app.air_every = 1;
+        app.air_len = Duration::from_secs(5);
+        let shared: crate::aircraft::Shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+        app.aircraft = Some(shared.clone());
+        app.on_key(KeyPress::Next);
+        assert!(pump_until(&mut app, |a| a.photo_position() == 1));
+        let later = Instant::now() + Duration::from_secs(31);
+        app.tick(later);
+        assert!(!app.showing_aircraft(), "機体がいなければ挟まない");
+        // 上の tick で次の写真へ進んだので、もう 1 枚分の時間をおく
+        let later = later + Duration::from_secs(31);
+        app.photos_since_air = 1;
+        *shared.lock().unwrap() = Some((Instant::now(), crate::aircraft::demo_view()));
+        app.tick(later);
+        assert!(app.showing_aircraft(), "機体がいれば挟む");
+        let mut c = Canvas::new(640, 270);
+        assert!(matches!(app.render_composite(&mut c), Composite::Canvas));
+        app.tick(later + Duration::from_secs(6));
+        assert!(!app.showing_aircraft(), "時間で閉じる");
+        // キーでも閉じる
+        app.photos_since_air = 1;
+        app.tick(later + Duration::from_secs(40));
+        assert!(app.showing_aircraft());
+        app.on_key(KeyPress::Next);
+        assert!(!app.showing_aircraft());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
