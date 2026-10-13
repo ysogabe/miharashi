@@ -332,7 +332,7 @@ fn multi_gpu_tile(c: &mut Canvas, t: &mut TextEngine, rect: Rect, s: &Snapshot) 
         fit_left(
             c,
             t,
-            &g.label,
+            g.display_name(),
             x + 20.0,
             ry + 6.0 * k,
             26.0 * k,
@@ -353,7 +353,7 @@ fn usage_series(s: &Snapshot) -> Vec<Series<'_>> {
     let mut v = vec![series("CPU", &s.cpu_history, CPU_COLOR)];
     if s.gpus.len() >= 2 {
         for (i, g) in s.gpus.iter().enumerate() {
-            v.push(series(&g.label, &g.history, gpu_color(i)));
+            v.push(series(g.display_name(), &g.history, gpu_color(i)));
         }
     } else {
         v.push(series("GPU", &s.gpu_history, GPU_COLOR));
