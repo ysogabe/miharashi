@@ -976,9 +976,11 @@ dependencies = [
  "drm",
  "gbm-sys",
  "glow",
+ "image",
  "khronos-egl",
  "libc",
  "miharashi-linux",
+ "miharashi-render",
 ]
 
 [[package]]

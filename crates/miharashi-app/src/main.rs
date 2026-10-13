@@ -10,8 +10,8 @@ mod runtime;
 mod screen;
 
 use config::Config;
-use miharashi_render::{Canvas, Pixmap, screens};
-use photos::{Catalog, Source};
+use miharashi_render::{Canvas, photo, screens};
+use photos::{Catalog, PhotoItem, PhotoPixels, Source};
 use std::path::PathBuf;
 
 #[derive(Default)]
@@ -110,7 +110,14 @@ fn run(cli: Cli) -> Result<(), String> {
     let src = source(&cfg, &cli);
     let (data, snap) = data_source(&cfg, cli.dummy)?;
     runtime::run(&cfg, |out| {
-        Box::new(app::KioskApp::new(&cfg, out.size, src, data, snap))
+        Box::new(app::KioskApp::new(
+            &cfg,
+            out.size,
+            out.gpu_max_texture,
+            src,
+            data,
+            snap,
+        ))
     })
 }
 
@@ -135,12 +142,20 @@ fn png(cli: Cli) -> Result<(), String> {
         app::set_clock(&mut s);
         snap = s;
     }
-    let item = Catalog::open(&source(&cfg, &cli), size)?.current()?;
+    let mut gles = gles_checker(&cfg, cli.renderer.is_some())?;
+    // GLES の検証では写真をデコードしただけで受け取って GPU で合成し、CPU 版の完成フレームは別に作る
+    let mut catalog = Catalog::open(&source(&cfg, &cli), size)?;
+    catalog.gpu_max = gles.is_some().then_some(u32::MAX);
+    let item = catalog.current()?;
+    let frame = match &item.pixels {
+        PhotoPixels::Source(img) => photo::compose_image(img, size.0, size.1, &item.layout)?,
+        PhotoPixels::Frame(f) => f.clone(),
+        PhotoPixels::Resident => return Err("写真の画素がない".into()),
+    };
     let mut text = app::text_engine(&cfg.ui.font);
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
-    let mut gles = gles_checker(&cfg, cli.renderer.is_some())?;
     let mut c = Canvas::new(size.0, size.1);
-    let mut save = |c: &Canvas, layers: Option<(&Pixmap, &Canvas)>, name: &str| {
+    let mut save = |c: &Canvas, layers: Option<(&PhotoItem, &Canvas)>, name: &str| {
         c.save_png(&out.join(format!("{name}.png")))?;
         if let Some(check) = gles.as_mut() {
             check(c, layers, &out.join(format!("{name}-gles.png")))?;
@@ -155,7 +170,7 @@ fn png(cli: Cli) -> Result<(), String> {
         &mut c,
         &mut text,
         &snap,
-        Some((&item.frame, &item.layout)),
+        Some((&frame, &item.layout)),
         Some(&item.info),
         None,
         None,
@@ -171,7 +186,7 @@ fn png(cli: Cli) -> Result<(), String> {
         Some(&item.info),
         None,
     );
-    save(&c, Some((&item.frame, &overlay)), "photo")?;
+    save(&c, Some((&item, &overlay)), "photo")?;
     println!(
         "wrote {}/{{status,status-details,photo}}.png ({}x{})",
         out.display(),
@@ -185,7 +200,7 @@ fn png(cli: Cli) -> Result<(), String> {
 /// 描いて読み戻し、`*-gles.png` に保存して CPU の画像との差を出す。`layers` が Some なら
 /// (写真のフレーム, 重ね絵)を GPU で合成し、None なら CPU の完成画面をそのまま描く。
 type GlesCheck =
-    Box<dyn FnMut(&Canvas, Option<(&Pixmap, &Canvas)>, &std::path::Path) -> Result<(), String>>;
+    Box<dyn FnMut(&Canvas, Option<(&PhotoItem, &Canvas)>, &std::path::Path) -> Result<(), String>>;
 
 #[cfg(target_os = "linux")]
 fn gles_checker(cfg: &Config, asked: bool) -> Result<Option<GlesCheck>, String> {
@@ -204,14 +219,11 @@ fn gles_checker(cfg: &Config, asked: bool) -> Result<Option<GlesCheck>, String> 
     println!("gles: {} ({})", node.display(), off.describe());
     Ok(Some(Box::new(
         move |c: &Canvas, layers, path: &std::path::Path| {
-            use miharashi_gpu::{Frame, PhotoLayer};
+            use miharashi_gpu::Frame;
             let (w, h) = (c.width(), c.height());
             let frame = match layers {
-                Some((photo, overlay)) => Frame::Photo {
-                    photo: PhotoLayer {
-                        id: 1,
-                        rgba: photo.data(),
-                    },
+                Some((item, overlay)) => Frame::Photo {
+                    photo: runtime::photo_layer(item.photo_ref(1), h),
                     old: None,
                     overlay: Some(overlay.pixmap.data()),
                 },

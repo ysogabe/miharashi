@@ -5,7 +5,9 @@ pub mod display;
 mod egl;
 mod gbm;
 pub mod offscreen;
+pub mod photo;
 
-pub use compose::{Frame, PhotoLayer};
+pub use compose::{Frame, PhotoLayer, PhotoSource};
+pub use photo::{Placement, SourceImage};
 pub use display::GlesDisplay;
 pub use offscreen::{Offscreen, diff_rgb, render_node_for_pci};
