@@ -74,6 +74,17 @@
 # show_minutes = 5         # 表示を続ける分数。キーを押せば先に閉じる
 # demo_after_secs = 0      # 0 より大きければ、起動からこの秒数後に地震、その 30 秒後に災害のテスト表示を出す
 
+[aircraft]
+# 航空機の画面。写真画面で写真を every_photos 枚出すごとに、受信機から radius_km 以内に
+# 機体がいれば show_secs 秒挟む(キーを押せば写真へ戻る)。左に受信機中心のレーダー、
+# 右にいちばん近い機体の諸元(adsbdb で機種・登録記号・運航会社・経路を引く)。
+# enabled = true
+# url = "https://ads-b.dam-lab.work/tar1090/data/aircraft.json"  # 受信機の位置は同じ場所の receiver.json
+# poll_secs = 5
+# radius_km = 50.0
+# every_photos = 10
+# show_secs = 30
+
 [ui]
 # font = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 # start_screen = "status"  # status / photo
