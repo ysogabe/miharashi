@@ -1,0 +1,13 @@
+[package]
+name = "miharashi-gpu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+drm = "0.15.0"
+gbm-sys = "0.4.0"
+glow = "0.18.0"
+# libEGL は実行時に読み込む(ない環境では CPU 経路に戻れるように)
+khronos-egl = { version = "6.0.0", features = ["dynamic"] }
+libc = "0.2.190"
+miharashi-linux = { path = "../miharashi-linux" }

@@ -10,6 +10,12 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 pub struct Card(File);
 
+impl Card {
+    pub fn new(fd: OwnedFd) -> Self {
+        Self(File::from(fd))
+    }
+}
+
 impl AsFd for Card {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
@@ -18,27 +24,17 @@ impl AsFd for Card {
 impl Device for Card {}
 impl ControlDevice for Card {}
 
-/// 1 コネクターへ dumb buffer で出力する Presenter。Drop で元の CRTC 状態を復元する。
-/// デバイスの fd は呼び出し側(seat)が閉じるので、Display を先に drop すること。
-pub struct Display {
-    card: Card,
-    crtc: crtc::Handle,
-    conn: connector::Handle,
-    mode: Mode,
-    saved: crtc::Info,
-    fb: framebuffer::Handle,
-    db: DumbBuffer,
-    suspended: bool,
+/// 出力先(コネクター、モード、CRTC)と、起動前の CRTC の状態。dumb buffer と GLES の両方の表示経路で使う。
+pub struct Output {
+    pub crtc: crtc::Handle,
+    pub conn: connector::Handle,
+    pub mode: Mode,
+    pub saved: crtc::Info,
 }
 
-fn conn_name(info: &connector::Info) -> String {
-    format!("{}-{}", info.interface().as_str(), info.interface_id())
-}
-
-impl Display {
-    /// `fd` は DRM デバイスの fd(複製済み)。`connector` は "auto" か "HDMI-A-1" など。
-    pub fn open(fd: OwnedFd, connector: &str, mode_sel: ModeSel) -> Result<Self, String> {
-        let card = Card(File::from(fd));
+impl Output {
+    /// `connector` は "auto" か "HDMI-A-1" など。
+    pub fn find(card: &Card, connector: &str, mode_sel: ModeSel) -> Result<Self, String> {
         let res = card
             .resource_handles()
             .map_err(|e| format!("resource_handles: {e}"))?;
@@ -72,26 +68,11 @@ impl Display {
             })
             .ok_or("使える CRTC がない")?;
         let saved = card.get_crtc(crtc).map_err(|e| e.to_string())?;
-        let (w, h) = mode.size();
-        let db = card
-            .create_dumb_buffer((w as u32, h as u32), DrmFourcc::Xrgb8888, 32)
-            .map_err(|e| format!("create_dumb_buffer: {e}"))?;
-        let fb = card
-            .add_framebuffer(&db, 24, 32)
-            .map_err(|e| format!("add_framebuffer: {e}"))?;
-        card.set_crtc(crtc, Some(fb), (0, 0), &[info.handle()], Some(mode))
-            .map_err(|e| {
-                format!("set_crtc: {e} (DRM master を他のプロセスが持っていないか確認)")
-            })?;
         Ok(Self {
-            card,
             crtc,
             conn: info.handle(),
             mode,
             saved,
-            fb,
-            db,
-            suspended: false,
         })
     }
 
@@ -100,8 +81,66 @@ impl Display {
         (w as u32, h as u32)
     }
 
+    /// `fb` を表示する(起動時と VT 復帰時)。
+    pub fn set(&self, card: &Card, fb: framebuffer::Handle) -> std::io::Result<()> {
+        card.set_crtc(self.crtc, Some(fb), (0, 0), &[self.conn], Some(self.mode))
+    }
+
+    /// 起動前の CRTC の状態に戻す(終了時)。
+    pub fn restore(&self, card: &Card) {
+        let _ = card.set_crtc(
+            self.crtc,
+            self.saved.framebuffer(),
+            self.saved.position(),
+            &[self.conn],
+            self.saved.mode(),
+        );
+    }
+}
+
+/// 1 コネクターへ dumb buffer で出力する Presenter。Drop で元の CRTC 状態を復元する。
+/// デバイスの fd は呼び出し側(seat)が閉じるので、Display を先に drop すること。
+pub struct Display {
+    card: Card,
+    out: Output,
+    fb: framebuffer::Handle,
+    db: DumbBuffer,
+    suspended: bool,
+}
+
+fn conn_name(info: &connector::Info) -> String {
+    format!("{}-{}", info.interface().as_str(), info.interface_id())
+}
+
+impl Display {
+    /// `fd` は DRM デバイスの fd(複製済み)。`connector` は "auto" か "HDMI-A-1" など。
+    pub fn open(fd: OwnedFd, connector: &str, mode_sel: ModeSel) -> Result<Self, String> {
+        let card = Card::new(fd);
+        let out = Output::find(&card, connector, mode_sel)?;
+        let db = card
+            .create_dumb_buffer(out.size(), DrmFourcc::Xrgb8888, 32)
+            .map_err(|e| format!("create_dumb_buffer: {e}"))?;
+        let fb = card
+            .add_framebuffer(&db, 24, 32)
+            .map_err(|e| format!("add_framebuffer: {e}"))?;
+        out.set(&card, fb).map_err(|e| {
+            format!("set_crtc: {e} (DRM master を他のプロセスが持っていないか確認)")
+        })?;
+        Ok(Self {
+            card,
+            out,
+            fb,
+            db,
+            suspended: false,
+        })
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        self.out.size()
+    }
+
     pub fn refresh(&self) -> u32 {
-        self.mode.vrefresh()
+        self.out.mode.vrefresh()
     }
 
     pub fn is_suspended(&self) -> bool {
@@ -117,14 +156,8 @@ impl Display {
     /// VT がアクティブに戻ったとき。master を取り直して CRTC を設定し直す。
     pub fn resume(&mut self) -> Result<(), String> {
         let _ = self.card.acquire_master_lock();
-        self.card
-            .set_crtc(
-                self.crtc,
-                Some(self.fb),
-                (0, 0),
-                &[self.conn],
-                Some(self.mode),
-            )
+        self.out
+            .set(&self.card, self.fb)
             .map_err(|e| format!("set_crtc(復帰): {e}"))?;
         self.suspended = false;
         Ok(())
@@ -162,13 +195,7 @@ fn pick_mode(modes: &[Mode], sel: ModeSel) -> Option<Mode> {
 impl Drop for Display {
     fn drop(&mut self) {
         if !self.suspended {
-            let _ = self.card.set_crtc(
-                self.crtc,
-                self.saved.framebuffer(),
-                self.saved.position(),
-                &[self.conn],
-                self.saved.mode(),
-            );
+            self.out.restore(&self.card);
         }
         let _ = self.card.destroy_framebuffer(self.fb);
         let _ = self.card.destroy_dumb_buffer(self.db);

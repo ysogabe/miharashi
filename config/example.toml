@@ -11,6 +11,7 @@
 # card = "auto"            # auto / /dev/dri/card1 / pci:0000:0e:00.0 / driver:amdgpu
 # connector = "auto"       # auto / HDMI-A-1 / DP-1 ...
 # mode = "preferred"       # preferred / 1920x1080 / 1920x1080@60
+# renderer = "cpu"         # cpu / gles / auto(GLES を試し、使えなければ cpu に戻る)。描画は表示カードの GPU だけで行う
 
 [input]
 # devices = []             # デバイス名に含む文字列。空なら 4/6 か矢印キーを持つ全キーボード

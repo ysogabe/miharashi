@@ -35,6 +35,8 @@ pub struct Display {
     pub connector: String,
     /// preferred / 1920x1080 / 1920x1080@60
     pub mode: String,
+    /// auto / cpu / gles。auto は GLES(表示カードの GPU)を試し、使えなければ CPU(dumb buffer)に戻る。
+    pub renderer: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -99,6 +101,7 @@ impl Default for Display {
             card: "auto".into(),
             connector: "auto".into(),
             mode: "preferred".into(),
+            renderer: "cpu".into(),
         }
     }
 }
@@ -189,6 +192,9 @@ impl Config {
         if !self.power.price_per_kwh.is_finite() || self.power.price_per_kwh < 0.0 {
             return Err("power.price_per_kwh は 0 以上の数(0 = 電気代を表示しない)".into());
         }
+        if !matches!(self.display.renderer.as_str(), "auto" | "cpu" | "gles") {
+            return Err("display.renderer は auto / cpu / gles".into());
+        }
         if !matches!(self.ui.start_screen.as_str(), "status" | "photo") {
             return Err("ui.start_screen は status か photo".into());
         }
@@ -250,6 +256,7 @@ mod tests {
         );
         assert!(Config::parse("[ui]\nstart_screen = \"menu\"\n").is_err());
         assert!(Config::parse("[metrics]\ngpu = \"rtx\"\n").is_err());
+        assert!(Config::parse("[display]\nrenderer = \"vulkan\"\n").is_err());
     }
 
     #[test]

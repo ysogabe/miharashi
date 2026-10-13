@@ -24,6 +24,7 @@ struct Cli {
     seconds: Option<u64>,
     frames: Option<usize>,
     screen: Option<String>,
+    renderer: Option<String>,
     dummy: bool,
     live: bool,
 }
@@ -41,6 +42,7 @@ fn parse_cli(argv: Vec<String>) -> Result<Cli, String> {
             "--seconds" => c.seconds = Some(v()?.parse().map_err(|_| "bad --seconds")?),
             "--frames" => c.frames = Some(v()?.parse().map_err(|_| "bad --frames")?),
             "--screen" => c.screen = Some(v()?),
+            "--renderer" => c.renderer = Some(v()?),
             "--dummy" => c.dummy = true,
             "--live" => c.live = true,
             "--size" => {
@@ -68,6 +70,12 @@ fn load_config(cli: &Cli) -> Result<Config, String> {
     }
     if let Some(s) = &cli.screen {
         cfg.ui.start_screen = s.clone();
+    }
+    if let Some(r) = &cli.renderer {
+        if !matches!(r.as_str(), "auto" | "cpu" | "gles") {
+            return Err("--renderer は auto / cpu / gles".into());
+        }
+        cfg.display.renderer = r.clone();
     }
     Ok(cfg)
 }
@@ -130,11 +138,19 @@ fn png(cli: Cli) -> Result<(), String> {
     let item = Catalog::open(&source(&cfg, &cli), size)?.current()?;
     let mut text = app::text_engine(&cfg.ui.font);
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+    let mut gles = gles_checker(&cfg, cli.renderer.is_some())?;
     let mut c = Canvas::new(size.0, size.1);
+    let mut save = |c: &Canvas, name: &str| -> Result<(), String> {
+        c.save_png(&out.join(format!("{name}.png")))?;
+        if let Some(check) = gles.as_mut() {
+            check(c, &out.join(format!("{name}-gles.png")))?;
+        }
+        Ok(())
+    };
     screens::status(&mut c, &mut text, &snap, screens::StatusPage::Overview);
-    c.save_png(&out.join("status.png"))?;
+    save(&c, "status")?;
     screens::status(&mut c, &mut text, &snap, screens::StatusPage::Details);
-    c.save_png(&out.join("status-details.png"))?;
+    save(&c, "status-details")?;
     screens::photo_frame(
         &mut c,
         &mut text,
@@ -144,7 +160,7 @@ fn png(cli: Cli) -> Result<(), String> {
         None,
         None,
     );
-    c.save_png(&out.join("photo.png"))?;
+    save(&c, "photo")?;
     println!(
         "wrote {}/{{status,status-details,photo}}.png ({}x{})",
         out.display(),
@@ -152,6 +168,50 @@ fn png(cli: Cli) -> Result<(), String> {
         size.1
     );
     Ok(())
+}
+
+/// `png --renderer gles|auto` の検証。CPU で描いた画像を GLES 経路(表示と同じシェーダー)で
+/// 表示カードの render node に描いて読み戻し、`*-gles.png` に保存して画素の差を出す。
+type GlesCheck = Box<dyn FnMut(&Canvas, &std::path::Path) -> Result<(), String>>;
+
+#[cfg(target_os = "linux")]
+fn gles_checker(cfg: &Config, asked: bool) -> Result<Option<GlesCheck>, String> {
+    use miharashi_linux::drm_select::{CardSel, choose_card, scan};
+    if !asked || cfg.display.renderer == "cpu" {
+        return Ok(None);
+    }
+    let cards = scan();
+    let card = choose_card(&cards, &CardSel::parse(&cfg.display.card))?;
+    let pci = card
+        .pci
+        .as_deref()
+        .ok_or("表示カードの PCI アドレスが分からない")?;
+    let node = miharashi_gpu::render_node_for_pci(pci);
+    let off = miharashi_gpu::Offscreen::open(&node)?;
+    println!("gles: {} ({})", node.display(), off.describe());
+    Ok(Some(Box::new(move |c: &Canvas, path: &std::path::Path| {
+        let (w, h) = (c.width(), c.height());
+        let got = off.render(c.pixmap.data(), (w, h))?;
+        let (over, max) = miharashi_gpu::diff_rgb(c.pixmap.data(), &got, 0);
+        image::RgbaImage::from_raw(w, h, got)
+            .ok_or("読み戻した画像の大きさが違う")?
+            .save(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        println!(
+            "gles: {} 差のある画素 {over} / {}(最大差 {max})",
+            path.display(),
+            w as usize * h as usize
+        );
+        Ok(())
+    })))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn gles_checker(_: &Config, asked: bool) -> Result<Option<GlesCheck>, String> {
+    if asked {
+        return Err("--renderer は Linux 専用".into());
+    }
+    Ok(None)
 }
 
 /// CPU 描画のベースライン。`--size` を省くと 1920x1080 と 2560x1080 の両方を測る。
