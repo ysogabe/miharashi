@@ -1,7 +1,10 @@
 //! 写真の取得元(GEOFRAME か単一ファイル)、並び順、デコードを担当する。
 //! `Feed` は別スレッドで取得・縮小するので、描画ループをブロックしない。
+use crate::screen::{PhotoData, PhotoRef};
 use chrono::{Datelike, NaiveDate};
-use miharashi_render::{Pixmap, photo, photo_layout::PhotoLayout, screens::PhotoInfo};
+use image::DynamicImage;
+use miharashi_render::photo_layout::{self, PhotoLayout};
+use miharashi_render::{Pixmap, photo, screens::PhotoInfo};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::Duration;
@@ -23,11 +26,58 @@ struct Entry {
     taken: String,
 }
 
-pub struct PhotoItem {
+/// 写真の画素。CPU 経路は取得スレッドで完成フレームまで作り、GPU 経路(PoC-005 PR3b)は
+/// デコードしただけの写真を渡して、縮小・ぼかし背景・配置を GPU で行う。
+pub enum PhotoPixels {
     /// 背景と写真を合成した、画面いっぱいの完成フレーム
-    pub frame: Pixmap,
+    Frame(Pixmap),
+    /// デコードしただけの写真(RGB8 か RGBA8)
+    Source(DynamicImage),
+    /// GPU に渡し終えた(CPU 側の画素は捨てた)
+    Resident,
+}
+
+pub struct PhotoItem {
+    pub pixels: PhotoPixels,
     pub layout: PhotoLayout,
     pub info: PhotoInfo,
+    /// GPU 経路で一度 GPU に渡したか(次の描画からは `Resident` にする)
+    pub sent: bool,
+}
+
+impl PhotoItem {
+    /// CPU 経路用に、デコードしただけの写真なら完成フレームを作って置き換える。
+    pub fn ensure_frame(&mut self, (w, h): (u32, u32)) {
+        if let PhotoPixels::Source(img) = &self.pixels {
+            match photo::compose_image(img, w, h, &self.layout) {
+                Ok(f) => self.pixels = PhotoPixels::Frame(f),
+                Err(e) => eprintln!("photo: {e}"),
+            }
+        }
+    }
+
+    /// GPU の合成器に渡す形(`id` は写真の通し番号)。
+    pub fn photo_ref(&self, id: u64) -> PhotoRef<'_> {
+        PhotoRef {
+            id,
+            data: match &self.pixels {
+                PhotoPixels::Frame(f) => PhotoData::Frame(f),
+                PhotoPixels::Source(image) => PhotoData::Source {
+                    image,
+                    layout: &self.layout,
+                },
+                PhotoPixels::Resident => PhotoData::Resident,
+            },
+        }
+    }
+
+    /// 完成フレーム(CPU 経路)。まだ作っていないか、GPU に渡し終えていれば None。
+    pub fn frame(&self) -> Option<&Pixmap> {
+        match &self.pixels {
+            PhotoPixels::Frame(f) => Some(f),
+            _ => None,
+        }
+    }
 }
 
 pub struct Catalog {
@@ -37,6 +87,8 @@ pub struct Catalog {
     size: (u32, u32),
     /// 写真の配置を巡回させる次の候補(左 → 右 → 中央)
     slot: usize,
+    /// GPU 経路なら、GPU で扱える写真の最大の幅と高さ。None なら CPU で完成フレームまで作る
+    pub gpu_max: Option<u32>,
 }
 
 /// 撮影日時の文字列("2026-03-08 13:22" など)を日付と時刻に分ける。
@@ -139,6 +191,7 @@ impl Catalog {
             pos: 0,
             size,
             slot: 0,
+            gpu_max: None,
         })
     }
 
@@ -191,12 +244,28 @@ impl Catalog {
             age,
             position: (self.pos + 1, self.order.len()),
         };
-        // 背景と写真の合成は、新しい写真ごとにここ(取得スレッド)で 1 回だけ行う。
-        let (frame, layout) = photo::compose(&bytes, self.size.0, self.size.1, &mut self.slot)?;
+        let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+        let (w, h) = self.size;
+        let layout = photo_layout::plan(&mut self.slot, w, h, img.width(), img.height());
+        let pixels = match self.gpu_max {
+            // GPU 経路: デコードだけして、縮小と合成は GPU に任せる
+            Some(max) if img.width().max(img.height()) <= max => {
+                PhotoPixels::Source(match img {
+                    DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => img,
+                    other if other.color().has_alpha() => {
+                        DynamicImage::ImageRgba8(other.to_rgba8())
+                    }
+                    other => DynamicImage::ImageRgb8(other.to_rgb8()),
+                })
+            }
+            // 背景と写真の合成は、新しい写真ごとにここ(取得スレッド)で 1 回だけ行う。
+            _ => PhotoPixels::Frame(photo::compose_image(&img, w, h, &layout)?),
+        };
         Ok(PhotoItem {
-            frame,
+            pixels,
             layout,
             info,
+            sent: false,
         })
     }
 }
@@ -266,7 +335,14 @@ pub struct Feed {
 impl Feed {
     /// 一覧の取得と最初の 1 枚の読み込みも別スレッドで行う。GEOFRAME が止まっても、
     /// `min`..`max` の指数バックオフで再接続を続ける(描画ループには影響しない)。
-    pub fn spawn(source: Source, size: (u32, u32), min: Duration, max: Duration) -> Self {
+    /// `gpu_max` は `Catalog::gpu_max` と同じ(GPU 経路なら Some)。
+    pub fn spawn(
+        source: Source,
+        size: (u32, u32),
+        gpu_max: Option<u32>,
+        min: Duration,
+        max: Duration,
+    ) -> Self {
         let (tx, cmd_rx) = channel::<Cmd>();
         let (ev_tx, rx) = channel();
         std::thread::spawn(move || {
@@ -278,7 +354,9 @@ impl Feed {
             loop {
                 let loaded = (|| {
                     if catalog.is_none() {
-                        catalog = Some(Catalog::open(&source, size)?);
+                        let mut c = Catalog::open(&source, size)?;
+                        c.gpu_max = gpu_max;
+                        catalog = Some(c);
                     }
                     catalog
                         .as_mut()
@@ -451,8 +529,9 @@ mod tests {
             pos: 0,
             size: (32, 18),
             slot: 0,
+            gpu_max: None,
         };
-        let red = |c: &mut Catalog| c.current().unwrap().frame.data()[0];
+        let red = |c: &mut Catalog| c.current().unwrap().frame().unwrap().data()[0];
         assert_eq!(
             (red(&mut cat), cat.current().unwrap().info.position),
             (200, (1, 3))
@@ -526,6 +605,7 @@ mod tests {
         let feed = Feed::spawn(
             Source::Geoframe(url),
             (64, 36),
+            None,
             Duration::from_millis(50),
             Duration::from_millis(200),
         );
@@ -563,6 +643,7 @@ mod tests {
         let feed = Feed::spawn(
             Source::Geoframe(url),
             (64, 36),
+            None,
             Duration::from_millis(50),
             Duration::from_millis(200),
         );
