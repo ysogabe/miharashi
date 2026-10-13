@@ -39,18 +39,21 @@ fn full() -> Snapshot {
         gpus: vec![
             GpuLoad {
                 label: "GPU0".into(),
+                name: "RTX 5090".into(),
                 usage: Some(97.0),
                 temp: Some(84.0),
                 history: wave(n, 60.0, 30.0, 40.0),
             },
             GpuLoad {
                 label: "GPU1".into(),
+                name: "RTX 4090".into(),
                 usage: Some(41.0),
                 temp: Some(66.0),
                 history: wave(n, 40.0, 20.0, 70.0),
             },
             GpuLoad {
                 label: "GPU2".into(),
+                name: "Radeon(内蔵)".into(),
                 usage: Some(3.0),
                 temp: None,
                 history: wave(n, 5.0, 4.0, 90.0),

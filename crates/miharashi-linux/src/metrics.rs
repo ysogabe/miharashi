@@ -52,10 +52,20 @@ pub struct Sample {
 /// GPU 1 台分の使用率と温度。
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct GpuReading {
-    /// "GPU0", "GPU1", ...
+    /// "GPU0", "GPU1", ...(状態ログのキー。番号は変えない)
     pub label: String,
+    /// 画面に出す名前("RTX 5060 Ti"、"Radeon(内蔵)" など)
+    pub name: String,
     pub usage: Option<f32>,
     pub temp: Option<f32>,
+}
+
+/// 画面用に GPU の名前を短くする("NVIDIA GeForce RTX 5060 Ti" → "RTX 5060 Ti")。
+pub fn short_gpu_name(name: &str) -> String {
+    let n = name.trim();
+    let n = n.strip_prefix("NVIDIA ").unwrap_or(n);
+    let n = n.strip_prefix("GeForce ").unwrap_or(n);
+    n.to_string()
 }
 
 /// amdgpu の GPU(内蔵 Radeon など)。sysfs から使用率と温度を読む。
@@ -260,6 +270,11 @@ impl Sampler {
                 })
                 .unwrap_or_default();
             let sysfs_gpus = find_sysfs_gpus(std::path::Path::new("/sys/class/drm"));
+            let display_names: Vec<String> = nvml_all
+                .iter()
+                .map(|d| short_gpu_name(&d.name().unwrap_or_else(|_| "NVIDIA".into())))
+                .chain(sysfs_gpus.iter().map(|_| "Radeon(内蔵)".to_string()))
+                .collect();
             let mut names: Vec<String> = nvml_all
                 .iter()
                 .map(|d| d.name().unwrap_or_else(|_| "NVIDIA".into()))
@@ -380,6 +395,7 @@ impl Sampler {
                             .enumerate()
                             .map(|(i, (usage, temp))| GpuReading {
                                 label: format!("GPU{i}"),
+                                name: display_names.get(i).cloned().unwrap_or_default(),
                                 usage,
                                 temp,
                             })
@@ -555,6 +571,13 @@ fn find_fan_inputs() -> Vec<(String, std::path::PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_names_are_shortened_for_screen() {
+        assert_eq!(short_gpu_name("NVIDIA GeForce RTX 5060 Ti"), "RTX 5060 Ti");
+        assert_eq!(short_gpu_name("NVIDIA RTX A2000"), "RTX A2000");
+        assert_eq!(short_gpu_name("Tesla T4"), "Tesla T4");
+    }
 
     #[test]
     fn live_sampler_reports_cpu_and_memory() {
