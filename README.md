@@ -25,7 +25,7 @@ cargo test
 ./target/release/miharashi run --config config/example.toml   # 実機表示(直接オープンは video・input グループが必要)
 ```
 
-常駐させる場合は `sudo systemd/install.sh <実行ユーザー>` で systemd サービスを導入します(root では動かしません)。設定は [`config/example.toml`](config/example.toml)、運用手順と復旧方法は [PoC-002](docs/poc/POC-002.md) を参照してください。
+常駐させる場合は `sudo systemd/install.sh <実行ユーザー>` で systemd サービスを導入します(root では動かしません)。Home Assistant の在宅判定で画面を消す場合は、設定の `[home_assistant]` と `[screen_power]` を埋め、トークンを `token_file` に置きます。設定は [`config/example.toml`](config/example.toml)、運用手順と復旧方法は [PoC-002](docs/poc/POC-002.md) を参照してください。
 
 ## 作成物
 

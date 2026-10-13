@@ -8,6 +8,7 @@ mod photos;
 #[cfg(target_os = "linux")]
 mod runtime;
 mod screen;
+mod screen_power;
 
 use config::Config;
 use miharashi_render::{Canvas, photo, screens};
