@@ -1,5 +1,6 @@
 //! Miharashi: Linux キオスク・ダッシュボード。`run`(実機)、`png`(ヘッドレス)、`kms-info`、
 //! `bench`(CPU 描画のベースライン)。
+mod album;
 mod app;
 mod bench;
 mod config;
@@ -14,7 +15,7 @@ mod screen_power;
 
 use config::Config;
 use miharashi_render::{Canvas, photo, screens};
-use photos::{Catalog, PhotoItem, PhotoPixels, Source};
+use photos::{Catalog, Grouping, HomeLookup, PhotoItem, PhotoPixels, Source};
 use std::path::PathBuf;
 
 #[derive(Default)]
@@ -146,9 +147,21 @@ fn png(cli: Cli) -> Result<(), String> {
     }
     let mut gles = gles_checker(&cfg, cli.renderer.is_some())?;
     // GLES の検証では写真をデコードしただけで受け取って GPU で合成し、CPU 版の完成フレームは別に作る
-    let mut catalog = Catalog::open(&source(&cfg, &cli), size)?;
+    let src = source(&cfg, &cli);
+    let grouping = Grouping {
+        home: match src {
+            Source::Geoframe(_) => HomeLookup {
+                ha: cfg.home_assistant.clone(),
+                radius_km: cfg.geoframe.home_radius_km,
+            }
+            .resolve(),
+            Source::File(..) => None,
+        },
+        radius_km: cfg.geoframe.home_radius_km,
+    };
+    let mut catalog = Catalog::open(&src, size, &grouping)?;
     catalog.gpu_max = gles.is_some().then_some(u32::MAX);
-    let item = catalog.current()?;
+    let item = catalog.current_photo()?;
     let frame = match &item.pixels {
         PhotoPixels::Source(img) => photo::compose_image(img, size.0, size.1, &item.layout)?,
         PhotoPixels::Frame(f) => f.clone(),
@@ -207,8 +220,19 @@ fn png(cli: Cli) -> Result<(), String> {
     miharashi_render::alert::disaster_overlay(&mut overlay, &mut text, &dv);
     miharashi_render::alert::disaster_overlay(&mut c, &mut text, &dv);
     save(&c, Some((&item, &overlay)), "alert-disaster")?;
+    // 旅のカード(一覧に旅があればそのうち最大のもの、なければ見本)
+    std::fs::write(out.join("groups.txt"), catalog.group_summary()).map_err(|e| e.to_string())?;
+    let cards = [
+        (catalog.sample_card(false).unwrap_or_else(album::demo_card), "trip-card"),
+        (catalog.sample_card(true).unwrap_or_else(album::demo_card), "everyday-card"),
+    ];
+    for (card, name) in cards {
+        miharashi_render::trip_card::trip_card(&mut overlay, &mut text, &card);
+        miharashi_render::trip_card::trip_card(&mut c, &mut text, &card);
+        save(&c, Some((&item, &overlay)), name)?;
+    }
     println!(
-        "wrote {}/{{status,status-details,photo,alert-quake,alert-disaster}}.png ({}x{})",
+        "wrote {}/{{status,status-details,photo,alert-quake,alert-disaster,trip-card,everyday-card}}.png ({}x{})",
         out.display(),
         size.0,
         size.1

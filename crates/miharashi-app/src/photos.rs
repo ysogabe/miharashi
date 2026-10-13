@@ -5,6 +5,8 @@ use chrono::{Datelike, NaiveDate};
 use image::DynamicImage;
 use miharashi_render::photo_layout::{self, PhotoLayout};
 use miharashi_render::{Pixmap, photo, screens::PhotoInfo};
+use crate::album::{self, Group, Meta, Scheduler, Slot};
+use miharashi_render::trip_card::TripCard;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::Duration;
@@ -82,13 +84,33 @@ impl PhotoItem {
 
 pub struct Catalog {
     entries: Vec<Entry>,
-    order: Vec<usize>,
+    /// 写真ごとの、並べ方に使う情報(GEOFRAME のときだけ。単一ファイルでは空)
+    metas: Vec<Meta>,
+    groups: Vec<Group>,
+    /// 旅・季節ごとに並べる(GEOFRAME のとき)。None なら `queue` を先頭から繰り返す
+    sched: Option<Scheduler>,
+    queue: Vec<Slot>,
     pos: usize,
     size: (u32, u32),
     /// 写真の配置を巡回させる次の候補(左 → 右 → 中央)
     slot: usize,
     /// GPU 経路なら、GPU で扱える写真の最大の幅と高さ。None なら CPU で完成フレームまで作る
     pub gpu_max: Option<u32>,
+}
+
+/// 次に見せるもの。
+pub enum Shown {
+    Photo(PhotoItem),
+    /// 旅・季節の切り替わりのカード
+    Card(TripCard),
+}
+
+/// 写真を旅と季節に分けるための設定。
+#[derive(Debug, Clone)]
+pub struct Grouping {
+    /// 自宅の (緯度, 経度)。分からなければ None(GEOFRAME の旅番号を使う)
+    pub home: Option<(f64, f64)>,
+    pub radius_km: f64,
 }
 
 /// 撮影日時の文字列("2026-03-08 13:22" など)を日付と時刻に分ける。
@@ -146,16 +168,9 @@ fn read_all(req: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())
 }
 
-fn xorshift(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    *state
-}
-
 impl Catalog {
-    pub fn open(source: &Source, size: (u32, u32)) -> Result<Self, String> {
-        let (entries, preferred) = match source {
+    pub fn open(source: &Source, size: (u32, u32), grouping: &Grouping) -> Result<Self, String> {
+        let (entries, metas) = match source {
             Source::File(p, caption) => {
                 let name = p
                     .file_name()
@@ -165,74 +180,144 @@ impl Catalog {
                     place: caption.clone().unwrap_or(name),
                     taken: String::new(),
                 };
-                (vec![e], vec![0])
+                (vec![e], Vec::new())
             }
             Source::Geoframe(base) => Self::list_geoframe(base)?,
         };
         if entries.is_empty() {
             return Err("写真が 1 枚もない".into());
         }
-        // 推奨・お気に入りが 5 枚以上あればそれらだけ、なければ全件を対象にする。
-        let mut order = if preferred.len() >= 5 {
-            preferred
-        } else {
-            (0..entries.len()).collect()
-        };
-        let mut seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0x9e3779b97f4a7c15, |d| d.as_nanos() as u64)
-            | 1;
-        for i in (1..order.len()).rev() {
-            order.swap(i, (xorshift(&mut seed) % (i as u64 + 1)) as usize);
-        }
-        Ok(Self {
+        let mut cat = Self {
             entries,
-            order,
+            metas,
+            groups: Vec::new(),
+            sched: None,
+            queue: Vec::new(),
             pos: 0,
             size,
             slot: 0,
             gpu_max: None,
-        })
+        };
+        if cat.metas.is_empty() {
+            let n = cat.entries.len();
+            cat.queue = (0..n)
+                .map(|entry| Slot::Photo {
+                    entry,
+                    k: entry + 1,
+                    n,
+                })
+                .collect();
+            return Ok(cat);
+        }
+        // 海外の写真は地名が空なので、国と都市を引いて写真の説明にも使う
+        let overseas = album::overseas_places(&cat.metas);
+        for (i, (country, city)) in &overseas {
+            if let Some(e) = cat.entries.get_mut(*i) {
+                e.place = format!("{country} {city}").trim().to_string();
+            }
+        }
+        cat.groups = album::build_groups(&cat.metas, &overseas, grouping.home, grouping.radius_km);
+        let trips = cat.groups.iter().filter(|g| !g.everyday).count();
+        eprintln!(
+            "photos: 対象 {} 枚 / 旅 {} / 暮らし {} / 自宅={}",
+            cat.entries.len(),
+            trips,
+            cat.groups.len() - trips,
+            if grouping.home.is_some() {
+                "HA"
+            } else {
+                "不明(GEOFRAME の旅番号を使う)"
+            }
+        );
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0x9e3779b97f4a7c15, |d| d.as_nanos() as u64);
+        let mut sched = Scheduler::new(seed);
+        cat.queue = sched.next_round(&cat.groups, &cat.metas, chrono::Local::now().naive_local());
+        cat.sched = Some(sched);
+        Ok(cat)
     }
 
-    fn list_geoframe(base: &str) -> Result<(Vec<Entry>, Vec<usize>), String> {
+    /// GEOFRAME の一覧から、表示対象の写真と並べ方の情報を読む。
+    fn list_geoframe(base: &str) -> Result<(Vec<Entry>, Vec<Meta>), String> {
         let base = base.trim_end_matches('/');
         let body = read_all(
-            ureq::get(&format!("{base}/api/photos"))
+            ureq::get(&format!("{base}/api/v1/photos"))
                 .call()
                 .map_err(|e| format!("GEOFRAME: {e}"))?,
         )?;
         let list: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
-        let arr = list.as_array().ok_or("unexpected /api/photos")?;
-        let (mut entries, mut preferred) = (Vec::new(), Vec::new());
+        let arr = list.as_array().ok_or("unexpected /api/v1/photos")?;
+        let (mut entries, mut metas) = (Vec::new(), Vec::new());
+        let text = |p: &serde_json::Value, k: &str| p[k].as_str().unwrap_or("").to_string();
         for p in arr {
             let Some(file) = p["file"].as_str() else {
                 continue;
             };
-            if p["quality_recommended"] == true || p["fav"] == true {
-                preferred.push(entries.len());
+            let fav = p["fav"] == true;
+            if !album::eligible(
+                p["quality_kind"].as_str().unwrap_or(""),
+                p["quality_recommended"] == true,
+                fav,
+            ) {
+                continue;
             }
-            let place = format!(
-                "{} {}",
-                p["pref"].as_str().unwrap_or(""),
-                p["title"].as_str().unwrap_or("")
-            );
+            let place = format!("{} {}", text(p, "pref"), text(p, "title"));
             entries.push(Entry {
                 origin: Origin::Url(format!("{base}/{file}")),
                 place: place.trim().to_string(),
-                taken: p["time"].as_str().unwrap_or("").to_string(),
+                taken: text(p, "time"),
+            });
+            metas.push(Meta {
+                lat: p["lat"].as_f64(),
+                lon: p["lon"].as_f64(),
+                time: text(p, "time"),
+                pref: text(p, "pref"),
+                city: text(p, "city"),
+                fav,
+                fetched_at: text(p, "fetched_at"),
+                trip: p["trip"].as_i64(),
             });
         }
-        Ok((entries, preferred))
+        Ok((entries, metas))
     }
 
     pub fn advance(&mut self, delta: isize) {
-        let n = self.order.len() as isize;
-        self.pos = (self.pos as isize + delta).rem_euclid(n) as usize;
+        let next = self.pos as isize + delta;
+        let Some(sched) = self.sched.as_mut() else {
+            self.pos = next.rem_euclid(self.queue.len() as isize) as usize;
+            return;
+        };
+        if next < 0 {
+            return; // 最初より前へは戻らない
+        }
+        self.pos = next as usize;
+        if self.pos >= self.queue.len() {
+            let round = sched.next_round(&self.groups, &self.metas, chrono::Local::now().naive_local());
+            self.queue.extend(round);
+        }
+        // 戻れる範囲を残して古いコマを捨てる(増え続けないように)
+        const KEEP_BACK: usize = 200;
+        if self.pos > 4000 {
+            let drop = self.pos - KEEP_BACK;
+            self.queue.drain(..drop);
+            self.pos -= drop;
+        }
     }
 
-    pub fn current(&mut self) -> Result<PhotoItem, String> {
-        let e = &self.entries[self.order[self.pos]];
+    pub fn current(&mut self) -> Result<Shown, String> {
+        let (index, k, n) = match self.queue.get(self.pos).copied() {
+            Some(Slot::Card(g)) => {
+                let card = self.groups.get(g).ok_or("まとまりがない")?.card.clone();
+                return Ok(Shown::Card(card));
+            }
+            Some(Slot::Photo { entry, k, n }) => (entry, k, n),
+            None => return Err("再生順が空".into()),
+        };
+        if let Some(s) = self.sched.as_mut() {
+            s.mark(index);
+        }
+        let e = &self.entries[index];
         let bytes = match &e.origin {
             Origin::Url(u) => read_all(ureq::get(u).call().map_err(|err| format!("{u}: {err}"))?)?,
             Origin::File(p) => std::fs::read(p).map_err(|err| format!("{}: {err}", p.display()))?,
@@ -242,7 +327,7 @@ impl Catalog {
             place: e.place.clone(),
             taken,
             age,
-            position: (self.pos + 1, self.order.len()),
+            position: (k, n),
         };
         let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
         let (w, h) = self.size;
@@ -261,12 +346,49 @@ impl Catalog {
             // 背景と写真の合成は、新しい写真ごとにここ(取得スレッド)で 1 回だけ行う。
             _ => PhotoPixels::Frame(photo::compose_image(&img, w, h, &layout)?),
         };
-        Ok(PhotoItem {
+        Ok(Shown::Photo(PhotoItem {
             pixels,
             layout,
             info,
             sent: false,
-        })
+        }))
+    }
+
+    /// 次の写真(カードは飛ばす)。`png` の出力用。
+    pub fn current_photo(&mut self) -> Result<PhotoItem, String> {
+        for _ in 0..64 {
+            if let Shown::Photo(p) = self.current()? {
+                return Ok(p);
+            }
+            self.advance(1);
+        }
+        Err("写真が見つからない".into())
+    }
+
+    /// まとまりの一覧(`png` の確認用)。
+    pub fn group_summary(&self) -> String {
+        self.groups
+            .iter()
+            .map(|g| {
+                format!(
+                    "{}\t{}\t{}\t{}枚\t{}\n",
+                    if g.everyday { "暮らし" } else { "旅" },
+                    g.card.title,
+                    g.card.period,
+                    g.members.len(),
+                    g.card.places.join("・")
+                )
+            })
+            .collect()
+    }
+
+    /// いちばん大きい旅(`everyday` なら季節)のカード。`png` の出力用。
+    pub fn sample_card(&self, everyday: bool) -> Option<TripCard> {
+        self.groups
+            .iter()
+            .filter(|g| g.everyday == everyday && g.members.len() >= album::CARD_MIN)
+            .max_by_key(|g| g.members.len())
+            .map(|g| g.card.clone())
     }
 }
 
@@ -324,7 +446,36 @@ pub enum FeedStatus {
 
 pub enum FeedEvent {
     Photo(PhotoItem),
+    /// 旅・季節の切り替わりのカード
+    Card(TripCard),
     Status(FeedStatus),
+}
+
+/// 自宅の位置の調べ方(Home Assistant)。写真を旅と季節に分けるのに使う。
+#[derive(Debug, Clone)]
+pub struct HomeLookup {
+    pub ha: crate::config::HomeAssistant,
+    pub radius_km: f64,
+}
+
+impl HomeLookup {
+    /// 自宅の位置。HA が未設定か、取れなければ None。
+    pub fn resolve(&self) -> Option<(f64, f64)> {
+        if self.ha.url.is_empty() {
+            return None;
+        }
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .build()
+            .into();
+        match crate::quake::home_location(&agent, &self.ha) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("photos: 自宅の位置を取れない(GEOFRAME の旅番号でまとめる): {e}");
+                None
+            }
+        }
+    }
 }
 
 pub struct Feed {
@@ -336,16 +487,22 @@ impl Feed {
     /// 一覧の取得と最初の 1 枚の読み込みも別スレッドで行う。GEOFRAME が止まっても、
     /// `min`..`max` の指数バックオフで再接続を続ける(描画ループには影響しない)。
     /// `gpu_max` は `Catalog::gpu_max` と同じ(GPU 経路なら Some)。
+    /// `home` があれば、一覧を取り直すたびに自宅の位置を調べ(取れたら覚えておく)、旅と季節に分ける。
     pub fn spawn(
         source: Source,
         size: (u32, u32),
         gpu_max: Option<u32>,
         min: Duration,
         max: Duration,
+        home: Option<HomeLookup>,
     ) -> Self {
         let (tx, cmd_rx) = channel::<Cmd>();
         let (ev_tx, rx) = channel();
-        std::thread::spawn(move || {
+        let spawned = std::thread::Builder::new().name("photos".into()).spawn(move || {
+            let mut grouping = Grouping {
+                home: None,
+                radius_km: home.as_ref().map_or(50.0, |h| h.radius_km),
+            };
             let mut backoff = Backoff::new(min, max);
             let mut catalog: Option<Catalog> = None;
             let mut delta = 1isize;
@@ -354,7 +511,10 @@ impl Feed {
             loop {
                 let loaded = (|| {
                     if catalog.is_none() {
-                        let mut c = Catalog::open(&source, size)?;
+                        if grouping.home.is_none() && matches!(source, Source::Geoframe(_)) {
+                            grouping.home = home.as_ref().and_then(HomeLookup::resolve);
+                        }
+                        let mut c = Catalog::open(&source, size, &grouping)?;
                         c.gpu_max = gpu_max;
                         catalog = Some(c);
                     }
@@ -370,7 +530,11 @@ impl Feed {
                         offline = false;
                         backoff.reset();
                         photo_failures = 0;
-                        if ev_tx.send(FeedEvent::Photo(item)).is_err() {
+                        let ev = match item {
+                            Shown::Photo(p) => FeedEvent::Photo(p),
+                            Shown::Card(c) => FeedEvent::Card(c),
+                        };
+                        if ev_tx.send(ev).is_err() {
                             return;
                         }
                         match cmd_rx.recv() {
@@ -414,6 +578,9 @@ impl Feed {
                 }
             }
         });
+        if let Err(e) = spawned {
+            eprintln!("photos: スレッドを起動できない: {e}");
+        }
         Self { tx, rx }
     }
 
@@ -446,7 +613,7 @@ mod tests {
         out
     }
 
-    /// GEOFRAME の最小モック。/api/photos と /derivatives/a.png だけを返す。
+    /// GEOFRAME の最小モック。/api/v1/photos と /derivatives/a.png だけを返す。
     fn mock_server(port: u16) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -463,8 +630,8 @@ mod tests {
                 let mut buf = [0u8; 2048];
                 let n = s.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                let (ctype, body): (&str, Vec<u8>) = if req.starts_with("GET /api/photos") {
-                    ("application/json", br#"[{"file":"derivatives/a.png","title":"T","pref":"P","time":"2026-01-01 00:00"}]"#.to_vec())
+                let (ctype, body): (&str, Vec<u8>) = if req.starts_with("GET /api/v1/photos") {
+                    ("application/json", br#"[{"file":"derivatives/a.png","title":"T","pref":"P","time":"2026-01-01 00:00","lat":35.0,"lon":139.0,"trip":0}]"#.to_vec())
                 } else {
                     ("image/png", png.clone())
                 };
@@ -525,28 +692,37 @@ mod tests {
             .collect();
         let mut cat = Catalog {
             entries,
-            order: vec![0, 1, 2],
+            metas: Vec::new(),
+            groups: Vec::new(),
+            sched: None,
+            queue: (0..3)
+                .map(|entry| Slot::Photo {
+                    entry,
+                    k: entry + 1,
+                    n: 3,
+                })
+                .collect(),
             pos: 0,
             size: (32, 18),
             slot: 0,
             gpu_max: None,
         };
-        let red = |c: &mut Catalog| c.current().unwrap().frame().unwrap().data()[0];
+        let red = |c: &mut Catalog| c.current_photo().unwrap().frame().unwrap().data()[0];
         assert_eq!(
-            (red(&mut cat), cat.current().unwrap().info.position),
+            (red(&mut cat), cat.current_photo().unwrap().info.position),
             (200, (1, 3))
         );
         cat.advance(1);
-        assert_eq!(cat.current().unwrap().info.place, "p1");
+        assert_eq!(cat.current_photo().unwrap().info.place, "p1");
         cat.advance(1);
         cat.advance(1);
         assert_eq!(
-            cat.current().unwrap().info.position,
+            cat.current_photo().unwrap().info.position,
             (1, 3),
             "末尾の次は先頭へ戻る"
         );
         cat.advance(-1);
-        assert_eq!(cat.current().unwrap().info.place, "p2", "先頭の前は末尾へ");
+        assert_eq!(cat.current_photo().unwrap().info.place, "p2", "先頭の前は末尾へ");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -608,6 +784,7 @@ mod tests {
             None,
             Duration::from_millis(50),
             Duration::from_millis(200),
+            None,
         );
         assert!(
             wait_event(&feed, 5, |e| matches!(e, FeedEvent::Photo(_))),
@@ -646,6 +823,7 @@ mod tests {
             None,
             Duration::from_millis(50),
             Duration::from_millis(200),
+            None,
         );
         assert!(wait_event(&feed, 5, |e| matches!(
             e,
