@@ -1,6 +1,6 @@
 //! 旅と「いつもの暮らし」の切り替わりに挟むカード。左に撮影地点の地図、右に名前・期間・枚数。
 use crate::canvas::{Canvas, rgba};
-use crate::geo::{countries, overlaps, prefs, projector};
+use crate::geo::{countries, distance_km, overlaps, prefs, projector};
 use crate::photo_layout::scale;
 use crate::text::TextEngine;
 
@@ -162,6 +162,84 @@ fn draw_map(c: &mut Canvas, card: &TripCard, accent: [u8; 3], k: f32) {
             c.fill_circle(hx, hy, 7.0 * k, rgba(30, 140, 255, 255));
         }
     }
+    if let Some(b) = locator_bounds(card) {
+        draw_locator(c, card, b, accent, k);
+    }
+}
+
+/// 遠い旅(自宅から 1000km 以上)の広域図の範囲。自宅と旅先が両方入り、最低 30×20 度。
+fn locator_bounds(card: &TripCard) -> Option<(f64, f64, f64, f64)> {
+    let home = card.home?;
+    if card.everyday || !card.points.iter().any(|&p| distance_km(home, p) >= 1000.0) {
+        return None;
+    }
+    let (mut x0, mut x1, mut y0, mut y1) = (home.1, home.1, home.0, home.0);
+    for &(lat, lon) in &card.points {
+        (x0, x1, y0, y1) = (x0.min(lon), x1.max(lon), y0.min(lat), y1.max(lat));
+    }
+    let (pad_x, pad_y) = ((x1 - x0) * 0.15 + 4.0, (y1 - y0) * 0.15 + 4.0);
+    (x0, x1, y0, y1) = (x0 - pad_x, x1 + pad_x, y0 - pad_y, y1 + pad_y);
+    for (lo, hi, min) in [(&mut x0, &mut x1, 30.0), (&mut y0, &mut y1, 20.0)] {
+        let span = *hi - *lo;
+        if span < min {
+            *lo -= (min - span) / 2.0;
+            *hi += (min - span) / 2.0;
+        }
+    }
+    Some((x0.max(-180.0), x1.min(180.0), y0.max(-80.0), y1.min(84.0)))
+}
+
+/// 地図の左下に、自宅(★の代わりに青い点)と旅先を結ぶ広域図を重ねる。
+fn draw_locator(
+    c: &mut Canvas,
+    card: &TripCard,
+    view: (f64, f64, f64, f64),
+    accent: [u8; 3],
+    k: f32,
+) {
+    let (w, h) = (c.width() as f32, c.height() as f32);
+    let iw = (w * 0.42).round();
+    let ih = (iw * 0.62).round();
+    let (ix, iy) = (16.0 * k, h - ih - 16.0 * k);
+    let mut m = Canvas::new(iw.max(1.0) as u32, ih.max(1.0) as u32);
+    m.clear(rgba(6, 14, 26, 255));
+    let proj = projector(view, (0.0, 0.0, iw, ih));
+    for r in countries().iter().filter(|r| overlaps(r.bbox, view)) {
+        let rings: Vec<Vec<(f32, f32)>> = r
+            .rings
+            .iter()
+            .map(|ring| ring.iter().map(|&(lon, lat)| proj(lon, lat)).collect())
+            .collect();
+        m.fill_rings(&rings, rgba(52, 66, 86, 255));
+    }
+    let [r, g, b] = accent;
+    // 旅先は、ほかの撮影地点との距離の合計が最も小さい地点(乗り継ぎ地に引っ張られない)
+    let pts = &card.points;
+    let step = (pts.len() / 200).max(1); // 多いときは間引いて比べる
+    let (clat, clon) = pts
+        .iter()
+        .step_by(step)
+        .min_by(|a, b| {
+            let cost = |p: &(f64, f64)| -> f64 {
+                pts.iter()
+                    .step_by(step)
+                    .map(|q| (p.0 - q.0).abs() + (p.1 - q.1).abs())
+                    .sum()
+            };
+            cost(a).total_cmp(&cost(b))
+        })
+        .copied()
+        .unwrap_or_default();
+    let dest = proj(clon, clat);
+    if let Some((lat, lon)) = card.home {
+        let home = proj(lon, lat);
+        m.polyline(&[home, dest], 2.5 * k, rgba(r, g, b, 200));
+        m.fill_circle(home.0, home.1, 8.0 * k, rgba(255, 255, 255, 255));
+        m.fill_circle(home.0, home.1, 5.0 * k, rgba(30, 140, 255, 255));
+    }
+    m.fill_circle(dest.0, dest.1, 8.0 * k, rgba(r, g, b, 255));
+    c.draw_pixmap(&m.pixmap, ix as i32, iy as i32);
+    c.stroke_rect(ix, iy, iw, ih, 2.0 * k, rgba(150, 165, 185, 255));
 }
 
 #[cfg(test)]
@@ -192,5 +270,24 @@ mod tests {
         assert!(e.0 < 139.767 && 139.767 < e.1 && e.2 < 35.681 && 35.681 < e.3);
         assert!(e.3 - e.2 < 2.0);
         assert_eq!(bounds(&card(false, vec![])).0, 122.5);
+    }
+
+    #[test]
+    fn locator_only_for_far_trips_and_covers_home() {
+        assert!(
+            locator_bounds(&card(false, vec![(36.3, 139.0)])).is_none(),
+            "国内"
+        );
+        assert!(
+            locator_bounds(&card(true, vec![(39.65, 66.96)])).is_none(),
+            "暮らし"
+        );
+        let b = locator_bounds(&card(false, vec![(39.65, 66.96), (41.31, 69.28)])).unwrap();
+        assert!(b.0 < 66.96 && b.1 > 139.767 && b.2 < 35.681 && b.3 > 41.31);
+        let near = locator_bounds(&card(false, vec![(25.03, 121.56)])).unwrap();
+        assert!(
+            near.1 - near.0 >= 30.0 && near.3 - near.2 >= 20.0,
+            "台湾でも最低の広さ"
+        );
     }
 }
