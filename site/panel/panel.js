@@ -1,14 +1,16 @@
 "use strict";
 
-// パネルのプレビュー。キオスクには接続せず、4 / 6 で画面の巡回、5 で状況画面のページ切替を模す。
+// パネルのプレビュー。キオスクには接続せず、4 / 6 で画面の巡回、5 で状況画面のページ切替、レールで直接遷移を模す。
 (() => {
   const screens = [
-    { id: "status", pages: ["OVERVIEW", "DETAILS"] },
-    { id: "photo", pages: null },
-    { id: "agent", pages: ["LIST"] },
+    { id: "status", title: "01 SERVER STATUS", pages: ["OVERVIEW", "DETAILS"] },
+    { id: "photo", title: "02 PHOTO FRAME", pages: null },
+    { id: "agent", title: "03 AGENT", pages: ["LIST"] },
   ];
   const device = document.querySelector("[data-panel]");
   const strip = [...document.querySelectorAll("#screen-strip li")];
+  const rail = [...document.querySelectorAll("[data-screen]")];
+  const title = document.getElementById("panel-screen-title");
   const detail = document.getElementById("panel-detail");
   const photo = document.getElementById("panel-photo");
   const selectLabel = document.getElementById("select-label");
@@ -22,6 +24,7 @@
   function render() {
     strip.forEach((li, i) => li.classList.toggle("is-current", i === index));
     const s = screens[index];
+    title.textContent = s.title;
     if (s.pages) {
       detail.textContent = s.pages[page % s.pages.length];
       detail.hidden = false;
@@ -35,6 +38,12 @@
     }
   }
 
+  function flash(button) {
+    if (!button) return;
+    button.classList.add("is-pressed");
+    setTimeout(() => button.classList.remove("is-pressed"), 120);
+  }
+
   function act(key) {
     if (key === "prev") index = (index + screens.length - 1) % screens.length;
     else if (key === "next") index = (index + 1) % screens.length;
@@ -43,14 +52,17 @@
       else position = (position % total) + 1;
     }
     render();
-    const button = keys.find((k) => k.dataset.key === key);
-    if (button) {
-      button.classList.add("is-pressed");
-      setTimeout(() => button.classList.remove("is-pressed"), 120);
-    }
+    flash(keys.find((k) => k.dataset.key === key));
   }
 
   keys.forEach((k) => k.addEventListener("click", () => act(k.dataset.key)));
+  rail.forEach((b) =>
+    b.addEventListener("click", () => {
+      index = Number(b.dataset.screen) % screens.length;
+      render();
+      flash(b);
+    }),
+  );
   if (device) {
     device.addEventListener("keydown", (ev) => {
       const map = { 4: "prev", 6: "next", 5: "select", ArrowLeft: "prev", ArrowRight: "next" };
