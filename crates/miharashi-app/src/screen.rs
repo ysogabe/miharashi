@@ -32,6 +32,32 @@ pub trait App {
     }
     /// 状態ログ用。runtime は中身を解釈せず、`k=v` を並べて出す。
     fn stats(&self) -> Vec<(&'static str, String)>;
+    /// 操作パネルの `/api/v1/status` に出す画面の状態。出さない画面ロジックは None。
+    fn panel_view(&self) -> Option<PanelView> {
+        None
+    }
+}
+
+/// 登録されている画面 1 つ。`id` はパネルとの約束なので変えない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenInfo {
+    pub id: &'static str,
+    pub title: &'static str,
+}
+
+/// 操作パネルに見せる画面の状態(docs/panel/DESIGN.md §5.2)。変わったときだけパネルへ送る。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelView {
+    /// 画面の一覧(切り替わる順)
+    pub screens: Vec<ScreenInfo>,
+    /// 表示中の画面(`screens` の添字)
+    pub current: usize,
+    /// 画面の中のページ名(状況画面の OVERVIEW / DETAILS)
+    pub page: Option<&'static str>,
+    /// 写真の (何枚目, 全体の枚数)。まだ写真が無ければ None
+    pub photo: Option<(usize, usize)>,
+    /// 写真の取得元に接続できているか
+    pub feed_online: bool,
 }
 
 /// 写真のフレームの中身。
