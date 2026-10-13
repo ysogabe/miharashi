@@ -1,9 +1,9 @@
 //! 全画面の上に重ねるアラート(地震・災害)。左に地図、右に要点を大きく出す。
 //! 画面の種類に依存しないので、状況画面でも写真画面(GPU の重ね絵)でも同じ関数で描く。
 use crate::canvas::{Canvas, rgba};
+use crate::geo::{prefs, projector};
 use crate::photo_layout::scale;
 use crate::text::TextEngine;
-use std::sync::OnceLock;
 
 /// 震度の段階。1〜4 はそのまま、5 弱 = 5、5 強 = 6、6 弱 = 7、6 強 = 8、7 = 9。
 pub type Intensity = u8;
@@ -76,42 +76,6 @@ pub struct QuakeView {
     pub prefs: Vec<(String, Intensity)>,
 }
 
-struct Pref {
-    code: String,
-    rings: Vec<Vec<(f64, f64)>>,
-}
-
-/// 同梱の都道府県ポリゴン(経度, 緯度)。最初に使うときに 1 回だけ読む。
-fn prefs() -> &'static [Pref] {
-    static PREFS: OnceLock<Vec<Pref>> = OnceLock::new();
-    PREFS.get_or_init(|| parse_prefs(include_str!("../assets/japan_prefs.txt")))
-}
-
-fn parse_prefs(text: &str) -> Vec<Pref> {
-    let mut out: Vec<Pref> = Vec::new();
-    for line in text.lines().filter(|l| !l.starts_with('#')) {
-        let mut it = line.split(' ');
-        let Some(code) = it.next() else { continue };
-        let ring: Vec<(f64, f64)> = it
-            .filter_map(|p| {
-                let (lon, lat) = p.split_once(',')?;
-                Some((lon.parse().ok()?, lat.parse().ok()?))
-            })
-            .collect();
-        if ring.len() < 3 {
-            continue;
-        }
-        match out.last_mut() {
-            Some(p) if p.code == code => p.rings.push(ring),
-            _ => out.push(Pref {
-                code: code.to_string(),
-                rings: vec![ring],
-            }),
-        }
-    }
-    out
-}
-
 /// 地図に出す範囲(経度・緯度の最小と最大)。震源と震度のあった都道府県を含め、
 /// 狭すぎないよう最低 6 度四方にし、日本の範囲に収める。
 fn map_bounds(view: &QuakeView) -> (f64, f64, f64, f64) {
@@ -143,26 +107,6 @@ fn map_bounds(view: &QuakeView) -> (f64, f64, f64, f64) {
         }
     }
     (x0, x1, y0, y1)
-}
-
-/// 経度・緯度を地図の矩形 (x, y, w, h) へ写す関数を返す(正距円筒図法に緯度の cos で横を縮める)。
-fn projector(
-    b: (f64, f64, f64, f64),
-    rect: (f32, f32, f32, f32),
-) -> impl Fn(f64, f64) -> (f32, f32) {
-    let (x0, x1, y0, y1) = b;
-    let kx = ((y0 + y1) / 2.0).to_radians().cos();
-    let (gw, gh) = ((x1 - x0) * kx, y1 - y0);
-    let (rx, ry, rw, rh) = rect;
-    let s = (rw as f64 / gw).min(rh as f64 / gh);
-    let ox = rx as f64 + (rw as f64 - gw * s) / 2.0;
-    let oy = ry as f64 + (rh as f64 - gh * s) / 2.0;
-    move |lon, lat| {
-        (
-            (ox + (lon - x0) * kx * s) as f32,
-            (oy + (y1 - lat) * s) as f32,
-        )
-    }
 }
 
 /// 画面全体に地震アラートを重ねる。下の画面は暗くして透かす。

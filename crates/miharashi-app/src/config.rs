@@ -57,6 +57,10 @@ pub struct Geoframe {
     pub photo_interval_secs: u64,
     pub reconnect_min_secs: u64,
     pub reconnect_max_secs: u64,
+    /// 自宅からこの距離(km)以上離れた写真を「旅」、近い写真を「いつもの暮らし」(季節ごと)にする。
+    pub home_radius_km: f64,
+    /// 旅・季節の切り替わりに挟むカードを出す秒数。
+    pub card_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -160,6 +164,8 @@ impl Default for Geoframe {
             photo_interval_secs: 30,
             reconnect_min_secs: 1,
             reconnect_max_secs: 60,
+            home_radius_km: 50.0,
+            card_secs: 10,
         }
     }
 }
@@ -267,6 +273,9 @@ impl Config {
             return Err(
                 "geoframe: reconnect_min_secs は 1 以上、reconnect_max_secs は min 以上".into(),
             );
+        }
+        if self.geoframe.card_secs == 0 || !(1.0..=1000.0).contains(&self.geoframe.home_radius_km) {
+            return Err("geoframe.card_secs は 1 以上、home_radius_km は 1〜1000".into());
         }
         if self.geoframe.photo_interval_secs == 0 || self.metrics.interval_secs == 0 {
             return Err("geoframe.photo_interval_secs と metrics.interval_secs は 1 以上".into());

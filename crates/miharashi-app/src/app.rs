@@ -1,12 +1,13 @@
 //! 画面ロジック(PC 状況 + フォトフレーム)。実行ループ(runtime)からは `App` として見える。
 use crate::config::Config;
-use crate::photos::{Feed, FeedEvent, FeedStatus, PhotoItem, PhotoPixels, Source};
+use crate::photos::{Feed, FeedEvent, FeedStatus, HomeLookup, PhotoItem, PhotoPixels, Source};
 #[cfg(test)]
 use crate::screen::PhotoData;
 use crate::screen::{App, Composite, KeyPress};
 use miharashi_render::alert::{self, AlertView};
 use miharashi_render::canvas::rgba;
 use miharashi_render::screens::{self, StatusPage};
+use miharashi_render::trip_card::{self, TripCard};
 use miharashi_render::{Canvas, TextEngine};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -39,6 +40,9 @@ pub struct KioskApp {
     /// GPU 経路で、重ね絵(時刻や写真の情報)を描き直す必要があるか。フェードの途中では描き直さない
     overlay_dirty: bool,
     notice: Option<String>,
+    /// 表示中の、旅・季節の切り替わりのカード
+    card: Option<TripCard>,
+    card_len: Duration,
     last_photo_change: Instant,
     photo_interval: Duration,
     fade_len: Duration,
@@ -101,6 +105,10 @@ impl KioskApp {
             gpu_max,
             Duration::from_secs(g.reconnect_min_secs),
             Duration::from_secs(g.reconnect_max_secs),
+            Some(HomeLookup {
+                ha: cfg.home_assistant.clone(),
+                radius_km: g.home_radius_km,
+            }),
         );
         Self {
             screen: if cfg.ui.start_screen == "photo" {
@@ -117,6 +125,8 @@ impl KioskApp {
             fade: None,
             overlay_dirty: true,
             notice: None,
+            card: None,
+            card_len: Duration::from_secs(g.card_secs),
             last_photo_change: Instant::now(),
             photo_interval: Duration::from_secs(g.photo_interval_secs),
             fade_len: Duration::from_millis(800),
@@ -201,10 +211,16 @@ impl KioskApp {
                     }
                     self.current = Some(item);
                     self.current_id += 1;
+                    self.card = None;
                     self.last_photo_change = now;
                     if self.notice.is_none() {
                         self.snap.feed_status = Some("online".into());
                     }
+                    redraw = true;
+                }
+                FeedEvent::Card(c) => {
+                    self.card = Some(c);
+                    self.last_photo_change = now;
                     redraw = true;
                 }
                 FeedEvent::Status(s) => {
@@ -234,9 +250,12 @@ impl KioskApp {
             self.alert = None;
             redraw = true;
         }
-        if self.screen == Screen::Photo
-            && now.duration_since(self.last_photo_change) >= self.photo_interval
-        {
+        let dwell = if self.card.is_some() {
+            self.card_len
+        } else {
+            self.photo_interval
+        };
+        if self.screen == Screen::Photo && now.duration_since(self.last_photo_change) >= dwell {
             self.feed.next();
             self.last_photo_change = now;
         }
@@ -296,6 +315,9 @@ impl KioskApp {
                 Some(&item.info),
                 self.notice.as_deref(),
             );
+            if let Some(card) = &self.card {
+                trip_card::trip_card(canvas, &mut self.text, card);
+            }
             if let Some((view, _)) = &self.alert {
                 alert::overlay(canvas, &mut self.text, view);
             }
@@ -313,6 +335,11 @@ impl KioskApp {
 
     pub fn render(&mut self, canvas: &mut Canvas) {
         self.render_screen(canvas);
+        if self.screen == Screen::Photo
+            && let Some(card) = &self.card
+        {
+            trip_card::trip_card(canvas, &mut self.text, card);
+        }
         if let Some((view, _)) = &self.alert {
             alert::overlay(canvas, &mut self.text, view);
         }

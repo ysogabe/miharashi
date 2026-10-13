@@ -21,6 +21,12 @@
 # photo_interval_secs = 30
 # reconnect_min_secs = 1   # 接続失敗時の再接続は指数バックオフ(min から倍々で max まで)
 # reconnect_max_secs = 60
+# 写真は「旅」と「いつもの暮らし」に分けて流す。自宅([home_assistant] の位置)から
+# home_radius_km 以上離れた写真を撮影間隔 48 時間で旅に区切り、近い写真は季節ごとにまとめる。
+# 1 周ごとにまとまりの順番を混ぜ、各まとまりから最大 6 枚を撮影順に出す。5 枚以上のまとまりの
+# 前には地図つきのカードを card_secs 秒挟む。自宅が分からなければ GEOFRAME の旅番号でまとめる。
+# home_radius_km = 50.0
+# card_secs = 10
 
 [metrics]
 # interval_secs = 1
