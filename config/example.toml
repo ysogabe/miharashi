@@ -36,6 +36,23 @@
 # 電気代の単価 [円/kWh]。0 なら電気代を表示しない。
 # price_per_kwh = 0
 
+[home_assistant]
+# 画面の電源制御(下の [screen_power])に使う。url が空なら連携しない(画面は常に点灯)。
+# 平文 http は IP アドレスか localhost に限る(ホスト名だと mDNS/DNS の偽装でトークンが盗まれる)。
+# url = ""                 # 例: http://192.0.2.10:8123 / https://ha.example.test
+# 長期アクセストークンを 1 行で書いたファイル。実行ユーザーだけが読めるようにする
+# (例: sudo install -m 0640 -o root -g <実行ユーザー> token.txt /etc/miharashi/ha-token)。
+# token_file = "/etc/miharashi/ha-token"
+
+[screen_power]
+# 不在が続いたら画面を消す(DPMS)。表示機のキー操作も在宅として扱い、消えていれば点ける。
+# presence_entity = ""     # person.xxx / binary_sensor.xxx。state が home か on なら在宅
+# mode_entity = ""         # 手動オーバーライドの input_select(auto / force_on / force_off)。空なら auto 固定
+# idle_minutes = 10        # 不在がこの分数を超えたら消す
+# override_decay_minutes = 5  # HA と通信できない状態がこの分数を超えたら、オーバーライドを捨てて auto に戻す
+# poll_secs = 10           # HA に問い合わせる間隔
+# HA と通信できないとき、auto では画面を点けたままにする。
+
 [ui]
 # font = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 # start_screen = "status"  # status / photo
