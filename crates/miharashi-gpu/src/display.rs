@@ -1,6 +1,6 @@
 //! GLES 3.2 で KMS に出す Presenter。GBM surface のダブルバッファを page flip で切り替える。
-//! 見た目は dumb buffer の経路と同じで、CPU で描いた画像をテクスチャにして 1 枚描くだけ。
-use crate::blit::Blitter;
+//! 合成は `compose::Compositor`(写真のフェードと文字の重ね絵は GPU で行う)。
+use crate::compose::{Compositor, Frame};
 use crate::{egl, gbm};
 use drm::Device as _;
 use drm::control::{Device as ControlDevice, Event, PageFlipFlags, framebuffer};
@@ -19,7 +19,7 @@ pub struct GlesDisplay {
     surface: gbm::Surface,
     _dev: gbm::Device,
     card: Card,
-    blit: Blitter,
+    comp: Compositor,
     out: Output,
     /// 表示中のバッファ(最初の表示の前は None)
     current: Option<gbm::Bo>,
@@ -36,13 +36,13 @@ impl GlesDisplay {
         let dev = gbm::Device::new(card.as_fd())?;
         let surface = gbm::Surface::new(&dev, out.size())?;
         let ctx = egl::Context::new(&dev, Some(&surface))?;
-        let blit = Blitter::new(&ctx.gl, out.size())?;
+        let comp = Compositor::new(&ctx.gl, out.size())?;
         Ok(Self {
             ctx,
             surface,
             _dev: dev,
             card,
-            blit,
+            comp,
             out,
             current: None,
             fbs: HashMap::new(),
@@ -82,13 +82,17 @@ impl GlesDisplay {
         Ok(())
     }
 
-    /// RGBA8(上から下、stride = 幅 × 4)の画像を表示する。page flip の完了まで待つ。
-    /// 一時停止中は何もしない。
+    /// RGBA8(上から下、stride = 幅 × 4)の完成画面を表示する。
     pub fn present(&mut self, rgba: &[u8]) -> Result<(), String> {
+        self.present_frame(&Frame::Image(rgba))
+    }
+
+    /// `frame` を GPU で合成して表示する。page flip の完了まで待つ。一時停止中は何もしない。
+    pub fn present_frame(&mut self, frame: &Frame<'_>) -> Result<(), String> {
         if self.suspended {
             return Ok(());
         }
-        self.blit.draw(&self.ctx.gl, rgba);
+        self.comp.draw(&self.ctx.gl, frame)?;
         self.ctx.swap_buffers()?;
         let bo = self.surface.lock_front_buffer()?;
         let fb = match fb_for(&self.card, &mut self.fbs, &bo) {
@@ -177,6 +181,6 @@ impl Drop for GlesDisplay {
         for fb in self.fbs.values() {
             let _ = self.card.destroy_framebuffer(*fb);
         }
-        self.blit.destroy(&self.ctx.gl);
+        self.comp.destroy(&self.ctx.gl);
     }
 }

@@ -10,7 +10,7 @@ mod runtime;
 mod screen;
 
 use config::Config;
-use miharashi_render::{Canvas, screens};
+use miharashi_render::{Canvas, Pixmap, screens};
 use photos::{Catalog, Source};
 use std::path::PathBuf;
 
@@ -140,17 +140,17 @@ fn png(cli: Cli) -> Result<(), String> {
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     let mut gles = gles_checker(&cfg, cli.renderer.is_some())?;
     let mut c = Canvas::new(size.0, size.1);
-    let mut save = |c: &Canvas, name: &str| -> Result<(), String> {
+    let mut save = |c: &Canvas, layers: Option<(&Pixmap, &Canvas)>, name: &str| {
         c.save_png(&out.join(format!("{name}.png")))?;
         if let Some(check) = gles.as_mut() {
-            check(c, &out.join(format!("{name}-gles.png")))?;
+            check(c, layers, &out.join(format!("{name}-gles.png")))?;
         }
-        Ok(())
+        Ok::<(), String>(())
     };
     screens::status(&mut c, &mut text, &snap, screens::StatusPage::Overview);
-    save(&c, "status")?;
+    save(&c, None, "status")?;
     screens::status(&mut c, &mut text, &snap, screens::StatusPage::Details);
-    save(&c, "status-details")?;
+    save(&c, None, "status-details")?;
     screens::photo_frame(
         &mut c,
         &mut text,
@@ -160,7 +160,18 @@ fn png(cli: Cli) -> Result<(), String> {
         None,
         None,
     );
-    save(&c, "photo")?;
+    // GPU 経路は写真と重ね絵(透明背景)に分けて GPU で合成する(PoC-005 PR3)
+    let mut overlay = Canvas::new(size.0, size.1);
+    overlay.clear(miharashi_render::canvas::rgba(0, 0, 0, 0));
+    screens::photo_overlay(
+        &mut overlay,
+        &mut text,
+        &snap,
+        &item.layout,
+        Some(&item.info),
+        None,
+    );
+    save(&c, Some((&item.frame, &overlay)), "photo")?;
     println!(
         "wrote {}/{{status,status-details,photo}}.png ({}x{})",
         out.display(),
@@ -170,9 +181,11 @@ fn png(cli: Cli) -> Result<(), String> {
     Ok(())
 }
 
-/// `png --renderer gles|auto` の検証。CPU で描いた画像を GLES 経路(表示と同じシェーダー)で
-/// 表示カードの render node に描いて読み戻し、`*-gles.png` に保存して画素の差を出す。
-type GlesCheck = Box<dyn FnMut(&Canvas, &std::path::Path) -> Result<(), String>>;
+/// `png --renderer gles|auto` の検証。GLES 経路(表示と同じ合成器)で表示カードの render node に
+/// 描いて読み戻し、`*-gles.png` に保存して CPU の画像との差を出す。`layers` が Some なら
+/// (写真のフレーム, 重ね絵)を GPU で合成し、None なら CPU の完成画面をそのまま描く。
+type GlesCheck =
+    Box<dyn FnMut(&Canvas, Option<(&Pixmap, &Canvas)>, &std::path::Path) -> Result<(), String>>;
 
 #[cfg(target_os = "linux")]
 fn gles_checker(cfg: &Config, asked: bool) -> Result<Option<GlesCheck>, String> {
@@ -189,21 +202,35 @@ fn gles_checker(cfg: &Config, asked: bool) -> Result<Option<GlesCheck>, String> 
     let node = miharashi_gpu::render_node_for_pci(pci);
     let off = miharashi_gpu::Offscreen::open(&node)?;
     println!("gles: {} ({})", node.display(), off.describe());
-    Ok(Some(Box::new(move |c: &Canvas, path: &std::path::Path| {
-        let (w, h) = (c.width(), c.height());
-        let got = off.render(c.pixmap.data(), (w, h))?;
-        let (over, max) = miharashi_gpu::diff_rgb(c.pixmap.data(), &got, 0);
-        image::RgbaImage::from_raw(w, h, got)
-            .ok_or("読み戻した画像の大きさが違う")?
-            .save(path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        println!(
-            "gles: {} 差のある画素 {over} / {}(最大差 {max})",
-            path.display(),
-            w as usize * h as usize
-        );
-        Ok(())
-    })))
+    Ok(Some(Box::new(
+        move |c: &Canvas, layers, path: &std::path::Path| {
+            use miharashi_gpu::{Frame, PhotoLayer};
+            let (w, h) = (c.width(), c.height());
+            let frame = match layers {
+                Some((photo, overlay)) => Frame::Photo {
+                    photo: PhotoLayer {
+                        id: 1,
+                        rgba: photo.data(),
+                    },
+                    old: None,
+                    overlay: Some(overlay.pixmap.data()),
+                },
+                None => Frame::Image(c.pixmap.data()),
+            };
+            let got = off.render_frames(&[frame], (w, h))?;
+            let (over, max) = miharashi_gpu::diff_rgb(c.pixmap.data(), &got, 0);
+            image::RgbaImage::from_raw(w, h, got)
+                .ok_or("読み戻した画像の大きさが違う")?
+                .save(path)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            println!(
+                "gles: {} 差のある画素 {over} / {}(最大差 {max})",
+                path.display(),
+                w as usize * h as usize
+            );
+            Ok(())
+        },
+    )))
 }
 
 #[cfg(not(target_os = "linux"))]

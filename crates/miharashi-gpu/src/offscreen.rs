@@ -1,6 +1,6 @@
 //! 表示せずに GLES 経路を検証する。render node で surfaceless のコンテキストを作り、表示と同じ
-//! `Blitter` で FBO に描いて読み戻す。CPU 経路の画像と画素が一致するかを確かめる(`png --renderer gles`)。
-use crate::blit::Blitter;
+//! `Compositor` で FBO に描いて読み戻す。CPU 経路の画像と画素が一致するかを確かめる(`png --renderer gles`)。
+use crate::compose::{Compositor, Frame};
 use crate::{egl, gbm};
 use glow::HasContext;
 use std::os::fd::AsFd;
@@ -40,9 +40,19 @@ impl Offscreen {
     }
 
     /// `rgba`(上から下、stride = 幅 × 4)を GLES で描き、上から下の RGBA8 で読み戻す。
-    pub fn render(&self, rgba: &[u8], (w, h): (u32, u32)) -> Result<Vec<u8>, String> {
+    pub fn render(&self, rgba: &[u8], size: (u32, u32)) -> Result<Vec<u8>, String> {
+        self.render_frames(&[Frame::Image(rgba)], size)
+    }
+
+    /// `frames` を順に同じ合成器で描き、最後の結果を読み戻す(写真のキャッシュや重ね絵の
+    /// 使い回しも表示と同じように動く)。
+    pub fn render_frames(
+        &self,
+        frames: &[Frame<'_>],
+        (w, h): (u32, u32),
+    ) -> Result<Vec<u8>, String> {
         let gl = &self.ctx.gl;
-        let blit = Blitter::new(gl, (w, h))?;
+        let mut comp = Compositor::new(gl, (w, h))?;
         let mut out = vec![0u8; w as usize * h as usize * 4];
         unsafe {
             let rb = gl.create_renderbuffer()?;
@@ -60,7 +70,9 @@ impl Offscreen {
             if status != glow::FRAMEBUFFER_COMPLETE {
                 return Err(format!("FBO が不完全: 0x{status:x}"));
             }
-            blit.draw(gl, rgba);
+            for f in frames {
+                comp.draw(gl, f)?;
+            }
             gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
             gl.read_pixels(
                 0,
@@ -75,7 +87,7 @@ impl Offscreen {
             gl.delete_framebuffer(fbo);
             gl.delete_renderbuffer(rb);
         }
-        blit.destroy(gl);
+        comp.destroy(gl);
         // glReadPixels は下の行から返すので、上から下に並べ直す
         let stride = w as usize * 4;
         let flipped = out.chunks_exact(stride).rev().flatten().copied().collect();
@@ -100,6 +112,7 @@ pub fn diff_rgb(a: &[u8], b: &[u8], tol: u8) -> (usize, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compose::{Frame, PhotoLayer};
 
     #[test]
     fn diff_counts_pixels_over_tolerance() {
@@ -136,5 +149,64 @@ mod tests {
         }
         let got = off.render(&img, (w, h)).unwrap();
         assert_eq!(diff_rgb(&img, &got, 0), (0, 0));
+    }
+
+    /// フェード(旧 → 新を不透明度 t で混ぜる)と重ね絵(premultiplied の source-over)が、
+    /// CPU で計算した値と ±1 以内で一致すること。重ね絵を渡さない回は前回のものを使うこと。
+    #[test]
+    fn offscreen_fade_and_overlay_match_cpu_math() {
+        let Ok(off) = Offscreen::open(Path::new("/dev/dri/renderD128")) else {
+            eprintln!("GLES が使えないので skip");
+            return;
+        };
+        let (w, h) = (64u32, 16u32);
+        let n = (w * h) as usize;
+        let solid = |c: [u8; 4]| c.repeat(n);
+        let old = solid([200, 40, 10, 255]);
+        let new = solid([20, 100, 240, 255]);
+        // 左半分は半透明の白(premultiplied で 128,128,128,128)、右半分は透明
+        let mut overlay = Vec::with_capacity(n * 4);
+        for _ in 0..h {
+            for x in 0..w {
+                overlay.extend_from_slice(if x < w / 2 {
+                    &[128, 128, 128, 128]
+                } else {
+                    &[0, 0, 0, 0]
+                });
+            }
+        }
+        let p = |id, rgba| PhotoLayer { id, rgba };
+        let t = 0.25f32;
+        let got = off
+            .render_frames(
+                &[
+                    Frame::Photo {
+                        photo: p(1, &old),
+                        old: None,
+                        overlay: Some(&overlay),
+                    },
+                    Frame::Photo {
+                        photo: p(2, &new),
+                        old: Some((p(1, &old), t)),
+                        overlay: None,
+                    },
+                ],
+                (w, h),
+            )
+            .unwrap();
+        let mix = |a: u8, b: u8| a as f32 + (b as f32 - a as f32) * t;
+        let over = |base: f32, src: u8, sa: u8| src as f32 + base * (1.0 - sa as f32 / 255.0);
+        for (x, want) in [(0usize, true), (w as usize - 1, false)] {
+            let px = &got[x * 4..x * 4 + 3];
+            for i in 0..3 {
+                let base = mix(old[i], new[i]);
+                let exp = if want { over(base, 128, 128) } else { base };
+                assert!(
+                    (px[i] as f32 - exp).abs() <= 1.0,
+                    "x={x} ch={i}: {} vs {exp}",
+                    px[i]
+                );
+            }
+        }
     }
 }
