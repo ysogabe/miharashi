@@ -203,6 +203,9 @@ impl Presenter {
 }
 
 /// 画面ロジックを作るために必要な、表示先が決まったあとの情報。
+/// 操作パネルの待ち受けに失敗したとき、試し直すまでの間隔。
+const PANEL_RETRY: Duration = Duration::from_secs(30);
+
 pub struct Output {
     pub size: (u32, u32),
     /// GLES なら Some(GPU で扱える写真の最大の幅と高さ)。auto で CPU に戻ったときは None
@@ -281,16 +284,11 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     let power = ScreenPower::start(&cfg.home_assistant, &cfg.screen_power);
     let mut screen_on = true;
     let mut power_tried = true;
-    // 手元の操作パネルの API。待ち受けられなくてもキオスクは動かし続ける(状態ログは panel=error)
-    let panel = cfg
-        .panel
-        .enabled
-        .then(|| Panel::start(&cfg.panel))
-        .and_then(|r| {
-            r.inspect(|p| eprintln!("panel: {} で待ち受け", p.addr()))
-                .map_err(|e| eprintln!("panel: 起動できない(パネルなしで続ける): {e}"))
-                .ok()
-        });
+    // 手元の操作パネルの API。待ち受けられなくてもキオスクは動かし続け(状態ログは panel=error)、
+    // PANEL_RETRY ごとに試し直す(起動直後で LAN の IP がまだ無いときなど)。同じ失敗は 1 回だけログに出す
+    let mut panel: Option<Panel> = None;
+    let mut panel_err: Option<String> = None;
+    let mut panel_retry = Instant::now();
 
     let reason = loop {
         if term.load(Ordering::Relaxed) {
@@ -363,6 +361,23 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
         }
         if quit {
             break "キー操作(Esc/q)";
+        }
+        if cfg.panel.enabled && panel.is_none() && Instant::now() >= panel_retry {
+            panel_retry = Instant::now() + PANEL_RETRY;
+            match Panel::start(&cfg.panel) {
+                Ok(p) => {
+                    eprintln!("panel: {} で待ち受け", p.addr());
+                    p.publish(app.panel_view());
+                    panel = Some(p);
+                    panel_err = None;
+                }
+                Err(e) => {
+                    if panel_err.as_ref() != Some(&e) {
+                        eprintln!("panel: 起動できない(パネルなしで続け、再試行する): {e}");
+                    }
+                    panel_err = Some(e);
+                }
+            }
         }
         // パネルのキーもキーボードと同じに扱う(消えている画面では点けるだけ)
         for key in panel.iter().flat_map(Panel::keys) {
@@ -499,13 +514,14 @@ mod tests {
         let prefix = "2026-10-13T08:00:00+09:00 host miharashi[1]: ";
         let mut text = String::new();
         for i in 0..3u64 {
-            // 今の並び: 画面ロジックの値 + gpus + PoC-005 の計測値
+            // 今の並び: 画面ロジックの値 + gpus + PoC-005 の計測値 + パネル(有効なときだけ)
             let mut e = extra(61 + 60 * i, "Some(13.0)");
             e.extend([
                 ("gpus", "GPU0:0,GPU1:0".to_string()),
                 ("cpu_self", format!("{}.5", i + 1)),
                 ("render_ms", "12.0/20.0".to_string()),
                 ("present_ms", "3.0/4.0".to_string()),
+                ("panel", "idle".to_string()),
             ]);
             let line = format_stats(60 * (i + 1), 81, 26, 62 + i, 19, &e);
             text.push_str(&format!("{prefix}{line}\n"));
