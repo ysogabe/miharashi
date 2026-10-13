@@ -167,8 +167,8 @@ flowchart LR
 | 段階 | 内容 | 確認方法 |
 |---|---|---|
 | P0(済) | 設計と LP | — |
-| P1 | miharashi に `[panel]` と API(既定 OFF)。`KeyPress` の注入、`/status`、SSE、トークン、レート制限。#5 より先に、今の `KeyPress`(Prev / Switch / Next)へ直接つなぐ最小版を入れた。キーは `prev` / `next` / `select` だけで、`up` / `down` / `menu` は `400`(#5 で `KeyPress` が増えたら受け付ける)。`/api/v1/screen` は P3 | **Echo なしで検証できる**: `curl -H "Authorization: Bearer ..." -d '{"key":"next"}'` で画面が切り替わり、`/status` が変わる。24 時間試験のログに `panel=` が出る |
-| P2 | 単体アプリ `miharashi-panel` の最小版。4 / 5 / 6、画面一覧、現在画面の表示、自動起動、全画面と常時点灯 | 実機で 4 / 6 の往復。Wi-Fi 切断 → 復帰で `OFFLINE` → `API` 点灯。端末を再起動すると自動で前面に出る |
+| P1(済、#26) | miharashi に `[panel]` と API(既定 OFF)。`KeyPress` の注入、`/status`、SSE、トークン、レート制限。#5 より先に、今の `KeyPress`(Prev / Switch / Next)へ直接つなぐ最小版を入れた。キーは `prev` / `next` / `select` だけで、`up` / `down` / `menu` は `400`(#5 で `KeyPress` が増えたら受け付ける)。`/api/v1/screen` は P3 | **Echo なしで検証できる**: `curl -H "Authorization: Bearer ..." -d '{"key":"next"}'` で画面が切り替わり、`/status` が変わる。24 時間試験のログに `panel=` が出る |
+| P2(済、miharashi-panel v0.1.0) | 単体アプリ `miharashi-panel` の最小版。4 / 5 / 6、現在画面の表示、自動起動、全画面。あとから足したもの: モニターの消灯・点灯・自動(`/api/v1/display`、#32、miharashi-panel#1)、触らなければ操作盤を消灯(miharashi-panel#2)。画面一覧のレールは、タップで遷移できないうちは不要としてやめ、その場所にモニターのボタンを置いた | 実機で 4 / 6 の往復。Wi-Fi 切断 → 復帰で `OFFLINE` → `API` 点灯。端末を再起動すると自動で前面に出る |
 | P3 | 8 / 2 / 0、写真 n/N、レールからの直接遷移(`/api/v1/screen`)、夜間の減光 | PoC-003 の後 |
 | P4 | LLM 管理(gpu-eval#19)とエージェントの状態を手元に表示 | gpu-eval 側の `/status` をキオスクが中継するか、パネルが直接読むかを決める |
 
