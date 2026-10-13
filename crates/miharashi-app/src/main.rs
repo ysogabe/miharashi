@@ -5,6 +5,7 @@ mod data;
 mod photos;
 #[cfg(target_os = "linux")]
 mod runtime;
+mod screen;
 
 use config::Config;
 use miharashi_render::{Canvas, screens};
@@ -97,7 +98,7 @@ fn run(cli: Cli) -> Result<(), String> {
     let src = source(&cfg, &cli);
     let (data, snap) = data_source(&cfg, cli.dummy)?;
     runtime::run(&cfg, |out| {
-        app::KioskApp::new(&cfg, out.size, src, data, snap)
+        Box::new(app::KioskApp::new(&cfg, out.size, src, data, snap))
     })
 }
 
