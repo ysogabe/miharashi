@@ -1,0 +1,47 @@
+[Unit]
+Description=Miharashi kiosk (DRM/KMS direct display)
+Documentation=https://github.com/ysogabe/miharashi
+After=systemd-user-sessions.service systemd-logind.service network.target
+# CPU 電力ヘルパー(任意)。Wants なので、ヘルパーが無い・失敗していてもキオスクは起動する。
+Wants=miharashi-rapl.service
+After=miharashi-rapl.service
+# このサービスが VT7 を使う。tty7 の getty とは共存しない。
+Conflicts=getty@tty7.service
+After=getty@tty7.service
+# 5 分以内に 5 回以上落ちたら再起動をあきらめる(無限ループで VT を奪い合わない)。
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# root では動かさない。logind の seat0 セッション(PAM)として DRM master と入力デバイスを得る。
+User=@USER@
+PAMName=login
+TTYPath=/dev/tty7
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+# PAM セッション(session-N.scope)に入るため `journalctl -u` には出ない。`journalctl -t miharashi` で見る。
+SyslogIdentifier=miharashi
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+UtmpIdentifier=tty7
+UtmpMode=user
+
+# /var/lib/miharashi(User=@USER@ の所有)。電力量などの状態を /var/lib/miharashi/energy.json に保存する。
+StateDirectory=miharashi
+
+# 起動前に VT7 へ切り替える。停止・異常終了後は VT1(通常のコンソール)へ戻す。
+ExecStartPre=+/usr/bin/chvt 7
+ExecStart=@BINDIR@/miharashi run --config /etc/miharashi/config.toml
+ExecStopPost=+/usr/bin/chvt 1
+
+# Esc/q での終了(正常終了)も再起動する。止めるときは systemctl stop miharashi。
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 drm = "0.15.0"
 evdev = "0.13.2"
+libc = "0.2.190"
+libseat = "0.2.4"
 nvml-wrapper = "0.13.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.152"
+signal-hook = "0.4.5"
