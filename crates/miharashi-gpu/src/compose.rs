@@ -2,7 +2,11 @@
 //! - `Frame::Image`: CPU で描いた完成画面を 1 枚転送して描く(状況画面など。PR2 と同じ)。
 //! - `Frame::Photo`: 写真のフレームは 1 枚ごとに 1 回だけテクスチャにし、クロスフェードは
 //!   シェーダーで混ぜる。文字などの重ね絵(透明背景の RGBA)は変わったときだけ転送して上に重ねる。
+//!   写真のフレームは、CPU で合成した完成フレームを転送するか、デコードしただけの写真から
+//!   GPU で作る(PR3b、`photo.rs`)。
+use crate::photo::{PhotoBuilder, SourceImage, program as link, texture as tex2d};
 use glow::HasContext;
+use std::time::Instant;
 
 const VERT: &str = r"#version 300 es
 out highp vec2 uv;
@@ -43,12 +47,22 @@ void main() {
 /// 写真のテクスチャを残しておく枚数(表示中とフェード元、と先読みの余裕)。
 const PHOTO_CACHE: usize = 3;
 
+/// 写真のフレームの中身。
+#[derive(Clone, Copy)]
+pub enum PhotoSource<'a> {
+    /// CPU で合成した完成フレーム。premultiplied RGBA8、上から下、stride = 幅 × 4(画面と同じ大きさ、不透明)
+    Frame(&'a [u8]),
+    /// デコードしただけの写真。GPU で完成フレームを作る
+    Image(SourceImage<'a>),
+    /// 前回までに GPU に渡した(呼び出し側はもう画素を持っていない)
+    Resident,
+}
+
 /// 写真のフレーム。`id` が同じなら同じ画像とみなし、転送し直さない。
 #[derive(Clone, Copy)]
 pub struct PhotoLayer<'a> {
     pub id: u64,
-    /// premultiplied RGBA8、上から下、stride = 幅 × 4(画面と同じ大きさ、不透明)
-    pub rgba: &'a [u8],
+    pub src: PhotoSource<'a>,
 }
 
 /// 1 回の表示の内容。
@@ -76,46 +90,19 @@ pub struct Compositor {
     /// 重ね絵を 1 度でも転送したか(まだなら重ねない)
     overlay_ready: bool,
     size: (u32, u32),
+    builder: PhotoBuilder,
     /// 今の時点までの転送量 [バイト](ログ用)
     pub uploaded: u64,
+    /// 写真から完成フレームを作るのにかかった CPU 時間 [ms](転送と命令の発行。状態ログ用、読んだら空にする)
+    pub build_ms: Vec<f32>,
 }
 
 fn program(gl: &glow::Context, frag: &str) -> Result<glow::Program, String> {
-    unsafe {
-        let program = gl.create_program()?;
-        for (kind, src) in [(glow::VERTEX_SHADER, VERT), (glow::FRAGMENT_SHADER, frag)] {
-            let s = gl.create_shader(kind)?;
-            gl.shader_source(s, src);
-            gl.compile_shader(s);
-            if !gl.get_shader_compile_status(s) {
-                return Err(format!("shader: {}", gl.get_shader_info_log(s)));
-            }
-            gl.attach_shader(program, s);
-            gl.delete_shader(s);
-        }
-        gl.link_program(program);
-        if !gl.get_program_link_status(program) {
-            return Err(format!("link: {}", gl.get_program_info_log(program)));
-        }
-        Ok(program)
-    }
+    link(gl, VERT, frag)
 }
 
-fn texture(gl: &glow::Context, (w, h): (u32, u32)) -> Result<glow::Texture, String> {
-    unsafe {
-        let tex = gl.create_texture()?;
-        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, w as i32, h as i32);
-        for (k, v) in [
-            (glow::TEXTURE_MIN_FILTER, glow::NEAREST),
-            (glow::TEXTURE_MAG_FILTER, glow::NEAREST),
-            (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
-            (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
-        ] {
-            gl.tex_parameter_i32(glow::TEXTURE_2D, k, v as i32);
-        }
-        Ok(tex)
-    }
+fn texture(gl: &glow::Context, size: (u32, u32)) -> Result<glow::Texture, String> {
+    tex2d(gl, glow::RGBA8, size, glow::NEAREST)
 }
 
 impl Compositor {
@@ -137,7 +124,9 @@ impl Compositor {
                 photos: Vec::new(),
                 overlay_ready: false,
                 size,
+                builder: PhotoBuilder::new(gl)?,
                 uploaded: 0,
+                build_ms: Vec::new(),
             })
         }
     }
@@ -167,7 +156,12 @@ impl Compositor {
         self.uploaded += rgba.len() as u64;
     }
 
-    /// 写真のテクスチャを返す(初めての id なら転送する)。
+    /// GPU で扱える写真の最大の幅と高さ。
+    pub fn max_texture(&self) -> u32 {
+        self.builder.max_texture
+    }
+
+    /// 写真のテクスチャを返す(初めての id なら転送するか、GPU で作る)。
     fn photo_tex(
         &mut self,
         gl: &glow::Context,
@@ -179,12 +173,29 @@ impl Compositor {
             self.photos.push(e);
             return Ok(e.1);
         }
-        let tex = if self.photos.len() >= PHOTO_CACHE {
-            self.photos.remove(0).1
-        } else {
-            texture(gl, self.size)?
+        let tex = match layer.src {
+            PhotoSource::Frame(rgba) => {
+                let tex = texture(gl, self.size)?;
+                self.upload(gl, tex, rgba);
+                tex
+            }
+            PhotoSource::Image(img) => {
+                let t0 = Instant::now();
+                let prev = unsafe { gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING) };
+                let built = self.builder.build(gl, self.vao, &img, self.size);
+                unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, prev) };
+                let tex = built?;
+                self.uploaded += img.pixels.len() as u64;
+                self.build_ms.push(t0.elapsed().as_secs_f32() * 1000.0);
+                tex
+            }
+            PhotoSource::Resident => {
+                return Err(format!("写真 {} のテクスチャが残っていない", layer.id));
+            }
         };
-        self.upload(gl, tex, layer.rgba);
+        if self.photos.len() >= PHOTO_CACHE {
+            unsafe { gl.delete_texture(self.photos.remove(0).1) };
+        }
         self.photos.push((layer.id, tex));
         Ok(tex)
     }
@@ -207,9 +218,10 @@ impl Compositor {
     /// 今バインドされている framebuffer に `frame` を描く。
     pub fn draw(&mut self, gl: &glow::Context, frame: &Frame<'_>) -> Result<(), String> {
         let (w, h) = self.size;
-        unsafe { gl.viewport(0, 0, w as i32, h as i32) };
+        let viewport = || unsafe { gl.viewport(0, 0, w as i32, h as i32) };
         match frame {
             Frame::Image(rgba) => {
+                viewport();
                 self.upload(gl, self.image_tex, rgba);
                 self.draw_base(gl, self.image_tex, self.image_tex, 1.0);
             }
@@ -218,12 +230,15 @@ impl Compositor {
                 old,
                 overlay,
             } => {
+                // 写真を GPU で作るときは別の framebuffer に描くので、表示先への描画より先に済ませる
                 let new = self.photo_tex(gl, *photo)?;
+                let old = match old {
+                    Some((o, t)) => Some((self.photo_tex(gl, *o)?, t.clamp(0.0, 1.0))),
+                    None => None,
+                };
+                viewport();
                 match old {
-                    Some((o, t)) => {
-                        let old = self.photo_tex(gl, *o)?;
-                        self.draw_base(gl, old, new, t.clamp(0.0, 1.0));
-                    }
+                    Some((old, t)) => self.draw_base(gl, old, new, t),
                     None => self.draw_base(gl, new, new, 1.0),
                 }
                 if let Some(rgba) = overlay {
@@ -257,5 +272,6 @@ impl Compositor {
             gl.delete_program(self.base);
             gl.delete_program(self.overlay);
         }
+        self.builder.destroy(gl);
     }
 }

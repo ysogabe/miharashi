@@ -1,4 +1,6 @@
 //! 実行ループ(runtime)と画面ロジックの境界。runtime は `App` だけを知る。
+use image::DynamicImage;
+use miharashi_render::photo_layout::PhotoLayout;
 use miharashi_render::{Canvas, Pixmap};
 use std::time::Instant;
 
@@ -28,11 +30,25 @@ pub trait App {
     fn stats(&self) -> Vec<(&'static str, String)>;
 }
 
+/// 写真のフレームの中身。
+#[derive(Clone, Copy)]
+pub enum PhotoData<'a> {
+    /// CPU で合成した完成フレーム
+    Frame(&'a Pixmap),
+    /// デコードしただけの写真と配置。GPU で完成フレームを作る(PoC-005 PR3b)
+    Source {
+        image: &'a DynamicImage,
+        layout: &'a PhotoLayout,
+    },
+    /// 前回までに GPU に渡した
+    Resident,
+}
+
 /// 写真のフレーム。`id` が同じなら同じ画像(GPU は転送し直さない)。
 #[derive(Clone, Copy)]
 pub struct PhotoRef<'a> {
     pub id: u64,
-    pub pixmap: &'a Pixmap,
+    pub data: PhotoData<'a>,
 }
 
 /// `App::render_composite` の結果。

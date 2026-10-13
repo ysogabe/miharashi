@@ -2,14 +2,15 @@
 //! seat/VT の有効・無効、SIGINT/SIGTERM、入力、描画、状態ログを扱う。
 //! 状態ログは共通部分(t / rss / fds / frames / worst_frame)に `App::stats()` の `k=v` を続けて出す。
 use crate::config::Config;
-use crate::screen::{App, Composite, KeyPress, PhotoRef};
-use miharashi_gpu::{Frame, GlesDisplay, PhotoLayer};
+use crate::screen::{App, Composite, KeyPress, PhotoData, PhotoRef};
+use miharashi_gpu::{Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, SourceImage};
 use miharashi_linux::drm_select::{self, CardSel, ModeSel};
 use miharashi_linux::input::{Action, Keys};
 use miharashi_linux::kms::Display;
 use miharashi_linux::seat::{SeatMode, Session, SessionEvent};
 use miharashi_linux::vt::VtGuard;
 use miharashi_render::Canvas;
+use miharashi_render::photo_layout::{self, Mode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -52,6 +53,25 @@ fn summarize_ms(samples: &mut Vec<f32>) -> String {
     let p95 = samples[((samples.len() as f32 * 0.95).ceil() as usize).clamp(1, samples.len()) - 1];
     samples.clear();
     format!("{avg:.1}/{p95:.1}")
+}
+
+/// 画面ロジックの写真を GPU の合成器の形にする。`screen_h` は画面の高さ(影の間隔の倍率に使う)。
+pub fn photo_layer(p: PhotoRef<'_>, screen_h: u32) -> PhotoLayer<'_> {
+    let src = match p.data {
+        PhotoData::Frame(f) => PhotoSource::Frame(f.data()),
+        PhotoData::Source { image, layout } => PhotoSource::Image(SourceImage {
+            pixels: image.as_bytes(),
+            size: (image.width(), image.height()),
+            channels: image.color().channel_count() as u32,
+            place: Placement {
+                cover: layout.mode == Mode::Cover,
+                rect: (layout.photo.x, layout.photo.y, layout.photo.w, layout.photo.h),
+                scale: photo_layout::scale(screen_h),
+            },
+        }),
+        PhotoData::Resident => PhotoSource::Resident,
+    };
+    PhotoLayer { id: p.id, src }
 }
 
 /// 表示経路。CPU は Canvas を dumb buffer へ変換コピーし、GLES は表示カードの GPU で
@@ -102,6 +122,22 @@ impl Presenter {
         }
     }
 
+    /// GLES なら、GPU で扱える写真の最大の幅と高さ(写真の合成を GPU に任せる)。
+    fn gpu_max_texture(&self) -> Option<u32> {
+        match self {
+            Self::Cpu(_) => None,
+            Self::Gles(d) => Some(d.max_texture()),
+        }
+    }
+
+    /// 前回から今までに写真を GPU で作った時間 [ms]。CPU 経路は空。
+    fn take_photo_build_ms(&mut self) -> Vec<f32> {
+        match self {
+            Self::Cpu(_) => Vec::new(),
+            Self::Gles(d) => d.take_build_ms(),
+        }
+    }
+
     fn suspend(&mut self) {
         match self {
             Self::Cpu(d) => d.suspend(),
@@ -130,14 +166,9 @@ impl Presenter {
                 Ok((ms(t0, t1), ms(t1, Instant::now())))
             }
             Self::Gles(d) => {
+                let h = canvas.height();
                 let comp = app.render_composite(canvas);
                 let t1 = Instant::now();
-                fn layer(p: PhotoRef<'_>) -> PhotoLayer<'_> {
-                    PhotoLayer {
-                        id: p.id,
-                        rgba: p.pixmap.data(),
-                    }
-                }
                 let frame = match comp {
                     Composite::Canvas => Frame::Image(canvas.pixmap.data()),
                     Composite::Photo {
@@ -145,8 +176,8 @@ impl Presenter {
                         old,
                         overlay_changed,
                     } => Frame::Photo {
-                        photo: layer(photo),
-                        old: old.map(|(p, t)| (layer(p), t)),
+                        photo: photo_layer(photo, h),
+                        old: old.map(|(p, t)| (photo_layer(p, h), t)),
                         overlay: overlay_changed.then(|| canvas.pixmap.data()),
                     },
                 };
@@ -160,6 +191,8 @@ impl Presenter {
 /// 画面ロジックを作るために必要な、表示先が決まったあとの情報。
 pub struct Output {
     pub size: (u32, u32),
+    /// GLES なら Some(GPU で扱える写真の最大の幅と高さ)。auto で CPU に戻ったときは None
+    pub gpu_max_texture: Option<u32>,
 }
 
 /// 実行ループ。`make_app` には確定した表示サイズが渡される。
@@ -210,7 +243,10 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     let mut keys = Keys::open(&mut session, &cfg.input.devices)?;
     eprintln!("input: {:?}", keys.device_names());
 
-    let mut app = make_app(&Output { size: (w, h) });
+    let mut app = make_app(&Output {
+        size: (w, h),
+        gpu_max_texture: display.gpu_max_texture(),
+    });
     let mut canvas = Canvas::new(w, h);
 
     let start = Instant::now();
@@ -222,6 +258,8 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     let mut self_cpu = miharashi_linux::sysinfo::SelfCpu::default();
     self_cpu.poll(Instant::now());
     let (mut render_ms, mut present_ms) = (Vec::new(), Vec::new());
+    // 写真 1 枚ごとの、GPU で完成フレームを作った CPU 時間(PoC-005 PR3b)
+    let mut photo_ms = Vec::new();
     let mut redraw = true;
     let mut resume_pending = false;
 
@@ -293,6 +331,7 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             let (r, p) = display.draw(app.as_mut(), &mut canvas)?;
             render_ms.push(r);
             present_ms.push(p);
+            photo_ms.extend(display.take_photo_build_ms());
             redraw = false;
             frames += 1;
             worst_ms = worst_ms.max(t0.elapsed().as_millis());
@@ -309,6 +348,7 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             ));
             extra.push(("render_ms", summarize_ms(&mut render_ms)));
             extra.push(("present_ms", summarize_ms(&mut present_ms)));
+            extra.push(("photo_gpu_ms", summarize_ms(&mut photo_ms)));
             eprintln!(
                 "{}",
                 format_stats(
