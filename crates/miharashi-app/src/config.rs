@@ -14,6 +14,7 @@ pub struct Config {
     pub power: Power,
     pub home_assistant: HomeAssistant,
     pub screen_power: ScreenPower,
+    pub alerts: Alerts,
     pub ui: Ui,
 }
 
@@ -105,6 +106,19 @@ pub struct ScreenPower {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
+pub struct Alerts {
+    /// 地震アラート(住んでいる地方で震度 4 以上、全国で震度 5 弱以上)。
+    pub quake: bool,
+    /// 気象庁の地震情報を読む間隔(秒)。
+    pub quake_poll_secs: u64,
+    /// アラートを出し続ける分数。キーを押せば先に閉じる。
+    pub show_minutes: u64,
+    /// 0 より大きければ、起動からこの秒数後にテスト表示を 1 回出す(動作確認用)。
+    pub demo_after_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
 pub struct Ui {
     /// 日本語フォントファイル。空ならシステムフォントを使う。
     pub font: String,
@@ -184,6 +198,17 @@ impl Default for ScreenPower {
     }
 }
 
+impl Default for Alerts {
+    fn default() -> Self {
+        Self {
+            quake: true,
+            quake_poll_secs: 30,
+            show_minutes: 5,
+            demo_after_secs: 0,
+        }
+    }
+}
+
 impl Default for Ui {
     fn default() -> Self {
         Self {
@@ -249,6 +274,9 @@ impl Config {
         if !self.home_assistant.url.is_empty() {
             crate::screen_power::check_url(&self.home_assistant.url)
                 .map_err(|e| format!("home_assistant.url: {e}"))?;
+        }
+        if self.alerts.quake_poll_secs < 10 || self.alerts.show_minutes == 0 {
+            return Err("alerts.quake_poll_secs は 10 以上、show_minutes は 1 以上".into());
         }
         let sp = &self.screen_power;
         if sp.idle_minutes == 0 || sp.override_decay_minutes == 0 || sp.poll_secs == 0 {
@@ -369,6 +397,22 @@ mod tests {
             Config::parse("[screen_power]\npresense_entity = \"x\"\n").is_err(),
             "typo"
         );
+    }
+
+    #[test]
+    fn alerts_defaults_and_bad_values() {
+        let a = Config::default().alerts;
+        assert!(a.quake);
+        assert_eq!(
+            (a.quake_poll_secs, a.show_minutes, a.demo_after_secs),
+            (30, 5, 0)
+        );
+        assert!(
+            Config::parse("[alerts]\nquake_poll_secs = 1\n").is_err(),
+            "気象庁を叩きすぎない"
+        );
+        assert!(Config::parse("[alerts]\nshow_minutes = 0\n").is_err());
+        assert!(Config::parse("[alerts]\nquake = false\n").is_ok());
     }
 
     #[test]
