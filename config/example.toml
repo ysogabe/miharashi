@@ -77,3 +77,15 @@
 [ui]
 # font = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 # start_screen = "status"  # status / photo
+
+[panel]
+# 手元の操作パネル(Echo Show 5 など)向けの API(docs/panel/DESIGN.md)。既定は無効。
+# 待ち受けは LAN のインターフェース(enp11s0)の IP だけにする。0.0.0.0 / :: は不可。Tailscale では待ち受けない。
+# トークンは 16 文字以上を 1 行で書いたファイル。ha-token と同じく root:<実行ユーザー> 0640(か 0600)。誰でも読める権限なら起動しない。
+# 例: head -c 24 /dev/urandom | base64 | sudo install -o root -g hermes -m 640 /dev/stdin /etc/miharashi/panel.token
+# 待ち受けられない(起動直後でまだ IP が無いなど)ときは 30 秒ごとに再試行する。
+# 使えるキーは prev / next / select(4 / 6 / 5)。up / down / menu は PoC-003(#5)の後。
+# enabled = false
+# listen = "192.168.0.132:8790"
+# token_file = "/etc/miharashi/panel.token"
+# max_rate_per_sec = 20    # POST /api/v1/input を 1 秒にこの回数まで。超えたら 429

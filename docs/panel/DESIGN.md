@@ -93,6 +93,8 @@ flowchart LR
 
 ### 5.2 API(案)
 
+> P1 で入っているのはこの一部です(キーは `prev` / `next` / `select` だけ、`/api/v1/screen` は未実装)。§6 の P1 を参照。
+
 | メソッド | パス | 内容 |
 |---|---|---|
 | GET | `/api/v1/status` | `{schema_version, host, screen: {id, title, index, count}, screens: [{id, title}], photo: {position, total} \| null, feed: "online" \| "retrying", uptime_s, generated_at}` |
@@ -101,7 +103,7 @@ flowchart LR
 | GET | `/api/v1/events` | SSE。画面が変わるたびに `status` と同じ JSON を 1 行。接続中は 15 秒ごとに `: keepalive` |
 | GET | `/api/v1/healthz` | 認証なし。`{"ok": true}` だけ |
 
-- 認証: `Authorization: Bearer <token>`。トークンは設定ファイルで指定したファイル(`/etc/miharashi/panel.token`、0600)から読む。不一致は `401`。`healthz` 以外は全て必須。
+- 認証: `Authorization: Bearer <token>`。トークンは設定ファイルで指定したファイル(`/etc/miharashi/panel.token`、`ha-token` と同じく root:<実行ユーザー> 0640 か 0600。誰でも読める権限なら起動しない)から読む。不一致は `401`。`healthz` 以外は全て必須。
 - 待ち受け: 設定の `[panel] listen = "192.168.x.x:8790"` のように**インターフェースを指定**する(`0.0.0.0` は拒否)。既定は無効(`enabled = false`)。
 - 実装: `tiny_http` のスレッド 1 本(写真の `Feed` と同じ形)。`KeyPress` は `std::sync::mpsc` で実行ループへ。`/status` はループが更新する `Arc<Mutex<PanelStatus>>` を読む。
 - レート: 1 秒に 20 操作を超えたら `429`(連打の暴走を止める)。
@@ -164,7 +166,7 @@ flowchart LR
 | 段階 | 内容 | 確認方法 |
 |---|---|---|
 | P0(済) | 設計と LP | — |
-| P1 | miharashi に `[panel]` と API(既定 OFF)。`KeyPress` の注入、`/status`、SSE、トークン、レート制限。#5(画面管理の実装)の後、または `KioskApp::on_key` へ直接つなぐ最小版を先に | **Echo なしで検証できる**: `curl -H "Authorization: Bearer ..." -d '{"key":"next"}'` で画面が切り替わり、`/status` が変わる。24 時間試験のログに `panel=` が出る |
+| P1 | miharashi に `[panel]` と API(既定 OFF)。`KeyPress` の注入、`/status`、SSE、トークン、レート制限。#5 より先に、今の `KeyPress`(Prev / Switch / Next)へ直接つなぐ最小版を入れた。キーは `prev` / `next` / `select` だけで、`up` / `down` / `menu` は `400`(#5 で `KeyPress` が増えたら受け付ける)。`/api/v1/screen` は P3 | **Echo なしで検証できる**: `curl -H "Authorization: Bearer ..." -d '{"key":"next"}'` で画面が切り替わり、`/status` が変わる。24 時間試験のログに `panel=` が出る |
 | P2 | 単体アプリ `miharashi-panel` の最小版。4 / 5 / 6、画面一覧、現在画面の表示、自動起動、全画面と常時点灯 | 実機で 4 / 6 の往復。Wi-Fi 切断 → 復帰で `OFFLINE` → `API` 点灯。端末を再起動すると自動で前面に出る |
 | P3 | 8 / 2 / 0、写真 n/N、レールからの直接遷移(`/api/v1/screen`)、夜間の減光 | PoC-003 の後 |
 | P4 | LLM 管理(gpu-eval#19)とエージェントの状態を手元に表示 | gpu-eval 側の `/status` をキオスクが中継するか、パネルが直接読むかを決める |
@@ -174,7 +176,7 @@ flowchart LR
 | 項目 | 状況 |
 |---|---|
 | Echo の Wi-Fi の安定性(2.4 / 5GHz) | 未検証。P2 で 24 時間の `API` 点灯率を測る |
-| `listen` の既定インターフェース | 実機の LAN(`enp11s0`)か Tailscale か。P1 で決める |
+| `listen` の既定インターフェース | **決定(P1)**: LAN(`enp11s0`)だけで待ち受ける。Tailscale では待ち受けない |
 | 8 / 2 / 0 | PoC-003(#5)の統一操作が前提 |
 | ホストの発見 | 最初は手入力。mDNS(`_miharashi._tcp`)での自動発見は P3 で検討(キオスク側に依存が増える) |
 | UI の技術 | View と Canvas を推奨(§5.6)。Compose の起動時間とメモリを測ってから決めてよい |
