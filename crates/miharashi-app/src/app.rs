@@ -4,7 +4,7 @@ use crate::photos::{Feed, FeedEvent, FeedStatus, PhotoItem, PhotoPixels, Source}
 #[cfg(test)]
 use crate::screen::PhotoData;
 use crate::screen::{App, Composite, KeyPress};
-use miharashi_render::alert::{self, QuakeView};
+use miharashi_render::alert::{self, AlertView};
 use miharashi_render::canvas::rgba;
 use miharashi_render::screens::{self, StatusPage};
 use miharashi_render::{Canvas, TextEngine};
@@ -45,10 +45,10 @@ pub struct KioskApp {
     next_tick: Instant,
     tick_len: Duration,
     text: TextEngine,
-    /// 地震アラートの受け口(無効なら None)
-    alerts: Option<Receiver<QuakeView>>,
+    /// アラート(地震・災害)の受け口(無効なら None)
+    alerts: Option<Receiver<AlertView>>,
     /// 表示中のアラートと、閉じる時刻
-    alert: Option<(QuakeView, Instant)>,
+    alert: Option<(AlertView, Instant)>,
     alert_len: Duration,
     pub ticks: u64,
     pub keys: u64,
@@ -131,8 +131,8 @@ impl KioskApp {
         }
     }
 
-    /// 地震アラートの受け口をつなぐ。
-    pub fn with_alerts(mut self, rx: Option<Receiver<QuakeView>>) -> Self {
+    /// アラートの受け口をつなぐ。
+    pub fn with_alerts(mut self, rx: Option<Receiver<AlertView>>) -> Self {
         self.alerts = rx;
         self
     }
@@ -297,7 +297,7 @@ impl KioskApp {
                 self.notice.as_deref(),
             );
             if let Some((view, _)) = &self.alert {
-                alert::quake_overlay(canvas, &mut self.text, view);
+                alert::overlay(canvas, &mut self.text, view);
             }
         }
         let old = self
@@ -314,7 +314,7 @@ impl KioskApp {
     pub fn render(&mut self, canvas: &mut Canvas) {
         self.render_screen(canvas);
         if let Some((view, _)) = &self.alert {
-            alert::quake_overlay(canvas, &mut self.text, view);
+            alert::overlay(canvas, &mut self.text, view);
         }
     }
 
