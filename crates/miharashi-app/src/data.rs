@@ -26,12 +26,14 @@ pub fn dummy_snapshot(phase: f32) -> Snapshot {
     let gpus = vec![
         GpuLoad {
             label: "GPU0".into(),
+            name: "RTX 5060 Ti".into(),
             usage: Some(gpu),
             temp: Some(55.0 + gpu * 0.15),
             history: gpu_history.clone(),
         },
         GpuLoad {
             label: "GPU1".into(),
+            name: "Radeon(内蔵)".into(),
             usage: igpu_history.last().copied(),
             temp: Some(42.0),
             history: igpu_history,
@@ -238,6 +240,7 @@ fn update_gpus(gpus: &mut Vec<GpuLoad>, readings: Vec<miharashi_linux::metrics::
         };
         let mut g = GpuLoad {
             label: r.label,
+            name: r.name,
             usage: r.usage,
             temp: r.temp,
             history,

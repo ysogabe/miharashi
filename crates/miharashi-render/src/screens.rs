@@ -5,10 +5,23 @@ pub use crate::status::{CPU_COLOR, GPU_COLOR, StatusPage, gpu_color, status};
 #[derive(Default, Clone, Debug)]
 pub struct GpuLoad {
     pub label: String,
+    /// 画面に出す名前。空なら `label` を出す
+    pub name: String,
     pub usage: Option<f32>,
     pub temp: Option<f32>,
     /// 使用率の時系列 [%](cpu_history と同じ長さ・間隔)
     pub history: Vec<f32>,
+}
+
+impl GpuLoad {
+    /// 画面に出す名前(なければ "GPU0" のような番号)。
+    pub fn display_name(&self) -> &str {
+        if self.name.is_empty() {
+            &self.label
+        } else {
+            &self.name
+        }
+    }
 }
 
 /// 画面に渡すデータ。取得できない項目は None(画面には "--" と表示する)。
