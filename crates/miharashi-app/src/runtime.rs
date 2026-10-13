@@ -205,6 +205,8 @@ impl Presenter {
 /// 画面ロジックを作るために必要な、表示先が決まったあとの情報。
 /// 操作パネルの待ち受けに失敗したとき、試し直すまでの間隔。
 const PANEL_RETRY: Duration = Duration::from_secs(30);
+/// キーボードが 1 台も無いとき、挿されていないか見直す間隔。
+const KEYS_RETRY: Duration = Duration::from_secs(10);
 
 /// 操作パネルに見せるモニターの状態。
 fn display_status(screen_on: bool, power: Option<&ScreenPower>) -> DisplayStatus {
@@ -265,8 +267,18 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             "標準入力は VT ではない"
         }
     );
-    let mut keys = Keys::open(&mut session, &cfg.input.devices)?;
-    eprintln!("input: {:?}", keys.device_names());
+    // 操作パネルがあればキーボードは無くてもよい(後から挿されたら KEYS_RETRY ごとに拾う)
+    let mut keys = if cfg.panel.enabled {
+        Keys::open_any(&mut session, &cfg.input.devices)
+    } else {
+        Keys::open(&mut session, &cfg.input.devices)?
+    };
+    if keys.is_empty() {
+        eprintln!("input: キーボードが無い(操作パネルで操作する)");
+    } else {
+        eprintln!("input: {:?}", keys.device_names());
+    }
+    let mut keys_retry = Instant::now() + KEYS_RETRY;
 
     let mut app = make_app(&Output {
         size: (w, h),
@@ -349,6 +361,12 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             }
         }
 
+        if keys.is_empty() && Instant::now() >= keys_retry {
+            keys_retry = Instant::now() + KEYS_RETRY;
+            if keys.reopen(&mut session) > 0 {
+                eprintln!("input: {:?}", keys.device_names());
+            }
+        }
         let mut quit = false;
         for a in keys.poll() {
             let key = match a {
