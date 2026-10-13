@@ -97,9 +97,10 @@ flowchart LR
 
 | メソッド | パス | 内容 |
 |---|---|---|
-| GET | `/api/v1/status` | `{schema_version, host, screen: {id, title, index, count}, screens: [{id, title}], photo: {position, total} \| null, feed: "online" \| "retrying", uptime_s, generated_at}` |
+| GET | `/api/v1/status` | `{schema_version, host, screen: {id, title, index, count}, screens: [{id, title}], photo: {position, total} \| null, feed: "online" \| "retrying", display: {on, mode: "auto" \| "force_on" \| "force_off" \| null, control}, uptime_s, generated_at}` |
 | POST | `/api/v1/input` | `{"key": "prev" \| "next" \| "select" \| "up" \| "down" \| "menu"}` → `204`。`quit` は受け付けない |
 | POST | `/api/v1/screen` | `{"id": "photo"}` → `204`。登録されていない id は `404` |
+| POST | `/api/v1/display` | `{"mode": "force_off" \| "force_on" \| "auto"}` → `204`。キオスクのモニターの消灯・点灯。キオスクが HA の手動オーバーライド(`screen_power.mode_entity` の input_select)を書き換え、すぐ問い合わせ直して反映する。HA と表示が食い違わないよう、キオスクの中だけでは切り替えない。mode エンティティが未設定なら `409`、HA に届かなければ `502` |
 | GET | `/api/v1/events` | SSE。画面が変わるたびに `status` と同じ JSON を 1 行。接続中は 15 秒ごとに `: keepalive` |
 | GET | `/api/v1/healthz` | 認証なし。`{"ok": true}` だけ |
 
