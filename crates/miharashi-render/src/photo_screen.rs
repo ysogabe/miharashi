@@ -224,6 +224,20 @@ pub fn photo_frame(
         }
         None => c.draw_pixmap(frame, 0, 0),
     }
+    photo_overlay(c, t, s, layout, info, notice);
+}
+
+/// 写真の上に重ねるもの(時刻・日付・写真の情報、取得状態の案内)だけを描く。CPU 経路では写真の
+/// 上に直接描き、GPU 経路(PoC-005 PR3)では透明な Canvas に描いて GPU で写真に重ねる。
+pub fn photo_overlay(
+    c: &mut Canvas,
+    t: &mut TextEngine,
+    s: &Snapshot,
+    layout: &PhotoLayout,
+    info: Option<&PhotoInfo>,
+    notice: Option<&str>,
+) {
+    let k = scale(c.height());
     overlay(c, t, s, layout, info);
     if let Some(n) = notice {
         // 最後の写真を表示したまま、右上に小さく状態を出す。
