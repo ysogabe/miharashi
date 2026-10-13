@@ -16,6 +16,7 @@ pub struct Config {
     pub screen_power: ScreenPower,
     pub alerts: Alerts,
     pub ui: Ui,
+    pub panel: Panel,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -132,6 +133,19 @@ pub struct Ui {
     pub start_screen: String,
 }
 
+/// 手元の操作パネル(Echo Show 5 など)向けの API(docs/panel/DESIGN.md §5.2)。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Panel {
+    pub enabled: bool,
+    /// 待ち受けるアドレス。LAN のインターフェースの IP を指定する(0.0.0.0 / :: は不可)。
+    pub listen: String,
+    /// Bearer トークンを 1 行で書いたファイル(0600)。
+    pub token_file: String,
+    /// `POST /api/v1/input` を 1 秒にこの回数まで受け付ける。超えたら 429。
+    pub max_rate_per_sec: u32,
+}
+
 impl Default for Runtime {
     fn default() -> Self {
         Self {
@@ -227,6 +241,17 @@ impl Default for Ui {
     }
 }
 
+impl Default for Panel {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: String::new(),
+            token_file: "/etc/miharashi/panel.token".into(),
+            max_rate_per_sec: 20,
+        }
+    }
+}
+
 impl Config {
     pub fn parse(text: &str) -> Result<Self, String> {
         let cfg: Config = toml::from_str(text).map_err(|e| format!("設定の読み込みに失敗: {e}"))?;
@@ -299,6 +324,13 @@ impl Config {
             return Err(
                 "screen_power の idle_minutes・override_decay_minutes・poll_secs は 1 以上".into(),
             );
+        }
+        if self.panel.enabled {
+            crate::panel::check_listen(&self.panel.listen)
+                .map_err(|e| format!("panel.listen: {e}"))?;
+            if self.panel.max_rate_per_sec == 0 || self.panel.token_file.is_empty() {
+                return Err("panel.max_rate_per_sec は 1 以上、token_file は必須".into());
+            }
         }
         Ok(())
     }
@@ -439,5 +471,20 @@ mod tests {
     fn shipped_example_parses() {
         let text = include_str!("../../../config/example.toml");
         Config::parse(text).expect("config/example.toml が読み込めること");
+    }
+
+    #[test]
+    fn panel_is_off_by_default_and_needs_a_specific_address() {
+        assert!(!Config::default().panel.enabled);
+        let on = |listen: &str| {
+            Config::parse(&format!("[panel]\nenabled = true\nlisten = \"{listen}\"\n"))
+        };
+        assert!(on("192.168.0.132:8790").is_ok());
+        assert!(on("0.0.0.0:8790").is_err(), "全インターフェース");
+        assert!(on("[::]:8790").is_err(), "全インターフェース(IPv6)");
+        assert!(on("").is_err());
+        assert!(on("geoframe-n100:8790").is_err(), "名前ではなく IP");
+        // 無効なら listen が空でもよい
+        assert!(Config::parse("[panel]\nmax_rate_per_sec = 5\n").is_ok());
     }
 }

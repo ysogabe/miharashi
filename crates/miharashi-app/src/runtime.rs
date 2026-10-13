@@ -2,6 +2,7 @@
 //! seat/VT の有効・無効、SIGINT/SIGTERM、入力、描画、画面の電源(DPMS)、状態ログを扱う。
 //! 状態ログは共通部分(t / rss / fds / frames / worst_frame)に `App::stats()` の `k=v` を続けて出す。
 use crate::config::Config;
+use crate::panel::Panel;
 use crate::screen::{App, Composite, KeyPress, PhotoData, PhotoRef};
 use crate::screen_power::ScreenPower;
 use miharashi_gpu::{Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, SourceImage};
@@ -280,6 +281,16 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     let power = ScreenPower::start(&cfg.home_assistant, &cfg.screen_power);
     let mut screen_on = true;
     let mut power_tried = true;
+    // 手元の操作パネルの API。待ち受けられなくてもキオスクは動かし続ける(状態ログは panel=error)
+    let panel = cfg
+        .panel
+        .enabled
+        .then(|| Panel::start(&cfg.panel))
+        .and_then(|r| {
+            r.inspect(|p| eprintln!("panel: {} で待ち受け", p.addr()))
+                .map_err(|e| eprintln!("panel: 起動できない(パネルなしで続ける): {e}"))
+                .ok()
+        });
 
     let reason = loop {
         if term.load(Ordering::Relaxed) {
@@ -353,7 +364,21 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
         if quit {
             break "キー操作(Esc/q)";
         }
+        // パネルのキーもキーボードと同じに扱う(消えている画面では点けるだけ)
+        for key in panel.iter().flat_map(Panel::keys) {
+            eprintln!("key: panel {key:?}");
+            if let Some(p) = &power {
+                p.on_key();
+            }
+            if screen_on {
+                redraw |= app.on_key(key);
+            }
+        }
         redraw |= app.tick(Instant::now());
+        // 画面を消していてもパネルの表示は追従させる
+        if redraw && let Some(p) = &panel {
+            p.publish(app.panel_view());
+        }
 
         // アラートは画面を消していても点けて見せる(tick で届いたものを同じ周期で反映する)
         let want_on = app.wants_screen() || power.as_ref().is_none_or(ScreenPower::want_on);
@@ -394,6 +419,9 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             extra.push(("render_ms", summarize_ms(&mut render_ms)));
             extra.push(("present_ms", summarize_ms(&mut present_ms)));
             extra.push(("photo_gpu_ms", summarize_ms(&mut photo_ms)));
+            if cfg.panel.enabled {
+                extra.push(("panel", panel.as_ref().map_or("error", Panel::stat).into()));
+            }
             eprintln!(
                 "{}",
                 format_stats(

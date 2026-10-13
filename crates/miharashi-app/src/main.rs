@@ -5,6 +5,7 @@ mod bench;
 mod config;
 mod data;
 mod disaster;
+mod panel;
 mod photos;
 mod quake;
 #[cfg(target_os = "linux")]

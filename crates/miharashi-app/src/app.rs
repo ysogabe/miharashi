@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::photos::{Feed, FeedEvent, FeedStatus, PhotoItem, PhotoPixels, Source};
 #[cfg(test)]
 use crate::screen::PhotoData;
-use crate::screen::{App, Composite, KeyPress};
+use crate::screen::{App, Composite, KeyPress, PanelView, ScreenInfo};
 use miharashi_render::alert::{self, AlertView};
 use miharashi_render::canvas::rgba;
 use miharashi_render::screens::{self, StatusPage};
@@ -396,6 +396,30 @@ impl App for KioskApp {
             ),
         ]
     }
+
+    fn panel_view(&self) -> Option<PanelView> {
+        let (current, page) = match self.screen {
+            Screen::Status(StatusPage::Overview) => (0, Some("OVERVIEW")),
+            Screen::Status(StatusPage::Details) => (0, Some("DETAILS")),
+            Screen::Photo => (1, None),
+        };
+        Some(PanelView {
+            screens: vec![
+                ScreenInfo {
+                    id: "status",
+                    title: "STATUS",
+                },
+                ScreenInfo {
+                    id: "photo",
+                    title: "PHOTO FRAME",
+                },
+            ],
+            current,
+            page,
+            photo: self.current.as_ref().map(|p| p.info.position),
+            feed_online: self.notice.is_none(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -489,6 +513,23 @@ mod tests {
         assert_eq!(app.screen(), DETAILS, "4 は何もしない");
         app.on_key(KeyPress::Switch);
         assert_eq!(app.screen(), OVERVIEW);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn panel_view_follows_the_screen() {
+        let (mut app, dir) = app_with_photo((320, 180));
+        let v = App::panel_view(&app).unwrap();
+        let ids: Vec<_> = v.screens.iter().map(|s| s.id).collect();
+        assert_eq!(ids, ["status", "photo"]);
+        assert_eq!((v.current, v.page), (0, Some("OVERVIEW")));
+        app.on_key(KeyPress::Switch);
+        assert_eq!(App::panel_view(&app).unwrap().page, Some("DETAILS"));
+        app.on_key(KeyPress::Next);
+        assert!(pump_until(&mut app, |a| a.photo_position() == 1));
+        let v = App::panel_view(&app).unwrap();
+        assert_eq!((v.current, v.page, v.photo), (1, None, Some((1, 1))));
+        assert!(v.feed_online);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
