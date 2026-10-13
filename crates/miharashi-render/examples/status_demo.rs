@@ -1,6 +1,6 @@
 //! 状況画面の目視確認用。全項目を埋めた Snapshot と、ほとんど None の Snapshot を
 //! 1920x1080 / 2560x1080 で /tmp/claude-status-demo/ に書き出す。
-use miharashi_render::screens::{Snapshot, StatusPage, status};
+use miharashi_render::screens::{GpuLoad, Snapshot, StatusPage, status};
 use miharashi_render::{Canvas, TextEngine};
 
 fn wave(n: usize, base: f32, amp: f32, phase: f32) -> Vec<f32> {
@@ -35,6 +35,27 @@ fn full() -> Snapshot {
         ],
         cpu_history: wave(n, 30.0, 20.0, 0.0),
         gpu_history: wave(n, 60.0, 30.0, 40.0),
+        // 3 台(NVIDIA 2 台 + 内蔵、内蔵の温度は取れない想定)
+        gpus: vec![
+            GpuLoad {
+                label: "GPU0".into(),
+                usage: Some(97.0),
+                temp: Some(84.0),
+                history: wave(n, 60.0, 30.0, 40.0),
+            },
+            GpuLoad {
+                label: "GPU1".into(),
+                usage: Some(41.0),
+                temp: Some(66.0),
+                history: wave(n, 40.0, 20.0, 70.0),
+            },
+            GpuLoad {
+                label: "GPU2".into(),
+                usage: Some(3.0),
+                temp: None,
+                history: wave(n, 5.0, 4.0, 90.0),
+            },
+        ],
         cpu_power_w: Some(95.0),
         gpu_power_w: Some(142.0),
         cpu_energy_today_wh: Some(1200.0),

@@ -1,6 +1,6 @@
 //! `DataSource` の実装: 実測(Linux)とダミー(試験・開発用)。
 use crate::app::DataSource;
-use miharashi_render::screens::Snapshot;
+use miharashi_render::screens::{GpuLoad, Snapshot};
 
 pub const HISTORY: usize = 120;
 
@@ -18,7 +18,27 @@ pub fn dummy_snapshot(phase: f32) -> Snapshot {
     let cpu_history = dummy_history(phase, HISTORY, 45.0);
     let gpu_history = dummy_history(phase + 40.0, HISTORY, 55.0);
     let (cpu, gpu) = (*cpu_history.last().unwrap(), *gpu_history.last().unwrap());
+    // GPU0 = 外付け(監視 GPU)、GPU1 = 内蔵
+    let igpu_history: Vec<f32> = dummy_history(phase + 80.0, HISTORY, 15.0)
+        .into_iter()
+        .map(|v| v.max(0.0))
+        .collect();
+    let gpus = vec![
+        GpuLoad {
+            label: "GPU0".into(),
+            usage: Some(gpu),
+            temp: Some(55.0 + gpu * 0.15),
+            history: gpu_history.clone(),
+        },
+        GpuLoad {
+            label: "GPU1".into(),
+            usage: igpu_history.last().copied(),
+            temp: Some(42.0),
+            history: igpu_history,
+        },
+    ];
     let mut s = Snapshot {
+        gpus,
         cpu: Some(cpu),
         cpu_temp: Some(50.0 + cpu * 0.15),
         gpu: Some(gpu),
@@ -164,6 +184,7 @@ impl DataSource for LiveData {
         if let Some(v) = m.gpu_percent {
             push_history(&mut s.gpu_history, v);
         }
+        update_gpus(&mut s.gpus, m.gpus);
 
         s.cpu_power_w = m.cpu_power_w;
         s.gpu_power_w = m.gpu_power_w;
@@ -203,6 +224,28 @@ impl DataSource for LiveData {
                 push_history(hist, v);
             }
         }
+    }
+}
+
+/// GPU ごとの値を反映する。履歴はラベルが同じ GPU から引き継ぐ(初めての GPU は 0 から貯める)。
+#[cfg(target_os = "linux")]
+fn update_gpus(gpus: &mut Vec<GpuLoad>, readings: Vec<miharashi_linux::metrics::GpuReading>) {
+    let mut prev = std::mem::take(gpus);
+    for r in readings {
+        let history = match prev.iter().position(|g| g.label == r.label) {
+            Some(i) => std::mem::take(&mut prev[i].history),
+            None => vec![0.0; HISTORY],
+        };
+        let mut g = GpuLoad {
+            label: r.label,
+            usage: r.usage,
+            temp: r.temp,
+            history,
+        };
+        if let Some(v) = r.usage {
+            push_history(&mut g.history, v);
+        }
+        gpus.push(g);
     }
 }
 
