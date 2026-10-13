@@ -1,16 +1,10 @@
 //! 画面ロジック(PC 状況 + フォトフレーム)。実行ループ(runtime)からは `App` として見える。
 use crate::config::Config;
 use crate::photos::{Feed, FeedEvent, FeedStatus, PhotoItem, Source};
+use crate::screen::{App, KeyPress};
 use miharashi_render::screens::{self, StatusPage};
 use miharashi_render::{Canvas, Pixmap, TextEngine};
 use std::time::{Duration, Instant};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Key {
-    Prev,
-    Switch,
-    Next,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -131,28 +125,28 @@ impl KioskApp {
     }
 
     /// 戻り値: 再描画が必要か。
-    pub fn on_key(&mut self, key: Key) -> bool {
+    pub fn on_key(&mut self, key: KeyPress) -> bool {
         self.keys += 1;
         match (key, self.screen) {
             // 状況画面: 5 でページ切替、6 / → でフォトフレームへ。
-            (Key::Switch, Screen::Status(p)) => {
+            (KeyPress::Switch, Screen::Status(p)) => {
                 self.status_page = p.toggled();
                 self.screen = Screen::Status(self.status_page);
             }
-            (Key::Next, Screen::Status(p)) => {
+            (KeyPress::Next, Screen::Status(p)) => {
                 self.status_page = p;
                 self.screen = Screen::Photo;
             }
-            (Key::Switch, Screen::Photo) => self.screen = Screen::Status(self.status_page),
-            (Key::Next, Screen::Photo) => {
+            (KeyPress::Switch, Screen::Photo) => self.screen = Screen::Status(self.status_page),
+            (KeyPress::Next, Screen::Photo) => {
                 self.feed.next();
                 self.last_photo_change = Instant::now();
             }
-            (Key::Prev, Screen::Photo) => {
+            (KeyPress::Prev, Screen::Photo) => {
                 self.feed.prev();
                 self.last_photo_change = Instant::now();
             }
-            (Key::Prev, Screen::Status(_)) => {}
+            (KeyPress::Prev, Screen::Status(_)) => {}
         }
         true
     }
@@ -242,6 +236,33 @@ impl KioskApp {
     }
 }
 
+impl App for KioskApp {
+    fn on_key(&mut self, key: KeyPress) -> bool {
+        KioskApp::on_key(self, key)
+    }
+
+    fn tick(&mut self, now: Instant) -> bool {
+        KioskApp::tick(self, now)
+    }
+
+    fn render(&mut self, canvas: &mut Canvas) {
+        KioskApp::render(self, canvas)
+    }
+
+    fn stats(&self) -> Vec<(&'static str, String)> {
+        let s = self.snapshot();
+        vec![
+            ("ticks", self.ticks.to_string()),
+            ("keys", self.keys.to_string()),
+            ("screen", format!("{:?}", self.screen())),
+            ("photo", self.photo_position().to_string()),
+            ("feed", self.feed_notice().unwrap_or("online").to_string()),
+            ("cpu", format!("{:?}", s.cpu.map(|v| v.round()))),
+            ("gpu", format!("{:?}", s.gpu.map(|v| v.round()))),
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,28 +309,28 @@ mod tests {
     fn key_flow_between_status_and_photo() {
         let (mut app, dir) = app_with_photo((320, 180));
         assert_eq!(app.screen(), OVERVIEW);
-        app.on_key(Key::Prev);
+        app.on_key(KeyPress::Prev);
         assert_eq!(app.screen(), OVERVIEW, "状況画面の 4 は何もしない");
-        app.on_key(Key::Next);
+        app.on_key(KeyPress::Next);
         assert_eq!(
             app.screen(),
             Screen::Photo,
             "状況画面の 6 でフォトフレームへ"
         );
-        app.on_key(Key::Switch);
+        app.on_key(KeyPress::Switch);
         assert_eq!(app.screen(), OVERVIEW, "5 で状況画面へ戻る");
-        app.on_key(Key::Switch);
+        app.on_key(KeyPress::Switch);
         assert_eq!(app.screen(), DETAILS, "状況画面の 5 でページ切替");
         assert!(
             pump_until(&mut app, |a| a.photo_position() == 1),
             "写真が読み込まれる"
         );
-        app.on_key(Key::Next);
+        app.on_key(KeyPress::Next);
         assert_eq!(app.screen(), Screen::Photo);
-        app.on_key(Key::Switch);
+        app.on_key(KeyPress::Switch);
         assert_eq!(app.screen(), DETAILS, "最後に見ていたページへ戻る");
-        app.on_key(Key::Next);
-        app.on_key(Key::Next);
+        app.on_key(KeyPress::Next);
+        app.on_key(KeyPress::Next);
         assert!(
             pump_until(&mut app, |a| a.photo_position() == 1),
             "写真切替後も位置が有効"
@@ -321,11 +342,11 @@ mod tests {
     #[test]
     fn status_page_toggles_with_switch_key() {
         let (mut app, dir) = app_with_photo((320, 180));
-        app.on_key(Key::Switch);
+        app.on_key(KeyPress::Switch);
         assert_eq!(app.screen(), DETAILS);
-        app.on_key(Key::Prev);
+        app.on_key(KeyPress::Prev);
         assert_eq!(app.screen(), DETAILS, "4 は何もしない");
-        app.on_key(Key::Switch);
+        app.on_key(KeyPress::Switch);
         assert_eq!(app.screen(), OVERVIEW);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -365,7 +386,7 @@ mod tests {
         }
         assert!(found, "CPU 使用率の折れ線");
 
-        app.on_key(Key::Next);
+        app.on_key(KeyPress::Next);
         assert!(pump_until(&mut app, |a| a.photo_position() == 1));
         // 写真が拡大されて全面に出る。フェードが終わるまで待って確認する。
         std::thread::sleep(Duration::from_millis(900));
@@ -420,7 +441,7 @@ mod tests {
                     // ページ指示のシアン色の文字が見出しにある。
                     assert!(has_color(&c, [64, 200, 255, 255], 300..700, 20..60));
                 }
-                app.on_key(Key::Switch);
+                app.on_key(KeyPress::Switch);
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
