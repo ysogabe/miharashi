@@ -26,6 +26,10 @@ pub trait App {
         self.render(canvas);
         Composite::Canvas
     }
+    /// 画面を消している間でも点けて見せたいもの(アラート)があるか。
+    fn wants_screen(&self) -> bool {
+        false
+    }
     /// 状態ログ用。runtime は中身を解釈せず、`k=v` を並べて出す。
     fn stats(&self) -> Vec<(&'static str, String)>;
 }

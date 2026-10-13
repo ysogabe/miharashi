@@ -1,12 +1,14 @@
 //! 画面ロジック(PC 状況 + フォトフレーム)。実行ループ(runtime)からは `App` として見える。
 use crate::config::Config;
 use crate::photos::{Feed, FeedEvent, FeedStatus, PhotoItem, PhotoPixels, Source};
-use crate::screen::{App, Composite, KeyPress};
 #[cfg(test)]
 use crate::screen::PhotoData;
+use crate::screen::{App, Composite, KeyPress};
+use miharashi_render::alert::{self, QuakeView};
 use miharashi_render::canvas::rgba;
 use miharashi_render::screens::{self, StatusPage};
 use miharashi_render::{Canvas, TextEngine};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +45,11 @@ pub struct KioskApp {
     next_tick: Instant,
     tick_len: Duration,
     text: TextEngine,
+    /// 地震アラートの受け口(無効なら None)
+    alerts: Option<Receiver<QuakeView>>,
+    /// 表示中のアラートと、閉じる時刻
+    alert: Option<(QuakeView, Instant)>,
+    alert_len: Duration,
     pub ticks: u64,
     pub keys: u64,
 }
@@ -116,9 +123,23 @@ impl KioskApp {
             next_tick: Instant::now(),
             tick_len: Duration::from_secs(1),
             text: text_engine(&cfg.ui.font),
+            alerts: None,
+            alert: None,
+            alert_len: Duration::from_secs(cfg.alerts.show_minutes * 60),
             ticks: 0,
             keys: 0,
         }
+    }
+
+    /// 地震アラートの受け口をつなぐ。
+    pub fn with_alerts(mut self, rx: Option<Receiver<QuakeView>>) -> Self {
+        self.alerts = rx;
+        self
+    }
+
+    /// アラートを表示中か(画面を消していても点ける)。
+    pub fn alert_active(&self) -> bool {
+        self.alert.is_some()
     }
 
     pub fn screen(&self) -> Screen {
@@ -141,6 +162,10 @@ impl KioskApp {
     pub fn on_key(&mut self, key: KeyPress) -> bool {
         self.keys += 1;
         self.overlay_dirty = true;
+        // アラート表示中のキーは閉じるだけにする
+        if self.alert.take().is_some() {
+            return true;
+        }
         match (key, self.screen) {
             // 状況画面: 5 でページ切替、6 / → でフォトフレームへ。
             (KeyPress::Switch, Screen::Status(p)) => {
@@ -194,6 +219,20 @@ impl KioskApp {
                     redraw = true;
                 }
             }
+        }
+        // 新しいアラートは前のものを置き換え、表示時間も数え直す
+        let mut latest = None;
+        while let Some(v) = self.alerts.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            latest = Some(v);
+        }
+        if let Some(v) = latest {
+            self.alert = Some((v, now + self.alert_len));
+            redraw = true;
+        }
+        // 表示時間が過ぎたら、ほかの入力が無くても必ず閉じる
+        if self.alert.as_ref().is_some_and(|(_, until)| now >= *until) {
+            self.alert = None;
+            redraw = true;
         }
         if self.screen == Screen::Photo
             && now.duration_since(self.last_photo_change) >= self.photo_interval
@@ -257,6 +296,9 @@ impl KioskApp {
                 Some(&item.info),
                 self.notice.as_deref(),
             );
+            if let Some((view, _)) = &self.alert {
+                alert::quake_overlay(canvas, &mut self.text, view);
+            }
         }
         let old = self
             .fade
@@ -270,6 +312,13 @@ impl KioskApp {
     }
 
     pub fn render(&mut self, canvas: &mut Canvas) {
+        self.render_screen(canvas);
+        if let Some((view, _)) = &self.alert {
+            alert::quake_overlay(canvas, &mut self.text, view);
+        }
+    }
+
+    fn render_screen(&mut self, canvas: &mut Canvas) {
         match self.screen {
             Screen::Status(page) => screens::status(canvas, &mut self.text, &self.snap, page),
             Screen::Photo => {
@@ -320,6 +369,10 @@ impl App for KioskApp {
         KioskApp::render_composite(self, canvas)
     }
 
+    fn wants_screen(&self) -> bool {
+        self.alert_active()
+    }
+
     fn stats(&self) -> Vec<(&'static str, String)> {
         let s = self.snapshot();
         vec![
@@ -355,10 +408,7 @@ mod tests {
     }
 
     /// `gpu_max` が Some なら GPU 経路(写真はデコードしただけで届く)。
-    fn app_with_photo_on(
-        size: (u32, u32),
-        gpu_max: Option<u32>,
-    ) -> (KioskApp, std::path::PathBuf) {
+    fn app_with_photo_on(size: (u32, u32), gpu_max: Option<u32>) -> (KioskApp, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "miharashi-app-{}-{:?}",
             std::process::id(),
