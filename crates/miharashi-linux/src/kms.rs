@@ -8,6 +8,10 @@ use drm::control::{
 use std::fs::File;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
+/// DPMS プロパティの値(include/uapi/drm/drm_mode.h の DRM_MODE_DPMS_ON / OFF)。
+const DPMS_ON: u64 = 0;
+const DPMS_OFF: u64 = 3;
+
 pub struct Card(File);
 
 impl Card {
@@ -86,6 +90,26 @@ impl Output {
         card.set_crtc(self.crtc, Some(fb), (0, 0), &[self.conn], Some(self.mode))
     }
 
+    /// 画面の電源を切り替える(DPMS)。表示は legacy の set_crtc / page flip なので、
+    /// コネクターの legacy の DPMS プロパティを使う。DRM master が必要。
+    pub fn set_power(&self, card: &Card, on: bool) -> Result<(), String> {
+        let props = card
+            .get_properties(self.conn)
+            .map_err(|e| format!("get_properties: {e}"))?;
+        for &h in props.as_props_and_values().0 {
+            let info = card
+                .get_property(h)
+                .map_err(|e| format!("get_property: {e}"))?;
+            if info.name().to_bytes() == b"DPMS" {
+                let value = if on { DPMS_ON } else { DPMS_OFF };
+                return card
+                    .set_property(self.conn, h, value)
+                    .map_err(|e| format!("DPMS: {e}"));
+            }
+        }
+        Err("コネクターに DPMS プロパティがない".into())
+    }
+
     /// 起動前の CRTC の状態に戻す(終了時)。
     pub fn restore(&self, card: &Card) {
         let _ = card.set_crtc(
@@ -161,6 +185,11 @@ impl Display {
             .map_err(|e| format!("set_crtc(復帰): {e}"))?;
         self.suspended = false;
         Ok(())
+    }
+
+    /// 画面の電源を切り替える(DPMS)。消している間も `present` は書けるが、見えない。
+    pub fn set_power(&mut self, on: bool) -> Result<(), String> {
+        self.out.set_power(&self.card, on)
     }
 
     /// フレームを dumb buffer へ書く。`fill` は (バッファ, pitch) を受け取る。一時停止中は何もしない。
