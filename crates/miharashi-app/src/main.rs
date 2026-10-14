@@ -371,6 +371,56 @@ fn bench(cli: Cli) -> Result<(), String> {
     Ok(())
 }
 
+/// `bench-metrics [--frames N]`: 監視スレッドの読み取りを 1 種類ずつ、1 秒ごとに N 回(既定 20)測る。
+#[cfg(target_os = "linux")]
+fn bench_metrics(cli: Cli) -> Result<(), String> {
+    use miharashi_linux::metrics::{GpuSel, SamplerOptions, profile};
+    let cfg = load_config(&cli)?;
+    let gpu = GpuSel::parse(&cfg.metrics.gpu)?;
+    let opts = SamplerOptions {
+        state_file: None,
+        rapl_helper_file: cfg.power.rapl_helper_file.clone().into(),
+    };
+    let rounds = cli.frames.unwrap_or(20) as u32;
+    let interval = std::time::Duration::from_secs(cfg.metrics.interval_secs.max(1));
+    let rd = |f: &str| {
+        std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu0/cpufreq/{f}"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "-".into())
+    };
+    let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    println!(
+        "bench-metrics: {rounds} 回、{}s ごと(1 回あたりの平均)。cpu0 {}kHz({})、loadavg {}",
+        interval.as_secs(),
+        rd("scaling_cur_freq"),
+        rd("scaling_governor"),
+        load.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+    );
+    let costs = profile(rounds, interval, &gpu, &opts);
+    let (mut wall, mut cpu) = (0.0, 0.0);
+    println!("{:<40} {:>10} {:>10}", "読み取り", "経過 [µs]", "CPU [µs]");
+    for c in &costs {
+        println!("{:<40} {:>10.1} {:>10.1}", c.name, c.wall_us, c.cpu_us);
+        if !c.name.starts_with("init:") {
+            wall += c.wall_us;
+            cpu += c.cpu_us;
+        }
+    }
+    println!(
+        "{:<40} {:>10.1} {:>10.1}  (1 秒ごとなら CPU {:.2}%)",
+        "合計(init を除く)",
+        wall,
+        cpu,
+        cpu / interval.as_secs_f64() / 1e4
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bench_metrics(_: Cli) -> Result<(), String> {
+    Err("bench-metrics は Linux 専用".into())
+}
+
 /// `bench-gpu [--size WxH] [--seconds N] [--fps N(0 = 上限)] [--neurons N] [--synapses N]
 /// [--stim N] [--gain X] [--lines none|all|active] [--out FILE.png]`(B1 コネクトーム)
 /// `bench-gpu --video FILE [--detections N] [--size WxH] [--seconds N] [--fps N] [--out FILE.png]`
@@ -483,10 +533,11 @@ fn main() -> Result<(), String> {
         "png" => png(cli),
         "bench" => bench(cli),
         "bench-gpu" => bench_gpu(cli),
+        "bench-metrics" => bench_metrics(cli),
         "kms-info" => kms_info(cli),
         "check-config" => load_config(&cli).map(|_| println!("OK")),
         other => Err(format!(
-            "unknown command {other}(run / png / bench / bench-gpu / kms-info / check-config)"
+            "unknown command {other}(run / png / bench / bench-gpu / bench-metrics / kms-info / check-config)"
         )),
     }
 }
