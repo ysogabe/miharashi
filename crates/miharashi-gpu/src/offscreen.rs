@@ -291,4 +291,41 @@ mod tests {
             assert!(in_bg.1 <= 2, "{mode:?} 背景の部分: {in_bg:?}");
         }
     }
+
+    /// レーダー: 線の直後は緑に光り、線の直前と円の外は背景のまま。点は線が通った直後ほど明るい。
+    #[test]
+    fn offscreen_radar_sweep_and_blips() {
+        use crate::compose::{Frame, Radar};
+        let Ok(off) = Offscreen::open(Path::new("/dev/dri/renderD128")) else {
+            eprintln!("GLES が使えないので skip");
+            return;
+        };
+        let size = (400u32, 300u32);
+        let bg: Vec<u8> = [8u8, 8, 8, 255].repeat((size.0 * size.1) as usize);
+        // 中心 (200, 150)、半径 100。線は東(π/2)。点は北東(さっき通った)と南東(これから通る)
+        let blips = [[250.0, 100.0, 0.0], [250.0, 200.0, 0.0]];
+        let frame = Frame::Radar {
+            background: Some(&bg),
+            radar: Radar {
+                center: (200.0, 150.0),
+                radius: 100.0,
+                sweep: std::f32::consts::FRAC_PI_2,
+                trail: 0.9,
+                scale: 1.0,
+                blips: &blips,
+            },
+        };
+        let got = off.render_frames(&[frame], size).unwrap();
+        let px = |x: u32, y: u32| {
+            let i = ((y * size.0 + x) * 4) as usize;
+            [got[i], got[i + 1], got[i + 2]]
+        };
+        let after = px(260, 140); // 線の少し後ろ(北東寄り)
+        let before = px(260, 165); // 線の少し手前(南東寄り)
+        assert!(after[1] > after[0] + 30, "線の後ろは緑: {after:?}");
+        assert!(before[1] < 20, "線の手前は暗い: {before:?}");
+        assert_eq!(px(10, 10), [8, 8, 8], "円の外は背景のまま");
+        let (swept, coming) = (px(250, 100), px(250, 200));
+        assert!(swept[1] > coming[1] + 40, "通った直後の点が明るい: {swept:?} {coming:?}");
+    }
 }

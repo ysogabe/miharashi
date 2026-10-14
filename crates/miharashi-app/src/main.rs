@@ -16,6 +16,7 @@ mod screen;
 mod screen_power;
 
 use config::Config;
+use miharashi_render::aircraft as air;
 use miharashi_render::{Canvas, photo, screens};
 use photos::{Catalog, Grouping, HomeLookup, PhotoItem, PhotoPixels, Source};
 use std::path::PathBuf;
@@ -174,7 +175,7 @@ fn png(cli: Cli) -> Result<(), String> {
     let mut text = app::text_engine(&cfg.ui.font);
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     let mut c = Canvas::new(size.0, size.1);
-    let mut save = |c: &Canvas, layers: Option<(&PhotoItem, &Canvas)>, name: &str| {
+    let mut save = |c: &Canvas, layers: Layers<'_>, name: &str| {
         c.save_png(&out.join(format!("{name}.png")))?;
         if let Some(check) = gles.as_mut() {
             check(c, layers, &out.join(format!("{name}-gles.png")))?;
@@ -182,9 +183,9 @@ fn png(cli: Cli) -> Result<(), String> {
         Ok::<(), String>(())
     };
     screens::status(&mut c, &mut text, &snap, screens::StatusPage::Overview);
-    save(&c, None, "status")?;
+    save(&c, Layers::Image, "status")?;
     screens::status(&mut c, &mut text, &snap, screens::StatusPage::Details);
-    save(&c, None, "status-details")?;
+    save(&c, Layers::Image, "status-details")?;
     screens::photo_frame(
         &mut c,
         &mut text,
@@ -205,11 +206,11 @@ fn png(cli: Cli) -> Result<(), String> {
         Some(&item.info),
         None,
     );
-    save(&c, Some((&item, &overlay)), "photo")?;
+    save(&c, Layers::Photo(&item, &overlay), "photo")?;
     // 地震アラート(テスト表示)を写真画面の重ね絵に足したもの
     miharashi_render::alert::quake_overlay(&mut overlay, &mut text, &quake::demo_view());
     miharashi_render::alert::quake_overlay(&mut c, &mut text, &quake::demo_view());
-    save(&c, Some((&item, &overlay)), "alert-quake")?;
+    save(&c, Layers::Photo(&item, &overlay), "alert-quake")?;
     // 災害アラート(テスト表示)。不透明に近い幕で覆うので地震の上に重ねてよい
     let dv = disaster::demo_view();
     overlay.clear(miharashi_render::canvas::rgba(0, 0, 0, 0));
@@ -223,7 +224,7 @@ fn png(cli: Cli) -> Result<(), String> {
     );
     miharashi_render::alert::disaster_overlay(&mut overlay, &mut text, &dv);
     miharashi_render::alert::disaster_overlay(&mut c, &mut text, &dv);
-    save(&c, Some((&item, &overlay)), "alert-disaster")?;
+    save(&c, Layers::Photo(&item, &overlay), "alert-disaster")?;
     // 旅のカード(一覧に旅があればそのうち最大のもの、なければ見本)
     std::fs::write(out.join("groups.txt"), catalog.group_summary()).map_err(|e| e.to_string())?;
     let cards = [
@@ -233,12 +234,24 @@ fn png(cli: Cli) -> Result<(), String> {
     for (card, name) in cards {
         miharashi_render::trip_card::trip_card(&mut overlay, &mut text, &card);
         miharashi_render::trip_card::trip_card(&mut c, &mut text, &card);
-        save(&c, Some((&item, &overlay)), name)?;
+        save(&c, Layers::Photo(&item, &overlay), name)?;
     }
-    miharashi_render::aircraft::aircraft_screen(&mut c, &mut text, &aircraft::demo_view());
-    save(&c, None, "aircraft")?;
+    // 航空機の画面。GPU 経路は背景だけを CPU で描き、回る線と点はシェーダーで描く。残光の長さを変えた見本も出す
+    let view = aircraft::demo_view();
+    let geom = air::radar_geometry(&view, size);
+    let mut bg = Canvas::new(size.0, size.1);
+    air::aircraft_background(&mut bg, &mut text, &view);
+    for (name, trail) in [
+        ("aircraft", air::TRAIL),
+        ("aircraft-trail-short", air::TRAIL / 2.0),
+        ("aircraft-trail-long", air::TRAIL * 2.0),
+    ] {
+        air::aircraft_background(&mut c, &mut text, &view);
+        air::sweep_cpu(&mut c, &geom, air::STILL_SWEEP, trail);
+        save(&c, Layers::Radar(&bg, &geom, trail), name)?;
+    }
     println!(
-        "wrote {}/{{status,status-details,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft}}.png ({}x{})",
+        "wrote {}/{{status,status-details,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long}}.png ({}x{})",
         out.display(),
         size.0,
         size.1
@@ -249,8 +262,18 @@ fn png(cli: Cli) -> Result<(), String> {
 /// `png --renderer gles|auto` の検証。GLES 経路(表示と同じ合成器)で表示カードの render node に
 /// 描いて読み戻し、`*-gles.png` に保存して CPU の画像との差を出す。`layers` が Some なら
 /// (写真のフレーム, 重ね絵)を GPU で合成し、None なら CPU の完成画面をそのまま描く。
-type GlesCheck =
-    Box<dyn FnMut(&Canvas, Option<(&PhotoItem, &Canvas)>, &std::path::Path) -> Result<(), String>>;
+type GlesCheck = Box<dyn FnMut(&Canvas, Layers<'_>, &std::path::Path) -> Result<(), String>>;
+
+/// `png --renderer gles` で GPU に渡す内容。
+enum Layers<'a> {
+    /// CPU の完成画面をそのまま描く
+    Image,
+    /// (写真のフレーム, 重ね絵)を GPU で合成する
+    Photo(&'a PhotoItem, &'a Canvas),
+    /// (背景, レーダー, 残光の長さ)。回る線は CPU と同じ `STILL_SWEEP` の角度で描く。
+    /// 線と点は CPU と描き方が違う(GPU は光のにじみを計算する)ので、差は大きく出る
+    Radar(&'a Canvas, &'a air::RadarGeom, f32),
+}
 
 #[cfg(target_os = "linux")]
 fn gles_checker(cfg: &Config, asked: bool) -> Result<Option<GlesCheck>, String> {
@@ -271,13 +294,21 @@ fn gles_checker(cfg: &Config, asked: bool) -> Result<Option<GlesCheck>, String> 
         move |c: &Canvas, layers, path: &std::path::Path| {
             use miharashi_gpu::Frame;
             let (w, h) = (c.width(), c.height());
+            let blips = match &layers {
+                Layers::Radar(_, g, _) => runtime::radar_blips(g),
+                _ => Vec::new(),
+            };
             let frame = match layers {
-                Some((item, overlay)) => Frame::Photo {
+                Layers::Photo(item, overlay) => Frame::Photo {
                     photo: runtime::photo_layer(item.photo_ref(1), h),
                     old: None,
                     overlay: Some(overlay.pixmap.data()),
                 },
-                None => Frame::Image(c.pixmap.data()),
+                Layers::Image => Frame::Image(c.pixmap.data()),
+                Layers::Radar(bg, g, trail) => Frame::Radar {
+                    background: Some(bg.pixmap.data()),
+                    radar: runtime::radar_layer(g, air::STILL_SWEEP, trail, h, &blips),
+                },
             };
             let got = off.render_frames(&[frame], (w, h))?;
             let (over, max) = miharashi_gpu::diff_rgb(c.pixmap.data(), &got, 0);
