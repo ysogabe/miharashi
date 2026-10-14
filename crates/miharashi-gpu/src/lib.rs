@@ -7,6 +7,7 @@ mod egl;
 mod gbm;
 pub mod offscreen;
 pub mod photo;
+pub mod video;
 
 pub use compose::{Frame, PhotoLayer, PhotoSource, RADAR_BLIPS, Radar};
 pub use photo::{Placement, SourceImage};

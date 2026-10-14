@@ -18,6 +18,11 @@ ureq = "3.4.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 miharashi-gpu = { path = "../miharashi-gpu" }
 miharashi-linux = { path = "../miharashi-linux" }
+# B2 の動画ベンチマーク(`--features video`)。ffmpeg の開発用パッケージが要るので既定では入れない
+miharashi-video = { path = "../miharashi-video", optional = true }
+
+[features]
+video = ["dep:miharashi-video"]
 
 [[bin]]
 name = "miharashi"
