@@ -536,7 +536,11 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             worst_ms = 0;
             next_stats += stats_every;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        // 動かし続ける画面は、表示の完了待ち(vsync)だけで間隔をとる(20ms 待つと 30fps に落ち、
+        // 背景を描き直すフレームで 1 枚飛んで引っかかって見える)
+        if !(screen_on && app.animating()) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     };
 
     eprintln!("終了: {reason}");
