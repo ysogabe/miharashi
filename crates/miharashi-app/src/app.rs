@@ -63,6 +63,8 @@ pub struct KioskApp {
     air_drawn: Option<aircraft::AircraftView>,
     /// GPU 経路で、レーダーの背景を最後に描いた内容
     radar_bg: Option<aircraft::AircraftView>,
+    /// レーダーの下地(地図と距離の輪)。受信機と半径が同じ間は描き直さない
+    radar_base: Option<aircraft::RadarBase>,
     /// アラート(地震・災害)の受け口(無効なら None)
     alerts: Option<Receiver<AlertView>>,
     /// 表示中のアラートと、閉じる時刻
@@ -155,6 +157,7 @@ impl KioskApp {
             gpu: gpu_max.is_some(),
             air_drawn: None,
             radar_bg: None,
+            radar_base: None,
             alerts: None,
             alert: None,
             alert_len: Duration::from_secs(cfg.alerts.show_minutes * 60),
@@ -371,7 +374,12 @@ impl KioskApp {
         {
             let changed = self.radar_bg.as_ref() != Some(&v);
             if changed {
-                aircraft::aircraft_background(canvas, &mut self.text, &v);
+                aircraft::aircraft_background_cached(
+                    canvas,
+                    &mut self.text,
+                    &v,
+                    &mut self.radar_base,
+                );
             }
             let geom = aircraft::radar_geometry(&v, (canvas.width(), canvas.height()));
             self.radar_bg = Some(v);
