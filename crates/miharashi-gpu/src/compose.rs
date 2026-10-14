@@ -4,6 +4,8 @@
 //!   シェーダーで混ぜる。文字などの重ね絵(透明背景の RGBA)は変わったときだけ転送して上に重ねる。
 //!   写真のフレームは、CPU で合成した完成フレームを転送するか、デコードしただけの写真から
 //!   GPU で作る(PR3b、`photo.rs`)。
+//! - `Frame::Radar`: 航空機の画面。CPU で描いた背景(地図と文字)は変わったときだけ転送し、
+//!   回る線、残光、点はシェーダーで毎フレーム描く(PR4a)。
 use crate::photo::{PhotoBuilder, SourceImage, program as link, texture as tex2d};
 use glow::HasContext;
 use std::time::Instant;
@@ -44,6 +46,70 @@ void main() {
 }
 ";
 
+// レーダー: 回る線と残光、線が通ると光って次の 1 周でゆっくり暗くなる点。加算で背景に重ねる。
+// 座標は画面の px(左上が原点、y は下向き)。角度は北 0、時計回り
+const FRAG_RADAR: &str = r"#version 300 es
+precision highp float;
+uniform vec2 size;
+uniform vec2 center;
+uniform float radius;
+uniform float sweep;
+uniform float trail;
+uniform float scale;
+uniform int n;
+uniform vec3 blips[32];
+out vec4 color;
+const float TAU = 6.28318530718;
+const vec3 GREEN = vec3(0.16, 1.0, 0.43);
+float behind(vec2 d) {
+    return mod(sweep - atan(d.x, -d.y), TAU);
+}
+void main() {
+    vec2 p = vec2(gl_FragCoord.x, size.y - gl_FragCoord.y);
+    vec2 d = p - center;
+    float r = length(d);
+    if (r > radius) discard;
+    float b = behind(d);
+    // 残光(CPU の sweep_cpu と同じく、線の直後で 0.45、TRAIL の角度で 1/e)
+    vec3 c = GREEN * 0.45 * exp(-b / trail);
+    // 線: 線からの距離 [px] で細く明るく。線の手前側もなめらかにする
+    float perp = r * sin(min(b, TAU - b));
+    float w = 1.6 * scale;
+    c += vec3(0.6, 1.0, 0.7) * exp(-perp * perp / (w * w)) * step(min(b, TAU - b), 1.0);
+    for (int i = 0; i < 32; i++) {
+        if (i >= n) break;
+        vec3 q = blips[i];
+        float life = exp(-behind(q.xy - center) / (TAU * 0.55));
+        int kind = int(q.z + 0.5);
+        vec3 col = kind == 1 ? vec3(1.0, 0.75, 0.24) : (kind == 2 ? vec3(0.35, 0.59, 0.45) : vec3(0.43, 1.0, 0.59));
+        float rr = (kind == 1 ? 11.0 : (kind == 2 ? 7.0 : 9.0)) * scale;
+        vec2 e = p - q.xy;
+        float d2 = dot(e, e);
+        float glow = exp(-d2 / (rr * rr)) + 0.3 * exp(-d2 / (6.0 * rr * rr));
+        c += col * glow * (0.3 + 1.0 * life);
+    }
+    color = vec4(c, 0.0);
+}
+";
+
+/// レーダーの点の上限(シェーダーの配列の長さ)。
+pub const RADAR_BLIPS: usize = 32;
+
+/// 航空機の画面のレーダー。座標は画面の px(左上が原点)、角度は北 0、時計回り [rad]。
+#[derive(Clone, Copy)]
+pub struct Radar<'a> {
+    pub center: (f32, f32),
+    pub radius: f32,
+    /// 回る線の角度
+    pub sweep: f32,
+    /// 残光の長さ(明るさが 1/e になる角度)
+    pub trail: f32,
+    /// 線の太さと点の大きさの倍率(1080 px の高さで 1)
+    pub scale: f32,
+    /// 点 (x, y, 種類)。種類は 0 = ほか、1 = いちばん近い機体、2 = 地上。`RADAR_BLIPS` を超えた分は描かない
+    pub blips: &'a [[f32; 3]],
+}
+
 /// 写真のテクスチャを残しておく枚数(表示中とフェード元、と先読みの余裕)。
 const PHOTO_CACHE: usize = 3;
 
@@ -76,12 +142,21 @@ pub enum Frame<'a> {
         /// 重ね絵が変わったときだけ Some(premultiplied RGBA8、透明背景)。None なら前回のものを使う
         overlay: Option<&'a [u8]>,
     },
+    /// 航空機の画面
+    Radar {
+        /// 背景(不透明)が変わったときだけ Some。None なら前回のものを使う
+        background: Option<&'a [u8]>,
+        radar: Radar<'a>,
+    },
 }
 
 pub struct Compositor {
     base: glow::Program,
     overlay: glow::Program,
+    radar: glow::Program,
     vao: glow::VertexArray,
+    /// `Frame::Radar` の背景(初めて使うときに作る)
+    radar_bg: Option<glow::Texture>,
     /// `Frame::Image` 用
     image_tex: glow::Texture,
     overlay_tex: glow::Texture,
@@ -109,6 +184,7 @@ impl Compositor {
     pub fn new(gl: &glow::Context, size: (u32, u32)) -> Result<Self, String> {
         let base = program(gl, FRAG_BASE)?;
         let overlay = program(gl, FRAG_OVERLAY)?;
+        let radar = program(gl, FRAG_RADAR)?;
         unsafe {
             gl.use_program(Some(base));
             gl.uniform_1_i32(gl.get_uniform_location(base, "a").as_ref(), 0);
@@ -118,7 +194,9 @@ impl Compositor {
             Ok(Self {
                 base,
                 overlay,
+                radar,
                 vao: gl.create_vertex_array()?,
+                radar_bg: None,
                 image_tex: texture(gl, size)?,
                 overlay_tex: texture(gl, size)?,
                 photos: Vec::new(),
@@ -257,6 +335,53 @@ impl Compositor {
                     gl.disable(glow::BLEND);
                 }
             }
+            Frame::Radar { background, radar } => {
+                viewport();
+                self.draw_radar(gl, *background, radar)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_radar(
+        &mut self,
+        gl: &glow::Context,
+        background: Option<&[u8]>,
+        radar: &Radar<'_>,
+    ) -> Result<(), String> {
+        let bg = match (self.radar_bg, background) {
+            (Some(t), _) => t,
+            (None, Some(_)) => {
+                let t = texture(gl, self.size)?;
+                self.radar_bg = Some(t);
+                t
+            }
+            (None, None) => return Err("レーダーの背景がまだ無い".into()),
+        };
+        if let Some(rgba) = background {
+            self.upload(gl, bg, rgba);
+        }
+        self.draw_base(gl, bg, bg, 1.0);
+        let n = radar.blips.len().min(RADAR_BLIPS);
+        let flat: Vec<f32> = radar.blips[..n].iter().flatten().copied().collect();
+        let p = self.radar;
+        unsafe {
+            let loc = |name: &str| gl.get_uniform_location(p, name);
+            gl.use_program(Some(p));
+            gl.uniform_2_f32(loc("size").as_ref(), self.size.0 as f32, self.size.1 as f32);
+            gl.uniform_2_f32(loc("center").as_ref(), radar.center.0, radar.center.1);
+            gl.uniform_1_f32(loc("radius").as_ref(), radar.radius);
+            gl.uniform_1_f32(loc("sweep").as_ref(), radar.sweep);
+            gl.uniform_1_f32(loc("trail").as_ref(), radar.trail.max(0.01));
+            gl.uniform_1_f32(loc("scale").as_ref(), radar.scale);
+            gl.uniform_1_i32(loc("n").as_ref(), n as i32);
+            if n > 0 {
+                gl.uniform_3_f32_slice(loc("blips").as_ref(), &flat);
+            }
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::ONE, glow::ONE);
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            gl.disable(glow::BLEND);
         }
         Ok(())
     }
@@ -268,9 +393,13 @@ impl Compositor {
             }
             gl.delete_texture(self.image_tex);
             gl.delete_texture(self.overlay_tex);
+            if let Some(t) = self.radar_bg {
+                gl.delete_texture(t);
+            }
             gl.delete_vertex_array(self.vao);
             gl.delete_program(self.base);
             gl.delete_program(self.overlay);
+            gl.delete_program(self.radar);
         }
         self.builder.destroy(gl);
     }
