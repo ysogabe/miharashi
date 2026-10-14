@@ -667,8 +667,10 @@ impl Timer {
         (s, d, waited)
     }
 
+    /// GPU の処理が全部終わるのを待ってから捨てる。
     pub fn destroy(self, gl: &glow::Context) {
         unsafe {
+            gl.finish();
             for q in self.queries.into_iter().flatten() {
                 gl.delete_query(q);
             }

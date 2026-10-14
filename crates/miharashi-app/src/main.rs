@@ -43,6 +43,8 @@ struct Cli {
     stim: Option<usize>,
     gain: Option<f32>,
     lines: Option<String>,
+    video: Option<PathBuf>,
+    detections: Option<usize>,
 }
 
 fn parse_cli(argv: Vec<String>) -> Result<Cli, String> {
@@ -66,6 +68,8 @@ fn parse_cli(argv: Vec<String>) -> Result<Cli, String> {
             "--stim" => c.stim = Some(v()?.parse().map_err(|_| "bad --stim")?),
             "--gain" => c.gain = Some(v()?.parse().map_err(|_| "bad --gain")?),
             "--lines" => c.lines = Some(v()?),
+            "--video" => c.video = Some(v()?.into()),
+            "--detections" => c.detections = Some(v()?.parse().map_err(|_| "bad --detections")?),
             "--live" => c.live = true,
             "--size" => {
                 let s = v()?;
@@ -368,7 +372,9 @@ fn bench(cli: Cli) -> Result<(), String> {
 }
 
 /// `bench-gpu [--size WxH] [--seconds N] [--fps N(0 = 上限)] [--neurons N] [--synapses N]
-/// [--stim N] [--gain X] [--lines none|all|active] [--out FILE.png]`
+/// [--stim N] [--gain X] [--lines none|all|active] [--out FILE.png]`(B1 コネクトーム)
+/// `bench-gpu --video FILE [--detections N] [--size WxH] [--seconds N] [--fps N] [--out FILE.png]`
+/// (B2 動画と検出枠。`--features video` でビルドしたときだけ)
 #[cfg(target_os = "linux")]
 fn bench_gpu(cli: Cli) -> Result<(), String> {
     use miharashi_linux::drm_select::{CardSel, choose_card, scan};
@@ -379,6 +385,25 @@ fn bench_gpu(cli: Cli) -> Result<(), String> {
         .pci
         .clone()
         .ok_or("表示カードの PCI アドレスが分からない")?;
+    if let Some(file) = cli.video.clone() {
+        #[cfg(feature = "video")]
+        return gpu_bench::run_video(&gpu_bench::VideoOpts {
+            pci,
+            file,
+            size: cli.size.unwrap_or((2560, 1080)),
+            duration: std::time::Duration::from_secs(cli.seconds.unwrap_or(60)),
+            fps: cli.fps.unwrap_or(0),
+            detections: cli.detections.unwrap_or(50),
+            font: cfg.ui.font.clone(),
+            rapl_helper: cfg.power.rapl_helper_file.clone().into(),
+            out: cli.out.clone(),
+        });
+        #[cfg(not(feature = "video"))]
+        return Err(format!(
+            "--video {} は `cargo build --release --features video` でビルドしたときだけ使える",
+            file.display()
+        ));
+    }
     gpu_bench::run(&gpu_bench::Opts {
         pci,
         size: cli.size.unwrap_or((2560, 1080)),
