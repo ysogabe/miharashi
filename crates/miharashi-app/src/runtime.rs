@@ -5,13 +5,14 @@ use crate::config::Config;
 use crate::panel::{DisplayControl, DisplayStatus, Panel};
 use crate::screen::{App, Composite, KeyPress, PhotoData, PhotoRef};
 use crate::screen_power::{Mode as PowerMode, ScreenPower};
-use miharashi_gpu::{Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, SourceImage};
+use miharashi_gpu::{Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, Radar, SourceImage};
 use miharashi_linux::drm_select::{self, CardSel, ModeSel};
 use miharashi_linux::input::{Action, Keys};
 use miharashi_linux::kms::Display;
 use miharashi_linux::seat::{SeatMode, Session, SessionEvent};
 use miharashi_linux::vt::VtGuard;
 use miharashi_render::Canvas;
+use miharashi_render::aircraft::{self, BlipKind, RadarGeom};
 use miharashi_render::photo_layout::{self, Mode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,6 +80,39 @@ pub fn photo_layer(p: PhotoRef<'_>, screen_h: u32) -> PhotoLayer<'_> {
         PhotoData::Resident => PhotoSource::Resident,
     };
     PhotoLayer { id: p.id, src }
+}
+
+/// レーダーの点を GPU の合成器の形 (x, y, 種類) にする。
+pub fn radar_blips(g: &RadarGeom) -> Vec<[f32; 3]> {
+    g.blips
+        .iter()
+        .map(|b| {
+            let kind = match b.kind {
+                BlipKind::Other => 0.0,
+                BlipKind::Focus => 1.0,
+                BlipKind::Ground => 2.0,
+            };
+            [b.x, b.y, kind]
+        })
+        .collect()
+}
+
+/// 航空機の画面のレーダーを GPU の合成器の形にする。`blips` は `radar_blips` の結果。
+pub fn radar_layer<'a>(
+    g: &RadarGeom,
+    sweep: f32,
+    trail: f32,
+    screen_h: u32,
+    blips: &'a [[f32; 3]],
+) -> Radar<'a> {
+    Radar {
+        center: g.center,
+        radius: g.radius,
+        sweep,
+        trail,
+        scale: photo_layout::scale(screen_h),
+        blips,
+    }
 }
 
 /// 表示経路。CPU は Canvas を dumb buffer へ変換コピーし、GLES は表示カードの GPU で
@@ -183,6 +217,10 @@ impl Presenter {
                 let h = canvas.height();
                 let comp = app.render_composite(canvas);
                 let t1 = Instant::now();
+                let blips = match &comp {
+                    Composite::Radar { geom, .. } => radar_blips(geom),
+                    _ => Vec::new(),
+                };
                 let frame = match comp {
                     Composite::Canvas => Frame::Image(canvas.pixmap.data()),
                     Composite::Photo {
@@ -193,6 +231,14 @@ impl Presenter {
                         photo: photo_layer(photo, h),
                         old: old.map(|(p, t)| (photo_layer(p, h), t)),
                         overlay: overlay_changed.then(|| canvas.pixmap.data()),
+                    },
+                    Composite::Radar {
+                        background_changed,
+                        geom,
+                        sweep,
+                    } => Frame::Radar {
+                        background: background_changed.then(|| canvas.pixmap.data()),
+                        radar: radar_layer(&geom, sweep, aircraft::TRAIL, h, &blips),
                     },
                 };
                 d.present_frame(&frame)?;
@@ -297,6 +343,8 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     let (mut render_ms, mut present_ms) = (Vec::new(), Vec::new());
     // 写真 1 枚ごとの、GPU で完成フレームを作った CPU 時間(PoC-005 PR3b)
     let mut photo_ms = Vec::new();
+    // 動かし続ける画面(レーダー)の、前のフレームからの間隔。(フレーム数, 遅れた数, 前回の表示時刻)
+    let (mut anim_frames, mut anim_slow, mut anim_last) = (0u32, 0u32, None::<Instant>);
     let mut redraw = true;
     let mut resume_pending = false;
     // 画面の電源。消している間は描かない(GLES は page flip が終わらないことがある)。
@@ -363,7 +411,8 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
 
         if keys.is_empty() && Instant::now() >= keys_retry {
             keys_retry = Instant::now() + KEYS_RETRY;
-            if keys.reopen(&mut session) > 0 {
+            // 入力デバイスが増減したときだけ開き直す(毎回開くと描画が数百 ms 止まる)
+            if keys.reopen_if_changed(&mut session).is_some_and(|n| n > 0) {
                 eprintln!("input: {:?}", keys.device_names());
             }
         }
@@ -423,7 +472,9 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                 redraw |= app.on_key(key);
             }
         }
-        redraw |= app.tick(Instant::now());
+        let tick_t0 = Instant::now();
+        redraw |= app.tick(tick_t0);
+        let tick_ms = tick_t0.elapsed().as_secs_f32() * 1000.0;
 
         // アラートは画面を消していても点けて見せる(tick で届いたものを同じ周期で反映する)
         let want_on = app.wants_screen() || power.as_ref().is_none_or(|p| p.want_on());
@@ -459,6 +510,25 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             redraw = false;
             frames += 1;
             worst_ms = worst_ms.max(t0.elapsed().as_millis());
+            // 60Hz で 1 枚飛ぶと間隔が 25ms を超える。どこで時間を使ったかを分けて残す(1 分に 10 件まで)
+            if app.animating() {
+                let now = Instant::now();
+                if let Some(last) = anim_last {
+                    let gap = now.duration_since(last).as_secs_f32() * 1000.0;
+                    anim_frames += 1;
+                    if gap > 25.0 {
+                        anim_slow += 1;
+                        if anim_slow <= 10 {
+                            eprintln!(
+                                "anim: 遅れ {gap:.1}ms(tick {tick_ms:.1} / 描画 {r:.1} / 転送と表示待ち {p:.1})"
+                            );
+                        }
+                    }
+                }
+                anim_last = Some(now);
+            } else {
+                anim_last = None;
+            }
         }
 
         if Instant::now() >= next_stats {
@@ -473,6 +543,11 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             extra.push(("render_ms", summarize_ms(&mut render_ms)));
             extra.push(("present_ms", summarize_ms(&mut present_ms)));
             extra.push(("photo_gpu_ms", summarize_ms(&mut photo_ms)));
+            // レーダーのフレーム数と、間隔が 25ms を超えた数(PoC-005 PR4a)
+            if anim_frames > 0 {
+                extra.push(("anim", format!("{anim_frames}/{anim_slow}")));
+                (anim_frames, anim_slow) = (0, 0);
+            }
             if cfg.panel.enabled {
                 extra.push(("panel", panel.as_ref().map_or("error", Panel::stat).into()));
             }
@@ -490,7 +565,11 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             worst_ms = 0;
             next_stats += stats_every;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        // 動かし続ける画面は、表示の完了待ち(vsync)だけで間隔をとる(20ms 待つと 30fps に落ち、
+        // 背景を描き直すフレームで 1 枚飛んで引っかかって見える)
+        if !(screen_on && app.animating()) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     };
 
     eprintln!("終了: {reason}");

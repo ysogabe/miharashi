@@ -57,6 +57,14 @@ pub struct KioskApp {
     air_until: Option<Instant>,
     air_every: u32,
     air_len: Duration,
+    /// GPU 経路(GLES)か。航空機の画面の回る線を毎フレーム描く
+    gpu: bool,
+    /// 航空機の画面を CPU で最後に描いた内容(CPU 経路は変わったときだけ描き直す)
+    air_drawn: Option<aircraft::AircraftView>,
+    /// GPU 経路で、レーダーの背景を最後に描いた内容
+    radar_bg: Option<aircraft::AircraftView>,
+    /// レーダーの下地(地図と距離の輪)。受信機と半径が同じ間は描き直さない
+    radar_base: Option<aircraft::RadarBase>,
     /// アラート(地震・災害)の受け口(無効なら None)
     alerts: Option<Receiver<AlertView>>,
     /// 表示中のアラートと、閉じる時刻
@@ -146,6 +154,10 @@ impl KioskApp {
             air_until: None,
             air_every: cfg.aircraft.every_photos,
             air_len: Duration::from_secs(cfg.aircraft.show_secs),
+            gpu: gpu_max.is_some(),
+            air_drawn: None,
+            radar_bg: None,
+            radar_base: None,
             alerts: None,
             alert: None,
             alert_len: Duration::from_secs(cfg.alerts.show_minutes * 60),
@@ -302,11 +314,17 @@ impl KioskApp {
         if let Some(until) = self.air_until {
             if now >= until || self.screen != Screen::Photo {
                 self.air_until = None;
+                self.air_drawn = None;
+                self.radar_bg = None;
                 // 閉じたらすぐ次の写真へ
                 self.feed.next();
                 self.last_photo_change = now;
+                redraw = true;
             }
-            redraw = true;
+            // GPU 経路は回る線を毎フレーム描く。CPU 経路は内容が変わったときだけ描き直す
+            if self.gpu || (self.air_until.is_some() && self.aircraft_view() != self.air_drawn) {
+                redraw = true;
+            }
         }
         let dwell = if self.card.is_some() {
             self.card_len
@@ -348,6 +366,32 @@ impl KioskApp {
 
     /// GPU 経路の描画。写真画面は写真と重ね絵に分け、重ね絵は変わったときだけ描き直す。
     pub fn render_composite(&mut self, canvas: &mut Canvas) -> Composite<'_> {
+        // 航空機の画面: 背景は内容が変わったときだけ描き、回る線と点は GPU に任せる。
+        // アラートを重ねるときは CPU で完成画面を描く
+        if let (Some(until), None) = (self.air_until, &self.alert)
+            && self.screen == Screen::Photo
+            && let Some(v) = self.aircraft_view()
+        {
+            let changed = self.radar_bg.as_ref() != Some(&v);
+            if changed {
+                aircraft::aircraft_background_cached(
+                    canvas,
+                    &mut self.text,
+                    &v,
+                    &mut self.radar_base,
+                );
+            }
+            let geom = aircraft::radar_geometry(&v, (canvas.width(), canvas.height()));
+            self.radar_bg = Some(v);
+            self.overlay_dirty = true;
+            let start = until.checked_sub(self.air_len).unwrap_or(until);
+            let turns = start.elapsed().as_secs_f32() / aircraft::SWEEP_PERIOD_SECS;
+            return Composite::Radar {
+                background_changed: changed,
+                geom,
+                sweep: turns.fract() * std::f32::consts::TAU,
+            };
+        }
         if self.screen != Screen::Photo || self.current.is_none() || self.air_until.is_some() {
             // 状況画面と、写真がまだ 1 枚もないときは Canvas が完成画面
             self.render(canvas);
@@ -395,9 +439,12 @@ impl KioskApp {
     }
 
     pub fn render(&mut self, canvas: &mut Canvas) {
+        if self.air_until.is_some() {
+            self.air_drawn = self.aircraft_view();
+        }
         if self.screen == Screen::Photo
             && self.air_until.is_some()
-            && let Some(v) = self.aircraft_view()
+            && let Some(v) = self.air_drawn.clone()
         {
             aircraft::aircraft_screen(canvas, &mut self.text, &v);
             if let Some((view, _)) = &self.alert {
@@ -469,6 +516,10 @@ impl App for KioskApp {
 
     fn wants_screen(&self) -> bool {
         self.alert_active()
+    }
+
+    fn animating(&self) -> bool {
+        self.gpu && self.showing_aircraft()
     }
 
     fn stats(&self) -> Vec<(&'static str, String)> {
@@ -716,7 +767,7 @@ mod tests {
                 };
                 (f.data().to_vec(), overlay_changed)
             }
-            Composite::Canvas => panic!("写真画面は Photo になる"),
+            _ => panic!("写真画面は Photo になる"),
         };
         assert!(changed, "最初は重ね絵を描く");
         // premultiplied の source-over: out = src + dst × (1 - src_a)
@@ -769,7 +820,7 @@ mod tests {
                     PhotoData::Source { .. } => "source",
                     PhotoData::Resident => "resident",
                 },
-                Composite::Canvas => "canvas",
+                _ => "canvas",
             }
         };
         let (mut app, dir) = app_with_photo_on(size, Some(16384));
@@ -817,8 +868,33 @@ mod tests {
         *shared.lock().unwrap() = Some((Instant::now(), crate::aircraft::demo_view()));
         app.tick(later);
         assert!(app.showing_aircraft(), "機体がいれば挟む");
+        // CPU 経路: 1 回描いたら、内容が変わるまで描き直さない
         let mut c = Canvas::new(640, 270);
-        assert!(matches!(app.render_composite(&mut c), Composite::Canvas));
+        app.render(&mut c);
+        assert!(!app.tick(later), "CPU 経路は止まった絵を描き直さない");
+        app.gpu = true;
+        assert!(app.tick(later), "GPU 経路は回る線を毎フレーム描く");
+        assert!(app.animating(), "回る線の間は vsync だけで間隔をとる");
+        // GPU 経路: 背景は 1 回だけ描き、回る線と点は GPU に任せる
+        match app.render_composite(&mut c) {
+            Composite::Radar {
+                background_changed,
+                geom,
+                sweep,
+            } => {
+                assert!(background_changed);
+                assert_eq!(geom.blips.len(), 5);
+                assert!((0.0..std::f32::consts::TAU).contains(&sweep));
+            }
+            _ => panic!("航空機の画面は Radar"),
+        }
+        assert!(matches!(
+            app.render_composite(&mut c),
+            Composite::Radar {
+                background_changed: false,
+                ..
+            }
+        ));
         app.tick(later + Duration::from_secs(6));
         assert!(!app.showing_aircraft(), "時間で閉じる");
         // キーでも閉じる

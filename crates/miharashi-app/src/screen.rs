@@ -1,5 +1,6 @@
 //! 実行ループ(runtime)と画面ロジックの境界。runtime は `App` だけを知る。
 use image::DynamicImage;
+use miharashi_render::aircraft::RadarGeom;
 use miharashi_render::photo_layout::PhotoLayout;
 use miharashi_render::{Canvas, Pixmap};
 use std::time::Instant;
@@ -25,6 +26,11 @@ pub trait App {
     fn render_composite(&mut self, canvas: &mut Canvas) -> Composite<'_> {
         self.render(canvas);
         Composite::Canvas
+    }
+    /// 毎フレーム動かし続けている画面か(航空機の画面の回る線)。true の間、実行ループは待ちを入れず、
+    /// 表示の完了待ち(vsync)だけで間隔をとる。
+    fn animating(&self) -> bool {
+        false
     }
     /// 画面を消している間でも点けて見せたいもの(アラート)があるか。
     fn wants_screen(&self) -> bool {
@@ -92,5 +98,13 @@ pub enum Composite<'a> {
         old: Option<(PhotoRef<'a>, f32)>,
         /// 今回 `canvas` を描き直したか(false なら前回の重ね絵を使う)
         overlay_changed: bool,
+    },
+    /// 航空機の画面。`canvas`(不透明の背景)の上に、回る線と点を GPU で描く(PoC-005 PR4a)
+    Radar {
+        /// 今回 `canvas` を描き直したか(false なら前回の背景を使う)
+        background_changed: bool,
+        geom: RadarGeom,
+        /// 回る線の角度 [rad]。北 0、時計回り
+        sweep: f32,
     },
 }
