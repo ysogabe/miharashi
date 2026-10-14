@@ -343,6 +343,8 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     let (mut render_ms, mut present_ms) = (Vec::new(), Vec::new());
     // 写真 1 枚ごとの、GPU で完成フレームを作った CPU 時間(PoC-005 PR3b)
     let mut photo_ms = Vec::new();
+    // 動かし続ける画面(レーダー)の、前のフレームからの間隔。(フレーム数, 遅れた数, 前回の表示時刻)
+    let (mut anim_frames, mut anim_slow, mut anim_last) = (0u32, 0u32, None::<Instant>);
     let mut redraw = true;
     let mut resume_pending = false;
     // 画面の電源。消している間は描かない(GLES は page flip が終わらないことがある)。
@@ -469,7 +471,9 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                 redraw |= app.on_key(key);
             }
         }
-        redraw |= app.tick(Instant::now());
+        let tick_t0 = Instant::now();
+        redraw |= app.tick(tick_t0);
+        let tick_ms = tick_t0.elapsed().as_secs_f32() * 1000.0;
 
         // アラートは画面を消していても点けて見せる(tick で届いたものを同じ周期で反映する)
         let want_on = app.wants_screen() || power.as_ref().is_none_or(|p| p.want_on());
@@ -505,6 +509,25 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             redraw = false;
             frames += 1;
             worst_ms = worst_ms.max(t0.elapsed().as_millis());
+            // 60Hz で 1 枚飛ぶと間隔が 25ms を超える。どこで時間を使ったかを分けて残す(1 分に 10 件まで)
+            if app.animating() {
+                let now = Instant::now();
+                if let Some(last) = anim_last {
+                    let gap = now.duration_since(last).as_secs_f32() * 1000.0;
+                    anim_frames += 1;
+                    if gap > 25.0 {
+                        anim_slow += 1;
+                        if anim_slow <= 10 {
+                            eprintln!(
+                                "anim: 遅れ {gap:.1}ms(tick {tick_ms:.1} / 描画 {r:.1} / 転送と表示待ち {p:.1})"
+                            );
+                        }
+                    }
+                }
+                anim_last = Some(now);
+            } else {
+                anim_last = None;
+            }
         }
 
         if Instant::now() >= next_stats {
@@ -519,6 +542,11 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             extra.push(("render_ms", summarize_ms(&mut render_ms)));
             extra.push(("present_ms", summarize_ms(&mut present_ms)));
             extra.push(("photo_gpu_ms", summarize_ms(&mut photo_ms)));
+            // レーダーのフレーム数と、間隔が 25ms を超えた数(PoC-005 PR4a)
+            if anim_frames > 0 {
+                extra.push(("anim", format!("{anim_frames}/{anim_slow}")));
+                (anim_frames, anim_slow) = (0, 0);
+            }
             if cfg.panel.enabled {
                 extra.push(("panel", panel.as_ref().map_or("error", Panel::stat).into()));
             }
