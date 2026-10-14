@@ -1,5 +1,5 @@
 //! Miharashi: Linux キオスク・ダッシュボード。`run`(実機)、`png`(ヘッドレス)、`kms-info`、
-//! `bench`(CPU 描画のベースライン)。
+//! `bench`(CPU 描画のベースライン)、`bench-gpu`(重い描画の GPU ベンチマーク)。
 mod aircraft;
 mod album;
 mod app;
@@ -7,6 +7,8 @@ mod bench;
 mod config;
 mod data;
 mod disaster;
+#[cfg(target_os = "linux")]
+mod gpu_bench;
 mod panel;
 mod photos;
 mod quake;
@@ -34,6 +36,13 @@ struct Cli {
     renderer: Option<String>,
     dummy: bool,
     live: bool,
+    // bench-gpu
+    fps: Option<u32>,
+    neurons: Option<u32>,
+    synapses: Option<u32>,
+    stim: Option<usize>,
+    gain: Option<f32>,
+    lines: Option<String>,
 }
 
 fn parse_cli(argv: Vec<String>) -> Result<Cli, String> {
@@ -51,6 +60,12 @@ fn parse_cli(argv: Vec<String>) -> Result<Cli, String> {
             "--screen" => c.screen = Some(v()?),
             "--renderer" => c.renderer = Some(v()?),
             "--dummy" => c.dummy = true,
+            "--fps" => c.fps = Some(v()?.parse().map_err(|_| "bad --fps")?),
+            "--neurons" => c.neurons = Some(v()?.parse().map_err(|_| "bad --neurons")?),
+            "--synapses" => c.synapses = Some(v()?.parse().map_err(|_| "bad --synapses")?),
+            "--stim" => c.stim = Some(v()?.parse().map_err(|_| "bad --stim")?),
+            "--gain" => c.gain = Some(v()?.parse().map_err(|_| "bad --gain")?),
+            "--lines" => c.lines = Some(v()?),
             "--live" => c.live = true,
             "--size" => {
                 let s = v()?;
@@ -352,6 +367,38 @@ fn bench(cli: Cli) -> Result<(), String> {
     Ok(())
 }
 
+/// `bench-gpu [--size WxH] [--seconds N] [--fps N(0 = 上限)] [--neurons N] [--synapses N]
+/// [--stim N] [--gain X] [--lines none|all|active] [--out FILE.png]`
+#[cfg(target_os = "linux")]
+fn bench_gpu(cli: Cli) -> Result<(), String> {
+    use miharashi_linux::drm_select::{CardSel, choose_card, scan};
+    let cfg = load_config(&cli)?;
+    let cards = scan();
+    let card = choose_card(&cards, &CardSel::parse(&cfg.display.card))?;
+    let pci = card
+        .pci
+        .clone()
+        .ok_or("表示カードの PCI アドレスが分からない")?;
+    gpu_bench::run(&gpu_bench::Opts {
+        pci,
+        size: cli.size.unwrap_or((2560, 1080)),
+        duration: std::time::Duration::from_secs(cli.seconds.unwrap_or(60)),
+        fps: cli.fps.unwrap_or(30),
+        neurons: cli.neurons.unwrap_or(160_000),
+        synapses: cli.synapses.unwrap_or(3_000_000),
+        stim: cli.stim.unwrap_or(4),
+        gain: cli.gain.unwrap_or(miharashi_gpu::connectome::GAIN),
+        lines: miharashi_gpu::connectome::Lines::parse(cli.lines.as_deref().unwrap_or("active"))?,
+        rapl_helper: cfg.power.rapl_helper_file.clone().into(),
+        out: cli.out.clone(),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bench_gpu(_: Cli) -> Result<(), String> {
+    Err("bench-gpu は Linux 専用".into())
+}
+
 #[cfg(target_os = "linux")]
 fn kms_info(cli: Cli) -> Result<(), String> {
     use miharashi_linux::drm_select::{CardSel, choose_card, choose_connector, scan};
@@ -410,10 +457,11 @@ fn main() -> Result<(), String> {
         "run" => run(cli),
         "png" => png(cli),
         "bench" => bench(cli),
+        "bench-gpu" => bench_gpu(cli),
         "kms-info" => kms_info(cli),
         "check-config" => load_config(&cli).map(|_| println!("OK")),
         other => Err(format!(
-            "unknown command {other}(run / png / bench / kms-info / check-config)"
+            "unknown command {other}(run / png / bench / bench-gpu / kms-info / check-config)"
         )),
     }
 }
