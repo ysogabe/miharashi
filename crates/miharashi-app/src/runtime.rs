@@ -553,8 +553,9 @@ mod tests {
         let prefix = "2026-10-13T08:00:00+09:00 host miharashi[1]: ";
         let mut text = String::new();
         for i in 0..3u64 {
-            // 今の並び: 画面ロジックの値 + gpus + PoC-005 の計測値 + パネル(有効なときだけ)
+            // 今の並び: 画面ロジックの値(aircraft を含む)+ gpus + PoC-005 の計測値 + パネル(有効なときだけ)
             let mut e = extra(61 + 60 * i, "Some(13.0)");
+            e.insert(4, ("aircraft", "false".to_string()));
             e.extend([
                 ("gpus", "GPU0:0,GPU1:0".to_string()),
                 ("cpu_self", format!("{}.5", i + 1)),
