@@ -1,4 +1,6 @@
 //! 航空機の画面。左半分に受信機を中心にしたレーダー、右半分にいちばん近い機体の諸元とほかの機体。
+//! 管制レーダー風に、回る線と残光、線が通ると光る点を描く。GPU 経路では背景(地図、文字)を CPU で
+//! 変わったときだけ描き、回る線と点は `miharashi-gpu` のシェーダーが毎フレーム描く(PoC-005 PR4a)。
 use crate::canvas::{Canvas, rgba};
 use crate::geo::{overlaps, prefs, projector};
 use crate::photo_layout::scale;
@@ -49,10 +51,46 @@ pub struct AircraftView {
     pub time: String,
 }
 
-const FG: [u8; 4] = [235, 240, 248, 255];
-const DIM: [u8; 4] = [150, 165, 185, 255];
+// 管制レーダー風の配色(暗い背景に緑)。いちばん近い機体だけ琥珀色にする
+const FG: [u8; 4] = [170, 245, 190, 255];
+const DIM: [u8; 4] = [80, 150, 105, 255];
 const FOCUS: [u8; 3] = [255, 190, 60];
-const OTHER: [u8; 3] = [90, 200, 255];
+const OTHER: [u8; 3] = [110, 255, 150];
+const GROUND: [u8; 3] = [90, 150, 115];
+const BG: [u8; 3] = [2, 8, 5];
+const LINE: [u8; 3] = [20, 60, 35];
+
+/// 回る線が 1 周する時間 [秒]。
+pub const SWEEP_PERIOD_SECS: f32 = 4.0;
+/// 残光の長さ(明るさが 1/e になるまでの角度 [rad])。
+pub const TRAIL: f32 = 0.9;
+/// CPU で描くとき(静止画)の回る線の角度 [rad]。北 0、時計回り
+pub const STILL_SWEEP: f32 = 2.6;
+
+/// レーダーの点の種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlipKind {
+    /// いちばん近い機体
+    Focus,
+    Other,
+    Ground,
+}
+
+/// レーダーの点 1 つ(画面の px)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Blip {
+    pub x: f32,
+    pub y: f32,
+    pub kind: BlipKind,
+}
+
+/// レーダーの円と点の位置(画面の px)。背景(CPU)と回る線(GPU)で同じものを使う。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RadarGeom {
+    pub center: (f32, f32),
+    pub radius: f32,
+    pub blips: Vec<Blip>,
+}
 
 fn dash(s: &str) -> &str {
     if s.is_empty() { "—" } else { s }
@@ -85,13 +123,67 @@ pub fn compass(deg: f64) -> &'static str {
     N[(((deg.rem_euclid(360.0) + 22.5) / 45.0) as usize) % 8]
 }
 
+fn rgb(c: [u8; 3], a: u8) -> tiny_skia::Color {
+    rgba(c[0], c[1], c[2], a)
+}
+
+/// 左半分のレーダーの範囲(画面の px)。
+fn radar_rect(size: (u32, u32)) -> (f32, f32, f32, f32) {
+    (0.0, 0.0, size.0 as f32 / 2.0, size.1 as f32)
+}
+
+/// 地図の範囲(経度 西, 東, 緯度 南, 北)。半径の 1.12 倍を南北の半分にとる(円の外に方位の文字を置く余白)
+fn map_bounds(view: &AircraftView) -> (f64, f64, f64, f64) {
+    let (lat, lon) = view.receiver;
+    let half = view.radius_km.max(1.0) * 1.12 / 111.0;
+    let half_lon = half / lat.to_radians().cos().max(0.2);
+    (lon - half_lon, lon + half_lon, lat - half, lat + half)
+}
+
+/// 受信機を中心にしたレーダーの円と、機体の点の位置。
+pub fn radar_geometry(view: &AircraftView, size: (u32, u32)) -> RadarGeom {
+    let (lat, lon) = view.receiver;
+    let proj = projector(map_bounds(view), radar_rect(size));
+    let (cx, cy) = proj(lon, lat);
+    let px_per_km = cy - proj(lon, lat + 1.0 / 111.0).1;
+    let blips = view
+        .planes
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let (x, y) = proj(p.lon, p.lat);
+            let kind = if p.ground {
+                BlipKind::Ground
+            } else if i == 0 {
+                BlipKind::Focus
+            } else {
+                BlipKind::Other
+            };
+            Blip { x, y, kind }
+        })
+        .collect();
+    RadarGeom {
+        center: (cx, cy),
+        radius: view.radius_km.max(1.0) as f32 * px_per_km,
+        blips,
+    }
+}
+
+/// CPU で描く完成画面(`renderer = cpu` と静止画)。回る線は `STILL_SWEEP` の角度で止めて描く。
 pub fn aircraft_screen(c: &mut Canvas, t: &mut TextEngine, view: &AircraftView) {
+    aircraft_background(c, t, view);
+    let g = radar_geometry(view, (c.width(), c.height()));
+    sweep_cpu(c, &g, STILL_SWEEP, TRAIL);
+}
+
+/// 回る線と点を除いた画面(GPU 経路の背景)。機体の情報が変わったときだけ描き直す。
+pub fn aircraft_background(c: &mut Canvas, t: &mut TextEngine, view: &AircraftView) {
     let (w, h) = (c.width() as f32, c.height() as f32);
     let k = scale(c.height());
-    c.fill_rect(0.0, 0.0, w, h, rgba(6, 10, 18, 255));
+    c.fill_rect(0.0, 0.0, w, h, rgb(BG, 255));
     let half = w / 2.0;
-    radar(c, t, view, (0.0, 0.0, half, h), k);
-    c.fill_rect(half, 0.0, 2.0 * k, h, rgba(40, 55, 75, 255));
+    radar(c, t, view, k);
+    c.fill_rect(half, 0.0, 2.0 * k, h, rgb(LINE, 255));
     details(
         c,
         t,
@@ -101,22 +193,13 @@ pub fn aircraft_screen(c: &mut Canvas, t: &mut TextEngine, view: &AircraftView) 
     );
 }
 
-fn radar(
-    c: &mut Canvas,
-    t: &mut TextEngine,
-    view: &AircraftView,
-    rect: (f32, f32, f32, f32),
-    k: f32,
-) {
-    let (rx, ry, rw, rh) = rect;
-    let (lat, lon) = view.receiver;
+fn radar(c: &mut Canvas, t: &mut TextEngine, view: &AircraftView, k: f32) {
+    let (rx, ry, rw, rh) = radar_rect((c.width(), c.height()));
     let r_km = view.radius_km.max(1.0);
-    // 半径の 1.12 倍を南北の半分にとる(円の外に方位の文字を置く余白)
-    let half = r_km * 1.12 / 111.0;
-    let half_lon = half / lat.to_radians().cos().max(0.2);
-    let b = (lon - half_lon, lon + half_lon, lat - half, lat + half);
+    let b = map_bounds(view);
+    let g = radar_geometry(view, (c.width(), c.height()));
     let mut m = Canvas::new(rw.max(1.0) as u32, rh.max(1.0) as u32);
-    m.clear(rgba(6, 12, 22, 255));
+    m.clear(rgb(BG, 255));
     let proj = projector(b, (0.0, 0.0, rw, rh));
     for r in prefs().iter().filter(|r| overlaps(r.bbox, b)) {
         let rings: Vec<Vec<(f32, f32)>> = r
@@ -124,18 +207,19 @@ fn radar(
             .iter()
             .map(|ring| ring.iter().map(|&(x, y)| proj(x, y)).collect())
             .collect();
-        m.fill_rings(&rings, rgba(20, 32, 46, 255));
-        m.stroke_rings(&rings, 1.2 * k, rgba(50, 70, 92, 255));
+        m.fill_rings(&rings, rgba(5, 20, 12, 255));
+        m.stroke_rings(&rings, 1.2 * k, rgba(25, 70, 42, 255));
     }
-    let (cx, cy) = proj(lon, lat);
-    let px_per_km = cy - proj(lon, lat + 1.0 / 111.0).1;
+    let (cx, cy) = (g.center.0 - rx, g.center.1 - ry);
+    let outer = g.radius;
+    let px_per_km = outer / r_km as f32;
     // 距離の輪と十字
     for ring in [10.0, 25.0, 50.0, 100.0] {
         if ring > r_km + 0.1 {
             continue;
         }
         let rr = ring as f32 * px_per_km;
-        m.stroke_circle(cx, cy, rr, 1.5 * k, rgba(60, 120, 90, 200));
+        m.stroke_circle(cx, cy, rr, 1.5 * k, rgba(40, 140, 75, 200));
         // 東の軸の上、輪の内側に距離を書く
         let label = format!("{ring:.0}km");
         let lw = t.measure(&label, 22.0 * k);
@@ -145,20 +229,24 @@ fn radar(
             cx + rr - lw - 6.0 * k,
             cy - 28.0 * k,
             22.0 * k,
-            [90, 160, 120, 255],
+            DIM,
         );
     }
-    let outer = r_km as f32 * px_per_km;
-    m.polyline(
-        &[(cx - outer, cy), (cx + outer, cy)],
-        1.0 * k,
-        rgba(60, 120, 90, 120),
-    );
-    m.polyline(
-        &[(cx, cy - outer), (cx, cy + outer)],
-        1.0 * k,
-        rgba(60, 120, 90, 120),
-    );
+    m.stroke_circle(cx, cy, outer, 2.0 * k, rgba(50, 170, 90, 230));
+    // 30° ごとの目盛り
+    for i in 0..12 {
+        let a = (i as f32 * 30.0).to_radians();
+        let (s, co) = (a.sin(), -a.cos());
+        let inner = if i % 3 == 0 { 0.0 } else { outer * 0.94 };
+        m.polyline(
+            &[
+                (cx + s * inner, cy + co * inner),
+                (cx + s * outer, cy + co * outer),
+            ],
+            1.0 * k,
+            rgba(40, 140, 75, if i % 3 == 0 { 120 } else { 200 }),
+        );
+    }
     for (label, dx, dy) in [
         ("N", 0.0, -1.0),
         ("E", 1.0, 0.0),
@@ -168,40 +256,41 @@ fn radar(
         let s = 30.0 * k;
         let x = cx + dx * (outer + 26.0 * k) - t.measure(label, s) / 2.0;
         let y = cy + dy * (outer + 26.0 * k) - s * 0.62;
-        t.draw(&mut m, label, x, y, s, [120, 180, 140, 255]);
+        t.draw(&mut m, label, x, y, s, [OTHER[0], OTHER[1], OTHER[2], 255]);
     }
-    m.fill_circle(cx, cy, 8.0 * k, rgba(255, 255, 255, 255));
-    m.fill_circle(cx, cy, 5.0 * k, rgba(30, 140, 255, 255));
-    // 機体(遠いものから描き、いちばん近い機体を最後に重ねる)
-    for (i, p) in view.planes.iter().enumerate().rev() {
-        let (x, y) = proj(p.lon, p.lat);
-        let color = if p.ground {
-            [130, 140, 150]
-        } else if i == 0 {
-            FOCUS
-        } else {
-            OTHER
+    m.fill_circle(cx, cy, 4.0 * k, rgb(OTHER, 255));
+    // 機体の名前と高度(点そのものは回る線と一緒に描く)。遠いものから描き、いちばん近い機体を最後に重ねる
+    for (p, blip) in view.planes.iter().zip(&g.blips).rev() {
+        let (x, y) = (blip.x - rx, blip.y - ry);
+        let color = match blip.kind {
+            BlipKind::Focus => FOCUS,
+            BlipKind::Other => OTHER,
+            BlipKind::Ground => GROUND,
         };
-        let size = if i == 0 { 30.0 } else { 20.0 } * k;
-        plane_marker(&mut m, x, y, p.track.unwrap_or(0.0), size, color);
+        let off = 28.0 * k;
+        if blip.kind == BlipKind::Focus {
+            // 選択中の機体を角かっこで囲む
+            let s = 16.0 * k;
+            for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                let (ex, ey) = (x + sx * s, y + sy * s);
+                m.polyline(
+                    &[(ex - sx * s * 0.5, ey), (ex, ey), (ex, ey - sy * s * 0.5)],
+                    2.0 * k,
+                    rgb(FOCUS, 255),
+                );
+            }
+        }
         let name = if p.callsign.is_empty() {
             dash(&p.reg).to_string()
         } else {
             p.callsign.clone()
         };
         let ink = [color[0], color[1], color[2], 255];
-        t.draw(
-            &mut m,
-            &name,
-            x + size + 8.0 * k,
-            y - 32.0 * k,
-            28.0 * k,
-            ink,
-        );
+        t.draw(&mut m, &name, x + off, y - 32.0 * k, 28.0 * k, ink);
         t.draw(
             &mut m,
             &altitude_label(p),
-            x + size + 8.0 * k,
+            x + off,
             y + 2.0 * k,
             24.0 * k,
             DIM,
@@ -219,21 +308,51 @@ fn radar(
     c.draw_pixmap(&m.pixmap, rx as i32, ry as i32);
 }
 
-/// 進行方向を向いた三角形。
-fn plane_marker(c: &mut Canvas, x: f32, y: f32, track: f64, size: f32, color: [u8; 3]) {
-    let a = (track as f32).to_radians();
-    let (s, co) = (a.sin(), a.cos());
-    // 北向きの三角形を回す(画面の y は下向き)
-    let rot = |dx: f32, dy: f32| (x + dx * co - dy * s, y + dx * s + dy * co);
-    let tri = vec![
-        rot(0.0, -size),
-        rot(size * 0.6, size * 0.7),
-        rot(0.0, size * 0.35),
-        rot(-size * 0.6, size * 0.7),
-    ];
-    let [r, g, b] = color;
-    c.fill_rings(std::slice::from_ref(&tri), rgba(r, g, b, 255));
-    c.stroke_rings(&[tri], 1.5 * size / 14.0, rgba(0, 0, 0, 180));
+/// 線が通ってからの角度 [0, 2π)。`a` は点の方位(北 0、時計回り)
+fn behind(sweep: f32, a: f32) -> f32 {
+    (sweep - a).rem_euclid(std::f32::consts::TAU)
+}
+
+/// 画面の点の方位(北 0、時計回り。画面の y は下向き)。
+fn bearing_px(center: (f32, f32), x: f32, y: f32) -> f32 {
+    (x - center.0).atan2(-(y - center.1))
+}
+
+/// 回る線、残光、点を CPU で描く(GPU 経路では `miharashi-gpu` のシェーダーが同じものを描く)。
+pub fn sweep_cpu(c: &mut Canvas, g: &RadarGeom, sweep: f32, trail: f32) {
+    let k = scale(c.height());
+    let (cx, cy) = g.center;
+    let r = g.radius;
+    let at = |a: f32, rr: f32| (cx + a.sin() * rr, cy - a.cos() * rr);
+    // 残光: 線の後ろを細い扇形に分け、離れるほど薄くする
+    let step = 0.04;
+    for i in 0..((3.0 * trail / step) as usize) {
+        let a0 = sweep - i as f32 * step;
+        let alpha = (0.45 * (-(i as f32 * step) / trail).exp() * 255.0) as u8;
+        if alpha == 0 {
+            break;
+        }
+        let ring = vec![
+            (cx, cy),
+            at(a0, r),
+            at(a0 - step * 0.5, r),
+            at(a0 - step, r),
+        ];
+        c.fill_rings(&[ring], rgba(40, 255, 110, alpha));
+    }
+    c.polyline(&[(cx, cy), at(sweep, r)], 3.0 * k, rgba(150, 255, 180, 255));
+    for b in &g.blips {
+        let life =
+            (-behind(sweep, bearing_px(g.center, b.x, b.y)) / (std::f32::consts::TAU * 0.55)).exp();
+        let (color, size) = match b.kind {
+            BlipKind::Focus => (FOCUS, 11.0),
+            BlipKind::Other => (OTHER, 9.0),
+            BlipKind::Ground => (GROUND, 7.0),
+        };
+        let a = (0.3 + life).min(1.0);
+        c.fill_circle(b.x, b.y, size * 2.2 * k, rgb(color, (a * 70.0) as u8));
+        c.fill_circle(b.x, b.y, size * k, rgb(color, (a * 255.0) as u8));
+    }
 }
 
 fn details(
@@ -325,7 +444,7 @@ fn details(
         y += 58.0 * k;
     }
     y += 10.0 * k;
-    c.fill_rect(x, y, width, 2.0 * k, rgba(40, 55, 75, 255));
+    c.fill_rect(x, y, width, 2.0 * k, rgb(LINE, 255));
     y += 24.0 * k;
     t.draw(c, "ほかの機体(近い順)", x, y, 30.0 * k, DIM);
     y += 50.0 * k;
@@ -389,5 +508,40 @@ mod tests {
         p.ground = false;
         p.alt_ft = None;
         assert_eq!(altitude_label(&p), "—");
+    }
+
+    #[test]
+    fn radar_geometry_centers_on_receiver() {
+        let plane = |lat: f64, lon: f64, ground: bool| Plane {
+            lat,
+            lon,
+            ground,
+            alt_ft: (!ground).then_some(10000),
+            ..Default::default()
+        };
+        let view = AircraftView {
+            receiver: (35.0, 139.0),
+            radius_km: 50.0,
+            // 真北 25km、受信機の上(地上)
+            planes: vec![
+                plane(35.0 + 25.0 / 111.0, 139.0, false),
+                plane(35.0, 139.0, true),
+            ],
+            ..Default::default()
+        };
+        let g = radar_geometry(&view, (2560, 1080));
+        // 左半分(1280×1080)の中央
+        assert!((g.center.0 - 640.0).abs() < 1.0, "{:?}", g.center);
+        assert!((g.center.1 - 540.0).abs() < 1.0, "{:?}", g.center);
+        // 円の外に方位の文字を置く余白をとる
+        assert!(g.radius > 400.0 && g.radius < 540.0, "{}", g.radius);
+        let (n, gnd) = (g.blips[0], g.blips[1]);
+        assert_eq!(n.kind, BlipKind::Focus);
+        assert!((n.x - g.center.0).abs() < 1.0);
+        assert!((g.center.1 - n.y - g.radius / 2.0).abs() < 2.0, "{n:?}");
+        assert_eq!(gnd.kind, BlipKind::Ground);
+        // 真北の点は線が通った直後に最も明るい
+        assert!(behind(0.01, bearing_px(g.center, n.x, n.y)) < 0.02);
+        assert!(behind(-0.01, bearing_px(g.center, n.x, n.y)) > 6.2);
     }
 }

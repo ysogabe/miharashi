@@ -5,13 +5,14 @@ use crate::config::Config;
 use crate::panel::{DisplayControl, DisplayStatus, Panel};
 use crate::screen::{App, Composite, KeyPress, PhotoData, PhotoRef};
 use crate::screen_power::{Mode as PowerMode, ScreenPower};
-use miharashi_gpu::{Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, SourceImage};
+use miharashi_gpu::{Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, Radar, SourceImage};
 use miharashi_linux::drm_select::{self, CardSel, ModeSel};
 use miharashi_linux::input::{Action, Keys};
 use miharashi_linux::kms::Display;
 use miharashi_linux::seat::{SeatMode, Session, SessionEvent};
 use miharashi_linux::vt::VtGuard;
 use miharashi_render::Canvas;
+use miharashi_render::aircraft::{self, BlipKind, RadarGeom};
 use miharashi_render::photo_layout::{self, Mode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,6 +80,39 @@ pub fn photo_layer(p: PhotoRef<'_>, screen_h: u32) -> PhotoLayer<'_> {
         PhotoData::Resident => PhotoSource::Resident,
     };
     PhotoLayer { id: p.id, src }
+}
+
+/// レーダーの点を GPU の合成器の形 (x, y, 種類) にする。
+pub fn radar_blips(g: &RadarGeom) -> Vec<[f32; 3]> {
+    g.blips
+        .iter()
+        .map(|b| {
+            let kind = match b.kind {
+                BlipKind::Other => 0.0,
+                BlipKind::Focus => 1.0,
+                BlipKind::Ground => 2.0,
+            };
+            [b.x, b.y, kind]
+        })
+        .collect()
+}
+
+/// 航空機の画面のレーダーを GPU の合成器の形にする。`blips` は `radar_blips` の結果。
+pub fn radar_layer<'a>(
+    g: &RadarGeom,
+    sweep: f32,
+    trail: f32,
+    screen_h: u32,
+    blips: &'a [[f32; 3]],
+) -> Radar<'a> {
+    Radar {
+        center: g.center,
+        radius: g.radius,
+        sweep,
+        trail,
+        scale: photo_layout::scale(screen_h),
+        blips,
+    }
 }
 
 /// 表示経路。CPU は Canvas を dumb buffer へ変換コピーし、GLES は表示カードの GPU で
@@ -183,6 +217,10 @@ impl Presenter {
                 let h = canvas.height();
                 let comp = app.render_composite(canvas);
                 let t1 = Instant::now();
+                let blips = match &comp {
+                    Composite::Radar { geom, .. } => radar_blips(geom),
+                    _ => Vec::new(),
+                };
                 let frame = match comp {
                     Composite::Canvas => Frame::Image(canvas.pixmap.data()),
                     Composite::Photo {
@@ -193,6 +231,14 @@ impl Presenter {
                         photo: photo_layer(photo, h),
                         old: old.map(|(p, t)| (photo_layer(p, h), t)),
                         overlay: overlay_changed.then(|| canvas.pixmap.data()),
+                    },
+                    Composite::Radar {
+                        background_changed,
+                        geom,
+                        sweep,
+                    } => Frame::Radar {
+                        background: background_changed.then(|| canvas.pixmap.data()),
+                        radar: radar_layer(&geom, sweep, aircraft::TRAIL, h, &blips),
                     },
                 };
                 d.present_frame(&frame)?;
