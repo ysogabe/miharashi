@@ -27,6 +27,11 @@ pub trait App {
         self.render(canvas);
         Composite::Canvas
     }
+    /// 毎フレーム動かし続けている画面か(航空機の画面の回る線)。true の間、実行ループは待ちを入れず、
+    /// 表示の完了待ち(vsync)だけで間隔をとる。
+    fn animating(&self) -> bool {
+        false
+    }
     /// 画面を消している間でも点けて見せたいもの(アラート)があるか。
     fn wants_screen(&self) -> bool {
         false

@@ -510,6 +510,10 @@ impl App for KioskApp {
         self.alert_active()
     }
 
+    fn animating(&self) -> bool {
+        self.gpu && self.showing_aircraft()
+    }
+
     fn stats(&self) -> Vec<(&'static str, String)> {
         let s = self.snapshot();
         vec![
@@ -862,6 +866,7 @@ mod tests {
         assert!(!app.tick(later), "CPU 経路は止まった絵を描き直さない");
         app.gpu = true;
         assert!(app.tick(later), "GPU 経路は回る線を毎フレーム描く");
+        assert!(app.animating(), "回る線の間は vsync だけで間隔をとる");
         // GPU 経路: 背景は 1 回だけ描き、回る線と点は GPU に任せる
         match app.render_composite(&mut c) {
             Composite::Radar {
