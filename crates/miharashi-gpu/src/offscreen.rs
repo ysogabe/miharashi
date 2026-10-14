@@ -51,9 +51,25 @@ impl Offscreen {
         frames: &[Frame<'_>],
         (w, h): (u32, u32),
     ) -> Result<Vec<u8>, String> {
+        let (r, img) = self.with_fbo((w, h), |gl| {
+            let mut comp = Compositor::new(gl, (w, h))?;
+            let r = frames.iter().try_for_each(|f| comp.draw(gl, f));
+            comp.destroy(gl);
+            r
+        })?;
+        r.map(|()| img)
+    }
+
+    /// 画面と同じ大きさの FBO を bind して `f` を呼び、終わったあとの FBO を上から下の RGBA8 で
+    /// 読み戻す(ベンチマークの場面もこの上で描く)。
+    pub fn with_fbo<R>(
+        &self,
+        (w, h): (u32, u32),
+        f: impl FnOnce(&glow::Context) -> R,
+    ) -> Result<(R, Vec<u8>), String> {
         let gl = &self.ctx.gl;
-        let mut comp = Compositor::new(gl, (w, h))?;
         let mut out = vec![0u8; w as usize * h as usize * 4];
+        let r;
         unsafe {
             let rb = gl.create_renderbuffer()?;
             gl.bind_renderbuffer(glow::RENDERBUFFER, Some(rb));
@@ -70,9 +86,8 @@ impl Offscreen {
             if status != glow::FRAMEBUFFER_COMPLETE {
                 return Err(format!("FBO が不完全: 0x{status:x}"));
             }
-            for f in frames {
-                comp.draw(gl, f)?;
-            }
+            r = f(gl);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
             gl.read_pixels(
                 0,
@@ -87,11 +102,10 @@ impl Offscreen {
             gl.delete_framebuffer(fbo);
             gl.delete_renderbuffer(rb);
         }
-        comp.destroy(gl);
         // glReadPixels は下の行から返すので、上から下に並べ直す
         let stride = w as usize * 4;
         let flipped = out.chunks_exact(stride).rev().flatten().copied().collect();
-        Ok(flipped)
+        Ok((r, flipped))
     }
 }
 
