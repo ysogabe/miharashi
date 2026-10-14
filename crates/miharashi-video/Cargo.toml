@@ -1,0 +1,8 @@
+[package]
+name = "miharashi-video"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# ビルドには libavcodec-dev / libavformat-dev / libavutil-dev / libclang-dev が要る
+ffmpeg-sys-next = { version = "7.1", default-features = false, features = ["avcodec", "avformat"] }

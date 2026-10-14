@@ -39,6 +39,11 @@ impl Offscreen {
         self.ctx.describe()
     }
 
+    /// dmabuf(動画のデコード結果など)をテクスチャに取り込む道具。
+    pub fn dmabuf(&self) -> Result<crate::video::Dmabuf<'_>, String> {
+        crate::video::Dmabuf::new(&self.ctx)
+    }
+
     /// `rgba`(上から下、stride = 幅 × 4)を GLES で描き、上から下の RGBA8 で読み戻す。
     pub fn render(&self, rgba: &[u8], size: (u32, u32)) -> Result<Vec<u8>, String> {
         self.render_frames(&[Frame::Image(rgba)], size)
