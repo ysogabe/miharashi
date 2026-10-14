@@ -178,11 +178,43 @@ pub fn aircraft_screen(c: &mut Canvas, t: &mut TextEngine, view: &AircraftView) 
 
 /// 回る線と点を除いた画面(GPU 経路の背景)。機体の情報が変わったときだけ描き直す。
 pub fn aircraft_background(c: &mut Canvas, t: &mut TextEngine, view: &AircraftView) {
-    let (w, h) = (c.width() as f32, c.height() as f32);
+    aircraft_background_cached(c, t, view, &mut None);
+}
+
+/// 地図、距離の輪、目盛りだけを描いたレーダーの下地(左半分)。受信機の位置、半径、画面の大きさで決まる。
+pub struct RadarBase {
+    key: ((f64, f64), f64, (u32, u32)),
+    canvas: Canvas,
+}
+
+/// `aircraft_background` と同じ画面を、レーダーの下地を `base` に取っておいて描く。
+/// 機体が動くたびの描き直しが、下地の写しと文字だけになる(地図の塗りがいちばん重い)。
+pub fn aircraft_background_cached(
+    c: &mut Canvas,
+    t: &mut TextEngine,
+    view: &AircraftView,
+    base: &mut Option<RadarBase>,
+) {
+    let size = (c.width(), c.height());
+    let (w, h) = (size.0 as f32, size.1 as f32);
     let k = scale(c.height());
-    c.fill_rect(0.0, 0.0, w, h, rgb(BG, 255));
+    let key = (view.receiver, view.radius_km, size);
+    if base.as_ref().is_none_or(|b| b.key != key) {
+        *base = Some(RadarBase {
+            key,
+            canvas: radar_base(t, view, size, k),
+        });
+    }
+    let base = base.as_ref().expect("上で作った");
+    // 左半分はレーダーで覆うので、右半分だけ塗る
+    c.fill_rect(w / 2.0, 0.0, w / 2.0, h, rgb(BG, 255));
+    let mut m = Canvas {
+        pixmap: base.canvas.pixmap.clone(),
+    };
+    radar_labels(&mut m, t, view, size, k);
+    let (rx, ry, _, _) = radar_rect(size);
+    c.draw_pixmap(&m.pixmap, rx as i32, ry as i32);
     let half = w / 2.0;
-    radar(c, t, view, k);
     c.fill_rect(half, 0.0, 2.0 * k, h, rgb(LINE, 255));
     details(
         c,
@@ -193,11 +225,12 @@ pub fn aircraft_background(c: &mut Canvas, t: &mut TextEngine, view: &AircraftVi
     );
 }
 
-fn radar(c: &mut Canvas, t: &mut TextEngine, view: &AircraftView, k: f32) {
-    let (rx, ry, rw, rh) = radar_rect((c.width(), c.height()));
+/// レーダーの下地: 地図、距離の輪、目盛り、方位の文字、受信機の位置。
+fn radar_base(t: &mut TextEngine, view: &AircraftView, size: (u32, u32), k: f32) -> Canvas {
+    let (rx, ry, rw, rh) = radar_rect(size);
     let r_km = view.radius_km.max(1.0);
     let b = map_bounds(view);
-    let g = radar_geometry(view, (c.width(), c.height()));
+    let g = radar_geometry(view, size);
     let mut m = Canvas::new(rw.max(1.0) as u32, rh.max(1.0) as u32);
     m.clear(rgb(BG, 255));
     let proj = projector(b, (0.0, 0.0, rw, rh));
@@ -259,7 +292,22 @@ fn radar(c: &mut Canvas, t: &mut TextEngine, view: &AircraftView, k: f32) {
         t.draw(&mut m, label, x, y, s, [OTHER[0], OTHER[1], OTHER[2], 255]);
     }
     m.fill_circle(cx, cy, 4.0 * k, rgb(OTHER, 255));
-    // 機体の名前と高度(点そのものは回る線と一緒に描く)。遠いものから描き、いちばん近い機体を最後に重ねる
+    t.draw(
+        &mut m,
+        &format!("航空機  受信機から半径{:.0}km", r_km),
+        24.0 * k,
+        20.0 * k,
+        34.0 * k,
+        FG,
+    );
+    m
+}
+
+/// 下地の上に、機体の名前と高度、時刻を描く(点そのものは回る線と一緒に描く)。
+fn radar_labels(m: &mut Canvas, t: &mut TextEngine, view: &AircraftView, size: (u32, u32), k: f32) {
+    let (rx, ry, rw, _) = radar_rect(size);
+    let g = radar_geometry(view, size);
+    // 遠いものから描き、いちばん近い機体を最後に重ねる
     for (p, blip) in view.planes.iter().zip(&g.blips).rev() {
         let (x, y) = (blip.x - rx, blip.y - ry);
         let color = match blip.kind {
@@ -286,26 +334,10 @@ fn radar(c: &mut Canvas, t: &mut TextEngine, view: &AircraftView, k: f32) {
             p.callsign.clone()
         };
         let ink = [color[0], color[1], color[2], 255];
-        t.draw(&mut m, &name, x + off, y - 32.0 * k, 28.0 * k, ink);
-        t.draw(
-            &mut m,
-            &altitude_label(p),
-            x + off,
-            y + 2.0 * k,
-            24.0 * k,
-            DIM,
-        );
+        t.draw(m, &name, x + off, y - 32.0 * k, 28.0 * k, ink);
+        t.draw(m, &altitude_label(p), x + off, y + 2.0 * k, 24.0 * k, DIM);
     }
-    t.draw(
-        &mut m,
-        &format!("航空機  受信機から半径{:.0}km", r_km),
-        24.0 * k,
-        20.0 * k,
-        34.0 * k,
-        FG,
-    );
-    t.draw_right(&mut m, &view.time, rw - 24.0 * k, 20.0 * k, 34.0 * k, DIM);
-    c.draw_pixmap(&m.pixmap, rx as i32, ry as i32);
+    t.draw_right(m, &view.time, rw - 24.0 * k, 20.0 * k, 34.0 * k, DIM);
 }
 
 /// 線が通ってからの角度 [0, 2π)。`a` は点の方位(北 0、時計回り)
