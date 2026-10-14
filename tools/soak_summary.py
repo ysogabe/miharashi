@@ -11,7 +11,7 @@ from datetime import datetime
 LINE = re.compile(
     r"^(?P<ts>\S+) .*stats: t=(?P<t>\d+)s rss=(?P<rss>\d+)MB fds=(?P<fds>\d+) frames=(?P<frames>\d+) "
     r"worst_frame=(?P<worst>\d+)ms ticks=(?P<ticks>\d+) keys=(?P<keys>\d+) screen=(?P<screen>\S+) "
-    r"photo=(?P<photo>\d+) feed=(?P<feed>.*?) cpu="
+    r"photo=(?P<photo>\d+) (?:aircraft=\S+ )?feed=(?P<feed>.*?) cpu="
 )
 # PoC-005 で追加した計測値(古いログには無い)
 CPU_SELF = re.compile(r" cpu_self=(?P<v>[\d.]+)")
