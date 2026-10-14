@@ -18,6 +18,25 @@ struct Dev {
 pub struct Keys {
     devices: Vec<Dev>,
     name_filter: Vec<String>,
+    /// 前回開き直したときの /dev/input/event* の一覧
+    seen: Vec<PathBuf>,
+}
+
+/// /dev/input/event* の一覧(名前順)。
+fn event_nodes() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir("/dev/input")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("event"))
+        })
+        .collect();
+    paths.sort();
+    paths
 }
 
 fn is_target(d: &Device) -> bool {
@@ -41,6 +60,7 @@ impl Keys {
         let mut keys = Self {
             devices: Vec::new(),
             name_filter: names.to_vec(),
+            seen: Vec::new(),
         };
         keys.reopen(session);
         keys
@@ -61,18 +81,8 @@ impl Keys {
     /// デバイスを開き直す(VT が戻ったとき)。開けたデバイス数を返す。
     pub fn reopen(&mut self, session: &mut Session) -> usize {
         self.close(session);
-        let mut paths: Vec<PathBuf> = std::fs::read_dir("/dev/input")
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("event"))
-            })
-            .collect();
-        paths.sort();
+        let paths = event_nodes();
+        self.seen = paths.clone();
         for path in paths {
             let Ok(opened) = session.open_device(&path) else {
                 continue;
@@ -102,6 +112,13 @@ impl Keys {
             self.devices.push(Dev { device, opened });
         }
         self.devices.len()
+    }
+
+    /// 前回から入力デバイスが増減したときだけ開き直す(キーボードが挿されたかの見直し用)。
+    /// 全デバイスを seat 経由で開くと数百 ms かかるので、変わっていなければ一覧を読むだけにする。
+    /// 戻り値: 開き直したら Some(開けたデバイス数)
+    pub fn reopen_if_changed(&mut self, session: &mut Session) -> Option<usize> {
+        (event_nodes() != self.seen).then(|| self.reopen(session))
     }
 
     pub fn device_names(&self) -> Vec<String> {

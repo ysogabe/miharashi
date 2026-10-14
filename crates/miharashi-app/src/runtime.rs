@@ -411,7 +411,8 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
 
         if keys.is_empty() && Instant::now() >= keys_retry {
             keys_retry = Instant::now() + KEYS_RETRY;
-            if keys.reopen(&mut session) > 0 {
+            // 入力デバイスが増減したときだけ開き直す(毎回開くと描画が数百 ms 止まる)
+            if keys.reopen_if_changed(&mut session).is_some_and(|n| n > 0) {
                 eprintln!("input: {:?}", keys.device_names());
             }
         }
