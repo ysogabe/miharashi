@@ -97,14 +97,15 @@ flowchart LR
 
 | メソッド | パス | 内容 |
 |---|---|---|
-| GET | `/api/v1/status` | `{schema_version, host, screen: {id, title, index, count}, screens: [{id, title}], photo: {position, total} \| null, feed: "online" \| "retrying", rotation: {state: "on" \| "paused", resume_in_s} \| null, display: {on, mode: "auto" \| "force_on" \| "force_off" \| null, control}, uptime_s, generated_at}` |
+| GET | `/api/v1/status` | `{schema_version, host, screen: {id, title, index, count}, screens: [{id, title}], photo: {position, total} \| null, feed: "online" \| "retrying", rotation: {state: "on" \| "paused", resume_in_s} \| null, menu: {index, id} \| null, display: {on, mode: "auto" \| "force_on" \| "force_off" \| null, control}, uptime_s, generated_at}` |
 | POST | `/api/v1/input` | `{"key": "prev" \| "next" \| "select" \| "up" \| "down" \| "menu"}` → `204`。`quit` は受け付けない |
 | POST | `/api/v1/screen` | `{"id": "photo"}` → `204`。登録されていない id は `404` |
 | POST | `/api/v1/display` | `{"mode": "force_off" \| "force_on" \| "auto"}` → `204`。キオスクのモニターの消灯・点灯。キオスクが HA の手動オーバーライド(`screen_power.mode_entity` の input_select)を書き換え、すぐ問い合わせ直して反映する。HA と表示が食い違わないよう、キオスクの中だけでは切り替えない。mode エンティティが未設定なら `409`、HA に届かなければ `502` |
-| GET | `/api/v1/events` | SSE。画面・モニター・巡回の状態が変わるたびに `status` と同じ JSON を 1 行。接続中は 15 秒ごとに `: keepalive` |
+| GET | `/api/v1/events` | SSE。画面・モニター・巡回・メニューの状態が変わるたびに `status` と同じ JSON を 1 行。接続中は 15 秒ごとに `: keepalive` |
 | GET | `/api/v1/healthz` | 認証なし。`{"ok": true}` だけ |
 
 - `rotation`: 自動巡回(DESIGN-screens.md §7.2)の状態。`[rotation]` が無効なら `null`。操作で止まっている間は `paused`、戻ると `on`(#45)。`resume_in_s` は戻るまでの残り秒数(切り上げ、0 未満にしない。`on` なら `null`)。残り秒数は `/status` を組み立てるときに戻る時刻から計算するので、SSE は止まる・戻る・もう一度の操作で止める時間が延びる、のときだけ送り、毎秒は送らない。項目を足しただけなので `schema_version` は 1 のまま。
+- `menu`: キオスクのメニュー(0 で開く)が開いていれば、選んでいる画面の `{index, id}`(`screen` の `index` / `id` と同じ意味)。閉じていれば `null`。開く・8 / 2(と 4 / 6)で選択が動く・5 か 0 で閉じる・`POST /api/v1/screen` で閉じる、のたびに SSE を送る(#49)。キーは必ず再描画を求め、実行ループは再描画のたびにパネルへ状態を渡すので、1 秒以内に届く。項目を足しただけなので `schema_version` は 1 のまま。
 - 認証: `Authorization: Bearer <token>`。トークンは設定ファイルで指定したファイル(`/etc/miharashi/panel.token`、`ha-token` と同じく root:<実行ユーザー> 0640 か 0600。誰でも読める権限なら起動しない)から読む。不一致は `401`。`healthz` 以外は全て必須。
 - 待ち受け: 設定の `[panel] listen = "192.168.x.x:8790"` のように**インターフェースを指定**する(`0.0.0.0` は拒否)。既定は無効(`enabled = false`)。
 - 実装: `tiny_http` のスレッド 1 本(写真の `Feed` と同じ形)。`KeyPress` は `std::sync::mpsc` で実行ループへ。`/status` はループが更新する `Arc<Mutex<PanelStatus>>` を読む。

@@ -175,6 +175,7 @@ impl Shared {
             "photo": view.photo.map(|(position, total)| json!({"position": position, "total": total})),
             "feed": if view.feed_online { "online" } else { "retrying" },
             "rotation": view.rotation.map(|r| rotation_json(r, Instant::now())),
+            "menu": view.menu.and_then(|i| view.screens.get(i).map(|s| json!({"index": i, "id": s.id}))),
             "display": {
                 "on": display.on,
                 "mode": display.mode,
@@ -569,6 +570,7 @@ mod tests {
             photo: Some((12, 187)),
             feed_online: true,
             rotation: None,
+            menu: None,
         }
     }
 
@@ -670,6 +672,22 @@ mod tests {
             v["display"],
             json!({"on": true, "mode": null, "control": false})
         );
+    }
+
+    #[test]
+    fn status_reports_the_menu() {
+        let (p, base) = start(20);
+        let menu = |p: &Panel, m| {
+            p.publish(
+                Some(PanelView { menu: m, ..view(0) }),
+                DisplayStatus::default(),
+            );
+            let v: Value = serde_json::from_str(&get(&base, "/api/v1/status", true).1).unwrap();
+            v["menu"].clone()
+        };
+        assert_eq!(menu(&p, None), Value::Null, "閉じている");
+        assert_eq!(menu(&p, Some(1)), json!({"index": 1, "id": "photo"}));
+        assert_eq!(menu(&p, Some(0)), json!({"index": 0, "id": "status"}));
     }
 
     #[test]
@@ -933,6 +951,18 @@ mod tests {
         };
         p.publish(Some(view(1)), on);
         assert_eq!(data()["display"]["on"], true, "モニターだけ変わっても送る");
+        let menu = PanelView {
+            menu: Some(0),
+            ..view(1)
+        };
+        p.publish(Some(menu), on);
+        assert_eq!(
+            data()["menu"],
+            json!({"index": 0, "id": "status"}),
+            "メニューの状態だけ変わっても送る"
+        );
+        p.publish(Some(view(1)), on);
+        assert_eq!(data()["menu"], Value::Null, "閉じたときも送る");
         let until = Instant::now() + Duration::from_secs(300);
         let paused = |until| PanelView {
             rotation: Some(PanelRotation::Paused { until }),
