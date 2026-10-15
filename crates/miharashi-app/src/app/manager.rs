@@ -61,6 +61,8 @@ pub struct ScreenManager {
     alert_len: Duration,
     /// runtime が知らせる出力の電源状態。Agent 演出は消灯中に止める。
     display_on: bool,
+    /// モニターの手動オーバーライドが force_off か(消えているあいだのパネルのキーのラベルに使う)
+    display_forced_off: bool,
     /// 焼き付き対策の間隔と、入れる画面の id(無効なら None)
     refresh: Option<(Duration, Vec<String>)>,
     /// 次の演出の時刻(対象の画面を続けて出しているあいだだけ近づく)
@@ -108,6 +110,7 @@ impl ScreenManager {
             alert: None,
             alert_len,
             display_on: true,
+            display_forced_off: false,
             refresh: None,
             refresh_due: now,
             refreshing: None,
@@ -367,8 +370,25 @@ impl ScreenManager {
         }
     }
 
-    /// 今 6 つのキーを押すと何が起きるか(`on_key` と同じ順で決める: アラート → メニュー → 画面)。
+    pub fn set_display_forced_off(&mut self, forced: bool) {
+        self.display_forced_off = forced;
+    }
+
+    /// 今 6 つのキーを押すと何が起きるか(runtime と `on_key` と同じ順で決める: モニターの消灯 → アラート → メニュー → 画面)。
     fn panel_keys(&self) -> PanelKeys {
+        // モニターが消えているあいだ、runtime はキーを `on_key` に渡さず、モニターを点けるだけにする。
+        // force_off のときは点けられないので、どのキーも何もしない
+        if !self.display_on {
+            let wake = (!self.display_forced_off).then_some("画面を点ける");
+            return PanelKeys {
+                prev: wake,
+                next: wake,
+                select: wake,
+                up: wake,
+                down: wake,
+                menu: wake,
+            };
+        }
         if self.alert.is_some() {
             let close = Some("閉じる");
             return PanelKeys {
@@ -665,6 +685,10 @@ impl App for ScreenManager {
 
     fn set_display_on(&mut self, on: bool, now: Instant) {
         ScreenManager::set_display_on(self, on, now)
+    }
+
+    fn set_display_forced_off(&mut self, forced: bool) {
+        ScreenManager::set_display_forced_off(self, forced)
     }
 
     fn animating(&self) -> bool {

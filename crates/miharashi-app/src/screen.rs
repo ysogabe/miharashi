@@ -168,6 +168,9 @@ pub trait App {
     }
     /// runtime から出力の消灯・点灯を通知する。
     fn set_display_on(&mut self, _on: bool, _now: Instant) {}
+    /// runtime から、モニターの手動オーバーライドが force_off か(キー操作では点かない)を通知する。
+    /// 操作パネルのキーのラベル(`PanelView::keys`)を、消えているあいだの実際の動きに合わせるのに使う。
+    fn set_display_forced_off(&mut self, _forced: bool) {}
     /// 状態ログ用。runtime は中身を解釈せず、`k=v` を並べて出す。
     fn stats(&self) -> Vec<(&'static str, String)>;
     /// 指定した id の画面にする(操作パネルの `POST /api/v1/screen`)。戻り値: 再描画が必要か。
