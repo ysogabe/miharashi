@@ -196,6 +196,17 @@ pub struct PanelView {
     pub photo: Option<(usize, usize)>,
     /// 写真の取得元に接続できているか
     pub feed_online: bool,
+    /// 自動巡回の状態。巡回が無効なら None
+    pub rotation: Option<PanelRotation>,
+}
+
+/// 操作パネルに見せる自動巡回の状態。
+/// 戻るまでの残り秒数は `/status` を組み立てるときに計算する。ここに秒数を入れると毎秒 SSE を送ることになるので、
+/// 操作したときにしか変わらない「戻る時刻」を持つ
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelRotation {
+    On,
+    Paused { until: Instant },
 }
 
 /// 写真のフレームの中身。
