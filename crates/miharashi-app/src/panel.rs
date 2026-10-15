@@ -4,8 +4,8 @@
 //! サーバーは別スレッド 1 本(写真の `Feed` と同じ形)。キーは mpsc で実行ループへ渡し、
 //! 実行ループは画面が変わったときに `publish` で状態を置く。SSE の接続はそれぞれ別スレッドで待つ。
 //!
-//! P1 の範囲: `prev` / `next` / `select` の 3 つ(今の `KeyPress` の Prev / Next / Switch)。
-//! `up` / `down` / `menu` は #5(PoC-003)で `KeyPress` が増えてから受け付ける。`/api/v1/screen` も #5 の後。
+//! キーは `prev` / `next` / `select` / `up` / `down` / `menu`(テンキーの 4 / 6 / 5 / 8 / 2 / 0)。
+//! `POST /api/v1/screen` で画面を直接選べる(P3、#5 の S2)。
 //!
 //! モニターの消灯・点灯(`POST /api/v1/display`)は、HA の手動オーバーライド(input_select)を書き換える。
 //! キオスクの中だけで切り替えると HA の画面と食い違うので、実際の切り替えは `DisplayControl` に任せる。
@@ -46,14 +46,22 @@ fn parse_key(name: &str) -> Result<KeyPress, String> {
     match name {
         "prev" => Ok(KeyPress::Prev),
         "next" => Ok(KeyPress::Next),
-        "select" => Ok(KeyPress::Switch),
-        "up" | "down" | "menu" => Err(format!(
-            "{name} は PoC-003(#5)まで未対応。使えるのは prev / next / select"
-        )),
+        "select" => Ok(KeyPress::Select),
+        "up" => Ok(KeyPress::Up),
+        "down" => Ok(KeyPress::Down),
+        "menu" => Ok(KeyPress::Menu),
         _ => Err(format!(
-            "未知のキー {name:?}。使えるのは prev / next / select"
+            "未知のキー {name:?}。使えるのは prev / next / select / up / down / menu"
         )),
     }
+}
+
+/// パネルから実行ループへ渡す操作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelInput {
+    Key(KeyPress),
+    /// 画面の id(登録されているものだけ)
+    Screen(&'static str),
 }
 
 /// モニターの手動オーバーライド(auto / force_on / force_off)を切り替える先。実体は `ScreenPower`。
@@ -188,7 +196,7 @@ impl Shared {
 
 /// 実行ループ側の持ち手。
 pub struct Panel {
-    keys: Receiver<KeyPress>,
+    keys: Receiver<PanelInput>,
     shared: Arc<Shared>,
     addr: SocketAddr,
 }
@@ -242,8 +250,8 @@ impl Panel {
         self.addr
     }
 
-    /// 届いているキー。
-    pub fn keys(&self) -> TryIter<'_, KeyPress> {
+    /// 届いている操作。
+    pub fn inputs(&self) -> TryIter<'_, PanelInput> {
         self.keys.try_iter()
     }
 
@@ -307,7 +315,7 @@ fn serve(
     server: Server,
     token: String,
     mut rate: RateLimit,
-    keys: Sender<KeyPress>,
+    keys: Sender<PanelInput>,
     display: Option<Arc<dyn DisplayControl>>,
     shared: Arc<Shared>,
 ) {
@@ -358,6 +366,19 @@ fn serve(
                     }
                 }
             }
+            (Method::Post, "/api/v1/screen") => {
+                if !rate.allow(Instant::now()) {
+                    error(429, "操作が速すぎる")
+                } else {
+                    let (id, result) = select_screen(&mut req, &keys, &shared);
+                    let code = result.as_ref().map_or_else(|(c, _)| *c, |_| 204);
+                    eprintln!("panel: {} screen {id:?} -> {code}", peer(&req));
+                    match result {
+                        Ok(()) => Response::from_data(Vec::new()).with_status_code(204),
+                        Err((code, msg)) => error(code, &msg),
+                    }
+                }
+            }
             (Method::Post, "/api/v1/display") => {
                 if !rate.allow(Instant::now()) {
                     error(429, "操作が速すぎる")
@@ -371,9 +392,11 @@ fn serve(
                     }
                 }
             }
-            (_, "/api/v1/status" | "/api/v1/events" | "/api/v1/input" | "/api/v1/display") => {
-                error(405, "メソッドが違う")
-            }
+            (
+                _,
+                "/api/v1/status" | "/api/v1/events" | "/api/v1/input" | "/api/v1/screen"
+                | "/api/v1/display",
+            ) => error(405, "メソッドが違う"),
             _ => error(404, "ない"),
         };
         let _ = req.respond(resp);
@@ -428,16 +451,45 @@ fn set_display(
 }
 
 /// `POST /api/v1/input` の本文を読んでキーを送る。戻り値: (キーの名前(ログ用), 結果)。Err は (状態コード, 本文)。
-fn input(req: &mut Request, keys: &Sender<KeyPress>) -> (String, Result<(), HttpError>) {
+fn input(req: &mut Request, keys: &Sender<PanelInput>) -> (String, Result<(), HttpError>) {
     let name = match read_field(req, "key", "next") {
         Ok(n) => n,
         Err(e) => return ("-".into(), Err(e)),
     };
     let result = parse_key(&name).map_err(|msg| (400, msg)).and_then(|key| {
-        keys.send(key)
+        keys.send(PanelInput::Key(key))
             .map_err(|_| (503, "キオスクが終了中".to_string()))
     });
     (name, result)
+}
+
+/// `POST /api/v1/screen` の本文を読んで、登録されている画面なら切り替えを送る。戻り値: (id(ログ用), 結果)。
+fn select_screen(
+    req: &mut Request,
+    keys: &Sender<PanelInput>,
+    shared: &Shared,
+) -> (String, Result<(), HttpError>) {
+    let id = match read_field(req, "id", "photo") {
+        Ok(i) => i,
+        Err(e) => return ("-".into(), Err(e)),
+    };
+    let found = {
+        let st = shared.state.lock().unwrap();
+        match &st.view {
+            None => Err((503, "起動中".to_string())),
+            Some(v) => v
+                .screens
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.id)
+                .ok_or_else(|| (404, format!("登録されていない画面 {id:?}"))),
+        }
+    };
+    let result = found.and_then(|sid| {
+        keys.send(PanelInput::Screen(sid))
+            .map_err(|_| (503, "キオスクが終了中".to_string()))
+    });
+    (id, result)
 }
 
 /// SSE。最初に今の状態を送り、以後は変わるたびに送る。15 秒ごとに keepalive。
@@ -615,7 +667,11 @@ mod tests {
     }
 
     fn post(base: &str, auth: Option<&str>, body: &str) -> u16 {
-        let mut r = agent().post(format!("{base}/api/v1/input"));
+        post_to(base, "/api/v1/input", auth, body)
+    }
+
+    fn post_to(base: &str, path: &str, auth: Option<&str>, body: &str) -> u16 {
+        let mut r = agent().post(format!("{base}{path}"));
         if let Some(t) = auth {
             r = r.header("Authorization", format!("Bearer {t}"));
         }
@@ -637,9 +693,9 @@ mod tests {
     }
 
     /// キーが実行ループ側に届くまで少し待つ。
-    fn recv_key(p: &Panel) -> Option<KeyPress> {
+    fn recv_key(p: &Panel) -> Option<PanelInput> {
         for _ in 0..100 {
-            if let Some(k) = p.keys().next() {
+            if let Some(k) = p.inputs().next() {
                 return Some(k);
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -657,11 +713,14 @@ mod tests {
     }
 
     #[test]
-    fn keys_map_to_the_current_keypress_only() {
+    fn keys_map_to_keypress() {
         assert_eq!(parse_key("prev"), Ok(KeyPress::Prev));
         assert_eq!(parse_key("next"), Ok(KeyPress::Next));
-        assert_eq!(parse_key("select"), Ok(KeyPress::Switch));
-        for k in ["up", "down", "menu", "quit", "Next", ""] {
+        assert_eq!(parse_key("select"), Ok(KeyPress::Select));
+        assert_eq!(parse_key("up"), Ok(KeyPress::Up));
+        assert_eq!(parse_key("down"), Ok(KeyPress::Down));
+        assert_eq!(parse_key("menu"), Ok(KeyPress::Menu));
+        for k in ["quit", "Next", ""] {
             assert!(parse_key(k).is_err(), "{k}");
         }
     }
@@ -707,7 +766,12 @@ mod tests {
             post(&base, Some("wrong-token-0123456789"), r#"{"key":"next"}"#),
             401
         );
-        assert_eq!(get(&base, "/api/v1/screen", true).0, 404, "P3 まで無い");
+        assert_eq!(get(&base, "/api/v1/screen", true).0, 405);
+        assert_eq!(
+            post_to(&base, "/api/v1/screen", None, r#"{"id":"photo"}"#),
+            401
+        );
+        assert_eq!(get(&base, "/api/v1/nothing", true).0, 404);
         assert_eq!(get(&base, "/api/v1/input", true).0, 405);
     }
 
@@ -716,10 +780,11 @@ mod tests {
         let (p, base) = start(20);
         assert_eq!(p.stat(), "idle");
         assert_eq!(post(&base, Some(TOKEN), r#"{"key":"next"}"#), 204);
-        assert_eq!(recv_key(&p), Some(KeyPress::Next));
+        assert_eq!(recv_key(&p), Some(PanelInput::Key(KeyPress::Next)));
         assert_eq!(post(&base, Some(TOKEN), r#"{"key":"select"}"#), 204);
-        assert_eq!(recv_key(&p), Some(KeyPress::Switch));
-        assert_eq!(post(&base, Some(TOKEN), r#"{"key":"up"}"#), 400);
+        assert_eq!(recv_key(&p), Some(PanelInput::Key(KeyPress::Select)));
+        assert_eq!(post(&base, Some(TOKEN), r#"{"key":"menu"}"#), 204);
+        assert_eq!(recv_key(&p), Some(PanelInput::Key(KeyPress::Menu)));
         assert_eq!(post(&base, Some(TOKEN), r#"{"key":"quit"}"#), 400);
         assert_eq!(post(&base, Some(TOKEN), "next"), 400);
         assert_eq!(post(&base, Some(TOKEN), &"x".repeat(2000)), 413);
@@ -734,7 +799,20 @@ mod tests {
             .map(|_| post(&base, Some(TOKEN), r#"{"key":"prev"}"#))
             .collect();
         assert_eq!(codes, [204, 204, 204, 429, 429]);
-        assert_eq!(p.keys().count(), 3);
+        assert_eq!(p.inputs().count(), 3);
+    }
+
+    #[test]
+    fn screen_selects_only_registered_ids() {
+        let (p, base) = start(20);
+        let screen = |body: &str| post_to(&base, "/api/v1/screen", Some(TOKEN), body);
+        assert_eq!(screen(r#"{"id":"photo"}"#), 503, "画面の一覧がまだない");
+        p.publish(Some(view(0)), DisplayStatus::default());
+        assert_eq!(screen(r#"{"id":"photo"}"#), 204);
+        assert_eq!(recv_key(&p), Some(PanelInput::Screen("photo")));
+        assert_eq!(screen(r#"{"id":"room"}"#), 404, "登録されていない");
+        assert_eq!(screen(r#"{"key":"photo"}"#), 400);
+        assert_eq!(recv_key(&p), None, "拒否したものは届かない");
     }
 
     #[test]

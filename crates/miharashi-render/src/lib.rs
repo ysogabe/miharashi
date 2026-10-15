@@ -4,6 +4,7 @@ pub mod alert;
 pub mod canvas;
 pub mod chart;
 pub mod geo;
+pub mod menu;
 pub mod photo;
 pub mod photo_layout;
 pub mod photo_screen;

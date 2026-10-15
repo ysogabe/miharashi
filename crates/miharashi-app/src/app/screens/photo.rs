@@ -1,4 +1,5 @@
 //! 写真画面(フォトフレーム)。写真の取得(`Feed`)とフェード、旅・季節のカード、写真の合間の航空機の画面(#27)を持つ。
+//! 8/2 = 前後の写真、5 = 写真の情報(撮影地・日付)の表示切替。
 use crate::config::Config;
 use crate::photos::{Feed, FeedEvent, FeedStatus, HomeLookup, PhotoItem, PhotoPixels, Source};
 use crate::screen::{
@@ -23,6 +24,8 @@ pub struct PhotoScreen {
     /// GPU 経路で、重ね絵(時刻や写真の情報)を描き直す必要があるか。フェードの途中では描き直さない
     overlay_dirty: bool,
     notice: Option<String>,
+    /// 写真の情報(撮影地・日付)を出すか。5 で切り替える。時刻と日付はいつも出す
+    show_info: bool,
     /// 写真フィードの状態。`FeedStateProvider` が `World` に写す
     feed_state: Arc<Mutex<FeedState>>,
     /// 表示中の、旅・季節の切り替わりのカード
@@ -81,6 +84,7 @@ impl PhotoScreen {
             fade: None,
             overlay_dirty: true,
             notice: None,
+            show_info: true,
             feed_state: Arc::new(Mutex::new(FeedState {
                 online: true,
                 ..FeedState::default()
@@ -258,7 +262,7 @@ impl Screen for PhotoScreen {
         match action {
             ScreenAction::Up => self.feed.prev(),
             ScreenAction::Down => self.feed.next(),
-            ScreenAction::Select => return Outcome::Ignored,
+            ScreenAction::Select => self.show_info = !self.show_info,
         }
         self.last_photo_change = now;
         Outcome::Consumed
@@ -286,7 +290,10 @@ impl Screen for PhotoScreen {
             self.current
                 .as_ref()
                 .and_then(|p| Some((p.frame()?, &p.layout))),
-            self.current.as_ref().map(|p| &p.info),
+            self.current
+                .as_ref()
+                .filter(|_| self.show_info)
+                .map(|p| &p.info),
         );
         screens::photo_frame(
             ctx.canvas,
@@ -307,7 +314,7 @@ impl Screen for PhotoScreen {
         // 航空機の画面: 背景は内容が変わったときだけ描き、回る線と点は GPU に任せる。
         // アラートを重ねるときは CPU で完成画面を描く
         if let Some(until) = self.air_until
-            && !ctx.alert
+            && !ctx.covered
             && let Some(v) = self.aircraft_view()
         {
             let changed = self.radar_bg.as_ref() != Some(&v);
@@ -355,7 +362,7 @@ impl Screen for PhotoScreen {
                 ctx.text,
                 &ctx.world.system,
                 &item.layout,
-                Some(&item.info),
+                self.show_info.then_some(&item.info),
                 self.notice.as_deref(),
             );
             if let Some(card) = &self.card {
@@ -431,6 +438,23 @@ mod tests {
         false
     }
 
+    /// 届いた写真を受け取り、フェードも終わって、再描画の要求が 0.2 秒続けて無くなるまで回す。
+    fn settle(s: &mut PhotoScreen, w: &World) {
+        let mut quiet = 0;
+        for _ in 0..500 {
+            if s.tick(w, Instant::now()) {
+                quiet = 0;
+            } else {
+                quiet += 1;
+                if quiet >= 20 {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("落ち着かない");
+    }
+
     /// GPU 経路で描き、航空機の画面なら (背景を描き直したか, 点の数, 回る線の角度)。
     fn radar(s: &mut PhotoScreen, w: &World, c: &mut Canvas) -> Option<(bool, usize, f32)> {
         let mut text = crate::app::text_engine("");
@@ -438,7 +462,7 @@ mod tests {
             canvas: c,
             text: &mut text,
             world: w,
-            alert: false,
+            covered: false,
             force_overlay: false,
         };
         match s.render_composite(&mut ctx) {
@@ -460,10 +484,15 @@ mod tests {
         let shared: crate::aircraft::Shared = Arc::new(Mutex::new(None));
         s.aircraft = Some(shared.clone());
         s.handle_action(ScreenAction::Down, Instant::now());
-        assert!(pump_until(&mut s, &w, |s| s.photo_position() == 1));
+        // 最初の写真と、8/2 で進めた写真の 2 枚が届くまで待つ
+        assert!(pump_until(&mut s, &w, |s| s.current_id == 2));
+        settle(&mut s, &w);
         let later = Instant::now() + Duration::from_secs(31);
         s.tick(&w, later);
         assert!(!s.showing_aircraft(), "機体がいなければ挟まない");
+        // 自動で進めた 3 枚目が届き、フェードが終わるまで待つ(あとの「描き直さない」の確認がぶれないように)
+        assert!(pump_until(&mut s, &w, |s| s.current_id == 3));
+        settle(&mut s, &w);
         // 上の tick で次の写真へ進んだので、もう 1 枚分の時間をおく
         let later = later + Duration::from_secs(31);
         s.photos_since_air = 1;
@@ -477,7 +506,7 @@ mod tests {
             canvas: &mut c,
             text: &mut text,
             world: &w,
-            alert: false,
+            covered: false,
             force_overlay: true,
         });
         assert!(!s.tick(&w, later), "CPU 経路は止まった絵を描き直さない");
