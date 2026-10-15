@@ -86,3 +86,12 @@ PR作成前の最終検証で `cargo test --workspace --locked` を実行し、2
 - 再起動後のmiharashiプロセスについて、同じDRM clientの `drm-engine-gfx` を3秒間測定し、実行時間が12.261ms増加した（区間平均0.409%）。プロセス別のGPU利用を確認した値で、GPU全体の使用率やFPSではない。同じclientを指す複数fdは合算していない。
 
 30日有効のtokenはv0.0.45 CLI標準の広いscopeを持つ。miharashiは一覧APIのGETだけを行う。tokenファイルは `/etc/miharashi/t3-agent.token`、root:hermes 0640。
+
+## トークンの自動更新
+
+上の広い権限のトークンは、読み取りだけ(`orchestration:read`)のトークンを週 1 回作り直す仕組みに置き換えた([トークンの更新](../DESIGN-t3-token.md))。token ファイルは `/var/lib/miharashi/t3-agent.token`(実行ユーザーの 0600)。
+
+- 試験用のラベルで 2 回続けて動かし、1 回目で読み取りだけのトークンができること、2 回目で 1 回目のセッションが失効することを確認した。
+- 読み取りだけのトークンで、`GET /api/orchestration/shell` は 200、書き込み系の `POST /api/auth/pairing-token` は 403(`insufficient_scope`)。
+- 置き場所が root 所有で書けないときは、T3 に何も作らずに止まる。
+- 本番に入れ、最初の 1 回で広い権限のトークンを失効させた。そのあとも Agent 画面は取得を続けている。

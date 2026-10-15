@@ -1,0 +1,14 @@
+[Unit]
+Description=Weekly renewal of the Miharashi T3 token
+Documentation=https://github.com/ysogabe/miharashi/blob/main/docs/DESIGN-t3-token.md
+
+[Timer]
+# トークンは 30 日で切れる。週 1 回なら、2〜3 回続けて失敗しても切れる前に気づける
+# (失敗すると miharashi-t3-token.service が failed になり、状況画面の DETAILS の failed ユニット数に出る)。
+OnCalendar=weekly
+RandomizedDelaySec=1h
+# 電源が落ちていて逃した回は、次に起動したときに動かす。
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -27,7 +27,7 @@ miharashi の常設モニターで把握できるようにする。
 
 | 項目 | 確認結果 |
 |---|---|
-| 接続先 | `http://192.168.0.132:3773`。待受もこの LAN アドレスで、localhost の待受ではない |
+| 接続先 | LAN のアドレスの 3773 番(`http://<LAN の IP>:3773`)。待受もこの LAN アドレスで、localhost の待受ではない |
 | 環境 | `geoframe-n100`、Linux x64 |
 | バージョン | `GET /.well-known/t3/environment` が 200。`serverVersion = 0.0.45`、`orchestrationProtocolVersion = 1` |
 | 認証 | `GET /api/auth/session` が 200。policy は `remote-reachable`、初回認証は `one-time-token` |
@@ -337,13 +337,13 @@ branch / worktree は初期画面に出さない。中央ポップアップも�
 
 ## 8. 接続・認証・設定案
 
-一覧 API は認証が必要。v0.0.45 の安定版 `t3 auth session issue` はscope指定に対応せず、発行tokenは `orchestration:operate` など更新系を含む広い権限を持つ。今回の常設設定ではtokenを30日で発行し、専用ファイルへ保管した。Bearer tokenは `GET /api/orchestration/shell` にだけ使い、表示用の環境情報は認証なしの `GET /.well-known/t3/environment` で取得する。更新系APIは呼び出さない。
+一覧 API は認証が必要。v0.0.45 の `t3 auth session issue` はscope指定に対応せず、発行tokenは `orchestration:operate` など更新系を含む広い権限を持つ。そこで、ペアリング用トークンを `POST /oauth/token` で `orchestration:read` だけのトークンに交換し、週 1 回作り直す([トークンの更新](DESIGN-t3-token.md))。Bearer tokenは `GET /api/orchestration/shell` にだけ使い、表示用の環境情報は認証なしの `GET /.well-known/t3/environment` で取得する。更新系APIは呼び出さない。
 
 ```toml
 [agents]
 enabled = true
-url = "http://192.168.0.132:3773"
-token_file = "/etc/miharashi/t3-agent.token"
+url = "http://192.0.2.10:3773"
+token_file = "/var/lib/miharashi/t3-agent.token"
 poll_secs = 5
 timeout_secs = 3
 stale_secs = 30
@@ -403,7 +403,7 @@ WS に移す場合は初期 snapshot と `thread/project-upserted`、`thread/pro
 
 ## 11. 実装前に解決する事項
 
-1. token の期限・更新方法と配置。v0.0.45ではscopeを制限できないため、miharashi側を一覧APIのGETのみに固定する。
+1. token の期限・更新方法と配置。→ [DESIGN-t3-token.md](DESIGN-t3-token.md) で決めた(読み取りだけのトークンを週 1 回作り直す)。miharashi 側も一覧APIのGETのみに固定する。
 2. 認証済み shell の実レスポンス。未取得・停止・完了・承認待ち・バックグラウンド監視時の値の組み合わせ。
 3. 日常のスレッド件数・応答サイズ・CPU / 通信量。5 秒間隔と「最近 24 時間」の妥当性。
 4. 中央の滞在時間、活動度の減衰、自動巡回の間隔と、GPU カード合成の性能。
