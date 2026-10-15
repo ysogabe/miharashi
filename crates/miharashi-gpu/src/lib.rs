@@ -9,7 +9,7 @@ pub mod offscreen;
 pub mod photo;
 pub mod video;
 
-pub use compose::{Frame, PhotoLayer, PhotoSource, RADAR_BLIPS, Radar};
+pub use compose::{AgentGpuCard, Frame, PhotoLayer, PhotoSource, RADAR_BLIPS, Radar};
 pub use display::GlesDisplay;
 pub use offscreen::{Offscreen, diff_rgb, render_node_for_pci};
 pub use photo::{Placement, SourceImage};

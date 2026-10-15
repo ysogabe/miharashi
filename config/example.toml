@@ -103,13 +103,25 @@
 # history_minutes = 10     # 折れ線の履歴を読み直す間隔
 # forecast_minutes = 30    # 天気予報を読む間隔(5 以上。気象庁の発表は 1 日 3 回)
 
+[agents]
+# T3 Code の閲覧専用 Agent 一覧。既定は無効。認証用 bearer は専用ファイルから読み、設定には書かない。
+# bearer は GET /api/orchestration/shell にだけ使う。環境表示用に認証なしの GET /.well-known/t3/environment も行う。
+# 更新系 API は呼び出さない。
+# enabled = false
+# url = "http://192.168.0.132:3773"
+# token_file = "/etc/miharashi/t3-agent.token"
+# poll_secs = 5
+# timeout_secs = 3
+# stale_secs = 30
+# recent_hours = 24
+
 [ui]
 # font = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
-# start_screen = "status"  # status / photo / room / aircraft
+# start_screen = "status"  # status / photo / room / aircraft / agents
 # 焼き付き対策: refresh_minutes 分ごとに、refresh_screens の画面をグリッチ → 暗転 → 再表示(約 1.6 秒)で
 # 描き直し、そのたびに画面全体を数 px ずらす(9 か所を順に回る)。0 なら行わない。動かない線が多い画面に使う(状況画面も入れるなら ["aircraft", "status"])
 # refresh_minutes = 5
-# refresh_screens = ["aircraft"]
+# refresh_screens = ["aircraft"]  # 現在 agents はrefresh演出未対応
 
 [panel]
 # 手元の操作パネル(Echo Show 5 など)向けの API(docs/panel/DESIGN.md)。既定は無効。

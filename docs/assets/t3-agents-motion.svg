@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-labelledby="title desc">
+<title id="title">T3 Agent カードの動き</title><desc id="desc">新着は右から中央へ拡大表示され、ボードへ着地する。既存の変更は元の位置から中央へ出て変更内容を表示し、元の位置へ戻る。</desc>
+<style>text{font-family:"Noto Sans CJK JP","Noto Sans JP",sans-serif;fill:#dfe7f0}</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="6" refY="3" orient="auto"><path d="M0 0L6 3L0 6" fill="none" stroke="#8fa3b7"/></marker></defs>
+<rect width="1920" height="1080" fill="#080c14"/>
+<text x="32" y="55" font-size="36" style="fill:#dfe7f0" >T3 AGENTS — カードの動き</text>
+<text x="1888" y="55" font-size="24" style="fill:#8fa3b7" text-anchor="end">画面案 / 仮データ</text>
+<text x="32" y="124" font-size="30" style="fill:#40c8ff" >新着：右から登場 → 中央で紹介 → カードボードへ着地</text>
+<text x="32" y="580" font-size="30" style="fill:#ffbc66" >変更：元の位置から浮上 → 何が変わったか表示 → 元の位置へ戻る</text>
+<rect x="32" y="146" width="592" height="365" rx="12" fill="#101824" stroke="#304357" opacity="1"/>
+<text x="52" y="185" font-size="25" style="fill:#dfe7f0" >1  右からフェードイン</text>
+<rect x="56" y="214" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="340" y="214" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="56" y="351" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="340" y="351" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="392" y="313" width="208" height="122" rx="12" fill="#10212d" stroke="#40c8ff" opacity="0.45"/>
+<text x="406" y="343" font-size="22" style="fill:#40c8ff" >gpu-eval</text>
+<text x="406" y="377" font-size="23" style="fill:#dfe7f0" >実行中</text>
+<path d="M402 381L342 381" stroke="#8fa3b7" stroke-width="2" marker-end="url(#arrow)" fill="none"/>
+<rect x="664" y="146" width="592" height="365" rx="12" fill="#101824" stroke="#304357" opacity="1"/>
+<text x="684" y="185" font-size="25" style="fill:#dfe7f0" >2  中央で大きく紹介</text>
+<rect x="688" y="214" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="972" y="214" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="688" y="351" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="972" y="351" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="756" y="260" width="408" height="176" rx="12" fill="#10212d" stroke="#40c8ff" opacity="1"/>
+<text x="770" y="290" font-size="22" style="fill:#40c8ff" >gpu-eval</text>
+<text x="770" y="324" font-size="23" style="fill:#dfe7f0" >新しいスレッド</text>
+<text x="772" y="366" font-size="29" style="fill:#dfe7f0" >長時間試験の確認</text>
+<text x="772" y="406" font-size="22" style="fill:#8fa3b7" >中央で約3秒</text>
+<rect x="1296" y="146" width="592" height="365" rx="12" fill="#101824" stroke="#304357" opacity="1"/>
+<text x="1316" y="185" font-size="25" style="fill:#dfe7f0" >3  縮小して着地</text>
+<rect x="1320" y="214" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="1604" y="214" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="1320" y="351" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="1604" y="351" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="1604" y="351" width="260" height="112" rx="12" fill="#10212d" stroke="#40c8ff" opacity="1"/>
+<text x="1618" y="381" font-size="22" style="fill:#40c8ff" >gpu-eval</text>
+<text x="1618" y="415" font-size="23" style="fill:#dfe7f0" >実行中</text>
+<path d="M1578 316L1716 352" stroke="#8fa3b7" stroke-width="2" marker-end="url(#arrow)" fill="none"/>
+<rect x="32" y="602" width="592" height="365" rx="12" fill="#101824" stroke="#304357" opacity="1"/>
+<text x="52" y="641" font-size="25" style="fill:#dfe7f0" >1  変化したカードが浮上</text>
+<rect x="56" y="670" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="340" y="670" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="56" y="807" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="340" y="807" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="56" y="670" width="260" height="112" rx="12" fill="#10212d" stroke="#40c8ff" opacity="1"/>
+<text x="70" y="700" font-size="22" style="fill:#40c8ff" >miharashi</text>
+<text x="70" y="734" font-size="23" style="fill:#dfe7f0" >実行中</text>
+<path d="M316 780L382 817" stroke="#8fa3b7" stroke-width="2" marker-end="url(#arrow)" fill="none"/>
+<rect x="664" y="602" width="592" height="365" rx="12" fill="#101824" stroke="#304357" opacity="1"/>
+<text x="684" y="641" font-size="25" style="fill:#dfe7f0" >2  変更内容を表示</text>
+<rect x="688" y="670" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="972" y="670" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="688" y="807" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="972" y="807" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="756" y="716" width="408" height="176" rx="12" fill="#251e18" stroke="#ffbc66" opacity="1"/>
+<text x="770" y="746" font-size="22" style="fill:#ffbc66" >miharashi</text>
+<text x="770" y="780" font-size="23" style="fill:#dfe7f0" >実行中 → 承認待ち</text>
+<text x="772" y="822" font-size="29" style="fill:#dfe7f0" >Agent 画面の追加</text>
+<text x="772" y="862" font-size="22" style="fill:#8fa3b7" >要確認は約5秒</text>
+<rect x="1296" y="602" width="592" height="365" rx="12" fill="#101824" stroke="#304357" opacity="1"/>
+<text x="1316" y="641" font-size="25" style="fill:#dfe7f0" >3  元の位置へ復帰</text>
+<rect x="1320" y="670" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="1604" y="670" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="1320" y="807" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="1604" y="807" width="260" height="112" rx="12" fill="#101824" stroke="#263647" opacity="0.75"/>
+<rect x="1320" y="670" width="260" height="112" rx="12" fill="#251e18" stroke="#ffbc66" opacity="1"/>
+<text x="1334" y="700" font-size="22" style="fill:#ffbc66" >miharashi</text>
+<text x="1334" y="734" font-size="23" style="fill:#dfe7f0" >承認待ち</text>
+<path d="M1656 842L1526 784" stroke="#8fa3b7" stroke-width="2" marker-end="url(#arrow)" fill="none"/>
+<text x="32" y="1040" font-size="25" style="fill:#8fa3b7" >活発・新着は大きく、静かになれば徐々に小さく。承認待ち・異常には大きさの下限を設けます。</text>
+</svg>

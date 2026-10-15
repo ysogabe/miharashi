@@ -16,6 +16,7 @@ cargo test
 
 ```sh
 ./target/release/miharashi png --live --out work/out           # ヘッドレス: 画面を PNG に出力する
+./target/release/miharashi agents-demo --size 1920x1080 --seconds 15 --fps 15 --out work/agents-demo # T3画面のオフライン連番
 ./target/release/miharashi kms-info                            # DRM カード・コネクターの一覧と、設定で選ばれる表示先
 ./target/release/miharashi run --config config/example.toml    # 実機表示(直接オープンは video・input グループが必要)
 ./target/release/miharashi bench                               # CPU 描画のベースライン(PoC-005)
@@ -31,6 +32,19 @@ cargo test
 | `--photo FILE --caption TEXT` | 写真サーバーの代わりに 1 枚のファイルを表示する |
 | `--config FILE` | 設定ファイル |
 
+T3 Agent 画面の静止 PNG fixture は `png` コマンドから出力できます。写真サーバーへの接続を避けるため、ローカル写真を明示してください。
+
+```sh
+./target/release/miharashi png --config config/example.toml \
+  --photo docs/poc/assets/poc-001-photo-frame.png --size 1920x1080 --out work/agent-fixtures
+```
+
+`agents-demo` は実接続せず、`AgentScreen` に仮データと仮時刻を流して連番 PNG を作ります。作成した連番は例えば次のように動画へ変換できます。
+
+```sh
+ffmpeg -framerate 15 -i work/agents-demo/frame-%06d.png -pix_fmt yuv420p work/agents-demo.mp4
+```
+
 ### キー操作
 
 テンキー(NumLock の状態は問わない)、キーボードの数字列と矢印キー、操作パネルで同じに動きます。
@@ -45,7 +59,7 @@ cargo test
 
 アラート(地震・災害)が出ているときは、どのキーも閉じるだけです。
 
-航空機の画面を 5 分続けて出していると、焼き付き対策に約 1.6 秒の演出(グリッチ → 暗転 → 再表示)が入り、そのたびに画面全体が数 px ずれます(9 か所を順に回る)。間隔と対象の画面は `[ui] refresh_minutes` / `refresh_screens` で変えられます。
+航空機の画面を 5 分続けて出していると、焼き付き対策に約 1.6 秒の演出(グリッチ → 暗転 → 再表示)が入り、そのたびに画面全体が数 px ずれます(9 か所を順に回る)。間隔と対象の画面は `[ui] refresh_minutes` / `refresh_screens` で変えられます。T3 Agent 画面はこの焼き付き対策演出に未対応です。
 
 ## 3. 常駐(systemd)
 
@@ -75,12 +89,35 @@ journalctl -t miharashi -f                  # ログ。PAM セッションに入
 | `[screen_power]` | 在宅判定のエンティティ、手動オーバーライドの input_select、消灯までの分 |
 | `[alerts]` | 地震・災害アラート、取得間隔、半径、表示時間 |
 | `[aircraft]` | ADS-B 受信機(readsb / tar1090)の aircraft.json |
+| `[agents]` | T3 Code の閲覧用 Agent 一覧(既定は無効) |
 | `[ui]` | フォント、起動時の画面 |
 | `[panel]` | 操作パネル向けの API(既定は無効) |
 
 ### Home Assistant で画面を消す
 
 `[home_assistant]` と `[screen_power]` を埋め、長期アクセストークンを `token_file` に置きます。手動オーバーライドには、選択肢が `auto` / `force_on` / `force_off` の input_select を使います。HA と通信できないときは点灯させておきます。
+
+### T3 Agent 一覧
+
+`[agents]` はT3の bearer tokenを専用ファイルから読みます。Bearer tokenは `GET /api/orchestration/shell` にだけ使い、環境表示用には認証なしの `GET /.well-known/t3/environment` も行います。更新系APIは呼び出しません。T3 v0.0.45の安定版CLIはスコープを制限できず、発行セッションには読み取り以外の権限も含まれます。token自体は広い権限を持つため、漏えいを防ぐ運用が必要です。既存ブラウザーのcookieやMCP tokenは使いません。tokenファイルは実行ユーザーの `0600`、またはroot所有で実行ユーザーのprimary groupに属する `0640` にします。平文HTTPはIPアドレスかlocalhostの接続先だけを受け付け、別ホストへ移るredirectは追いません。
+
+T3 v0.0.45でセッションを発行し、tokenを端末に表示せず専用ファイルへ置きます。
+
+```sh
+umask 077
+t3 auth session issue --ttl 30d --label miharashi-agents --token-only > /tmp/t3-agent.token
+sudo install -o root -g runtime-group -m 640 /tmp/t3-agent.token /etc/miharashi/t3-agent.token
+rm -f /tmp/t3-agent.token
+```
+
+```toml
+[agents]
+enabled = true
+url = "http://192.0.2.10:3773"
+token_file = "/etc/miharashi/t3-agent.token"
+```
+
+取得は専用 worker が `GET /api/orchestration/shell` を 5 秒ごとに行い、接続時に環境情報を `GET /.well-known/t3/environment` で取得します。画面は一覧の状態だけを表示し、会話本文や承認内容は取得しません。認証が失効した場合は 401 / 403 を区別して表示し、token ファイルが変更されたときに再試行します。
 
 ### 操作パネル(Echo Show 5)をつなぐ
 
