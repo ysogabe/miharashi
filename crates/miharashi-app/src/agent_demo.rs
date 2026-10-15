@@ -11,10 +11,14 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 fn entry(id: &str, title: &str, state: AgentState) -> AgentEntry {
+    project_entry("web", id, title, state)
+}
+
+fn project_entry(project: &str, id: &str, title: &str, state: AgentState) -> AgentEntry {
     AgentEntry {
         thread_id: id.into(),
-        project_id: "demo-project".into(),
-        project_title: "仮データ / demo".into(),
+        project_id: format!("demo-{project}"),
+        project_title: format!("仮データ / {project}"),
         title: title.into(),
         provider: Some("Codex".into()),
         model: Some("選択モデル".into()),
@@ -32,6 +36,20 @@ fn initial_snapshot(wall: SystemTime, mono: Instant) -> AgentSnapshot {
         entries: vec![
             entry("demo-running", "カードボードの確認", AgentState::Running),
             entry("demo-idle", "待機カード", AgentState::Idle),
+            entry("demo-done", "一覧の並び順を整える", AgentState::Completed),
+            project_entry("api", "demo-api", "応答の型を定義する", AgentState::Running),
+            project_entry(
+                "docs",
+                "demo-docs",
+                "使い方の説明を更新",
+                AgentState::Completed,
+            ),
+            project_entry(
+                "tools",
+                "demo-tools",
+                "設定ファイルの確認",
+                AgentState::Idle,
+            ),
         ]
         .into(),
         connection: AgentConnection::Live,
@@ -98,6 +116,71 @@ fn changed_snapshot(base: &AgentSnapshot, wall: SystemTime, mono: Instant) -> Ag
     }]
     .into();
     snapshot
+}
+
+/// Many threads in a few projects, to review stacking without a live server.
+fn busy_snapshot(base: &AgentSnapshot) -> AgentSnapshot {
+    let mut entries = Vec::new();
+    let web = [
+        ("承認を待つ作業", AgentState::Approval),
+        ("画面の配置を計算", AgentState::Running),
+        ("動画の再生を確認", AgentState::Running),
+        ("一覧の並び順を整える", AgentState::Completed),
+        ("天気の表示を直す", AgentState::Completed),
+        ("待機中の調整", AgentState::Idle),
+        ("説明画像の更新", AgentState::Idle),
+        ("文言の見直し", AgentState::Idle),
+        ("軌跡を短くする", AgentState::Idle),
+    ];
+    for (i, (title, state)) in web.into_iter().enumerate() {
+        entries.push(project_entry("web", &format!("busy-web-{i}"), title, state));
+    }
+    let api = [
+        ("計測の結果が取れない", AgentState::Error),
+        ("応答の型を定義する", AgentState::Running),
+        ("一覧の取得", AgentState::Completed),
+        ("使用量の記録", AgentState::Idle),
+    ];
+    for (i, (title, state)) in api.into_iter().enumerate() {
+        entries.push(project_entry("api", &format!("busy-api-{i}"), title, state));
+    }
+    for (project, items) in [
+        (
+            "panel",
+            &[
+                ("設定画面の構成", AgentState::Input),
+                ("文字を大きく", AgentState::Completed),
+                ("アイコンの差し替え", AgentState::Idle),
+            ][..],
+        ),
+        (
+            "device",
+            &[
+                ("値の平滑化", AgentState::Running),
+                ("配線図の更新", AgentState::Idle),
+            ][..],
+        ),
+        ("docs", &[("月次の集計", AgentState::Completed)][..]),
+        ("tools", &[("補完設定", AgentState::Idle)][..]),
+    ] {
+        for (i, (title, state)) in items.iter().enumerate() {
+            entries.push(project_entry(
+                project,
+                &format!("busy-{project}-{i}"),
+                title,
+                *state,
+            ));
+        }
+    }
+    for e in &mut entries {
+        e.has_pending_approvals = e.state == AgentState::Approval;
+        e.has_pending_user_input = e.state == AgentState::Input;
+    }
+    AgentSnapshot {
+        entries: entries.into(),
+        changes: Vec::new().into(),
+        ..base.clone()
+    }
 }
 
 /// Shared synthetic states used by both still PNG fixtures and the timed demo.
@@ -188,6 +271,22 @@ pub fn write_fixtures(
             size,
         )?;
     }
+
+    let mut busy_screen = AgentScreen::new(size, false, stale_secs);
+    busy_screen.on_enter(changed_at);
+    let busy_world = World {
+        agents: busy_snapshot(&changed),
+        ..World::default()
+    };
+    save(
+        &mut busy_screen,
+        &busy_world,
+        changed_at,
+        "agents-busy",
+        out,
+        text,
+        size,
+    )?;
 
     let mut stale = changed.clone();
     stale.connection = AgentConnection::Retrying;

@@ -229,7 +229,7 @@ Provider のスレッド(`metrics::Sampler`、写真の `Feed`)は今と同じ�
 
 §3 の案から変えた点:
 
-- **`Screen` に足したもの**: GPU 経路の `render_composite`(PoC-005 で入った `Composite` を返す)、`animating`(航空機の回る線)、`page`(操作パネルのページ名)。`RenderContext` には、アラートを重ねるか(`alert`)と、GPU 経路の重ね絵を描き直させるか(`force_overlay`)を足した。アラートは ScreenManager が画面の上に描くので、写真画面の重ね絵を描き直させないと GPU 経路で消える。
+- **`Screen` に足したもの**: GPU 経路の `render_composite`(PoC-005 で入った `Composite` を返す)、`animating`(航空機の回る線)、`page`(操作パネルのページ名)、`key_labels`(5・8・2 の今の意味。操作パネルのボタンのラベルで、`handle_action` で何もしないキーは `None`。#51)。`RenderContext` には、アラートを重ねるか(`alert`)と、GPU 経路の重ね絵を描き直させるか(`force_overlay`)を足した。アラートは ScreenManager が画面の上に描くので、写真画面の重ね絵を描き直させないと GPU 経路で消える。
 - **`Outcome` に redraw を持たせない**: キーを受けたら必ず描き直す(今の動作)。
 - **キー**: `KeyPress` は今の Prev / Switch / Next のまま(S2 で 0・8・2 を足す)。ScreenManager は Prev → `Up`、Switch → `Select`、Next → `Down` にして表示中の画面へ渡し、画面が使わなかったら今の操作どおりに切り替える(6 = 次の画面、4 = 前の画面で端で止まる、5 = 先頭の状況画面)。写真画面は `Up` / `Down` を前後の写真に使うので、写真画面の 4/6 は今までどおり写真の前後になる。
 - **データ**: `World` は `system`(今の `Snapshot`。日付と時刻もここ)と `photo_feed` の 2 つ。実測値は今の `DataSource` のまま 1 秒ごとに ScreenManager が呼ぶ。`Provider::update(&mut World)` は毎周期呼び、写真フィードの状態だけを写す(写真画面が共有ハンドルに書き、`FeedStateProvider` が `World` に写す。`Feed` から受け取るのは写真画面だけ)。
