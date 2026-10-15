@@ -192,6 +192,10 @@ mod tests {
         let ids: Vec<_> = v.screens.iter().map(|s| (s.id, s.title)).collect();
         assert_eq!(ids, [("status", "STATUS"), ("photo", "PHOTO FRAME")]);
         assert_eq!((v.current, v.page), (0, Some("OVERVIEW")));
+        assert!(
+            v.feed_online,
+            "最初の tick より前から、今までどおり接続中として出す"
+        );
         app.on_key(KeyPress::Switch);
         assert_eq!(app.panel_view().unwrap().page, Some("DETAILS"));
         app.on_key(KeyPress::Next);

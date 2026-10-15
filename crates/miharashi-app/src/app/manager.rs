@@ -69,7 +69,9 @@ impl ScreenManager {
     }
 
     /// 毎周期 `World` に写すものを足す。
-    pub fn with_provider(mut self, p: Box<dyn Provider>) -> Self {
+    pub fn with_provider(mut self, mut p: Box<dyn Provider>) -> Self {
+        // 最初の tick より前の操作パネルの状態にも、Provider の初期値を出す
+        p.update(&mut self.world);
         self.providers.push(p);
         self
     }
