@@ -353,4 +353,304 @@ mod tests {
             "通った直後の点が明るい: {swept:?} {coming:?}"
         );
     }
+
+    #[test]
+    fn offscreen_agent_card_orientation_pose_cache_and_revision() {
+        use crate::compose::{AgentGpuCard, Compositor, Frame};
+        let Ok(off) = Offscreen::open(Path::new("/dev/dri/renderD128")) else {
+            eprintln!("GLES が使えないので skip");
+            return;
+        };
+        let size = (12u32, 8u32);
+        let bg = [8u8, 12, 20, 255].repeat((size.0 * size.1) as usize);
+        // Upper row: red/green. Lower row: blue/white. This catches vertical and horizontal flips.
+        let card_a = [
+            255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        let card_b = [
+            0u8, 0, 255, 255, 255, 255, 255, 255, 255, 0, 0, 255, 0, 255, 0, 255,
+        ];
+        let ((uploaded, moved_uploaded, changed_uploaded), got) = off
+            .with_fbo(size, |gl| {
+                let mut comp = Compositor::new(gl, size).unwrap();
+                let layer = |revision, pixels, rect| AgentGpuCard {
+                    id: 55,
+                    revision,
+                    pixels,
+                    size: (2, 2),
+                    rect,
+                    alpha: 1.0,
+                };
+                // Keep this orientation check at 1:1 so LINEAR filtering is
+                // sampled at texel centers; scaling is covered by the CPU/GPU test below.
+                let cards = [layer(1, &card_a, (1.0, 1.0, 2.0, 2.0))];
+                comp.draw(
+                    gl,
+                    &Frame::Agents {
+                        background: Some(&bg),
+                        cards: &cards,
+                        scrim_alpha: 0.0,
+                        focus_card_id: None,
+                    },
+                )
+                .unwrap();
+                let first = comp.agent_uploaded;
+                // Movement changes only uniforms; neither full background nor card is transferred.
+                let moved = [layer(1, &card_a, (3.0, 1.0, 2.0, 2.0))];
+                comp.draw(
+                    gl,
+                    &Frame::Agents {
+                        background: None,
+                        cards: &moved,
+                        scrim_alpha: 0.0,
+                        focus_card_id: None,
+                    },
+                )
+                .unwrap();
+                let second = comp.agent_uploaded;
+                // A new content revision replaces only the 2x2 cached surface.
+                let revised = [layer(2, &card_b, (3.0, 1.0, 2.0, 2.0))];
+                comp.draw(
+                    gl,
+                    &Frame::Agents {
+                        background: None,
+                        cards: &revised,
+                        scrim_alpha: 0.0,
+                        focus_card_id: None,
+                    },
+                )
+                .unwrap();
+                let third = comp.agent_uploaded;
+                comp.destroy(gl);
+                (first, second, third)
+            })
+            .unwrap();
+        assert_eq!(uploaded, bg.len() as u64 + card_a.len() as u64);
+        assert_eq!(
+            moved_uploaded, uploaded,
+            "pose-only frames transfer no pixels"
+        );
+        assert_eq!(
+            changed_uploaded,
+            uploaded + card_b.len() as u64,
+            "a changed revision transfers just its card surface"
+        );
+        let px = |x: usize, y: usize| {
+            let at = (y * size.0 as usize + x) * 4;
+            &got[at..at + 4]
+        };
+        assert_eq!(
+            px(3, 1),
+            &[0, 0, 255, 255],
+            "top-left source pixel remains at top-left"
+        );
+        assert_eq!(
+            px(4, 1),
+            &[255, 255, 255, 255],
+            "top-right source pixel remains at top-right"
+        );
+        assert_eq!(
+            px(3, 2),
+            &[255, 0, 0, 255],
+            "bottom-left source pixel remains at bottom-left"
+        );
+        assert_eq!(
+            px(4, 2),
+            &[0, 255, 0, 255],
+            "bottom-right source pixel remains at bottom-right"
+        );
+    }
+
+    #[test]
+    fn offscreen_agent_alpha_scale_and_scrim_match_cpu_scene() {
+        use crate::compose::{AgentGpuCard, Frame};
+        use miharashi_render::agents::{AgentCardSurface, AgentPose, AgentScene, render_scene_cpu};
+        use std::sync::Arc;
+        let Ok(off) = Offscreen::open(Path::new("/dev/dri/renderD128")) else {
+            eprintln!("GLES が使えないので skip");
+            return;
+        };
+        let size = (12u32, 8u32);
+        let bg = [40u8, 80, 120, 255].repeat((size.0 * size.1) as usize);
+        let mut card = miharashi_render::Pixmap::new(2, 2).unwrap();
+        // Four distinct premultiplied half-opacity colors exercise bilinear
+        // sampling while the card is enlarged to twice its surface size.
+        card.data_mut().copy_from_slice(&[
+            80, 20, 0, 128, 0, 40, 80, 128, 20, 60, 0, 128, 100, 0, 30, 128,
+        ]);
+        let card = Arc::new(card);
+        let pose = AgentPose {
+            x: 2.0,
+            y: 2.0,
+            width: 4.0,
+            height: 4.0,
+            alpha: 0.5,
+        };
+        let layer = AgentCardSurface {
+            id: 1,
+            revision: 1,
+            surface: card.clone(),
+            pose,
+        };
+        let scene = AgentScene {
+            size,
+            background: Some(&bg),
+            cards: &[layer],
+            scrim_alpha: 0.25,
+            focus_card_id: Some(2),
+        };
+        let cpu = render_scene_cpu(&scene).unwrap();
+        let gpu_card = [AgentGpuCard {
+            id: 1,
+            revision: 1,
+            pixels: card.data(),
+            size: (2, 2),
+            rect: (pose.x, pose.y, pose.width, pose.height),
+            alpha: pose.alpha,
+        }];
+        let gpu = off
+            .render_frames(
+                &[Frame::Agents {
+                    background: Some(&bg),
+                    cards: &gpu_card,
+                    scrim_alpha: 0.25,
+                    focus_card_id: Some(2),
+                }],
+                size,
+            )
+            .unwrap();
+        let (different, max) = diff_rgb(cpu.data(), &gpu, 2);
+        assert_eq!(
+            different, 0,
+            "CPU/GPU card scale, alpha, and scrim differ; max channel delta={max}"
+        );
+    }
+
+    /// Manual GPU-side submission sample. This measures CPU time spent issuing
+    /// compositor commands; it does not measure GPU completion or app CPU use.
+    #[test]
+    #[ignore = "manual render-node sample: six cached 600x300 cards over 300 pose-only frames"]
+    fn bench_agent_pose_only_submission_300_frames() {
+        use crate::compose::{AgentGpuCard, Compositor, Frame};
+        use std::time::{Duration, Instant};
+        let Ok(off) = Offscreen::open(Path::new("/dev/dri/renderD128")) else {
+            eprintln!("GLES render node is unavailable; skipping manual sample");
+            return;
+        };
+        let size = (1920u32, 1080u32);
+        let background = [8u8, 12, 20, 255].repeat(size.0 as usize * size.1 as usize);
+        let card_size = (600u32, 300u32);
+        let colors = [
+            [64u8, 200, 255, 255],
+            [255, 188, 102, 255],
+            [196, 160, 255, 255],
+            [255, 127, 140, 255],
+            [103, 217, 173, 255],
+            [143, 163, 183, 255],
+        ];
+        let surfaces: Vec<Vec<u8>> = colors
+            .iter()
+            .map(|color| color.repeat(card_size.0 as usize * card_size.1 as usize))
+            .collect();
+        let initial: Vec<AgentGpuCard<'_>> = surfaces
+            .iter()
+            .enumerate()
+            .map(|(i, pixels)| AgentGpuCard {
+                id: i as u64 + 1,
+                revision: 1,
+                pixels,
+                size: card_size,
+                rect: (
+                    60.0 + (i % 3) as f32 * 630.0,
+                    120.0 + (i / 3) as f32 * 430.0,
+                    600.0,
+                    300.0,
+                ),
+                alpha: 1.0,
+            })
+            .collect();
+        let ((initial_upload, final_upload, total_submission), _) = off
+            .with_fbo(size, |gl| {
+                let mut compositor = Compositor::new(gl, size).unwrap();
+                compositor
+                    .draw(
+                        gl,
+                        &Frame::Agents {
+                            background: Some(&background),
+                            cards: &initial,
+                            scrim_alpha: 0.0,
+                            focus_card_id: None,
+                        },
+                    )
+                    .unwrap();
+                let first_upload = compositor.agent_uploaded;
+                let expected_upload =
+                    background.len() as u64 + surfaces.iter().map(|s| s.len() as u64).sum::<u64>();
+                assert_eq!(
+                    first_upload, expected_upload,
+                    "only the background and six card surfaces upload initially"
+                );
+
+                let mut submission = Duration::ZERO;
+                for frame_index in 0..300 {
+                    let t = frame_index as f32 / 300.0;
+                    let cards: Vec<AgentGpuCard<'_>> = surfaces
+                        .iter()
+                        .enumerate()
+                        .map(|(i, pixels)| {
+                            let phase = t * std::f32::consts::TAU + i as f32 * 0.7;
+                            let scale = 0.94 + 0.06 * (phase.sin() * 0.5 + 0.5);
+                            let width = card_size.0 as f32 * scale;
+                            let height = card_size.1 as f32 * scale;
+                            let center_x = 360.0 + (i % 3) as f32 * 630.0;
+                            let center_y = 270.0 + (i / 3) as f32 * 430.0;
+                            AgentGpuCard {
+                                id: i as u64 + 1,
+                                revision: 1,
+                                pixels,
+                                size: card_size,
+                                rect: (
+                                    center_x - width * 0.5,
+                                    center_y - height * 0.5,
+                                    width,
+                                    height,
+                                ),
+                                alpha: 0.85 + 0.15 * (phase.cos() * 0.5 + 0.5),
+                            }
+                        })
+                        .collect();
+                    let start = Instant::now();
+                    compositor
+                        .draw(
+                            gl,
+                            &Frame::Agents {
+                                background: None,
+                                cards: &cards,
+                                scrim_alpha: 0.0,
+                                focus_card_id: None,
+                            },
+                        )
+                        .unwrap();
+                    submission += start.elapsed();
+                }
+                let last_upload = compositor.agent_uploaded;
+                let gl_error = unsafe { gl.get_error() };
+                compositor.destroy(gl);
+                assert_eq!(
+                    gl_error,
+                    glow::NO_ERROR,
+                    "GLES error during cached card frames: 0x{gl_error:x}"
+                );
+                (first_upload, last_upload, submission)
+            })
+            .unwrap();
+        assert_eq!(
+            final_upload, initial_upload,
+            "pose/scale/alpha-only frames must not transfer pixels"
+        );
+        let average_ms = total_submission.as_secs_f64() * 1000.0 / 300.0;
+        eprintln!(
+            "agent cached pose-only: 300 frames, 6 cards at 1920x1080; initial_upload={initial_upload} B; final_upload={final_upload} B; mean CPU submission={average_ms:.4} ms/frame"
+        );
+    }
 }

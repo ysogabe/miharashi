@@ -46,6 +46,59 @@ void main() {
 }
 ";
 
+const VERT_CARD: &str = r"#version 300 es
+uniform vec2 viewport;
+uniform vec4 rect;
+out highp vec2 uv;
+void main() {
+    vec2 p = gl_VertexID == 0 ? vec2(0.0, 0.0) : gl_VertexID == 1 ? vec2(1.0, 0.0) :
+             gl_VertexID == 2 ? vec2(0.0, 1.0) : gl_VertexID == 3 ? vec2(0.0, 1.0) :
+             gl_VertexID == 4 ? vec2(1.0, 0.0) : vec2(1.0, 1.0);
+    // Card vertices use screen-space coordinates (p.y = 0 is the top), and
+    // uploaded row zero is the source image's top row. Unlike the fullscreen
+    // triangle, this geometry does not need a vertical UV flip.
+    uv = p;
+    vec2 px = rect.xy + p * rect.zw;
+    gl_Position = vec4(2.0 * px.x / viewport.x - 1.0, 1.0 - 2.0 * px.y / viewport.y, 0.0, 1.0);
+}
+";
+
+const FRAG_CARD: &str = r"#version 300 es
+precision highp float;
+uniform sampler2D tex;
+uniform float alpha;
+in highp vec2 uv;
+out vec4 color;
+void main() { color = texture(tex, uv) * alpha; }
+";
+
+const FRAG_SCRIM: &str = r"#version 300 es
+precision highp float;
+uniform float alpha;
+out vec4 color;
+void main() { color = vec4(0.0, 0.0, 0.0, alpha); }
+";
+
+/// Borrowed, premultiplied card pixels; this module intentionally has no render-crate dependency.
+#[derive(Clone, Copy)]
+pub struct AgentGpuCard<'a> {
+    pub id: u64,
+    pub revision: u64,
+    pub pixels: &'a [u8],
+    pub size: (u32, u32),
+    /// (x, y, width, height), in screen pixels with top-left origin.
+    pub rect: (f32, f32, f32, f32),
+    pub alpha: f32,
+}
+
+const AGENT_CACHE: usize = 64;
+struct AgentTexture {
+    id: u64,
+    revision: u64,
+    size: (u32, u32),
+    texture: glow::Texture,
+}
+
 // レーダー: 回る線と残光、線が通ると光って次の 1 周でゆっくり暗くなる点。加算で背景に重ねる。
 // 座標は画面の px(左上が原点、y は下向き)。角度は北 0、時計回り
 const FRAG_RADAR: &str = r"#version 300 es
@@ -148,15 +201,25 @@ pub enum Frame<'a> {
         background: Option<&'a [u8]>,
         radar: Radar<'a>,
     },
+    Agents {
+        background: Option<&'a [u8]>,
+        cards: &'a [AgentGpuCard<'a>],
+        scrim_alpha: f32,
+        focus_card_id: Option<u64>,
+    },
 }
 
 pub struct Compositor {
     base: glow::Program,
     overlay: glow::Program,
     radar: glow::Program,
+    card: glow::Program,
+    scrim: glow::Program,
     vao: glow::VertexArray,
     /// `Frame::Radar` の背景(初めて使うときに作る)
     radar_bg: Option<glow::Texture>,
+    agent_bg: Option<glow::Texture>,
+    agent_cards: Vec<AgentTexture>,
     /// `Frame::Image` 用
     image_tex: glow::Texture,
     overlay_tex: glow::Texture,
@@ -168,6 +231,8 @@ pub struct Compositor {
     builder: PhotoBuilder,
     /// 今の時点までの転送量 [バイト](ログ用)
     pub uploaded: u64,
+    /// Agent background and card uploads, useful for verifying that pose-only frames transfer no pixels.
+    pub agent_uploaded: u64,
     /// 写真から完成フレームを作るのにかかった CPU 時間 [ms](転送と命令の発行。状態ログ用、読んだら空にする)
     pub build_ms: Vec<f32>,
 }
@@ -180,23 +245,37 @@ fn texture(gl: &glow::Context, size: (u32, u32)) -> Result<glow::Texture, String
     tex2d(gl, glow::RGBA8, size, glow::NEAREST)
 }
 
+fn card_texture(gl: &glow::Context, size: (u32, u32)) -> Result<glow::Texture, String> {
+    // Card faces are routinely enlarged for the center focus animation. Keep
+    // other compositor textures on NEAREST; only these cached surfaces need smoothing.
+    tex2d(gl, glow::RGBA8, size, glow::LINEAR)
+}
+
 impl Compositor {
     pub fn new(gl: &glow::Context, size: (u32, u32)) -> Result<Self, String> {
         let base = program(gl, FRAG_BASE)?;
         let overlay = program(gl, FRAG_OVERLAY)?;
         let radar = program(gl, FRAG_RADAR)?;
+        let card = link(gl, VERT_CARD, FRAG_CARD)?;
+        let scrim = program(gl, FRAG_SCRIM)?;
         unsafe {
             gl.use_program(Some(base));
             gl.uniform_1_i32(gl.get_uniform_location(base, "a").as_ref(), 0);
             gl.uniform_1_i32(gl.get_uniform_location(base, "b").as_ref(), 1);
             gl.use_program(Some(overlay));
             gl.uniform_1_i32(gl.get_uniform_location(overlay, "tex").as_ref(), 0);
+            gl.use_program(Some(card));
+            gl.uniform_1_i32(gl.get_uniform_location(card, "tex").as_ref(), 0);
             Ok(Self {
                 base,
                 overlay,
                 radar,
+                card,
+                scrim,
                 vao: gl.create_vertex_array()?,
                 radar_bg: None,
+                agent_bg: None,
+                agent_cards: Vec::new(),
                 image_tex: texture(gl, size)?,
                 overlay_tex: texture(gl, size)?,
                 photos: Vec::new(),
@@ -204,6 +283,7 @@ impl Compositor {
                 size,
                 builder: PhotoBuilder::new(gl)?,
                 uploaded: 0,
+                agent_uploaded: 0,
                 build_ms: Vec::new(),
             })
         }
@@ -339,6 +419,160 @@ impl Compositor {
                 viewport();
                 self.draw_radar(gl, *background, radar)?;
             }
+            Frame::Agents {
+                background,
+                cards,
+                scrim_alpha,
+                focus_card_id,
+            } => {
+                viewport();
+                self.draw_agents(gl, *background, cards, *scrim_alpha, *focus_card_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_agents(
+        &mut self,
+        gl: &glow::Context,
+        background: Option<&[u8]>,
+        cards: &[AgentGpuCard<'_>],
+        scrim_alpha: f32,
+        focus_card_id: Option<u64>,
+    ) -> Result<(), String> {
+        let bg = match (self.agent_bg, background) {
+            (Some(t), _) => t,
+            (None, Some(_)) => {
+                let t = texture(gl, self.size)?;
+                self.agent_bg = Some(t);
+                t
+            }
+            (None, None) => return Err("agent background is not initialized".into()),
+        };
+        if let Some(pixels) = background {
+            let expected = self.size.0 as usize * self.size.1 as usize * 4;
+            if pixels.len() != expected {
+                return Err("agent background size does not match compositor".into());
+            }
+            self.upload(gl, bg, pixels);
+            self.agent_uploaded += pixels.len() as u64;
+        }
+        self.draw_base(gl, bg, bg, 1.0);
+        let shade = if scrim_alpha.is_finite() {
+            scrim_alpha.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if shade > 0.0 {
+            unsafe {
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                gl.use_program(Some(self.scrim));
+                gl.uniform_1_f32(gl.get_uniform_location(self.scrim, "alpha").as_ref(), shade);
+                gl.bind_vertex_array(Some(self.vao));
+                gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                gl.disable(glow::BLEND);
+            }
+        }
+        let live: std::collections::HashSet<u64> =
+            cards.iter().take(AGENT_CACHE).map(|c| c.id).collect();
+        let mut index = 0;
+        while index < self.agent_cards.len() {
+            if !live.contains(&self.agent_cards[index].id) {
+                unsafe {
+                    gl.delete_texture(self.agent_cards.remove(index).texture);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        for card in cards.iter().take(AGENT_CACHE) {
+            if card.size.0 == 0
+                || card.size.1 == 0
+                || card.pixels.len() != card.size.0 as usize * card.size.1 as usize * 4
+            {
+                return Err(format!("agent card {} has invalid surface size", card.id));
+            }
+            let found = self.agent_cards.iter().position(|c| c.id == card.id);
+            if found.is_none_or(|i| self.agent_cards[i].size != card.size) {
+                if let Some(i) = found {
+                    unsafe {
+                        gl.delete_texture(self.agent_cards.remove(i).texture);
+                    }
+                }
+                let tex = card_texture(gl, card.size)?;
+                self.agent_cards.push(AgentTexture {
+                    id: card.id,
+                    revision: u64::MAX,
+                    size: card.size,
+                    texture: tex,
+                });
+            }
+            let i = self
+                .agent_cards
+                .iter()
+                .position(|c| c.id == card.id)
+                .ok_or("agent texture cache insertion failed")?;
+            if self.agent_cards[i].revision != card.revision {
+                unsafe {
+                    gl.bind_texture(glow::TEXTURE_2D, Some(self.agent_cards[i].texture));
+                    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+                    gl.tex_sub_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        card.size.0 as i32,
+                        card.size.1 as i32,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(Some(card.pixels)),
+                    );
+                }
+                self.uploaded += card.pixels.len() as u64;
+                self.agent_uploaded += card.pixels.len() as u64;
+                self.agent_cards[i].revision = card.revision;
+            }
+            if !card.rect.0.is_finite()
+                || !card.rect.1.is_finite()
+                || !card.rect.2.is_finite()
+                || !card.rect.3.is_finite()
+                || !card.alpha.is_finite()
+            {
+                continue;
+            }
+            let alpha = card.alpha.clamp(0.0, 1.0)
+                * if shade > 0.0 && focus_card_id != Some(card.id) {
+                    1.0 - shade
+                } else {
+                    1.0
+                };
+            if card.rect.2 <= 0.0 || card.rect.3 <= 0.0 || alpha <= 0.0 {
+                continue;
+            }
+            unsafe {
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                gl.use_program(Some(self.card));
+                gl.uniform_2_f32(
+                    gl.get_uniform_location(self.card, "viewport").as_ref(),
+                    self.size.0 as f32,
+                    self.size.1 as f32,
+                );
+                gl.uniform_4_f32(
+                    gl.get_uniform_location(self.card, "rect").as_ref(),
+                    card.rect.0,
+                    card.rect.1,
+                    card.rect.2,
+                    card.rect.3,
+                );
+                gl.uniform_1_f32(gl.get_uniform_location(self.card, "alpha").as_ref(), alpha);
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(self.agent_cards[i].texture));
+                gl.bind_vertex_array(Some(self.vao));
+                gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                gl.disable(glow::BLEND);
+            }
         }
         Ok(())
     }
@@ -396,10 +630,18 @@ impl Compositor {
             if let Some(t) = self.radar_bg {
                 gl.delete_texture(t);
             }
+            if let Some(t) = self.agent_bg {
+                gl.delete_texture(t);
+            }
+            for card in &self.agent_cards {
+                gl.delete_texture(card.texture);
+            }
             gl.delete_vertex_array(self.vao);
             gl.delete_program(self.base);
             gl.delete_program(self.overlay);
             gl.delete_program(self.radar);
+            gl.delete_program(self.card);
+            gl.delete_program(self.scrim);
         }
         self.builder.destroy(gl);
     }

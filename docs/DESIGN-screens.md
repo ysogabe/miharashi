@@ -7,6 +7,10 @@ Echo Show の「操作パネル」([panel/DESIGN.md](panel/DESIGN.md))とは区�
 `ScreenManager` / `Screen` / `Provider` / `World`)をそのまま土台にし、この文書では**どの画面を持ち、
 データをどこから取り、無人のときにどう切り替えるか**を決める。
 
+2026-10-15 追記: T3 サーバーを取得元とする Agent 画面を別途検討し、
+[T3 Agent 画面の概要設計](DESIGN-t3-agent-monitor.md)に画面案とデータフローをまとめた(未実装)。
+下記の Hermes 連携中止は当時の経緯であり、今回の T3 連携案とは区別する。
+
 ## 1. 前提(決定事項)
 
 | 項目 | 決定 | 経緯 |
