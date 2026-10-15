@@ -102,23 +102,30 @@ journalctl -t miharashi -f                  # ログ。PAM セッションに入
 
 ### T3 Agent 一覧
 
-`[agents]` はT3の bearer tokenを専用ファイルから読みます。Bearer tokenは `GET /api/orchestration/shell` にだけ使い、環境表示用には認証なしの `GET /.well-known/t3/environment` も行います。更新系APIは呼び出しません。T3 v0.0.45の安定版CLIはスコープを制限できず、発行セッションには読み取り以外の権限も含まれます。token自体は広い権限を持つため、漏えいを防ぐ運用が必要です。既存ブラウザーのcookieやMCP tokenは使いません。tokenファイルは実行ユーザーの `0600`、またはroot所有で実行ユーザーのprimary groupに属する `0640` にします。平文HTTPはIPアドレスかlocalhostの接続先だけを受け付け、別ホストへ移るredirectは追いません。
+`[agents]` はT3の bearer tokenを専用ファイルから読みます。Bearer tokenは `GET /api/orchestration/shell` にだけ使い、環境表示用には認証なしの `GET /.well-known/t3/environment` も行います。更新系APIは呼び出しません。既存ブラウザーのcookieやMCP tokenは使いません。tokenファイルは実行ユーザーの `0600`、またはroot所有で実行ユーザーのprimary groupに属する `0640` にします。平文HTTPはIPアドレスかlocalhostの接続先だけを受け付け、別ホストへ移るredirectは追いません。
 
-T3 v0.0.45でセッションを発行し、tokenを端末に表示せず専用ファイルへ置きます。
-
-```sh
-umask 077
-t3 auth session issue --ttl 30d --label miharashi-agents --token-only > /tmp/t3-agent.token
-sudo install -o root -g runtime-group -m 640 /tmp/t3-agent.token /etc/miharashi/t3-agent.token
-rm -f /tmp/t3-agent.token
-```
+T3 の bearer は 30 日で切れ、延長の仕組みがありません。T3 と同じマシン・同じユーザーで動かしているなら、`miharashi-t3-token.timer` が週 1 回、**読み取りだけ(`orchestration:read`)のトークン**を作り直して `token_file` を置き換えます(仕組みは [DESIGN-t3-token.md](DESIGN-t3-token.md))。
 
 ```toml
 [agents]
 enabled = true
 url = "http://192.0.2.10:3773"
-token_file = "/etc/miharashi/t3-agent.token"
+# 自動更新のスクリプトが書き換えるので、実行ユーザーが書ける場所に置く
+token_file = "/var/lib/miharashi/t3-agent.token"
 ```
+
+```sh
+sudo systemd/install.sh <実行ユーザー>             # miharashi-t3-token とユニットも入る
+sudo systemctl start miharashi-t3-token            # 最初の 1 回(トークンを作って置く。1 分ほどかかる)
+sudo journalctl -u miharashi-t3-token -n 5         # 「新しいトークンを … に置きました(権限 orchestration:read、有効 30 日)」
+sudo systemctl enable --now miharashi-t3-token.timer
+t3 auth session list                               # ラベル miharashi-agent-monitor・権限 orchestration:read が 1 つ
+```
+
+- miharashi は `token_file` を 30 秒ごとに読み直すので、置き換えても再起動は要りません。
+- 古いセッション(同じラベル)は、置き換えてから 60 秒後にスクリプトが失効させます。
+- 失敗すると `miharashi-t3-token.service` が failed になり、状況画面の DETAILS の failed ユニットに出ます。原因は `journalctl -u miharashi-t3-token` で見ます。
+- T3 を別のマシンで動かしているときは自動更新を使えません。T3 のマシンで `t3 auth session issue --ttl 30d --label miharashi-agent-monitor --token-only` を実行し、出たトークンを `token_file` に 0600(実行ユーザー)で置き、30 日以内に同じことを繰り返します。このトークンは管理者の権限をすべて持つので、扱いに注意してください。
 
 取得は専用 worker が `GET /api/orchestration/shell` を 5 秒ごとに行い、接続時に環境情報を `GET /.well-known/t3/environment` で取得します。画面は一覧の状態だけを表示し、会話本文や承認内容は取得しません。認証が失効した場合は 401 / 403 を区別して表示し、token ファイルが変更されたときに再試行します。
 

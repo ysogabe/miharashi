@@ -17,6 +17,7 @@
 | [画面管理インターフェース](DESIGN-screen-interface.md) | 画面を追加するための最小の契約(Screen / Provider / World / App)、共通操作、遷移(Issue #9) |
 | [画面の全体構成](DESIGN-screens.md) | 状況・写真・室内環境と天気・航空機の画面、データの取得元、無人時の巡回 |
 | [T3 Agent 画面の概要設計](DESIGN-t3-agent-monitor.md) | 操作不要のカードボード、新着・変更・縮小の動き、T3 データフロー、認証、実装前の確認事項 |
+| [T3 Agent 画面のトークンの更新](DESIGN-t3-token.md) | T3 の認証の仕組み(30 日で切れる、ペアリングは使い捨て、交換で権限を絞れる)と、読み取りだけのトークンを週 1 回作り直す仕組み |
 | [次の画面の設計(PoC)](poc/DESIGN-next-screens.md) | 室内環境・天気・航空機などの調査と設計メモ |
 | [監視のコスト](DESIGN-monitoring-cost.md) | 監視スレッドの読み取りごとの CPU 時間、読む間隔の決め方、監視するものを増やすときの手順 |
 | [操作パネルの設計](panel/DESIGN.md) | Echo Show 5 を手元の操作盤にする設計。接続方式の比較、API(§5.2)、段階 |
