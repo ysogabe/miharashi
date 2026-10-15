@@ -49,9 +49,13 @@ pub struct AircraftView {
     pub total: usize,
     /// 時刻("22:41:05")
     pub time: String,
+    /// 注目する機体(`planes` の添字)。0 = いちばん近い機体
+    pub focus: usize,
+    /// 機体がいないときに出す受信の状態("受信機から応答がありません" など)。None なら「半径内に機体はありません」
+    pub notice: Option<String>,
 }
 
-// 管制レーダー風の配色(暗い背景に緑)。いちばん近い機体だけ琥珀色にする
+// 管制レーダー風の配色(暗い背景に緑)。注目する機体だけ琥珀色にする
 const FG: [u8; 4] = [170, 245, 190, 255];
 const DIM: [u8; 4] = [80, 150, 105, 255];
 const FOCUS: [u8; 3] = [255, 190, 60];
@@ -70,7 +74,7 @@ pub const STILL_SWEEP: f32 = 2.6;
 /// レーダーの点の種類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlipKind {
-    /// いちばん近い機体
+    /// 注目する機体
     Focus,
     Other,
     Ground,
@@ -152,10 +156,10 @@ pub fn radar_geometry(view: &AircraftView, size: (u32, u32)) -> RadarGeom {
         .enumerate()
         .map(|(i, p)| {
             let (x, y) = proj(p.lon, p.lat);
-            let kind = if p.ground {
-                BlipKind::Ground
-            } else if i == 0 {
+            let kind = if i == view.focus {
                 BlipKind::Focus
+            } else if p.ground {
+                BlipKind::Ground
             } else {
                 BlipKind::Other
             };
@@ -307,8 +311,10 @@ fn radar_base(t: &mut TextEngine, view: &AircraftView, size: (u32, u32), k: f32)
 fn radar_labels(m: &mut Canvas, t: &mut TextEngine, view: &AircraftView, size: (u32, u32), k: f32) {
     let (rx, ry, rw, _) = radar_rect(size);
     let g = radar_geometry(view, size);
-    // 遠いものから描き、いちばん近い機体を最後に重ねる
-    for (p, blip) in view.planes.iter().zip(&g.blips).rev() {
+    // 遠いものから描き、注目する機体を最後に重ねる
+    let mut order: Vec<usize> = (0..view.planes.len()).rev().collect();
+    order.sort_by_key(|&i| i == view.focus);
+    for (p, blip) in order.iter().map(|&i| (&view.planes[i], &g.blips[i])) {
         let (x, y) = (blip.x - rx, blip.y - ry);
         let color = match blip.kind {
             BlipKind::Focus => FOCUS,
@@ -397,15 +403,14 @@ fn details(
     let (x, _, width, h) = rect;
     let acc = [FOCUS[0], FOCUS[1], FOCUS[2], 255];
     let mut y = 40.0 * k;
-    let Some(p) = view.planes.first() else {
-        t.draw(
-            c,
-            "半径内に機体はありません",
-            x,
-            y + 40.0 * k,
-            48.0 * k,
-            DIM,
-        );
+    let count = format!("半径内 {} 機 / 受信 {} 機", view.planes.len(), view.total);
+    let Some(p) = view.planes.get(view.focus) else {
+        let msg = view.notice.as_deref().unwrap_or("半径内に機体はありません");
+        t.draw(c, msg, x, y + 40.0 * k, 48.0 * k, DIM);
+        if !view.time.is_empty() {
+            let last = format!("最終受信 {}   {count}", view.time);
+            t.draw(c, &last, x, y + 130.0 * k, 32.0 * k, DIM);
+        }
         return;
     };
     let fit = |t: &mut TextEngine, s: &str, max: f32| {
@@ -417,7 +422,12 @@ fn details(
     } else {
         p.callsign.clone()
     };
-    t.draw(c, "いちばん近い機体", x, y, 30.0 * k, DIM);
+    let heading = if view.focus == 0 {
+        "いちばん近い機体".to_string()
+    } else {
+        format!("{} 番目に近い機体(5 でいちばん近い機体へ)", view.focus + 1)
+    };
+    t.draw(c, &heading, x, y, 30.0 * k, DIM);
     y += 46.0 * k;
     t.draw(c, &name, x, y, 84.0 * k, acc);
     y += 112.0 * k;
@@ -481,7 +491,13 @@ fn details(
     t.draw(c, "ほかの機体(近い順)", x, y, 30.0 * k, DIM);
     y += 50.0 * k;
     let cols = [0.0, 0.22, 0.38, 0.62, 0.8];
-    for p in view.planes.iter().skip(1).take(6) {
+    let others = view
+        .planes
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != view.focus)
+        .map(|(_, p)| p);
+    for p in others.take(6) {
         if y > h - 110.0 * k {
             break;
         }
@@ -507,14 +523,7 @@ fn details(
         }
         y += 48.0 * k;
     }
-    t.draw_right(
-        c,
-        &format!("半径内 {} 機 / 受信 {} 機", view.planes.len(), view.total),
-        x + width,
-        h - 70.0 * k,
-        28.0 * k,
-        DIM,
-    );
+    t.draw_right(c, &count, x + width, h - 70.0 * k, 28.0 * k, DIM);
 }
 
 #[cfg(test)]
