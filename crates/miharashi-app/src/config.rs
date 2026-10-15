@@ -19,6 +19,7 @@ pub struct Config {
     pub room: Room,
     pub ui: Ui,
     pub panel: Panel,
+    pub agents: ConfigAgents,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -154,6 +155,19 @@ pub struct Panel {
     pub token_file: String,
     /// `POST /api/v1/input` を 1 秒にこの回数まで受け付ける。超えたら 429。
     pub max_rate_per_sec: u32,
+}
+
+/// T3 の閲覧専用 Agent 一覧。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConfigAgents {
+    pub enabled: bool,
+    pub url: String,
+    pub token_file: String,
+    pub poll_secs: u64,
+    pub timeout_secs: u64,
+    pub stale_secs: u64,
+    pub recent_hours: u64,
 }
 
 impl Default for Runtime {
@@ -347,6 +361,20 @@ impl Default for Panel {
     }
 }
 
+impl Default for ConfigAgents {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: "http://192.168.0.132:3773".into(),
+            token_file: "/etc/miharashi/t3-agent.token".into(),
+            poll_secs: 5,
+            timeout_secs: 3,
+            stale_secs: 30,
+            recent_hours: 24,
+        }
+    }
+}
+
 impl Config {
     pub fn parse(text: &str) -> Result<Self, String> {
         let cfg: Config = toml::from_str(text).map_err(|e| format!("設定の読み込みに失敗: {e}"))?;
@@ -409,18 +437,22 @@ impl Config {
         if !matches!(self.display.renderer.as_str(), "auto" | "cpu" | "gles") {
             return Err("display.renderer は auto / cpu / gles".into());
         }
-        const SCREENS: [&str; 4] = ["status", "photo", "room", "aircraft"];
-        if !SCREENS.contains(&self.ui.start_screen.as_str()) {
-            return Err("ui.start_screen は status / photo / room / aircraft".into());
+        const START_SCREENS: [&str; 5] = ["status", "photo", "room", "aircraft", "agents"];
+        if !START_SCREENS.contains(&self.ui.start_screen.as_str()) {
+            return Err("ui.start_screen は status / photo / room / aircraft / agents".into());
         }
+        if self.ui.start_screen == "agents" && !self.agents.enabled {
+            return Err("ui.start_screen = agents には agents.enabled = true が必要".into());
+        }
+        const REFRESH_SCREENS: [&str; 4] = ["status", "photo", "room", "aircraft"];
         if let Some(id) = self
             .ui
             .refresh_screens
             .iter()
-            .find(|id| !SCREENS.contains(&id.as_str()))
+            .find(|id| !REFRESH_SCREENS.contains(&id.as_str()))
         {
             return Err(format!(
-                "ui.refresh_screens に未知の画面 {id:?}(status / photo / room / aircraft)"
+                "ui.refresh_screens に未知または未対応の画面 {id:?}(status / photo / room / aircraft)"
             ));
         }
         let r = &self.room;
@@ -479,6 +511,18 @@ impl Config {
                 .map_err(|e| format!("panel.listen: {e}"))?;
             if self.panel.max_rate_per_sec == 0 || self.panel.token_file.is_empty() {
                 return Err("panel.max_rate_per_sec は 1 以上、token_file は必須".into());
+            }
+        }
+        if self.agents.enabled {
+            crate::agents::check_url(&self.agents.url).map_err(|e| format!("agents.url: {e}"))?;
+            if self.agents.token_file.is_empty()
+                || !(1..=3600).contains(&self.agents.poll_secs)
+                || !(1..=60).contains(&self.agents.timeout_secs)
+                || !(1..=86400).contains(&self.agents.stale_secs)
+                || !(1..=8760).contains(&self.agents.recent_hours)
+                || self.agents.stale_secs < self.agents.poll_secs
+            {
+                return Err("agents.token_file は必須、poll_secs は 1〜3600、timeout_secs は 1〜60、stale_secs は poll_secs 以上かつ 86400 以下、recent_hours は 1〜8760".into());
             }
         }
         Ok(())
@@ -546,6 +590,14 @@ mod tests {
         );
         assert!(Config::parse("[ui]\nstart_screen = \"menu\"\n").is_err());
         assert!(Config::parse("[ui]\nstart_screen = \"aircraft\"\n").is_ok());
+        assert!(Config::parse("[ui]\nstart_screen = \"agents\"\n").is_err());
+        assert!(Config::parse(
+            "[agents]\nenabled = true\nurl = \"http://192.0.2.10:3773\"\ntoken_file = \"/tmp/token\"\n[ui]\nstart_screen = \"agents\"\n"
+        ).is_ok());
+        assert!(Config::parse("[ui]\nrefresh_screens = [\"agents\"]\n").is_err());
+        assert!(Config::parse(
+            "[agents]\nenabled = true\nurl = \"http://192.0.2.10:3773\"\ntoken_file = \"/tmp/token\"\n[ui]\nrefresh_screens = [\"agents\"]\n"
+        ).is_err());
         assert!(Config::parse("[ui]\nrefresh_screens = [\"status\", \"radar\"]\n").is_err());
         let c = Config::parse(
             "[ui]\nrefresh_minutes = 0\nrefresh_screens = [\"status\", \"aircraft\"]\n",
@@ -675,5 +727,22 @@ mod tests {
         assert!(on("geoframe-n100:8790").is_err(), "名前ではなく IP");
         // 無効なら listen が空でもよい
         assert!(Config::parse("[panel]\nmax_rate_per_sec = 5\n").is_ok());
+    }
+
+    #[test]
+    fn t3_agents_are_off_by_default_and_validate_private_http_settings() {
+        assert!(!Config::default().agents.enabled);
+        assert!(Config::parse("[agents]\nurl = \"http://t3.local:3773\"\n").is_ok());
+        assert!(
+            Config::parse("[agents]\nenabled = true\nurl = \"http://t3.local:3773\"\n").is_err()
+        );
+        assert!(
+            Config::parse("[agents]\nenabled = true\nurl = \"http://192.0.2.10:3773\"\n").is_ok()
+        );
+        assert!(Config::parse("[agents]\nenabled = true\npoll_secs = 0\n").is_err());
+        assert!(
+            Config::parse("[agents]\nenabled = true\npoll_secs = 60\nstale_secs = 30\n").is_err()
+        );
+        assert!(Config::parse("[agents]\ntoken_flie = \"x\"\n").is_err());
     }
 }

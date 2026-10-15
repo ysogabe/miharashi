@@ -5,7 +5,9 @@ use crate::config::Config;
 use crate::panel::{DisplayControl, DisplayStatus, Panel, PanelInput};
 use crate::screen::{App, Composite, KeyPress, PhotoData, PhotoRef};
 use crate::screen_power::{Mode as PowerMode, ScreenPower};
-use miharashi_gpu::{Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, Radar, SourceImage};
+use miharashi_gpu::{
+    AgentGpuCard, Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, Radar, SourceImage,
+};
 use miharashi_linux::drm_select::{self, CardSel, ModeSel};
 use miharashi_linux::input::{Action, Keys};
 use miharashi_linux::kms::Display;
@@ -221,6 +223,7 @@ impl Presenter {
                     Composite::Radar { geom, .. } => radar_blips(geom),
                     _ => Vec::new(),
                 };
+                let mut agent_gpu_cards = Vec::new();
                 let frame = match comp {
                     Composite::Canvas => Frame::Image(canvas.pixmap.data()),
                     Composite::Photo {
@@ -240,6 +243,27 @@ impl Presenter {
                         background: background_changed.then(|| canvas.pixmap.data()),
                         radar: radar_layer(&geom, sweep, aircraft::TRAIL, h, &blips),
                     },
+                    Composite::Agents {
+                        background_changed,
+                        cards,
+                        scrim_alpha,
+                        focus_card_id,
+                    } => {
+                        agent_gpu_cards.extend(cards.iter().map(|c| AgentGpuCard {
+                            id: c.id,
+                            revision: c.revision,
+                            pixels: c.surface.data(),
+                            size: (c.surface.width(), c.surface.height()),
+                            rect: (c.pose.x, c.pose.y, c.pose.width, c.pose.height),
+                            alpha: c.pose.alpha,
+                        }));
+                        Frame::Agents {
+                            background: background_changed.then(|| canvas.pixmap.data()),
+                            cards: &agent_gpu_cards,
+                            scrim_alpha,
+                            focus_card_id,
+                        }
+                    }
                 };
                 d.present_frame(&frame)?;
                 Ok((ms(t0, t1), ms(t1, Instant::now())))
@@ -374,6 +398,7 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                     // VT が非アクティブ: 描画・入力・DRM master を手放してから応答する。
                     keys.close(&mut session);
                     display.suspend();
+                    app.set_display_on(false, Instant::now());
                     session.ack_disable();
                     eprintln!("seat: 無効化(描画を停止)");
                 }
@@ -400,6 +425,7 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                         screen_on = true;
                         power_tried = true;
                     }
+                    app.set_display_on(screen_on, Instant::now());
                 }
                 Err(e) => {
                     eprintln!("{e}(再試行)");
@@ -491,6 +517,7 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             match display.set_power(want_on) {
                 Ok(()) => {
                     screen_on = want_on;
+                    app.set_display_on(screen_on, Instant::now());
                     redraw |= want_on;
                     eprintln!("display: {}", if want_on { "点灯" } else { "消灯" });
                 }

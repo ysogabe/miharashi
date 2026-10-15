@@ -2,6 +2,7 @@
 //! 画面を足すときは `kiosk` の登録に足す(docs/DESIGN-screen-interface.md)。
 pub mod manager;
 pub mod screens {
+    pub mod agents;
     pub mod aircraft;
     pub mod photo;
     pub mod room;
@@ -69,7 +70,18 @@ pub fn kiosk(
     if let Some(shared) = aircraft {
         screens.push(Box::new(AircraftScreen::new(shared, gpu_max.is_some())));
     }
-    let m = ScreenManager::new(
+    let agent_shared = cfg
+        .agents
+        .enabled
+        .then(|| crate::agents::start(&cfg.agents));
+    if cfg.agents.enabled {
+        screens.push(Box::new(AgentScreen::new(
+            size,
+            gpu_max.is_some(),
+            cfg.agents.stale_secs,
+        )));
+    }
+    let mut m = ScreenManager::new(
         screens,
         &cfg.ui.start_screen,
         data,
@@ -78,6 +90,9 @@ pub fn kiosk(
         Duration::from_secs(cfg.alerts.show_minutes * 60),
     )
     .with_provider(Box::new(feed));
+    if let Some(shared) = agent_shared {
+        m = m.with_provider(Box::new(crate::agents::AgentProvider::new(shared)));
+    }
     if cfg.ui.refresh_minutes > 0 {
         m.with_refresh(
             Duration::from_secs(cfg.ui.refresh_minutes * 60),
@@ -87,6 +102,8 @@ pub fn kiosk(
         m
     }
 }
+
+use screens::agents::AgentScreen;
 
 #[cfg(test)]
 mod tests {

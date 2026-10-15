@@ -50,6 +50,8 @@ pub struct World {
     /// 実測値と時刻(日付・時刻は 1 秒ごとに ScreenManager が設定する)
     pub system: Snapshot,
     pub photo_feed: FeedState,
+    /// T3 Agent 一覧。AgentProvider が更新し、画面は読むだけ。
+    pub agents: crate::agents::AgentSnapshot,
 }
 
 /// 取得した値を `World` に写す。毎周期呼ぶので、ブロックしない。
@@ -76,6 +78,16 @@ pub trait Screen {
     fn on_enter(&mut self, _now: Instant) {}
     /// 別の画面へ移る直前。
     fn on_leave(&mut self, _now: Instant) {}
+    /// 画面が見えているか、上にアラート/メニューがあるか、出力が点灯中か。
+    /// 非表示中もデータは取り込むが、復帰時に演出をまとめて再生しない。
+    fn set_presentation(
+        &mut self,
+        _visible: bool,
+        _covered: bool,
+        _display_on: bool,
+        _now: Instant,
+    ) {
+    }
     /// 表示中かどうかに関係なく、毎周期呼ぶ(写真の受信など)。
     /// 戻り値: 再描画が必要か(表示中の画面のものだけ使う)。
     fn tick(&mut self, _world: &World, _now: Instant) -> bool {
@@ -146,6 +158,8 @@ pub trait App {
     fn wants_screen(&self) -> bool {
         false
     }
+    /// runtime から出力の消灯・点灯を通知する。
+    fn set_display_on(&mut self, _on: bool, _now: Instant) {}
     /// 状態ログ用。runtime は中身を解釈せず、`k=v` を並べて出す。
     fn stats(&self) -> Vec<(&'static str, String)>;
     /// 指定した id の画面にする(操作パネルの `POST /api/v1/screen`)。戻り値: 再描画が必要か。
@@ -220,5 +234,12 @@ pub enum Composite<'a> {
         geom: RadarGeom,
         /// 回る線の角度 [rad]。北 0、時計回り
         sweep: f32,
+    },
+    /// Agent card surfaces are cached independently and positioned by the GPU.
+    Agents {
+        background_changed: bool,
+        cards: &'a [miharashi_render::agents::AgentCardSurface],
+        scrim_alpha: f32,
+        focus_card_id: Option<u64>,
     },
 }

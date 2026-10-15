@@ -35,6 +35,8 @@ pub struct ScreenManager {
     /// 表示中のアラートと、閉じる時刻
     alert: Option<(AlertView, Instant)>,
     alert_len: Duration,
+    /// runtime が知らせる出力の電源状態。Agent 演出は消灯中に止める。
+    display_on: bool,
     /// 焼き付き対策の間隔と、入れる画面の id(無効なら None)
     refresh: Option<(Duration, Vec<String>)>,
     /// 次の演出の時刻(対象の画面を続けて出しているあいだだけ近づく)
@@ -79,6 +81,7 @@ impl ScreenManager {
             alerts: None,
             alert: None,
             alert_len,
+            display_on: true,
             refresh: None,
             refresh_due: now,
             refreshing: None,
@@ -218,6 +221,21 @@ impl ScreenManager {
         self.screens[self.current].on_leave(now);
         self.current = i;
         self.screens[i].on_enter(now);
+        self.update_presentation(now);
+    }
+
+    fn update_presentation(&mut self, now: Instant) {
+        let covered = self.alert.is_some() || self.menu.is_some();
+        for (i, screen) in self.screens.iter_mut().enumerate() {
+            screen.set_presentation(i == self.current, covered, self.display_on, now);
+        }
+    }
+
+    pub fn set_display_on(&mut self, on: bool, now: Instant) {
+        if self.display_on != on {
+            self.display_on = on;
+            self.update_presentation(now);
+        }
     }
 
     /// メニューを開いているか(テスト用)。
@@ -303,6 +321,7 @@ impl ScreenManager {
             self.alert = None;
             redraw = true;
         }
+        self.update_presentation(now);
         if now >= self.next_tick {
             self.data.update(&mut self.world.system);
             super::set_clock(&mut self.world.system);
@@ -410,6 +429,7 @@ impl ScreenManager {
                 }
             }
             Composite::Photo { .. } => {}
+            Composite::Agents { .. } => {}
         }
         let draw_alert = match &comp {
             Composite::Canvas => true,
@@ -418,6 +438,7 @@ impl ScreenManager {
             } => *overlay_changed,
             // 航空機の画面は、重ねるものがあるときは Canvas で返る
             Composite::Radar { .. } => false,
+            Composite::Agents { .. } => false,
         };
         if draw_alert {
             layers(
@@ -473,6 +494,10 @@ impl App for ScreenManager {
 
     fn wants_screen(&self) -> bool {
         self.alert_active()
+    }
+
+    fn set_display_on(&mut self, on: bool, now: Instant) {
+        ScreenManager::set_display_on(self, on, now)
     }
 
     fn animating(&self) -> bool {
