@@ -115,9 +115,25 @@
 # stale_secs = 30
 # recent_hours = 24
 
+[rotation]
+# 無人のときの自動巡回。画面 id と表示する秒数の手順を上から順に繰り返す。有効なら ui.start_screen ではなく
+# 最初の手順の画面から始める。出していない画面(無効な航空機など)の手順は飛ばす。
+# skip_if_empty = true の手順は、出すものが無ければ飛ばす(航空機の画面で、半径内に機体がいないとき)。
+# キー・操作パネルで操作したら pause_after_input_secs 秒止め、最後の操作から時間がたったら次の手順から戻る。
+# アラートの間は手順の時間を進めない。写真画面に戻ると続きの写真から(写真は表示中だけ進む)。
+# enabled = false
+# steps = [
+#   { screen = "photo",    secs = 600 },
+#   { screen = "room",     secs = 60 },
+#   { screen = "photo",    secs = 600 },
+#   { screen = "aircraft", secs = 60, skip_if_empty = true },
+#   { screen = "status",   secs = 30 },
+# ]
+# pause_after_input_secs = 300
+
 [ui]
 # font = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
-# start_screen = "status"  # status / photo / room / aircraft / agents
+# start_screen = "status"  # status / photo / room / aircraft / agents([rotation] が有効なら使わない)
 # 焼き付き対策: refresh_minutes 分ごとに、refresh_screens の画面をグリッチ → 暗転 → 再表示(約 1.6 秒)で
 # 描き直し、そのたびに画面全体を数 px ずらす(9 か所を順に回る)。0 なら行わない。動かない線が多い画面に使う(状況画面も入れるなら ["aircraft", "status"])
 # refresh_minutes = 5
