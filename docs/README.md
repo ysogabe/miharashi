@@ -17,6 +17,7 @@
 | [画面管理インターフェース](DESIGN-screen-interface.md) | 画面を追加するための最小の契約(Screen / Provider / World / App)、共通操作、遷移(Issue #9) |
 | [画面の全体構成](DESIGN-screens.md) | 状況・写真・室内環境と天気・航空機の画面、データの取得元、無人時の巡回 |
 | [次の画面の設計(PoC)](poc/DESIGN-next-screens.md) | 室内環境・天気・航空機などの調査と設計メモ |
+| [監視のコスト](DESIGN-monitoring-cost.md) | 監視スレッドの読み取りごとの CPU 時間、読む間隔の決め方、監視するものを増やすときの手順 |
 | [操作パネルの設計](panel/DESIGN.md) | Echo Show 5 を手元の操作盤にする設計。接続方式の比較、API(§5.2)、段階 |
 | [LP 構成書](LP.md) | LP の役割、構成、載せる画像の約束、ローカルでの確認方法 |
 
@@ -34,7 +35,7 @@
 |---|---|
 | PoC-001 Direct Display | 完了 |
 | PoC-002 Kiosk Runtime | 完了(12 時間試験に合格) |
-| PoC-005 GPU Render Baseline | PR3b まで完了(写真画面の CPU 使用率 0.8%)。[#16](https://github.com/ysogabe/miharashi/issues/16) |
+| PoC-005 GPU Render Baseline | 完了(写真画面の CPU 使用率 0.8%、重いエフェクトの予算は GPU 50% 以下)。[#16](https://github.com/ysogabe/miharashi/issues/16) |
 | アラート・電源・写真・航空機 | 実装済み(地震・災害アラート、在宅判定でのモニター消灯、旅ごとの写真、写真の合間の航空機) |
 | 操作パネル | P2 まで完了(API、Echo Show 5 のアプリ、モニターの消灯・点灯、操作盤の自動消灯) |
 | PoC-003 Screen Plugins | 未着手。[#5](https://github.com/ysogabe/miharashi/issues/5) |
