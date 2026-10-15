@@ -1,4 +1,6 @@
-//! 操作不要の T3 Agent カードボード。
+//! 操作不要の T3 Agent カードボード。ボードは 1 枚で、スレッドはプロジェクトごとの枠にまとめる。
+mod layout;
+
 use crate::agents::{AgentChangeKind, AgentConnection, AgentEntry, AgentSnapshot};
 use crate::screen::{Composite, Outcome, RenderContext, Screen, ScreenAction, ScreenId};
 use miharashi_render::agents as draw;
@@ -7,14 +9,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-const PAGE_SIZE: usize = 6;
-const PAGE_SECS: Duration = Duration::from_secs(12);
-const HALF_LIFE: f32 = 90.0;
 const MAX_QUEUE: usize = 32;
 const NEW_INTRO: Duration = Duration::from_millis(700);
 const RETURN: Duration = Duration::from_millis(800);
 const MAX_AGE_SECS: Duration = Duration::from_secs(30);
-const SIZE_TWEEN: Duration = Duration::from_millis(500);
+const MOVE_TWEEN: Duration = Duration::from_millis(500);
+/// ヘッダーと集計行の下端、フッターの区切り線より上が、枠を並べる領域。
+const BOARD_TOP: f32 = 212.0;
+const BOARD_BOTTOM_MARGIN: f32 = 80.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EventKind {
@@ -47,6 +49,39 @@ enum FocusStage {
     Out,
 }
 
+/// 並び替えや件数の変化で配置が変わったとき、カードを新しい位置へ滑らせる。
+#[derive(Clone, Copy, Debug)]
+struct PoseTween {
+    from: draw::AgentPose,
+    to: draw::AgentPose,
+    started: Instant,
+}
+
+impl PoseTween {
+    fn at(&self, now: Instant) -> draw::AgentPose {
+        let x = (now.saturating_duration_since(self.started).as_secs_f32()
+            / MOVE_TWEEN.as_secs_f32())
+        .clamp(0.0, 1.0);
+        let p = x * x * (3.0 - 2.0 * x);
+        draw::AgentPose {
+            x: lerp(self.from.x, self.to.x, p),
+            y: lerp(self.from.y, self.to.y, p),
+            width: lerp(self.from.width, self.to.width, p),
+            height: lerp(self.from.height, self.to.height, p),
+            alpha: lerp(self.from.alpha, self.to.alpha, p),
+        }
+    }
+    fn moving(&self) -> bool {
+        self.from != self.to
+    }
+}
+
+/// 1 つのプロジェクトのスレッド。重要な順に並ぶ。
+struct Group {
+    label: String,
+    entries: Vec<AgentEntry>,
+}
+
 pub struct AgentScreen {
     size: (u32, u32),
     stale_secs: u64,
@@ -55,13 +90,13 @@ pub struct AgentScreen {
     revisions: HashMap<String, u64>,
     content_keys: HashMap<String, String>,
     entry_keys: HashMap<String, String>,
-    home_slots: HashMap<String, usize>,
-    pin_slots: HashMap<String, usize>,
-    next_slot: usize,
+    /// 初めて見た順。並びの最後の決め手と、表示中スレッドの集合を兼ねる。
+    seen: HashMap<String, u64>,
+    project_seen: HashMap<String, u64>,
+    next_seen: u64,
     last_activity: HashMap<String, Instant>,
-    stale_activities: HashMap<String, f32>,
-    activity_targets: HashMap<String, f32>,
-    activity_tweens: HashMap<String, (f32, f32, Instant)>,
+    poses: HashMap<String, PoseTween>,
+    board: layout::Layout,
     progress_notified: HashMap<String, Instant>,
     stale: bool,
     overflow_updates: usize,
@@ -71,8 +106,6 @@ pub struct AgentScreen {
     change_cursor: u64,
     resync_generation: u64,
     observed_sync: bool,
-    page: usize,
-    page_due: Instant,
     presentable: bool,
     paused_at: Option<Instant>,
     background: Option<Pixmap>,
@@ -85,7 +118,6 @@ pub struct AgentScreen {
     entries: Vec<AgentEntry>,
     last_snapshot: AgentSnapshot,
     last_now: Instant,
-    activity_layout_due: Instant,
     header_due: Instant,
 }
 
@@ -99,13 +131,12 @@ impl AgentScreen {
             revisions: HashMap::new(),
             content_keys: HashMap::new(),
             entry_keys: HashMap::new(),
-            home_slots: HashMap::new(),
-            pin_slots: HashMap::new(),
-            next_slot: 0,
+            seen: HashMap::new(),
+            project_seen: HashMap::new(),
+            next_seen: 0,
             last_activity: HashMap::new(),
-            stale_activities: HashMap::new(),
-            activity_targets: HashMap::new(),
-            activity_tweens: HashMap::new(),
+            poses: HashMap::new(),
+            board: layout::Layout::default(),
             progress_notified: HashMap::new(),
             stale: false,
             overflow_updates: 0,
@@ -114,8 +145,6 @@ impl AgentScreen {
             change_cursor: 0,
             resync_generation: 0,
             observed_sync: false,
-            page: 0,
-            page_due: Instant::now() + PAGE_SECS,
             presentable: true,
             paused_at: None,
             background: None,
@@ -129,7 +158,6 @@ impl AgentScreen {
             pending_new: HashSet::new(),
             last_snapshot: AgentSnapshot::default(),
             last_now: Instant::now(),
-            activity_layout_due: Instant::now() + Duration::from_secs(15),
             header_due: Instant::now() + Duration::from_secs(1),
         }
     }
@@ -166,29 +194,11 @@ impl AgentScreen {
         });
         if now_stale != self.stale {
             if now_stale {
-                self.stale_activities = self
-                    .entries
-                    .iter()
-                    .map(|e| (e.thread_id.clone(), self.activity(e, now)))
-                    .collect();
-                self.activity_tweens.clear();
                 self.queue.clear();
                 self.pending_new.clear();
                 self.focus = None;
                 self.scrim_alpha = 0.0;
             } else {
-                for e in &self.entries {
-                    let value = self
-                        .stale_activities
-                        .get(&e.thread_id)
-                        .copied()
-                        .unwrap_or(1.0);
-                    let age = self.age_for_activity(e, value);
-                    self.last_activity
-                        .insert(e.thread_id.clone(), now - Duration::from_secs_f32(age));
-                    self.activity_targets.insert(e.thread_id.clone(), value);
-                }
-                self.stale_activities.clear();
                 self.queue.clear();
                 self.pending_new.clear();
                 self.focus = None;
@@ -222,23 +232,17 @@ impl AgentScreen {
             .retain(|e| current_ids.contains(e.thread_id.as_str()));
         self.pending_new
             .retain(|id| current_ids.contains(id.as_str()));
-        let mut entries = snap.entries.to_vec();
-        entries.sort_by_key(|e| {
-            self.home_slots
-                .get(&e.thread_id)
-                .copied()
-                .unwrap_or(usize::MAX)
-        });
+        let entries = snap.entries.to_vec();
         for entry in &entries {
-            if !self.home_slots.contains_key(&entry.thread_id) {
-                let mut slot = 0;
-                while self.home_slots.values().any(|used| *used == slot) {
-                    slot += 1;
-                }
-                self.home_slots.insert(entry.thread_id.clone(), slot);
-                self.next_slot = self.next_slot.max(slot + 1);
+            if !self.project_seen.contains_key(&entry.project_id) {
+                self.project_seen
+                    .insert(entry.project_id.clone(), self.next_seen);
+                self.next_seen += 1;
+            }
+            if !self.seen.contains_key(&entry.thread_id) {
+                self.seen.insert(entry.thread_id.clone(), self.next_seen);
+                self.next_seen += 1;
                 self.last_activity.insert(entry.thread_id.clone(), now);
-                self.activity_targets.insert(entry.thread_id.clone(), 1.0);
                 self.id_map.insert(
                     entry.thread_id.clone(),
                     stable_id(&format!(
@@ -259,20 +263,24 @@ impl AgentScreen {
             }
         }
         let removed: Vec<String> = self
-            .home_slots
+            .seen
             .keys()
             .filter(|id| !current_ids.contains(id.as_str()))
             .cloned()
             .collect();
+        let live_projects = entries
+            .iter()
+            .map(|e| e.project_id.as_str())
+            .collect::<HashSet<_>>();
+        self.project_seen
+            .retain(|id, _| live_projects.contains(id.as_str()));
         for id in removed {
-            self.home_slots.remove(&id);
+            self.seen.remove(&id);
             self.surfaces.remove(&id);
             self.content_keys.remove(&id);
             self.entry_keys.remove(&id);
             self.last_activity.remove(&id);
-            self.stale_activities.remove(&id);
-            self.activity_targets.remove(&id);
-            self.activity_tweens.remove(&id);
+            self.poses.remove(&id);
             self.progress_notified.remove(&id);
             self.id_map.remove(&id);
             self.pending_new.remove(&id);
@@ -292,8 +300,6 @@ impl AgentScreen {
             for change in snap.changes.iter().filter(|c| c.id > previous_cursor) {
                 self.change_cursor = self.change_cursor.max(change.id);
                 self.last_activity.insert(change.thread_id.clone(), now);
-                self.activity_targets.insert(change.thread_id.clone(), 1.0);
-                self.activity_tweens.remove(&change.thread_id);
                 if self.presentable
                     && !self.stale
                     && let Some(entry) = entries.iter().find(|e| e.thread_id == change.thread_id)
@@ -360,32 +366,6 @@ impl AgentScreen {
             self.change_cursor = self.change_cursor.max(snap.change_cursor);
         }
         self.entries = entries;
-        let urgent = self
-            .entries
-            .iter()
-            .filter(|e| attention(e))
-            .map(|e| e.thread_id.clone())
-            .collect::<Vec<_>>();
-        if urgent.len() >= PAGE_SIZE {
-            self.pin_slots.clear();
-        } else {
-            self.pin_slots
-                .retain(|id, _| urgent.iter().any(|u| u == id));
-            for id in &urgent {
-                if !self.pin_slots.contains_key(id)
-                    && let Some(home) = self.home_slots.get(id).map(|s| s % PAGE_SIZE)
-                    && !self.pin_slots.values().any(|v| *v == home)
-                {
-                    self.pin_slots.insert(id.clone(), home);
-                }
-            }
-        }
-        if self.page >= self.page_count() {
-            self.page = 0;
-            self.page_due = now + PAGE_SECS;
-            self.background_dirty = true;
-            redraw = true;
-        }
         self.last_snapshot = snap.clone();
         if redraw {
             self.background_dirty = true;
@@ -442,43 +422,86 @@ impl AgentScreen {
         expired
     }
 
-    fn page_count(&self) -> usize {
-        let remaining = self.entries.len().saturating_sub(self.pin_slots.len());
-        let capacity = PAGE_SIZE - self.pin_slots.len().min(PAGE_SIZE - 1);
-        remaining.div_ceil(capacity).max(1)
+    fn scale(&self) -> f32 {
+        (self.size.0 as f32 / 1920.0)
+            .min(self.size.1 as f32 / 1080.0)
+            .max(0.35)
     }
-    fn visible_entries(&self) -> Vec<(AgentEntry, usize)> {
-        let mut out = self
-            .entries
-            .iter()
-            .filter_map(|e| {
-                self.pin_slots
-                    .get(&e.thread_id)
-                    .map(|slot| (e.clone(), *slot))
-            })
-            .collect::<Vec<_>>();
-        out.sort_by_key(|(_, slot)| *slot);
-        let rotating = self
-            .entries
-            .iter()
-            .filter(|e| !self.pin_slots.contains_key(&e.thread_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        let capacity = PAGE_SIZE - self.pin_slots.len().min(PAGE_SIZE - 1);
-        let start = self.page * capacity;
-        let mut display_slots = (0..PAGE_SIZE)
-            .filter(|slot| !self.pin_slots.values().any(|pin| pin == slot))
-            .collect::<Vec<_>>();
-        for e in rotating.into_iter().skip(start).take(capacity) {
-            let home = self.home_slots.get(&e.thread_id).copied().unwrap_or(0) % PAGE_SIZE;
-            let slot = if let Some(i) = display_slots.iter().position(|s| *s == home) {
-                display_slots.remove(i)
+
+    /// 要確認、実行中、最近動いたもの、T3 の更新時刻、初めて見た順。
+    fn rank(&self, a: &AgentEntry, b: &AgentEntry) -> std::cmp::Ordering {
+        let tier = |e: &AgentEntry| {
+            if attention(e) {
+                0
+            } else if running(e) {
+                1
             } else {
-                display_slots.remove(0)
-            };
-            out.push((e, slot));
+                2
+            }
+        };
+        tier(a)
+            .cmp(&tier(b))
+            .then_with(|| {
+                self.last_activity
+                    .get(&b.thread_id)
+                    .cmp(&self.last_activity.get(&a.thread_id))
+            })
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+            .then_with(|| {
+                self.seen
+                    .get(&a.thread_id)
+                    .cmp(&self.seen.get(&b.thread_id))
+            })
+    }
+
+    /// プロジェクトを初めて見た順に並べ、各枠の中を重要な順に並べる。
+    fn groups(&self) -> Vec<Group> {
+        let mut groups: Vec<(u64, &str, Group)> = Vec::new();
+        for e in &self.entries {
+            if let Some((_, _, g)) = groups.iter_mut().find(|(_, id, _)| *id == e.project_id) {
+                g.entries.push(e.clone());
+            } else {
+                let label = if e.project_title.is_empty() {
+                    short(&e.project_id)
+                } else {
+                    e.project_title.clone()
+                };
+                groups.push((
+                    self.project_seen
+                        .get(&e.project_id)
+                        .copied()
+                        .unwrap_or(u64::MAX),
+                    &e.project_id,
+                    Group {
+                        label,
+                        entries: vec![e.clone()],
+                    },
+                ));
+            }
         }
-        out
+        groups.sort_by_key(|(seq, _, _)| *seq);
+        groups
+            .into_iter()
+            .map(|(_, _, mut g)| {
+                g.entries.sort_by(|a, b| self.rank(a, b));
+                g
+            })
+            .collect()
+    }
+
+    fn layout(&self, groups: &[Group]) -> layout::Layout {
+        let (w, h) = (self.size.0 as f32, self.size.1 as f32);
+        let area = layout::Rect {
+            x: 32.0,
+            y: BOARD_TOP,
+            w: w - 64.0,
+            h: h - BOARD_TOP - BOARD_BOTTOM_MARGIN,
+        };
+        let ids = groups
+            .iter()
+            .map(|g| g.entries.iter().map(|e| e.thread_id.clone()).collect())
+            .collect::<Vec<Vec<String>>>();
+        layout::layout(area, self.scale(), &ids)
     }
 
     fn activate_event(&mut self, now: Instant) -> bool {
@@ -488,10 +511,7 @@ impl AgentScreen {
         let mut stale = Vec::new();
         let wall = SystemTime::now();
         for (i, e) in self.queue.iter().enumerate() {
-            if self
-                .home_slots
-                .get(&e.thread_id)
-                .is_some_and(|s| s / PAGE_SIZE == self.page)
+            if self.seen.contains_key(&e.thread_id)
                 && wall.duration_since(e.observed_at).unwrap_or_default() > MAX_AGE_SECS
             {
                 stale.push(i);
@@ -517,12 +537,12 @@ impl AgentScreen {
                 .saturating_add(count.saturating_sub(1));
             self.background_dirty = true;
         }
-        let visible = self.visible_entries();
+        let board = self.layout(&self.groups());
         let pos = self
             .queue
             .iter()
             .enumerate()
-            .filter(|(_, e)| visible.iter().any(|(v, _)| v.thread_id == e.thread_id))
+            .filter(|(_, e)| board.cards.contains_key(&e.thread_id))
             .max_by_key(|(i, e)| (e.priority, std::cmp::Reverse(*i)))
             .map(|(i, _)| i);
         let Some(pos) = pos else { return false };
@@ -549,12 +569,6 @@ impl AgentScreen {
             return false;
         }
         let mut redraw = false;
-        if self.page_count() > 1 && now >= self.page_due && self.focus.is_none() {
-            self.page = (self.page + 1) % self.page_count();
-            self.page_due = now + PAGE_SECS;
-            redraw = true;
-            self.background_dirty = true;
-        }
         if self.focus.is_none() {
             redraw |= self.activate_event(now);
         }
@@ -585,15 +599,21 @@ impl AgentScreen {
     fn render_scene(&mut self, ctx: &mut RenderContext<'_>, composite_cpu: bool) {
         let snap = self.last_snapshot.clone();
         let now = self.last_now;
+        let groups = self.groups();
+        let board = self.layout(&groups);
+        if board != self.board {
+            self.board = board;
+            self.background_dirty = true;
+        }
         if self.background_dirty || self.background.is_none() {
             let mut bg = Canvas::new(self.size.0, self.size.1);
             draw_background(
                 &mut bg,
                 ctx.text,
                 &snap,
-                self.entries.len(),
-                self.page + 1,
-                self.page_count(),
+                &groups,
+                &self.board,
+                self.scale(),
                 self.overflow_updates,
                 now,
                 self.stale_secs,
@@ -602,73 +622,55 @@ impl AgentScreen {
             self.background_dirty = false;
         }
         let focus = self.focus.clone();
-        let visible = self
-            .visible_entries()
-            .into_iter()
-            .filter(|(entry, _)| {
-                !self.pending_new.contains(&entry.thread_id)
-                    || focus
-                        .as_ref()
-                        .is_some_and(|f| f.event.thread_id == entry.thread_id)
-            })
-            .collect::<Vec<_>>();
-        let page_total = self.page_count();
-        let visible_ids = visible
-            .iter()
-            .map(|(e, _)| e.thread_id.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        self.surfaces
-            .retain(|id, _| visible_ids.contains(id.as_str()));
-        self.content_keys
-            .retain(|id, _| visible_ids.contains(id.as_str()));
-        let scale = (self.size.0 as f32 / 1920.0)
-            .min(self.size.1 as f32 / 1080.0)
-            .max(0.35);
-        let mut cards = Vec::with_capacity(visible.len());
-        for (entry, slot) in &visible {
-            let home = home_center(self.size, *slot % PAGE_SIZE, scale);
-            let activity = self.activity(entry, now);
-            let w = 600.0 * scale * (0.70 + 0.30 * activity);
-            let h = 300.0 * scale * (0.70 + 0.30 * activity);
-            let mut pose = draw::AgentPose {
-                x: home.0 - w / 2.0,
-                y: home.1 - h / 2.0,
-                width: w,
-                height: h,
-                alpha: if self.stale { 0.65 } else { 1.0 },
+        let scale = self.scale();
+        let mut shown = HashSet::new();
+        let mut cards = Vec::new();
+        for entry in groups.iter().flat_map(|g| &g.entries) {
+            let Some(slot) = self.board.cards.get(&entry.thread_id).copied() else {
+                continue;
             };
             let is_focus = focus
                 .as_ref()
                 .is_some_and(|f| f.event.thread_id == entry.thread_id);
-            if let Some(f) = focus
-                .as_ref()
-                .filter(|f| f.event.thread_id == entry.thread_id)
-            {
+            if self.pending_new.contains(&entry.thread_id) && !is_focus {
+                continue;
+            }
+            shown.insert(entry.thread_id.clone());
+            let target = draw::AgentPose {
+                x: slot.rect.x,
+                y: slot.rect.y,
+                width: slot.rect.w,
+                height: slot.rect.h,
+                alpha: if self.stale { 0.65 } else { 1.0 },
+            };
+            let home = self.tween_pose(&entry.thread_id, target, now);
+            let mut pose = home;
+            if let Some(f) = focus.as_ref().filter(|_| is_focus) {
                 let elapsed = now.saturating_duration_since(f.started).as_secs_f32();
                 let intro = NEW_INTRO.as_secs_f32();
                 let end_in = intro + f.hold.as_secs_f32();
                 let end = end_in + RETURN.as_secs_f32();
                 let center = (self.size.0 as f32 * 0.5, self.size.1 as f32 * 0.52);
-                let focus_w = 888.0 * scale;
-                let focus_h = 444.0 * scale;
+                let focus_w = 880.0 * scale;
+                let focus_h = 420.0 * scale;
+                // The focus surface keeps its own aspect while it leaves and returns,
+                // so its text is never stretched to the shape of the board slot.
+                let w = home.width;
+                let h = w * focus_h / focus_w;
+                let home_c = (home.x + home.width / 2.0, home.y + home.height / 2.0);
                 let t = |v: f32| {
                     let x = v.clamp(0.0, 1.0);
                     x * x * (3.0 - 2.0 * x)
                 };
                 if elapsed < intro {
                     let p = t(elapsed / intro);
-                    let start_x = if f.event.kind == EventKind::New {
-                        self.size.0 as f32 + focus_w
+                    let start = if f.event.kind == EventKind::New {
+                        (self.size.0 as f32 + focus_w, center.1)
                     } else {
-                        home.0
+                        home_c
                     };
-                    let start_y = if f.event.kind == EventKind::New {
-                        center.1
-                    } else {
-                        home.1
-                    };
-                    pose.x = lerp(start_x - w / 2.0, center.0 - focus_w / 2.0, p);
-                    pose.y = lerp(start_y - h / 2.0, center.1 - focus_h / 2.0, p);
+                    pose.x = lerp(start.0 - w / 2.0, center.0 - focus_w / 2.0, p);
+                    pose.y = lerp(start.1 - h / 2.0, center.1 - focus_h / 2.0, p);
                     pose.width = lerp(w, focus_w, p);
                     pose.height = lerp(h, focus_h, p);
                     pose.alpha = if f.event.kind == EventKind::New {
@@ -682,11 +684,12 @@ impl AgentScreen {
                     pose.y = center.1 - focus_h / 2.0;
                     pose.width = focus_w;
                     pose.height = focus_h;
+                    pose.alpha = 1.0;
                     self.scrim_alpha = 0.46;
                 } else {
                     let p = t((elapsed - end_in) / (end - end_in));
-                    pose.x = lerp(center.0 - focus_w / 2.0, home.0 - w / 2.0, p);
-                    pose.y = lerp(center.1 - focus_h / 2.0, home.1 - h / 2.0, p);
+                    pose.x = lerp(center.0 - focus_w / 2.0, home_c.0 - w / 2.0, p);
+                    pose.y = lerp(center.1 - focus_h / 2.0, home_c.1 - h / 2.0, p);
                     pose.width = lerp(focus_w, w, p);
                     pose.height = lerp(focus_h, h, p);
                     pose.alpha = 1.0;
@@ -694,34 +697,40 @@ impl AgentScreen {
                 }
                 let id = self.id_map[&entry.thread_id];
                 self.focus_card_id = Some(id);
-                let before = if f.event.kind == EventKind::New {
-                    "新しく検出".to_string()
-                } else {
-                    f.event.before.clone()
-                };
                 let summary = if f.event.kind == EventKind::New {
                     format!("新しく検出 · {}", state_label(entry.state))
                 } else {
-                    format!("{} → {}", before, f.event.after)
+                    format!("{} → {}", f.event.before, f.event.after)
                 };
-                let content = self.content(entry, now, &snap, Some(summary));
-                self.ensure_surface(&entry.thread_id, &content, ctx.text);
+                let content = self.content(entry, now, Some(summary), false, true);
+                self.ensure_surface(&entry.thread_id, &content, (focus_w, focus_h), ctx.text);
             } else {
-                let content = self.content(entry, now, &snap, None);
-                self.ensure_surface(&entry.thread_id, &content, ctx.text);
+                let compact = slot.mode == layout::CardMode::Strip;
+                let content = self.content(entry, now, None, compact, false);
+                self.ensure_surface(
+                    &entry.thread_id,
+                    &content,
+                    (slot.rect.w, slot.rect.h),
+                    ctx.text,
+                );
             }
             cards.push((
                 entry.thread_id.clone(),
                 self.id_map[&entry.thread_id],
                 pose,
-                is_focus,
+                (is_focus, slot.z),
             ));
         }
+        self.surfaces.retain(|id, _| shown.contains(id));
+        self.content_keys.retain(|id, _| shown.contains(id));
+        let placed = &self.board.cards;
+        self.poses.retain(|id, _| placed.contains_key(id));
         if focus.is_none() {
             self.scrim_alpha = 0.0;
             self.focus_card_id = None;
         }
-        cards.sort_by_key(|(_, _, _, is_focus)| *is_focus);
+        // Strips first, then the full cards in front of them, then the focus.
+        cards.sort_by_key(|(_, _, _, order)| *order);
         self.scene_cards.clear();
         for (id, stable, pose, _) in cards {
             let surface = self.surfaces.get(&id).expect("surface prepared").clone();
@@ -732,7 +741,7 @@ impl AgentScreen {
                 pose,
             });
         }
-        self.id_map.retain(|id, _| self.home_slots.contains_key(id));
+        self.id_map.retain(|id, _| self.seen.contains_key(id));
         let scene = draw::AgentScene {
             size: self.size,
             background: Some(self.background.as_ref().unwrap().data()),
@@ -744,82 +753,59 @@ impl AgentScreen {
             ctx.canvas.pixmap.data_mut().copy_from_slice(frame.data());
         }
         self.text_dirty = false;
-        let _ = page_total;
+    }
+
+    fn tween_pose(&mut self, id: &str, target: draw::AgentPose, now: Instant) -> draw::AgentPose {
+        let tween = self.poses.entry(id.to_string()).or_insert(PoseTween {
+            from: target,
+            to: target,
+            started: now,
+        });
+        if tween.to != target {
+            *tween = PoseTween {
+                from: tween.at(now),
+                to: target,
+                started: now,
+            };
+        }
+        tween.at(now)
     }
 
     fn ensure_surface(
         &mut self,
         id: &str,
         content: &draw::AgentCardContent,
+        size: (f32, f32),
         text: &mut miharashi_render::TextEngine,
     ) {
-        let key = content_key_from_display(content);
+        let size = (
+            size.0.round().max(1.0) as u32,
+            size.1.round().max(1.0) as u32,
+        );
+        let key = format!(
+            "{}|{}x{}",
+            content_key_from_display(content),
+            size.0,
+            size.1
+        );
         if self.content_keys.get(id) != Some(&key) || !self.surfaces.contains_key(id) {
             let rev = self.revisions.entry(id.to_string()).or_insert(0);
             *rev = rev.wrapping_add(1);
             self.content_keys.insert(id.to_string(), key);
             self.surfaces.insert(
                 id.to_string(),
-                Arc::new(draw::render_card(
-                    content,
-                    (draw::CARD_WIDTH, draw::CARD_HEIGHT),
-                    text,
-                )),
+                Arc::new(draw::render_card(content, size, text)),
             );
         }
     }
 
-    fn activity(&self, entry: &AgentEntry, now: Instant) -> f32 {
-        if self.stale {
-            return self
-                .stale_activities
-                .get(&entry.thread_id)
-                .copied()
-                .unwrap_or(1.0);
-        }
-        if let Some((from, to, started)) = self.activity_tweens.get(&entry.thread_id) {
-            let t = (now.saturating_duration_since(*started).as_secs_f32()
-                / SIZE_TWEEN.as_secs_f32())
-            .clamp(0.0, 1.0);
-            return from + (to - from) * t;
-        }
-        self.activity_targets
-            .get(&entry.thread_id)
-            .copied()
-            .unwrap_or_else(|| self.activity_live(entry, now))
-    }
-    fn activity_live(&self, entry: &AgentEntry, now: Instant) -> f32 {
-        let age = now
-            .saturating_duration_since(*self.last_activity.get(&entry.thread_id).unwrap_or(&now))
-            .as_secs_f32();
-        let floor = self.floor(entry);
-        floor + (1.0 - floor) * 2f32.powf(-age / HALF_LIFE)
-    }
-    fn age_for_activity(&self, e: &AgentEntry, value: f32) -> f32 {
-        let floor = self.floor(e);
-        let r = ((value - floor) / (1.0 - floor)).clamp(0.0001, 1.0);
-        -HALF_LIFE * r.log2()
-    }
-    fn floor(&self, entry: &AgentEntry) -> f32 {
-        if matches!(
-            entry.state,
-            crate::agents::AgentState::Starting
-                | crate::agents::AgentState::Running
-                | crate::agents::AgentState::Monitoring
-        ) {
-            0.75
-        } else if attention(entry) {
-            0.60
-        } else {
-            0.0
-        }
-    }
     fn content(
         &self,
         e: &AgentEntry,
         now: Instant,
-        _snap: &AgentSnapshot,
         badge: Option<String>,
+        compact: bool,
+        focused: bool,
     ) -> draw::AgentCardContent {
         let state = draw_state(e.state);
         let progress = e
@@ -847,19 +833,19 @@ impl AgentScreen {
             detail = format!("前回取得時 · {detail}");
         }
         let active = self.last_activity.get(&e.thread_id).copied().unwrap_or(now);
-        let age = Some(if now.saturating_duration_since(active).as_secs() < 60 {
-            "最後の動き 1分未満".into()
+        let secs = now.saturating_duration_since(active).as_secs();
+        let age = Some(if secs < 60 {
+            "1分未満".into()
+        } else if secs < 3600 {
+            format!("{}分", secs / 60)
         } else {
-            format!(
-                "最後の動き {} 分",
-                now.saturating_duration_since(active).as_secs() / 60
-            )
+            format!("{}時間", secs / 3600)
         });
         draw::AgentCardContent {
-            project: if e.project_title.is_empty() {
-                short(&e.project_id)
-            } else {
-                e.project_title.clone()
+            project: match (focused, e.project_title.is_empty()) {
+                (false, _) => String::new(),
+                (true, true) => short(&e.project_id),
+                (true, false) => e.project_title.clone(),
             },
             title: if e.title.is_empty() {
                 "無題".into()
@@ -877,6 +863,7 @@ impl AgentScreen {
             age,
             progress,
             badge: None,
+            compact,
         }
     }
 }
@@ -888,8 +875,9 @@ impl Screen for AgentScreen {
     fn title(&self) -> &'static str {
         "T3 AGENTS"
     }
-    fn on_enter(&mut self, now: Instant) {
-        self.page_due = now + PAGE_SECS;
+    fn on_enter(&mut self, _: Instant) {
+        // Show the current layout at once on return instead of sliding to it.
+        self.poses.clear();
         self.text_dirty = true;
         self.background_dirty = true;
     }
@@ -906,6 +894,7 @@ impl Screen for AgentScreen {
             self.paused_at = Some(now);
             self.background_dirty = true;
         } else if !self.presentable && can_present {
+            self.poses.clear();
             self.queue.clear();
             self.pending_new.clear();
             self.focus = None;
@@ -919,43 +908,26 @@ impl Screen for AgentScreen {
         self.last_now = now;
         let mut redraw = self.sync(&world.agents, now);
         redraw |= self.advance(now);
-        if self.presentable && now >= self.activity_layout_due {
-            self.activity_layout_due = now + Duration::from_secs(15);
-            redraw = true;
-            if !self.stale {
-                for e in &self.entries {
-                    let from = self.activity(e, now);
-                    let to = self.activity_live(e, now);
-                    self.activity_targets.insert(e.thread_id.clone(), to);
-                    if (from - to).abs() > 0.001 {
-                        self.activity_tweens
-                            .insert(e.thread_id.clone(), (from, to, now));
-                    }
-                }
+        // Land each finished move on an exact frame, and keep drawing while any card moves.
+        let mut moving = false;
+        for tween in self.poses.values_mut() {
+            if !tween.moving() {
+                continue;
+            }
+            if now.saturating_duration_since(tween.started) >= MOVE_TWEEN {
+                tween.from = tween.to;
+                redraw = true;
+            } else {
+                moving = true;
             }
         }
-        let done = self
-            .activity_tweens
-            .iter()
-            .filter(|(_, (_, _, started))| now.saturating_duration_since(*started) >= SIZE_TWEEN)
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        if !done.is_empty() {
-            for id in done {
-                self.activity_tweens.remove(&id);
-            }
-            redraw = true;
-        }
-        if self.presentable && !self.stale && !self.activity_tweens.is_empty() {
+        if self.presentable && moving {
             redraw = true;
         }
         if self.presentable && now >= self.header_due {
             self.header_due = now + Duration::from_secs(1);
             self.background_dirty = true;
             redraw = true;
-        }
-        if self.entries.len() > PAGE_SIZE && self.focus.is_none() {
-            redraw |= now >= self.page_due;
         }
         redraw
     }
@@ -998,7 +970,7 @@ impl Screen for AgentScreen {
                 .focus
                 .as_ref()
                 .is_some_and(|f| matches!(f.stage, FocusStage::In | FocusStage::Out))
-                || !self.activity_tweens.is_empty())
+                || self.poses.values().any(PoseTween::moving))
     }
     fn page(&self) -> Option<&'static str> {
         Some("OVERVIEW")
@@ -1015,9 +987,9 @@ fn draw_background(
     canvas: &mut Canvas,
     text: &mut miharashi_render::TextEngine,
     snap: &AgentSnapshot,
-    total: usize,
-    page: usize,
-    pages: usize,
+    groups: &[Group],
+    board: &layout::Layout,
+    scale: f32,
     overflow: usize,
     now: Instant,
     stale_secs: u64,
@@ -1145,16 +1117,15 @@ fn draw_background(
         text.draw(canvas, &format!("{label} {count}"), x, 174.0, 20.0, color);
         x += 175.0;
     }
+    let total = snap.entries.len();
     let mut count = if snap.synchronized {
-        format!("{total} スレッド · {page}/{pages} ボード")
+        format!("{total} スレッド · {} プロジェクト", groups.len())
     } else {
         "-- スレッド".into()
     };
-    if total > PAGE_SIZE {
-        count.push_str(&format!(
-            " · 要確認 {}件",
-            snap.entries.iter().filter(|e| attention(e)).count()
-        ));
+    let urgent = snap.entries.iter().filter(|e| attention(e)).count();
+    if urgent > 0 {
+        count.push_str(&format!(" · 要確認 {urgent} 件"));
     }
     if overflow > 0 {
         count.push_str(&format!(" · ほか {overflow} 件更新"));
@@ -1169,6 +1140,81 @@ fn draw_background(
             28.0,
             [143, 163, 183, 255],
         );
+    }
+    for lane in &board.lanes {
+        let Some(group) = groups.get(lane.group) else {
+            continue;
+        };
+        let r = lane.rect;
+        canvas.fill_rect(
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            miharashi_render::canvas::rgba(120, 150, 190, 12),
+        );
+        canvas.stroke_rect(
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            1.0,
+            miharashi_render::canvas::rgba(120, 150, 190, 28),
+        );
+        let head = lane.head;
+        let name_size = 28.0 * scale;
+        let count_size = 23.0 * scale;
+        let count = group.entries.len().to_string();
+        let count_w = text.measure(&count, count_size);
+        let name = fit_header_label(
+            &group.label,
+            (head.w - count_w - 24.0 * scale).max(40.0),
+            name_size,
+        );
+        text.draw(
+            canvas,
+            &name,
+            head.x,
+            head.y,
+            name_size,
+            [223, 231, 240, 255],
+        );
+        let mut x = head.x + text.measure(&name, name_size) + 10.0 * scale;
+        text.draw(
+            canvas,
+            &count,
+            x,
+            head.y + 4.0 * scale,
+            count_size,
+            [143, 163, 183, 255],
+        );
+        x += count_w + 18.0 * scale;
+        // One dot per thread, most important first, as many as the header has room for.
+        let r_dot = 6.5 * scale;
+        let cy = head.y + name_size * 0.62;
+        for e in &group.entries {
+            if x + r_dot * 2.0 > head.x + head.w {
+                break;
+            }
+            let [cr, cg, cb] = draw_state(e.state).color();
+            canvas.fill_circle(
+                x + r_dot,
+                cy,
+                r_dot,
+                miharashi_render::canvas::rgba(cr, cg, cb, 255),
+            );
+            x += r_dot * 2.0 + 7.0 * scale;
+        }
+        for (mx, my, hidden) in &lane.more {
+            text.draw(
+                canvas,
+                &format!("ほか {hidden} 件"),
+                mx + 12.0 * scale,
+                my + 2.0 * scale,
+                22.0 * scale,
+                [143, 163, 183, 255],
+            );
+        }
     }
     text.draw(
         canvas,
@@ -1194,18 +1240,6 @@ fn draw_background(
     );
 }
 
-fn home_center(size: (u32, u32), slot: usize, scale: f32) -> (f32, f32) {
-    let (w, h) = (size.0 as f32, size.1 as f32);
-    let card_h = 300.0 * scale;
-    let top = h * 0.19 + card_h * 0.5;
-    let bottom = h - 72.0 - card_h * 0.5 - 18.0;
-    let row_y = if (slot % PAGE_SIZE) / 3 == 0 {
-        top
-    } else {
-        bottom.max(top)
-    };
-    (w * [1.0 / 6.0, 0.5, 5.0 / 6.0][slot % 3], row_y)
-}
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
@@ -1263,6 +1297,14 @@ fn attention(e: &AgentEntry) -> bool {
                 | crate::agents::AgentState::Input
                 | crate::agents::AgentState::Plan
         )
+}
+fn running(e: &AgentEntry) -> bool {
+    matches!(
+        e.state,
+        crate::agents::AgentState::Starting
+            | crate::agents::AgentState::Running
+            | crate::agents::AgentState::Monitoring
+    )
 }
 fn draw_state(s: crate::agents::AgentState) -> draw::AgentState {
     match s {
@@ -1331,8 +1373,16 @@ fn content_key(e: &AgentEntry) -> String {
 }
 fn content_key_from_display(c: &draw::AgentCardContent) -> String {
     format!(
-        "{:?}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}",
-        c.state, c.project, c.title, c.detail, c.provider_model, c.age, c.progress, c.badge
+        "{:?}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}",
+        c.state,
+        c.project,
+        c.title,
+        c.detail,
+        c.provider_model,
+        c.age,
+        c.progress,
+        c.badge,
+        c.compact
     )
 }
 
@@ -1365,7 +1415,7 @@ mod tests {
             ..Default::default()
         };
         s.sync(&a, now);
-        let slot = s.home_slots["b"];
+        let slot = s.seen["b"];
         a.entries = vec![
             entry("a", AgentState::Running),
             entry("c", AgentState::Idle),
@@ -1373,7 +1423,7 @@ mod tests {
         ]
         .into();
         s.sync(&a, now);
-        assert_eq!(s.home_slots["b"], slot);
+        assert_eq!(s.seen["b"], slot);
     }
     #[test]
     fn same_thread_changes_coalesce_and_focus_is_single() {
@@ -1505,112 +1555,98 @@ mod tests {
         assert!(s.queue.is_empty());
     }
     #[test]
-    fn overflow_rotates_without_duplicate_home_slots() {
+    fn every_thread_is_on_the_single_board_grouped_by_project() {
         let now = Instant::now();
-        let mut s = AgentScreen::new((1920, 1080), false, 30);
-        let entries = (0..13)
-            .map(|i| entry(&format!("{i}"), AgentState::Idle))
-            .collect::<Vec<_>>();
-        let snap = AgentSnapshot {
-            entries: entries.into(),
-            synchronized: true,
-            ..Default::default()
-        };
-        s.sync(&snap, now);
-        let mut slots = s.home_slots.values().copied().collect::<Vec<_>>();
-        slots.sort();
-        slots.dedup();
-        assert_eq!(slots.len(), 13);
-        assert_eq!(s.page_count(), 3);
-        s.page = 2;
-        assert_eq!(s.visible_entries().len(), 1);
-    }
-    #[test]
-    fn repeated_remove_and_add_reuses_only_free_homes_without_duplicate_pages() {
-        let now = Instant::now();
-        let mut s = AgentScreen::new((1920, 1080), false, 30);
-        let entries = (0..13)
+        let mut s = AgentScreen::new((2560, 1080), false, 30);
+        let mut entries = (0..13)
             .map(|i| entry(&format!("a{i}"), AgentState::Idle))
             .collect::<Vec<_>>();
+        for (i, e) in entries.iter_mut().enumerate() {
+            e.project_id = format!("p{}", i % 3);
+        }
         let mut snap = AgentSnapshot {
             entries: entries.clone().into(),
             synchronized: true,
             ..Default::default()
         };
         s.sync(&snap, now);
-        let gone = entries
+        let groups = s.groups();
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups.iter().map(|g| g.entries.len()).sum::<usize>(), 13);
+        let board = s.layout(&groups);
+        assert_eq!(board.cards.len(), 13);
+        let lane_of = |id: &str| {
+            let x = board.cards[id].rect.x;
+            board
+                .lanes
+                .iter()
+                .position(|l| x >= l.rect.x && x < l.rect.x + l.rect.w)
+                .unwrap()
+        };
+        assert_eq!(lane_of("a0"), lane_of("a3"));
+        assert_ne!(lane_of("a0"), lane_of("a1"));
+
+        // Removing and adding threads keeps one entry per thread and forgets the gone ones.
+        snap.entries = entries
             .iter()
-            .take(6)
-            .map(|e| e.thread_id.clone())
-            .collect::<std::collections::HashSet<_>>();
-        snap.entries = entries.iter().skip(6).cloned().collect::<Vec<_>>().into();
-        s.sync(&snap, now);
-        let add = (0..6)
-            .map(|i| entry(&format!("b{i}"), AgentState::Idle))
-            .collect::<Vec<_>>();
-        snap.entries = snap
-            .entries
-            .iter()
+            .skip(6)
             .cloned()
-            .chain(add)
+            .chain((0..6).map(|i| entry(&format!("b{i}"), AgentState::Idle)))
             .collect::<Vec<_>>()
             .into();
         s.sync(&snap, now);
-        let mut slots = s.home_slots.values().copied().collect::<Vec<_>>();
-        slots.sort_unstable();
-        slots.dedup();
-        assert_eq!(slots.len(), 13);
-        assert_eq!(s.page_count(), 3);
-        assert!(gone.iter().all(|id| !s.home_slots.contains_key(id)));
-        let mut paged = HashSet::new();
-        for p in 0..s.page_count() {
-            s.page = p;
-            let visible = s.visible_entries();
-            assert!(visible.len() <= PAGE_SIZE);
-            let unique = visible
-                .iter()
-                .map(|(e, _)| e.thread_id.as_str())
-                .collect::<HashSet<_>>();
-            assert_eq!(visible.len(), unique.len());
-            assert!(
-                visible
-                    .iter()
-                    .all(|(e, _)| paged.insert(e.thread_id.clone()))
-            );
-        }
-        assert_eq!(paged.len(), 13);
+        assert_eq!(s.seen.len(), 13);
+        assert!((0..6).all(|i| !s.seen.contains_key(&format!("a{i}"))));
+        assert_eq!(s.layout(&s.groups()).cards.len(), 13);
     }
     #[test]
-    fn stale_freezes_card_scale_and_live_recovery_is_quiet() {
+    fn attention_comes_first_in_its_project_then_running_then_recent() {
         let now = Instant::now();
         let mut s = AgentScreen::new((1920, 1080), false, 30);
-        let e = entry("a", AgentState::Idle);
         let snap = AgentSnapshot {
-            entries: vec![e.clone()].into(),
-            last_success_mono: Some(now),
+            entries: vec![
+                entry("idle", AgentState::Idle),
+                entry("run", AgentState::Running),
+                entry("ask", AgentState::Approval),
+                entry("done", AgentState::Completed),
+            ]
+            .into(),
             synchronized: true,
             ..Default::default()
         };
         s.sync(&snap, now);
         s.last_activity
-            .insert("a".into(), now - Duration::from_secs(90));
-        let before = s.activity(&e, now);
+            .insert("done".into(), now + Duration::from_secs(5));
+        let order = s.groups()[0]
+            .entries
+            .iter()
+            .map(|e| e.thread_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["ask", "run", "done", "idle"]);
+    }
+    #[test]
+    fn stale_recovery_is_quiet() {
+        let now = Instant::now();
+        let mut s = AgentScreen::new((1920, 1080), false, 30);
+        let snap = AgentSnapshot {
+            entries: vec![entry("a", AgentState::Idle)].into(),
+            last_success_mono: Some(now),
+            synchronized: true,
+            ..Default::default()
+        };
+        s.sync(&snap, now);
         let mut stale = snap.clone();
         stale.connection = crate::agents::AgentConnection::Retrying;
         stale.last_success_mono = Some(now - Duration::from_secs(31));
         s.sync(&stale, now);
-        let frozen = s.activity(&e, now);
-        s.last_activity
-            .insert("a".into(), now - Duration::from_secs(600));
-        assert!((s.activity(&e, now + Duration::from_secs(2)) - frozen).abs() < 0.001);
-        assert!((before - frozen).abs() < 0.01);
+        assert!(s.stale);
         let mut live = stale;
         live.connection = crate::agents::AgentConnection::Live;
         live.last_success_mono = Some(now + Duration::from_secs(3));
         s.sync(&live, now + Duration::from_secs(3));
         assert!(!s.stale);
         assert!(s.queue.is_empty());
-        assert!((s.activity(&e, now + Duration::from_secs(3)) - frozen).abs() < 0.01);
+        assert!(s.focus.is_none());
     }
     #[test]
     fn animation_runs_only_during_motion_phases() {
@@ -1641,53 +1677,33 @@ mod tests {
         assert!(!Screen::animating(&s));
     }
     #[test]
-    fn cached_card_surface_is_reused_and_only_visible_pages_stay_rasterized() {
+    fn cached_card_surface_is_reused_and_gone_threads_are_released() {
         let now = Instant::now();
         let mut s = AgentScreen::new((1920, 1080), false, 30);
         let entries = (0..13)
             .map(|i| entry(&format!("t{i}"), AgentState::Idle))
             .collect::<Vec<_>>();
-        let snap = AgentSnapshot {
-            entries: entries.into(),
+        let mut snap = AgentSnapshot {
+            entries: entries.clone().into(),
             synchronized: true,
             ..Default::default()
         };
-        let world = crate::screen::World {
-            agents: snap.clone(),
-            ..Default::default()
-        };
         s.sync(&snap, now);
-        let mut canvas = Canvas::new(1920, 1080);
-        let mut text = miharashi_render::TextEngine::new("Noto Sans CJK JP");
-        let (rev, surface) = {
-            let mut ctx = RenderContext {
-                canvas: &mut canvas,
-                text: &mut text,
-                world: &world,
-                covered: false,
-                force_overlay: true,
-            };
-            s.render(&mut ctx);
-            let rev = s.revisions["t0"];
-            let surface = s.surfaces["t0"].clone();
-            s.render(&mut ctx);
-            (rev, surface)
+        let rev = {
+            render_for_test(&mut s, &snap, now);
+            s.revisions["t0"]
         };
+        let surface = s.surfaces["t0"].clone();
+        render_for_test(&mut s, &snap, now);
         assert_eq!(s.revisions["t0"], rev);
         assert!(Arc::ptr_eq(&s.surfaces["t0"], &surface));
-        assert!(s.surfaces.len() <= PAGE_SIZE);
-        s.page = 1;
-        let mut ctx = RenderContext {
-            canvas: &mut canvas,
-            text: &mut text,
-            world: &world,
-            covered: false,
-            force_overlay: true,
-        };
-        s.render(&mut ctx);
-        assert!(s.surfaces.len() <= PAGE_SIZE);
-        assert!(s.surfaces.contains_key("t6"));
-        assert!(!s.surfaces.contains_key("t0"));
+        assert_eq!(s.surfaces.len(), s.board.cards.len());
+
+        snap.entries = entries[..3].to_vec().into();
+        s.sync(&snap, now + Duration::from_secs(1));
+        render_for_test(&mut s, &snap, now + Duration::from_secs(1));
+        assert_eq!(s.surfaces.len(), 3);
+        assert!(!s.surfaces.contains_key("t5"));
     }
     #[test]
     fn change_descriptions_keep_progress_and_title_differences() {
@@ -1892,18 +1908,13 @@ mod tests {
     }
 
     #[test]
-    fn attention_pinning_keeps_existing_home_pose_when_more_cards_become_attention() {
+    fn reordered_cards_slide_to_their_new_place_and_cpu_does_not_claim_gpu_animation() {
         let now = Instant::now();
         let mut screen = AgentScreen::new((1920, 1080), false, 30);
         let mut entries = vec![
             entry("a", AgentState::Running),
-            entry("b", AgentState::Approval),
-            entry("c", AgentState::Input),
-            entry("d", AgentState::Error),
-            entry("e", AgentState::Completed),
-            entry("f", AgentState::Running),
+            entry("b", AgentState::Idle),
         ];
-        entries[2].has_pending_user_input = true;
         let mut snap = AgentSnapshot {
             entries: entries.clone().into(),
             synchronized: true,
@@ -1911,50 +1922,62 @@ mod tests {
         };
         screen.sync(&snap, now);
         let before = render_for_test(&mut screen, &snap, now);
-        let f_id = screen.id_map["f"];
-        let before_pose = before.iter().find(|card| card.id == f_id).unwrap().pose;
-        assert_eq!(screen.pin_slots["b"], 1);
-        assert_eq!(screen.pin_slots["c"], 2);
-        assert_eq!(screen.pin_slots["d"], 3);
+        let b_id = screen.id_map["b"];
+        let pose = |cards: &[draw::AgentCardSurface]| {
+            cards.iter().find(|card| card.id == b_id).unwrap().pose
+        };
+        let start = pose(&before);
 
-        entries[5].state = AgentState::Approval;
+        entries[1].state = AgentState::Approval;
         snap.entries = entries.into();
-        screen.sync(&snap, now + Duration::from_secs(1));
-        let after = render_for_test(&mut screen, &snap, now + Duration::from_secs(1));
-        let after_pose = after.iter().find(|card| card.id == f_id).unwrap().pose;
-        assert_eq!(screen.pin_slots["f"], 5);
-        assert_eq!(before_pose.x, after_pose.x);
-        assert_eq!(before_pose.y, after_pose.y);
+        let world = crate::screen::World {
+            agents: snap.clone(),
+            ..Default::default()
+        };
+        screen.tick(&world, now + Duration::from_secs(1));
+        let first = render_for_test(&mut screen, &snap, now + Duration::from_secs(1));
+        assert_eq!(
+            pose(&first).y,
+            start.y,
+            "the move starts where the card was"
+        );
+        assert!(!Screen::animating(&screen));
+        assert!(screen.tick(&world, now + Duration::from_millis(1_250)));
+        let mid = render_for_test(&mut screen, &snap, now + Duration::from_millis(1_250));
+        assert!(pose(&mid).y < start.y);
+        assert!(screen.tick(&world, now + Duration::from_millis(1_600)));
+        assert!(screen.poses.values().all(|t| !t.moving()));
+        let end = render_for_test(&mut screen, &snap, now + Duration::from_millis(1_600));
+        assert!(pose(&end).y < pose(&mid).y);
     }
 
     #[test]
-    fn activity_size_uses_a_short_tween_and_cpu_does_not_claim_gpu_animation() {
+    fn a_card_moving_behind_others_is_rasterized_again_as_a_strip() {
         let now = Instant::now();
         let mut screen = AgentScreen::new((1920, 1080), false, 30);
-        let snap = AgentSnapshot {
-            entries: vec![entry("runner", AgentState::Running)].into(),
-            synchronized: true,
-            ..Default::default()
-        };
-        screen.sync(&snap, now);
-        let before = screen.activity(&snap.entries[0], now);
-        let world = crate::screen::World {
-            agents: snap,
-            ..Default::default()
-        };
-        assert!(screen.tick(&world, now + Duration::from_secs(16)));
-        let mid = screen.activity(
-            &world.agents.entries[0],
-            now + Duration::from_millis(16_250),
+        let mut text = miharashi_render::TextEngine::new("Noto Sans CJK JP");
+        let e = entry("a", AgentState::Idle);
+        let full = screen.content(&e, now, None, false, false);
+        screen.ensure_surface("a", &full, (400.0, 210.0), &mut text);
+        let (rev, surface) = (screen.revisions["a"], screen.surfaces["a"].clone());
+        let strip = screen.content(&e, now, None, true, false);
+        screen.ensure_surface("a", &strip, (400.0, 210.0), &mut text);
+        assert_ne!(screen.revisions["a"], rev);
+        assert!(!Arc::ptr_eq(&screen.surfaces["a"], &surface));
+    }
+
+    #[test]
+    fn focused_card_names_its_project_and_board_cards_do_not() {
+        let now = Instant::now();
+        let screen = AgentScreen::new((1920, 1080), false, 30);
+        let e = entry("a", AgentState::Running);
+        assert_eq!(screen.content(&e, now, None, false, false).project, "");
+        assert_eq!(
+            screen
+                .content(&e, now, Some("x".into()), false, true)
+                .project,
+            "project"
         );
-        let end = screen.activity(
-            &world.agents.entries[0],
-            now + Duration::from_millis(16_600),
-        );
-        assert!(mid < before && mid > end);
-        assert!(!Screen::animating(&screen));
-        assert!(screen.tick(&world, now + Duration::from_millis(16_600)));
-        assert!(screen.activity_tweens.is_empty());
     }
 
     #[test]
@@ -1983,7 +2006,6 @@ mod tests {
         assert_eq!(screen.queue.len(), MAX_QUEUE);
         let overflow_id = format!("n{}", MAX_QUEUE);
         assert!(!screen.pending_new.contains(&overflow_id));
-        screen.page = screen.page_count() - 1;
         let cards = render_for_test(&mut screen, &snap, now);
         assert!(
             cards
