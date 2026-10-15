@@ -92,6 +92,8 @@ pub trait Screen {
         self.render(ctx);
         Composite::Canvas
     }
+    /// 演出などで別のものを描いたあと、次の描画で全部を描き直させる(GPU 経路の背景や重ね絵)。
+    fn invalidate(&mut self) {}
     /// 毎フレーム動かし続けているか(`App::animating`)。
     fn animating(&self) -> bool {
         false

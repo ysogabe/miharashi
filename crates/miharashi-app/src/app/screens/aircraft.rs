@@ -147,6 +147,11 @@ impl Screen for AircraftScreen {
         }
     }
 
+    fn invalidate(&mut self) {
+        self.drawn = None;
+        self.radar_bg = None;
+    }
+
     fn animating(&self) -> bool {
         self.gpu && self.visible
     }

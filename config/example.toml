@@ -86,6 +86,10 @@
 [ui]
 # font = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
 # start_screen = "status"  # status / photo / aircraft
+# 焼き付き対策: refresh_minutes 分ごとに、refresh_screens の画面をグリッチ → 暗転 → 再表示(約 1.6 秒)で
+# 描き直す。0 なら行わない。動かない線が多い画面に使う(状況画面も入れるなら ["aircraft", "status"])
+# refresh_minutes = 5
+# refresh_screens = ["aircraft"]
 
 [panel]
 # 手元の操作パネル(Echo Show 5 など)向けの API(docs/panel/DESIGN.md)。既定は無効。
