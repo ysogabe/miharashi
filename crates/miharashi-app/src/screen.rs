@@ -1,9 +1,108 @@
 //! 実行ループ(runtime)と画面ロジックの境界。runtime は `App` だけを知る。
+//! `App` を実装する `ScreenManager`(app/manager.rs)と、個々の画面(`Screen`)の契約もここに置く
+//! (docs/DESIGN-screen-interface.md §3)。
 use image::DynamicImage;
 use miharashi_render::aircraft::RadarGeom;
 use miharashi_render::photo_layout::PhotoLayout;
-use miharashi_render::{Canvas, Pixmap};
+use miharashi_render::screens::Snapshot;
+use miharashi_render::{Canvas, Pixmap, TextEngine};
 use std::time::Instant;
+
+/// 画面の識別子。操作パネルとの約束なので、決めたら変えない(docs/DESIGN-screens.md §2)。
+pub type ScreenId = &'static str;
+
+/// 画面に渡す操作(ScreenManager が共通操作を取り除いたあとの意味)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenAction {
+    /// 5: 決定・詳細(状況画面のページ切替)
+    Select,
+    /// 前の項目(写真画面の前の写真)
+    Up,
+    /// 次の項目(写真画面の次の写真)
+    Down,
+}
+
+/// 画面が操作を受けた結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// 画面が処理した
+    Consumed,
+    /// 画面では使わない(ScreenManager が共通操作として扱う)
+    Ignored,
+}
+
+/// 写真フィードの状態。写真画面が書き、状況画面の HEALTH と操作パネルが読む。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeedState {
+    /// 状況画面の HEALTH に出す状態("online" / "再接続中")。まだ何も届いていなければ None
+    pub status: Option<&'static str>,
+    /// 写真の (何枚目, 全体の枚数)。まだ写真が無ければ None
+    pub position: Option<(usize, usize)>,
+    /// 取得元に接続できているか
+    pub online: bool,
+    /// 接続できないときの知らせ(状態ログの feed=)
+    pub notice: Option<String>,
+}
+
+/// 画面が読む共有データ。書くのは ScreenManager と Provider だけで、画面は読むだけ。
+#[derive(Default)]
+pub struct World {
+    /// 実測値と時刻(日付・時刻は 1 秒ごとに ScreenManager が設定する)
+    pub system: Snapshot,
+    pub photo_feed: FeedState,
+}
+
+/// 取得した値を `World` に写す。毎周期呼ぶので、ブロックしない。
+pub trait Provider {
+    fn update(&mut self, world: &mut World);
+}
+
+/// 描画に必要なものをまとめて画面に渡す。
+pub struct RenderContext<'a> {
+    pub canvas: &'a mut Canvas,
+    pub text: &'a mut TextEngine,
+    pub world: &'a World,
+    /// アラートを重ねるか。重ねるときは ScreenManager が画面の上に描く
+    pub alert: bool,
+    /// GPU 経路の重ね絵を描き直させる(アラートが開いた・閉じた、キーが押された)
+    pub force_overlay: bool,
+}
+
+/// 登録する画面 1 つ。画面の中の状態(ページ、写真)と、画面の中の操作、描画を受け持つ。
+pub trait Screen {
+    fn id(&self) -> ScreenId;
+    fn title(&self) -> &'static str;
+    /// 表示される直前。
+    fn on_enter(&mut self, _now: Instant) {}
+    /// 別の画面へ移る直前。
+    fn on_leave(&mut self, _now: Instant) {}
+    /// 表示中かどうかに関係なく、毎周期呼ぶ(写真の受信など)。
+    /// 戻り値: 再描画が必要か(表示中の画面のものだけ使う)。
+    fn tick(&mut self, _world: &World, _now: Instant) -> bool {
+        false
+    }
+    /// 画面の中の操作。
+    fn handle_action(&mut self, _action: ScreenAction, _now: Instant) -> Outcome {
+        Outcome::Ignored
+    }
+    /// CPU で完成画面を描く。
+    fn render(&mut self, ctx: &mut RenderContext<'_>);
+    /// GPU 経路(`App::render_composite`)の描画。既定は `render` と同じで、Canvas が完成画面になる。
+    fn render_composite(&mut self, ctx: &mut RenderContext<'_>) -> Composite<'_> {
+        self.render(ctx);
+        Composite::Canvas
+    }
+    /// 毎フレーム動かし続けているか(`App::animating`)。
+    fn animating(&self) -> bool {
+        false
+    }
+    /// 操作パネルに出す画面の中のページ名(状況画面の OVERVIEW / DETAILS)。
+    fn page(&self) -> Option<&'static str> {
+        None
+    }
+    /// 状態ログに足す `k=v`(写真画面の photo=12)。表示中かどうかに関係なく出す。
+    fn stats(&self, _out: &mut Vec<(&'static str, String)>) {}
+}
 
 /// 画面ロジックに渡すキー操作。今の動作に必要な最小限。#5 で設計メモ(DESIGN-screen-interface)に沿って拡張する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
