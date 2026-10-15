@@ -1,6 +1,7 @@
 //! 画面の登録と切り替え、メニュー、アラート層の重ね描き、共有データ(`World`)の更新。runtime からは `App` として見える。
 //! キーは docs/DESIGN-screens.md §4.1: 4/6 = 画面の巡回、0 = メニュー、5・8/2 = 表示中の画面の中の操作。
-//! 動かない線が多い画面には、数分に一度、焼き付き対策の演出(グリッチ → 暗転 → 再表示)を入れる。
+//! 動かない線が多い画面には、数分に一度、焼き付き対策の演出(グリッチ → 暗転 → 再表示)を入れ、
+//! そのたびに画面全体の位置を数 px ずらす。
 use super::DataSource;
 use crate::screen::{
     App, Composite, KeyPress, PanelView, Provider, RenderContext, Screen, ScreenAction, ScreenInfo,
@@ -42,6 +43,8 @@ pub struct ScreenManager {
     refreshing: Option<(Instant, u32)>,
     /// 演出の元にする画面(演出の最初に 1 回だけ描く)
     clean: Option<Canvas>,
+    /// 演出をした回数。画面全体をずらす位置(`glitch::shift_offset`)もこれで決める
+    refreshes: usize,
     pub ticks: u64,
     pub keys: u64,
 }
@@ -80,6 +83,7 @@ impl ScreenManager {
             refresh_due: now,
             refreshing: None,
             clean: None,
+            refreshes: 0,
             ticks: 0,
             keys: 0,
         };
@@ -139,9 +143,21 @@ impl ScreenManager {
             self.reset_refresh(now);
         } else if now >= self.refresh_due {
             self.refreshing = Some((now, 0));
+            // 位置を次へ。乱れと暗転のあいだに動くので、ずれた瞬間は目立たない
+            self.refreshes += 1;
             return true;
         }
         false
+    }
+
+    /// 表示中の画面をずらす量 [px]。焼き付き対策の対象の画面だけ。
+    fn offset(&self, canvas_h: u32) -> (i32, i32) {
+        match &self.refresh {
+            Some((_, ids)) if ids.iter().any(|id| id == self.screen_id()) => {
+                glitch::shift_offset(self.refreshes, canvas_h)
+            }
+            _ => (0, 0),
+        }
     }
 
     /// 演出の 1 フレームを描く。元の画面は最初に 1 回だけ描いて取っておく。
@@ -156,6 +172,7 @@ impl ScreenManager {
             .as_ref()
             .is_none_or(|c| (c.width(), c.height()) != (canvas.width(), canvas.height()))
         {
+            let (dx, dy) = self.offset(canvas.height());
             let mut c = Canvas::new(canvas.width(), canvas.height());
             let mut ctx = RenderContext {
                 canvas: &mut c,
@@ -165,6 +182,7 @@ impl ScreenManager {
                 force_overlay: true,
             };
             self.screens[self.current].render(&mut ctx);
+            glitch::shift(&mut c, dx, dy);
             self.clean = Some(c);
         }
         glitch::refresh_frame(canvas, self.clean.as_ref().expect("上で描いた"), t, seed);
@@ -315,6 +333,7 @@ impl ScreenManager {
             return self.render_refresh(canvas);
         }
         let titles = self.titles();
+        let (dx, dy) = self.offset(canvas.height());
         let Self {
             screens,
             current,
@@ -332,6 +351,7 @@ impl ScreenManager {
             force_overlay: true,
         };
         screens[*current].render(&mut ctx);
+        glitch::shift(ctx.canvas, dx, dy);
         layers(
             ctx.canvas,
             ctx.text,
@@ -354,6 +374,7 @@ impl ScreenManager {
         }
         let force_overlay = std::mem::take(&mut self.force_overlay);
         let titles = self.titles();
+        let (dx, dy) = self.offset(canvas.height());
         let Self {
             screens,
             current,
@@ -370,7 +391,26 @@ impl ScreenManager {
             covered: alert.is_some() || menu.is_some(),
             force_overlay,
         };
-        let comp = screens[*current].render_composite(&mut ctx);
+        let mut comp = screens[*current].render_composite(&mut ctx);
+        // 焼き付き対策の位置のずらし。写真(重ね絵つき)は対象にしない
+        match &mut comp {
+            Composite::Canvas => glitch::shift(ctx.canvas, dx, dy),
+            Composite::Radar {
+                background_changed,
+                geom,
+                ..
+            } => {
+                if *background_changed {
+                    glitch::shift(ctx.canvas, dx, dy);
+                }
+                let (fx, fy) = (dx as f32, dy as f32);
+                geom.center = (geom.center.0 + fx, geom.center.1 + fy);
+                for b in &mut geom.blips {
+                    (b.x, b.y) = (b.x + fx, b.y + fy);
+                }
+            }
+            Composite::Photo { .. } => {}
+        }
         let draw_alert = match &comp {
             Composite::Canvas => true,
             Composite::Photo {
@@ -469,6 +509,9 @@ impl App for ScreenManager {
         ]);
         if let Some(p) = self.screens[self.current].page() {
             out.push(("page", p.to_lowercase()));
+        }
+        if self.refresh.is_some() {
+            out.push(("refreshes", self.refreshes.to_string()));
         }
         out
     }

@@ -119,6 +119,58 @@ fn shift_row(out: &mut [u8], line: &[u8], dx: i32) {
     }
 }
 
+/// 焼き付き対策で画面全体をずらす位置の順番(1080p での px。`shift_offset` で画面の高さに合わせる)。
+/// 演出のたびに 1 つ進め、9 か所を回る。
+const SHIFTS: [(i32, i32); 9] = [
+    (0, 0),
+    (6, 0),
+    (6, 6),
+    (0, 6),
+    (-6, 6),
+    (-6, 0),
+    (-6, -6),
+    (0, -6),
+    (6, -6),
+];
+
+/// `n` 回目の位置(画面の px)。
+pub fn shift_offset(n: usize, canvas_h: u32) -> (i32, i32) {
+    let (x, y) = SHIFTS[n % SHIFTS.len()];
+    let k = scale(canvas_h);
+    ((x as f32 * k).round() as i32, (y as f32 * k).round() as i32)
+}
+
+/// 画面全体を (dx, dy) px ずらす。はみ出した側は黒で埋める。
+pub fn shift(c: &mut Canvas, dx: i32, dy: i32) {
+    if (dx, dy) == (0, 0) {
+        return;
+    }
+    let (w, h) = (c.width() as usize, c.height() as usize);
+    let row = w * 4;
+    let data = c.pixmap.data_mut();
+    let dyu = (dy.unsigned_abs() as usize).min(h);
+    if dy > 0 {
+        data.copy_within(0..(h - dyu) * row, dyu * row);
+        fill_black(&mut data[..dyu * row]);
+    } else if dy < 0 {
+        data.copy_within(dyu * row.., 0);
+        fill_black(&mut data[(h - dyu) * row..]);
+    }
+    let d = (dx.unsigned_abs() as usize * 4).min(row);
+    if d == 0 {
+        return;
+    }
+    for line in data.chunks_mut(row) {
+        if dx > 0 {
+            line.copy_within(..row - d, d);
+            fill_black(&mut line[..d]);
+        } else {
+            line.copy_within(d.., 0);
+            fill_black(&mut line[row - d..]);
+        }
+    }
+}
+
 fn fill_black(px: &mut [u8]) {
     for p in px.as_chunks_mut::<4>().0 {
         *p = [0, 0, 0, 255];
@@ -170,6 +222,27 @@ mod tests {
         assert!(dst.pixmap.data() != src.pixmap.data(), "乱れながら戻る");
         refresh_frame(&mut dst, &src, REFRESH_SECS, 10);
         assert!(dst.pixmap.data() == src.pixmap.data(), "元の画面");
+    }
+
+    #[test]
+    fn whole_screen_shift_moves_pixels_and_blacks_the_edge() {
+        let mut c = Canvas::new(20, 10);
+        c.clear(rgba(10, 60, 30, 255));
+        c.fill_rect(5.0, 5.0, 1.0, 1.0, rgba(255, 255, 255, 255));
+        let px = |c: &Canvas, x: usize, y: usize| {
+            let i = (y * 20 + x) * 4;
+            c.pixmap.data()[i..i + 4].to_vec()
+        };
+        shift(&mut c, 3, -2);
+        assert_eq!(px(&c, 8, 3), [255, 255, 255, 255], "白い点が (+3, -2) へ");
+        assert_eq!(px(&c, 0, 0), [0, 0, 0, 255], "左の端は黒");
+        assert_eq!(px(&c, 10, 9), [0, 0, 0, 255], "下の端は黒");
+        shift(&mut c, -3, 2);
+        assert_eq!(px(&c, 5, 5), [255, 255, 255, 255], "戻せる");
+        assert_eq!(shift_offset(0, 1080), (0, 0));
+        assert_eq!(shift_offset(2, 1080), (6, 6));
+        assert_eq!(shift_offset(9, 1080), (0, 0), "9 か所で一周");
+        assert_eq!(shift_offset(1, 540), (3, 0), "画面の高さに合わせる");
     }
 
     #[test]

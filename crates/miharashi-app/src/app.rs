@@ -352,8 +352,17 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "ticks", "keys", "screen", "photo", "aircraft", "feed", "cpu", "gpu", "gpus",
-                "page"
+                "ticks",
+                "keys",
+                "screen",
+                "photo",
+                "aircraft",
+                "feed",
+                "cpu",
+                "gpu",
+                "gpus",
+                "page",
+                "refreshes"
             ]
         );
         let get = |app: &ScreenManager, k: &str| {
@@ -411,7 +420,7 @@ mod tests {
         };
         let mut app = kiosk(
             &cfg,
-            (320, 135),
+            (1280, 540),
             None,
             Source::File(p, None),
             Box::new(DummyData::new()),
@@ -422,25 +431,36 @@ mod tests {
         let t0 = Instant::now();
         app.tick(t0);
         assert!(!app.refreshing());
+        let center = |app: &mut ScreenManager| {
+            let mut c = Canvas::new(1280, 540);
+            match app.render_composite(&mut c) {
+                Composite::Radar {
+                    background_changed,
+                    geom,
+                    ..
+                } => (background_changed, geom.center),
+                _ => panic!("航空機の画面は Radar"),
+            }
+        };
+        let (_, before) = center(&mut app);
         assert!(app.tick(t0 + Duration::from_secs(61)), "間隔が来たら演出");
         assert!(
             app.refreshing() && app.animating(),
             "演出中は毎フレーム描く"
         );
-        let mut c = Canvas::new(320, 135);
+        let mut c = Canvas::new(1280, 540);
         assert!(matches!(app.render_composite(&mut c), Composite::Canvas));
-        let mut normal = Canvas::new(320, 135);
+        let mut normal = Canvas::new(1280, 540);
         app.render(&mut normal);
         app.tick(t0 + Duration::from_secs(63));
         assert!(!app.refreshing(), "1.6 秒で終わる");
-        // 終わったら GPU 経路の背景を描き直す
-        assert!(matches!(
-            app.render_composite(&mut c),
-            Composite::Radar {
-                background_changed: true,
-                ..
-            }
-        ));
+        let (redrawn, after) = center(&mut app);
+        assert!(redrawn, "終わったら GPU 経路の背景を描き直す");
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (3.0, 0.0),
+            "演出のたびに画面全体を 6px(1080p 換算)ずらす"
+        );
         // キーで打ち切る(画面はキーのとおりに動く)
         app.tick(t0 + Duration::from_secs(130));
         assert!(app.refreshing());
