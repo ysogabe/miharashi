@@ -1,6 +1,6 @@
 # 画面管理インターフェースの最小設計(Issue #9)
 
-状態: **S1・S2 を実装**(2026-10-15、[#5](https://github.com/ysogabe/miharashi/issues/5))。実装で変えた点は §10・§11。2026-10-13 作成。対象: [#9](https://github.com/ysogabe/miharashi/issues/9)。
+状態: **S1〜S3 を実装**(2026-10-15、[#5](https://github.com/ysogabe/miharashi/issues/5))。実装で変えた点は §10〜§12。2026-10-13 作成。対象: [#9](https://github.com/ysogabe/miharashi/issues/9)。
 基準にしたコード: ブランチ `trial/poc-002-kiosk-runtime`([PR #8](https://github.com/ysogabe/miharashi/pull/8))の `crates/miharashi-app`(`runtime.rs` / `app.rs` / `data.rs` / `photos.rs`)。`main` の `miharashi-poc` ではない。
 
 [DESIGN.md](DESIGN.md) §3 のワークスペース案(`core` / `screens` / `data` crate)と §4 の trait 例は実装前の案で、実際の crate は `render` / `linux` / `app` の 3 つである。この文書は、その現実のコードを起点に、画面を追加するための最小の契約を決める。§4 の trait 例はこの文書で置き換える。
@@ -256,3 +256,16 @@ Provider のスレッド(`metrics::Sampler`、写真の `Feed`)は今と同じ�
 - 状況画面の下のキーの案内を「4/6: 画面の切替  0: メニュー」にした。
 - `Outcome` は残した(S3 の航空機の画面などで、画面が使わない操作を区別するため)。今の ScreenManager は `Ignored` でも何もしない。
 - まだのもの: `png` コマンドのレジストリー化と `variants()`(S3 で航空機の画面を足すときに合わせる)、`runtime.quit_key`。
+
+## 12. 実装(S3、2026-10-15)
+
+航空機を独立した画面(`src/app/screens/aircraft.rs`、id `aircraft`、題名 AIRCRAFT)にし、写真画面の合間に挟むのをやめた([DESIGN-screens.md](DESIGN-screens.md) §2.2)。
+
+- **登録**: `kiosk()` の末尾に足しただけ(状況画面と写真画面のコードは、合間の航空機を取り除いた以外は変えていない)。`[aircraft] enabled = false` なら登録しない。巡回の順は status → photo → aircraft。
+- **データ**: 取得スレッドの `aircraft::Shared` は `World` に写さず、画面が直接持つ(読むのが航空機の画面だけで、写す手間が要らないため。§3.1 の表から変えた)。
+- **操作**: 8/2 で注目する機体を近い順に切り替え(端で折り返す)、5 でいちばん近い機体に戻す。注目は hex で覚えるので、取得し直して並びが変わっても同じ機体を追う。いなくなったら、いちばん近い機体に戻る。描画では `AircraftView::focus` の機体を琥珀色で囲み、右に諸元を出す。
+- **機体がいないとき**: レーダーと「半径内に機体はありません」、最終受信の時刻と受信している機体の数。取得結果が 30 秒より古ければ「受信機から応答がありません」、まだ 1 度も取れていなければ「受信機に接続しています…」。
+- **動き**: 位置は 5 秒ごとにしか届かないので、取得からの秒数(1 秒きざみ、最大 10 秒)だけ速度と進行方向で進める(`aircraft::advanced`)。描き直すのは 1 秒に 1 回。背景(下地を写して文字と諸元を描く)は 2560×1080 で 1 回 8.6ms(`miharashi bench` の `aircraft-bg`)、毎秒で CPU 約 0.9%。地図の下地(`aircraft-base`、14.7ms)は受信機と半径が変わるまで作り直さない。CPU 経路でも下地を取っておく。GPU 経路の回る線は表示中だけ毎フレーム描く。
+- **状態ログ**: `aircraft=` は「写真の合間に出しているか(true/false)」から「半径内の機体の数」に変わった(`tools/soak_summary.py` は `aircraft=\S+` を読み飛ばすだけなので影響しない)。
+- **設定**: `[aircraft] every_photos` / `show_secs` は使わない。古い設定ファイルでも起動できるよう読むだけ読み、警告を出す。
+- **png**: `aircraft-focus.png`(3 番目に近い機体に注目)と `aircraft-empty.png`(機体がいない)を足した。`png` コマンドのレジストリー化(§3.1)は見送った。`png` は画面の初期状態ではなく、見本のデータ(アラート、旅のカード、残光の長さ、GPU 経路との比較)の絵を出す道具になっていて、画面を回すだけでは今の出力を作れないため。画面を足したら、見本の絵は `main.rs` の `png` に足す。

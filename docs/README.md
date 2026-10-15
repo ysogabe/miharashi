@@ -36,9 +36,9 @@
 | PoC-001 Direct Display | 完了 |
 | PoC-002 Kiosk Runtime | 完了(12 時間試験に合格) |
 | PoC-005 GPU Render Baseline | 完了(写真画面の CPU 使用率 0.8%、重いエフェクトの予算は GPU 50% 以下)。[#16](https://github.com/ysogabe/miharashi/issues/16) |
-| アラート・電源・写真・航空機 | 実装済み(地震・災害アラート、在宅判定でのモニター消灯、旅ごとの写真、写真の合間の航空機) |
+| アラート・電源・写真・航空機 | 実装済み(地震・災害アラート、在宅判定でのモニター消灯、旅ごとの写真、航空機の画面) |
 | 操作パネル | P2 まで完了(API、Echo Show 5 のアプリ、モニターの消灯・点灯、操作盤の自動消灯) |
-| PoC-003 Screen Plugins | S1(`ScreenManager` / `Screen` への分割)と S2(4/6 = 画面の巡回、8/2 = 写真の前後、0 = メニュー、`POST /api/v1/screen`)を実装。次は S3(航空機の画面)。[#5](https://github.com/ysogabe/miharashi/issues/5) |
+| PoC-003 Screen Plugins | S1(`ScreenManager` / `Screen` への分割)と S2(4/6 = 画面の巡回、8/2 = 写真の前後、0 = メニュー、`POST /api/v1/screen`)、S3(航空機を独立した画面に)を実装。次は S4(室内環境と天気)。[#5](https://github.com/ysogabe/miharashi/issues/5) |
 | 室内環境と天気・航空機の画面・自動巡回 | 未着手。[#30](https://github.com/ysogabe/miharashi/issues/30)、[#29](https://github.com/ysogabe/miharashi/issues/29)、[#31](https://github.com/ysogabe/miharashi/issues/31) |
 | PoC-004 Agent Monitor | 作らない(Hermes 連携をやめたため。[画面の全体構成](DESIGN-screens.md) §1) |
 

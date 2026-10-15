@@ -2,6 +2,7 @@
 //! 画面を足すときは `kiosk` の登録に足す(docs/DESIGN-screen-interface.md)。
 pub mod manager;
 pub mod screens {
+    pub mod aircraft;
     pub mod photo;
     pub mod status;
 }
@@ -11,6 +12,7 @@ use crate::photos::Source;
 use manager::ScreenManager;
 use miharashi_render::TextEngine;
 use miharashi_render::screens::Snapshot;
+use screens::aircraft::AircraftScreen;
 use screens::photo::PhotoScreen;
 use screens::status::StatusScreen;
 use std::time::Duration;
@@ -42,7 +44,8 @@ pub fn set_clock(s: &mut Snapshot) {
 }
 
 /// キオスクの画面を登録する。並び順が切り替わる順になる(docs/DESIGN-screens.md §2)。
-/// `gpu_max` は GPU 経路のとき Some(GPU で扱える写真の最大の幅と高さ)。
+/// `gpu_max` は GPU 経路のとき Some(GPU で扱える写真の最大の幅と高さ)。航空機の取得が無効(`aircraft` が None)なら
+/// 航空機の画面は登録しない。
 pub fn kiosk(
     cfg: &Config,
     size: (u32, u32),
@@ -52,10 +55,15 @@ pub fn kiosk(
     snap: Snapshot,
     aircraft: Option<crate::aircraft::Shared>,
 ) -> ScreenManager {
-    let photo = PhotoScreen::new(cfg, size, gpu_max, source).with_aircraft(aircraft);
+    let photo = PhotoScreen::new(cfg, size, gpu_max, source);
     let feed = photo.feed_provider();
+    let mut screens: Vec<Box<dyn crate::screen::Screen>> =
+        vec![Box::new(StatusScreen::new()), Box::new(photo)];
+    if let Some(shared) = aircraft {
+        screens.push(Box::new(AircraftScreen::new(shared, gpu_max.is_some())));
+    }
     ScreenManager::new(
-        vec![Box::new(StatusScreen::new()), Box::new(photo)],
+        screens,
         &cfg.ui.start_screen,
         data,
         snap,
@@ -317,7 +325,20 @@ mod tests {
     /// 状態ログ: tools/soak_summary.py が読む順に並び、screen= は画面の id。
     #[test]
     fn stats_use_screen_ids_in_soak_summary_order() {
-        let (mut app, dir) = app_with_photo((320, 180));
+        let (dir, p) = test_photo();
+        let planes: crate::aircraft::Shared = std::sync::Arc::new(std::sync::Mutex::new(Some((
+            Instant::now(),
+            crate::aircraft::demo_view(),
+        ))));
+        let mut app = kiosk(
+            &Config::default(),
+            (320, 180),
+            None,
+            Source::File(p, None),
+            Box::new(DummyData::new()),
+            dummy_snapshot(0.0),
+            Some(planes),
+        );
         app.tick(Instant::now());
         let keys: Vec<_> = app.stats().iter().map(|(k, _)| *k).collect();
         assert_eq!(
@@ -336,9 +357,30 @@ mod tests {
         assert_eq!(get(&app, "screen").as_deref(), Some("status"));
         assert_eq!(get(&app, "page").as_deref(), Some("overview"));
         assert_eq!(get(&app, "feed").as_deref(), Some("online"));
+        assert_eq!(
+            get(&app, "aircraft").as_deref(),
+            Some("5"),
+            "半径内の機体の数"
+        );
         app.on_key(KeyPress::Next);
         assert_eq!(get(&app, "screen").as_deref(), Some("photo"));
         assert_eq!(get(&app, "page"), None);
+        app.on_key(KeyPress::Next);
+        assert_eq!(
+            get(&app, "screen").as_deref(),
+            Some("aircraft"),
+            "3 つ目の画面"
+        );
+        app.on_key(KeyPress::Next);
+        assert_eq!(get(&app, "screen").as_deref(), Some("status"));
+        let ids: Vec<_> = app
+            .panel_view()
+            .unwrap()
+            .screens
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, ["status", "photo", "aircraft"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
