@@ -1,0 +1,132 @@
+#!/bin/sh
+# T3 Agent 画面(agents)のトークンを、読み取りだけの権限で発行し直す。
+# miharashi-t3-token.timer から週 1 回、キオスクと同じ一般ユーザー(T3 を動かしているユーザー)で動かす。
+#
+# T3 v0.0.45 の bearer は 30 日で切れ、延長や refresh の API が無い。そこで毎回次の手順で作り直す
+# (docs/DESIGN-t3-token.md):
+#   1. t3 CLI でペアリング用のトークンを作る(1 回だけ使える、5 分)
+#   2. T3 の POST /oauth/token で、orchestration:read だけのトークンに交換する
+#   3. 一覧 API(GET /api/orchestration/shell)で使えることを確かめる
+#   4. [agents] token_file を置き換える(実行ユーザーの 0600)
+#   5. miharashi が読み直すのを待ってから、同じラベルの古いセッションを失効させる
+#
+# トークンは引数・環境変数・ログに出さない(ps やジャーナルから見えないよう、一時ファイルで渡す)。
+# 設定は環境変数で上書きできる: MIHARASHI_CONFIG、T3_CLI、T3_URL、T3_TOKEN_FILE、T3_TOKEN_LABEL、
+# T3_TOKEN_REVOKE_WAIT(秒)。
+set -eu
+umask 077
+
+CONFIG=${MIHARASHI_CONFIG:-/etc/miharashi/config.toml}
+T3_CLI=${T3_CLI:-$HOME/.local/bin/t3}
+LABEL=${T3_TOKEN_LABEL:-miharashi-agent-monitor}
+SCOPE=orchestration:read
+# miharashi は token_file を 30 秒ごとに読み直す。古いトークンを失効させるのは、その 2 倍待ってから。
+REVOKE_WAIT=${T3_TOKEN_REVOKE_WAIT:-60}
+
+log() { echo "miharashi-t3-token: $*"; }
+die() {
+    echo "miharashi-t3-token: $*" >&2
+    exit 1
+}
+
+# 設定の [agents] から、key = "value" の 1 行を読む。
+agents_key() {
+    sed -n '/^\[agents\]/,/^\[/{s/^[[:space:]]*'"$1"'[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p;}' "$CONFIG" | head -n 1
+}
+
+# 標準入力の JSON から、引数のキーの値を出す(改行を付けない)。
+json_get() {
+    python3 -I -c '
+import json, sys
+value = json.load(sys.stdin)
+for key in sys.argv[1].split("."):
+    value = value[key]
+sys.stdout.write(value if isinstance(value, str) else json.dumps(value))
+' "$1"
+}
+
+URL=${T3_URL:-$(agents_key url)}
+URL=${URL%/}
+TOKEN_FILE=${T3_TOKEN_FILE:-$(agents_key token_file)}
+[ -n "$URL" ] || die "$CONFIG の [agents] に url がありません"
+[ -n "$TOKEN_FILE" ] || die "$CONFIG の [agents] に token_file がありません"
+[ -x "$T3_CLI" ] || die "t3 CLI がありません: $T3_CLI(T3_CLI で指定できます)"
+TOKEN_DIR=$(dirname "$TOKEN_FILE")
+# 書けない場所(root 所有の /etc/miharashi など)なら、T3 に何かを作る前に止める。
+[ -w "$TOKEN_DIR" ] || die "$TOKEN_DIR に書けません。token_file は実行ユーザーが書ける場所(/var/lib/miharashi など)にしてください"
+
+work=$(mktemp -d)
+pairing_id=
+cleanup() {
+    # 交換する前に失敗したら、使わなかったペアリング用のトークンを消しておく。
+    if [ -n "$pairing_id" ]; then
+        "$T3_CLI" auth pairing revoke "$pairing_id" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$work"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+# T3 の発行時刻はミリ秒つき(…:SS.mmmZ)。文字列で比べるので、こちらも .000Z にそろえる。
+started=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+
+# 1. ペアリング用のトークン
+"$T3_CLI" auth pairing create --ttl 5m --label "$LABEL" --json >"$work/pairing.json" 2>"$work/err" ||
+    die "ペアリング用のトークンを作れません: $(head -c 300 "$work/err")"
+pairing_id=$(json_get id <"$work/pairing.json")
+json_get credential <"$work/pairing.json" >"$work/credential"
+
+# 2. 読み取りだけのトークンに交換する
+code=$(curl -sS --max-time 15 -o "$work/access.json" -w '%{http_code}' \
+    --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+    --data-urlencode "subject_token@$work/credential" \
+    --data-urlencode "subject_token_type=urn:t3:params:oauth:token-type:environment-bootstrap" \
+    --data-urlencode "requested_token_type=urn:ietf:params:oauth:token-type:access_token" \
+    --data-urlencode "scope=$SCOPE" \
+    --data-urlencode "client_label=$LABEL" \
+    --data-urlencode "client_device_type=bot" \
+    "$URL/oauth/token" 2>"$work/err") || die "T3 に届きません($URL): $(head -c 300 "$work/err")"
+# 交換を試したペアリング用のトークンは、成否にかかわらず使用済み。
+pairing_id=
+[ "$code" = 200 ] || die "交換に失敗しました(HTTP $code): $(head -c 300 "$work/access.json")"
+granted=$(json_get scope <"$work/access.json")
+[ "$granted" = "$SCOPE" ] || die "権限が $SCOPE だけになっていません(受け取った権限: $granted)。トークンは置き換えません"
+json_get access_token <"$work/access.json" >"$work/token"
+printf 'Authorization: Bearer ' >"$work/auth"
+cat "$work/token" >>"$work/auth"
+
+# 3. 使えることを確かめる
+code=$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' -H "@$work/auth" \
+    "$URL/api/orchestration/shell" 2>"$work/err") || die "T3 に届きません($URL): $(head -c 300 "$work/err")"
+[ "$code" = 200 ] || die "新しいトークンで一覧を読めません(HTTP $code)。トークンは置き換えません"
+
+# 4. token_file を置き換える(同じディレクトリに書いてから mv で入れ替える)
+tmp=$(mktemp "$TOKEN_DIR/.t3-token.XXXXXX")
+cat "$work/token" >"$tmp"
+chmod 0600 "$tmp"
+mv -f "$tmp" "$TOKEN_FILE"
+expires_in=$(json_get expires_in <"$work/access.json")
+log "新しいトークンを $TOKEN_FILE に置きました(権限 $SCOPE、有効 $(((expires_in + 43200) / 86400)) 日)"
+
+# 5. 同じラベルの古いセッションを失効させる(今回のものは、この実行の開始より後に発行されたいちばん新しいもの)
+sleep "$REVOKE_WAIT"
+"$T3_CLI" auth session list --json >"$work/sessions.json" 2>"$work/err" ||
+    die "セッションの一覧を取れません。古いセッションは失効させていません: $(head -c 300 "$work/err")"
+old=$(python3 -I -c '
+import json, sys
+label, started = sys.argv[1], sys.argv[2]
+mine = [s for s in json.load(sys.stdin) if (s.get("client") or {}).get("label") == label]
+mine.sort(key=lambda s: s["issuedAt"])
+if not mine or mine[-1]["issuedAt"] < started:
+    sys.exit("今回発行したセッションが一覧にありません")
+print("\n".join(s["sessionId"] for s in mine[:-1]))
+' "$LABEL" "$started" <"$work/sessions.json") || die "古いセッションを特定できません。失効させていません"
+revoked=0
+for id in $old; do
+    if "$T3_CLI" auth session revoke "$id" >/dev/null 2>"$work/err"; then
+        revoked=$((revoked + 1))
+    else
+        log "セッション $id を失効できません: $(head -c 300 "$work/err")"
+    fi
+done
+log "古いセッションを $revoked 件失効させました(ラベル $LABEL)"

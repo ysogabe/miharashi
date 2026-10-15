@@ -108,8 +108,10 @@
 # bearer は GET /api/orchestration/shell にだけ使う。環境表示用に認証なしの GET /.well-known/t3/environment も行う。
 # 更新系 API は呼び出さない。
 # enabled = false
-# url = "http://192.168.0.132:3773"
-# token_file = "/etc/miharashi/t3-agent.token"
+# url = "http://192.0.2.10:3773"
+# T3 の bearer は 30 日で切れる。miharashi-t3-token.timer が週 1 回、読み取りだけのトークンを作り直して
+# このファイルを置き換える(docs/DESIGN-t3-token.md)。そのため実行ユーザーが書ける場所に置く。
+# token_file = "/var/lib/miharashi/t3-agent.token"
 # poll_secs = 5
 # timeout_secs = 3
 # stale_secs = 30
