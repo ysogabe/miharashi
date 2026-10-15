@@ -2,7 +2,9 @@
 //! キーは docs/DESIGN-screens.md §4.1: 4/6 = 画面の巡回、0 = メニュー、5・8/2 = 表示中の画面の中の操作。
 //! 動かない線が多い画面には、数分に一度、焼き付き対策の演出(グリッチ → 暗転 → 再表示)を入れ、
 //! そのたびに画面全体の位置を数 px ずらす。
+//! 自動巡回(§4.2)が有効なら、設定の順番と秒数で画面を回す。操作があればしばらく止め、時間がたったら次の手順から戻る。
 use super::DataSource;
+use crate::config::RotationStep;
 use crate::screen::{
     App, Composite, KeyPress, PanelView, Provider, RenderContext, Screen, ScreenAction, ScreenInfo,
     World,
@@ -13,6 +15,28 @@ use miharashi_render::menu;
 use miharashi_render::{Canvas, TextEngine};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
+
+/// 自動巡回の手順(画面の添字に直したもの)。
+struct Step {
+    screen: usize,
+    secs: Duration,
+    skip_if_empty: bool,
+}
+
+/// 自動巡回の状態。
+struct Rotation {
+    steps: Vec<Step>,
+    /// 操作のあと止める時間
+    pause: Duration,
+    /// 今の手順
+    index: usize,
+    /// 今の手順の残り時間。アラートとメニューの間は減らさない
+    remaining: Duration,
+    /// 操作で止めている間の終わり
+    paused_until: Option<Instant>,
+    /// 前回の tick の時刻(残り時間を減らす)
+    last: Instant,
+}
 
 pub struct ScreenManager {
     /// 登録した画面。並び順が切り替わる順と、操作パネルの画面一覧の順になる
@@ -47,6 +71,8 @@ pub struct ScreenManager {
     clean: Option<Canvas>,
     /// 演出をした回数。画面全体をずらす位置(`glitch::shift_offset`)もこれで決める
     refreshes: usize,
+    /// 自動巡回(無効なら None)
+    rotation: Option<Rotation>,
     pub ticks: u64,
     pub keys: u64,
 }
@@ -87,6 +113,7 @@ impl ScreenManager {
             refreshing: None,
             clean: None,
             refreshes: 0,
+            rotation: None,
             ticks: 0,
             keys: 0,
         };
@@ -107,6 +134,108 @@ impl ScreenManager {
         self.refresh_due = Instant::now() + every;
         self.refresh = Some((every, ids));
         self
+    }
+
+    /// 自動巡回を始める。登録に無い画面の手順は飛ばす(航空機や室内環境の画面が無効なとき)。
+    /// 手順が 1 つも残らなければ巡回しない。最初の手順の画面から始める。
+    pub fn with_rotation(mut self, steps: &[RotationStep], pause: Duration) -> Self {
+        let steps: Vec<Step> = steps
+            .iter()
+            .filter_map(|st| {
+                let i = self.screens.iter().position(|s| s.id() == st.screen);
+                if i.is_none() {
+                    eprintln!(
+                        "rotation: 画面 {} は出していないので、この手順は飛ばす",
+                        st.screen
+                    );
+                }
+                Some(Step {
+                    screen: i?,
+                    secs: Duration::from_secs(st.secs),
+                    skip_if_empty: st.skip_if_empty,
+                })
+            })
+            .collect();
+        let Some(first) = steps.first() else {
+            eprintln!("rotation: 回せる画面が無いので巡回しない");
+            return self;
+        };
+        let now = Instant::now();
+        let (screen, remaining) = (first.screen, first.secs);
+        self.switch_to(screen, now);
+        self.rotation = Some(Rotation {
+            steps,
+            pause,
+            index: 0,
+            remaining,
+            paused_until: None,
+            last: now,
+        });
+        self
+    }
+
+    /// 自動巡回の状態("on" / "paused")。無効なら None。
+    pub fn rotation_state(&self) -> Option<&'static str> {
+        self.rotation.as_ref().map(|r| {
+            if r.paused_until.is_some() {
+                "paused"
+            } else {
+                "on"
+            }
+        })
+    }
+
+    /// 操作があったので巡回を止める。
+    fn pause_rotation(&mut self, now: Instant) {
+        if let Some(r) = self.rotation.as_mut() {
+            r.paused_until = Some(now + r.pause);
+        }
+    }
+
+    /// 自動巡回を進める。戻り値: 画面を切り替えたか。
+    fn tick_rotation(&mut self, now: Instant) -> bool {
+        let frozen = self.alert.is_some() || self.menu.is_some();
+        let Self {
+            rotation, screens, ..
+        } = self;
+        let Some(r) = rotation.as_mut() else {
+            return false;
+        };
+        let dt = now.saturating_duration_since(r.last);
+        r.last = now;
+        if let Some(until) = r.paused_until {
+            if now < until {
+                return false;
+            }
+            // 止める前の手順の続き(次の手順)から
+            r.paused_until = None;
+            r.remaining = Duration::ZERO;
+        }
+        // アラートとメニューの間は時間を進めない
+        if frozen {
+            return false;
+        }
+        r.remaining = r.remaining.saturating_sub(dt);
+        if !r.remaining.is_zero() {
+            return false;
+        }
+        let n = r.steps.len();
+        let next = (1..=n).map(|k| (r.index + k) % n).find(|&i| {
+            let st = &r.steps[i];
+            !(st.skip_if_empty && screens[st.screen].is_empty())
+        });
+        let Some(i) = next else {
+            // どの手順も飛ばす状態なら、今の画面のまま次の手順の時間だけ待つ
+            r.remaining = r.steps[r.index].secs;
+            return false;
+        };
+        r.index = i;
+        r.remaining = r.steps[i].secs;
+        let screen = r.steps[i].screen;
+        let changed = screen != self.current;
+        self.switch_to(screen, now);
+        self.force_overlay |= changed;
+        changed
     }
 
     /// 焼き付き対策の演出中か(テスト用)。
@@ -249,6 +378,7 @@ impl ScreenManager {
         self.keys += 1;
         self.force_overlay = true;
         let now = Instant::now();
+        self.pause_rotation(now);
         // 演出中のキーは演出を打ち切ってから、ふつうに扱う
         self.reset_refresh(now);
         // アラート表示中のキーは閉じるだけにする
@@ -300,7 +430,9 @@ impl ScreenManager {
         self.force_overlay = true;
         self.alert = None;
         self.menu = None;
-        self.switch_to(i, Instant::now());
+        let now = Instant::now();
+        self.pause_rotation(now);
+        self.switch_to(i, now);
         true
     }
 
@@ -332,6 +464,7 @@ impl ScreenManager {
             }
             redraw = true;
         }
+        redraw |= self.tick_rotation(now);
         self.force_overlay |= redraw;
         // 非表示の画面も回す(写真の受信を続ける)。再描画は表示中の画面の分だけ見る
         for (i, s) in self.screens.iter_mut().enumerate() {
@@ -537,6 +670,9 @@ impl App for ScreenManager {
         }
         if self.refresh.is_some() {
             out.push(("refreshes", self.refreshes.to_string()));
+        }
+        if let Some(r) = self.rotation_state() {
+            out.push(("rotation", r.to_string()));
         }
         out
     }

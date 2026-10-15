@@ -93,6 +93,14 @@ pub fn kiosk(
     if let Some(shared) = agent_shared {
         m = m.with_provider(Box::new(crate::agents::AgentProvider::new(shared)));
     }
+    m = if cfg.rotation.enabled {
+        m.with_rotation(
+            &cfg.rotation.steps,
+            Duration::from_secs(cfg.rotation.pause_after_input_secs),
+        )
+    } else {
+        m
+    };
     if cfg.ui.refresh_minutes > 0 {
         m.with_refresh(
             Duration::from_secs(cfg.ui.refresh_minutes * 60),
@@ -257,6 +265,175 @@ mod tests {
             ctx.canvas
                 .clear(miharashi_render::canvas::rgba(0, 0, 40, 255));
         }
+    }
+
+    /// 出すものが無いかを外から切り替えられる画面(自動巡回の skip_if_empty)。
+    struct Maybe(std::rc::Rc<std::cell::Cell<bool>>);
+
+    impl crate::screen::Screen for Maybe {
+        fn id(&self) -> crate::screen::ScreenId {
+            "maybe"
+        }
+        fn title(&self) -> &'static str {
+            "MAYBE"
+        }
+        fn render(&mut self, ctx: &mut crate::screen::RenderContext<'_>) {
+            ctx.canvas
+                .clear(miharashi_render::canvas::rgba(40, 0, 0, 255));
+        }
+        fn is_empty(&self) -> bool {
+            self.0.get()
+        }
+    }
+
+    fn step(screen: &str, secs: u64, skip_if_empty: bool) -> crate::config::RotationStep {
+        crate::config::RotationStep {
+            screen: screen.into(),
+            secs,
+            skip_if_empty,
+        }
+    }
+
+    /// status・blank・maybe の 3 画面で巡回する。`empty` で maybe を空にできる。
+    fn rotating(
+        steps: &[crate::config::RotationStep],
+        pause_secs: u64,
+    ) -> (ScreenManager, std::rc::Rc<std::cell::Cell<bool>>) {
+        let empty = std::rc::Rc::new(std::cell::Cell::new(false));
+        let app = ScreenManager::new(
+            vec![
+                Box::new(StatusScreen::new()),
+                Box::new(Blank),
+                Box::new(Maybe(empty.clone())),
+            ],
+            "status",
+            Box::new(DummyData::new()),
+            dummy_snapshot(0.0),
+            text_engine(""),
+            Duration::from_secs(60),
+        )
+        .with_rotation(steps, Duration::from_secs(pause_secs));
+        (app, empty)
+    }
+
+    /// 1 秒ごとに tick して、`secs` 秒後の画面。
+    fn run_for(app: &mut ScreenManager, t: &mut Instant, secs: u64) -> &'static str {
+        for _ in 0..secs {
+            *t += Duration::from_secs(1);
+            app.tick(*t);
+        }
+        app.screen_id()
+    }
+
+    /// 最初の手順の画面から始め、手順の秒数ごとに次へ。skip_if_empty の画面は空なら飛ばす。
+    /// 登録に無い画面の手順は捨てる。巡回はキーの数に入れない。
+    #[test]
+    fn rotation_follows_the_steps_and_skips_empty_screens() {
+        let steps = [
+            step("blank", 10, false),
+            step("aircraft", 10, false),
+            step("maybe", 20, true),
+            step("status", 5, false),
+        ];
+        let (mut app, empty) = rotating(&steps, 300);
+        let mut t = Instant::now();
+        assert_eq!(app.screen_id(), "blank", "start_screen ではなく最初の手順");
+        assert_eq!(run_for(&mut app, &mut t, 9), "blank");
+        assert_eq!(
+            run_for(&mut app, &mut t, 1),
+            "maybe",
+            "無い画面(aircraft)は飛ばす"
+        );
+        assert_eq!(run_for(&mut app, &mut t, 20), "status");
+        assert_eq!(run_for(&mut app, &mut t, 5), "blank", "最後の次は先頭");
+        empty.set(true);
+        assert_eq!(
+            run_for(&mut app, &mut t, 10),
+            "status",
+            "空の maybe を飛ばす"
+        );
+        assert_eq!(app.keys, 0);
+        let stats = app.stats();
+        assert_eq!(stats.last(), Some(&("rotation", "on".to_string())));
+    }
+
+    /// どの手順も飛ばす状態なら、今の画面のまま待つ。
+    #[test]
+    fn rotation_stays_when_every_step_is_skipped() {
+        let (mut app, empty) = rotating(&[step("maybe", 10, true)], 300);
+        empty.set(true);
+        let mut t = Instant::now();
+        assert_eq!(run_for(&mut app, &mut t, 35), "maybe");
+        let (none, _) = rotating(&[step("radar", 10, false)], 300);
+        assert_eq!(
+            none.rotation_state(),
+            None,
+            "回せる画面が無ければ巡回しない"
+        );
+        assert_eq!(none.screen_id(), "status");
+    }
+
+    /// キー・操作パネルで止まり、最後の操作から pause 秒たったら次の手順から戻る。
+    #[test]
+    fn input_pauses_the_rotation_then_it_resumes_at_the_next_step() {
+        let steps = [
+            step("status", 10, false),
+            step("blank", 10, false),
+            step("maybe", 10, false),
+        ];
+        let (mut app, _) = rotating(&steps, 60);
+        let mut t = Instant::now();
+        assert_eq!(run_for(&mut app, &mut t, 10), "blank");
+        app.on_key(KeyPress::Prev);
+        assert_eq!(
+            (app.screen_id(), app.rotation_state()),
+            ("status", Some("paused"))
+        );
+        let mut t = Instant::now();
+        assert_eq!(
+            run_for(&mut app, &mut t, 59),
+            "status",
+            "止めている間は動かない"
+        );
+        assert_eq!(
+            run_for(&mut app, &mut t, 1),
+            "maybe",
+            "blank の次の手順から"
+        );
+        assert_eq!(app.rotation_state(), Some("on"));
+        app.show_screen("blank");
+        assert_eq!(app.rotation_state(), Some("paused"), "操作パネルでも止まる");
+        assert_eq!(
+            app.stats().last(),
+            Some(&("rotation", "paused".to_string()))
+        );
+    }
+
+    /// アラートの間は手順の時間を進めない(メニューは開くキーで巡回が止まる)。
+    #[test]
+    fn alerts_freeze_the_rotation_clock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (app, _) = rotating(&[step("status", 10, false), step("blank", 10, false)], 0);
+        let mut app = app.with_alerts(Some(rx));
+        let mut t = Instant::now();
+        assert_eq!(run_for(&mut app, &mut t, 5), "status");
+        tx.send(miharashi_render::alert::AlertView::Disaster(
+            crate::disaster::demo_view(),
+        ))
+        .unwrap();
+        assert_eq!(run_for(&mut app, &mut t, 59), "status", "アラート中");
+        assert!(app.alert_active());
+        assert_eq!(run_for(&mut app, &mut t, 2), "status", "閉じた");
+        assert!(!app.alert_active());
+        assert_eq!(run_for(&mut app, &mut t, 4), "blank", "残りの 5 秒で次へ");
+    }
+
+    /// 巡回が無効なら状態ログに rotation を出さない。
+    #[test]
+    fn no_rotation_by_default() {
+        let app = three_screens();
+        assert_eq!(app.rotation_state(), None);
+        assert!(app.stats().iter().all(|(k, _)| *k != "rotation"));
     }
 
     /// 0 でメニューを開き、8/2(4/6 も)で選んで 5 で移る。0 で閉じる。メニュー中は画面に操作を渡さない。

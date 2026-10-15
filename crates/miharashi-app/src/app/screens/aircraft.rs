@@ -156,6 +156,10 @@ impl Screen for AircraftScreen {
         self.gpu && self.visible
     }
 
+    fn is_empty(&self) -> bool {
+        self.planes() == 0
+    }
+
     fn stats(&self, out: &mut Vec<(&'static str, String)>) {
         out.push(("aircraft", self.planes().to_string()));
     }
