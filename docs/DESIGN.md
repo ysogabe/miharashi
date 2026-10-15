@@ -31,25 +31,30 @@ flowchart LR
 
 M1は`Frame → PNG`までを完成させる。M2では同じフレームにLinuxのseat・入力・KMSを接続する。
 
-## 3. Rustワークスペース案
+## 3. Rustワークスペース
+
+当初の案(core / screens / data を別 crate にする)はやめ、実際は次の 5 つにした(2026-10-15 に更新)。画面と取得は app crate の中のモジュールで足りる。
 
 ```text
 miharashi/
   Cargo.toml
   crates/
-    miharashi-core/       # モデル、Action、Screen/Adapter契約
-    miharashi-render/     # Taffy、RGBA、文字、図形、グラフ、写真
-    miharashi-screens/    # system、agents、photo
-    miharashi-data/       # 非同期収集、Linuxセンサー、MockAdapter
-    miharashi-linux/      # libseat、evdev、DRM/KMS（Linuxのみ）
-    miharashi-app/        # CLI、TOML、レジストリー、実行ループ
+    miharashi-render/     # Canvas(tiny-skia)、文字、図形、グラフ、写真、各画面の描画関数、メニュー
+    miharashi-linux/      # libseat、evdev(KeyPress の元になる Action)、DRM/KMS、実測値の取得(Linux のみ)
+    miharashi-gpu/        # GLES 3.2 の表示経路と合成(PoC-005)
+    miharashi-video/      # VA-API の動画ベンチマーク(PoC-005 B2。既定のビルドには入れない)
+    miharashi-app/        # CLI、TOML、実行ループ(runtime.rs)、画面(app/)、操作パネル(panel.rs)
+      src/screen.rs       #   App / Screen / World / Provider の契約
+      src/app.rs          #   画面の登録(kiosk())
+      src/app/manager.rs  #   ScreenManager: 画面の切り替え、メニュー、アラート層
+      src/app/screens/    #   status.rs、photo.rs(画面を足すときはここに足し、kiosk() に登録する)
   config/example.toml
   systemd/
   docs/
   site/                   # 製品説明・画面構成・想定FAQ
 ```
 
-依存は`core → render/screens/data → app`の向きに整理する。`miharashi-render`からLinux専用crateへの依存は禁止する。Linux専用crateはtarget条件とfeatureで切り分け、Linux以外の開発ホストでもPNG生成経路をビルド可能にする。
+依存は `render → (linux / gpu) → app` の向き。`miharashi-render` から Linux 専用 crate への依存は禁止する。Linux 専用 crate は target 条件と feature で切り分け、Linux 以外の開発ホストでも PNG 生成経路をビルド可能にする。画面の契約は [DESIGN-screen-interface.md](DESIGN-screen-interface.md)。
 
 実行ファイル名は `miharashi`、設定ディレクトリ名は `miharashi`、systemdユニット名は `miharashi.service` に統一する。
 

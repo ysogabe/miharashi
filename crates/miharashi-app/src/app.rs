@@ -136,35 +136,34 @@ mod tests {
     const DETAILS: (&str, Option<&str>) = ("status", Some("DETAILS"));
     const PHOTO: (&str, Option<&str>) = ("photo", None);
 
+    /// 4/6 は画面の巡回(端で折り返す)、5・8/2 は表示中の画面の中の操作。
     #[test]
-    fn key_flow_between_status_and_photo() {
+    fn keys_cycle_screens_and_act_inside_them() {
         let (mut app, dir) = app_with_photo((320, 180));
         assert_eq!(screen(&app), OVERVIEW);
-        app.on_key(KeyPress::Prev);
-        assert_eq!(screen(&app), OVERVIEW, "状況画面の 4 は何もしない");
-        app.on_key(KeyPress::Next);
-        assert_eq!(screen(&app), PHOTO, "状況画面の 6 でフォトフレームへ");
-        app.on_key(KeyPress::Switch);
-        assert_eq!(screen(&app), OVERVIEW, "5 で状況画面へ戻る");
-        app.on_key(KeyPress::Switch);
+        app.on_key(KeyPress::Up);
+        app.on_key(KeyPress::Down);
+        assert_eq!(screen(&app), OVERVIEW, "状況画面の 8/2 は何もしない");
+        app.on_key(KeyPress::Select);
         assert_eq!(screen(&app), DETAILS, "状況画面の 5 でページ切替");
+        app.on_key(KeyPress::Next);
+        assert_eq!(screen(&app), PHOTO, "6 で次の画面");
+        app.on_key(KeyPress::Next);
+        assert_eq!(
+            screen(&app),
+            DETAILS,
+            "最後の画面の 6 は先頭へ。最後に見ていたページ"
+        );
+        app.on_key(KeyPress::Prev);
+        assert_eq!(screen(&app), PHOTO, "先頭の画面の 4 は最後へ");
         assert!(
             pump_until(&mut app, |a| photo_position(a) == 1),
             "写真が読み込まれる"
         );
-        app.on_key(KeyPress::Next);
-        assert_eq!(screen(&app), PHOTO);
-        app.on_key(KeyPress::Switch);
-        assert_eq!(screen(&app), DETAILS, "最後に見ていたページへ戻る");
-        app.on_key(KeyPress::Next);
-        app.on_key(KeyPress::Next);
-        assert_eq!(
-            screen(&app),
-            PHOTO,
-            "写真画面の 6 は次の写真で、画面は変わらない"
-        );
-        app.on_key(KeyPress::Prev);
-        assert_eq!(screen(&app), PHOTO, "写真画面の 4 は前の写真");
+        app.on_key(KeyPress::Down);
+        app.on_key(KeyPress::Up);
+        app.on_key(KeyPress::Select);
+        assert_eq!(screen(&app), PHOTO, "写真画面の 8/2・5 は画面を変えない");
         assert!(
             pump_until(&mut app, |a| photo_position(a) == 1),
             "写真切替後も位置が有効"
@@ -173,16 +172,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 何も描かない画面(3 つ目の画面としてメニューと巡回を確かめる)。
+    struct Blank;
+
+    impl crate::screen::Screen for Blank {
+        fn id(&self) -> crate::screen::ScreenId {
+            "blank"
+        }
+        fn title(&self) -> &'static str {
+            "BLANK"
+        }
+        fn render(&mut self, ctx: &mut crate::screen::RenderContext<'_>) {
+            ctx.canvas
+                .clear(miharashi_render::canvas::rgba(0, 0, 0, 255));
+        }
+    }
+
+    fn three_screens() -> ScreenManager {
+        ScreenManager::new(
+            vec![
+                Box::new(StatusScreen::new()),
+                Box::new(Blank),
+                Box::new(Blank2),
+            ],
+            "status",
+            Box::new(DummyData::new()),
+            dummy_snapshot(0.0),
+            text_engine(""),
+            Duration::from_secs(60),
+        )
+    }
+
+    struct Blank2;
+
+    impl crate::screen::Screen for Blank2 {
+        fn id(&self) -> crate::screen::ScreenId {
+            "blank2"
+        }
+        fn title(&self) -> &'static str {
+            "BLANK 2"
+        }
+        fn render(&mut self, ctx: &mut crate::screen::RenderContext<'_>) {
+            ctx.canvas
+                .clear(miharashi_render::canvas::rgba(0, 0, 40, 255));
+        }
+    }
+
+    /// 0 でメニューを開き、8/2(4/6 も)で選んで 5 で移る。0 で閉じる。メニュー中は画面に操作を渡さない。
     #[test]
-    fn status_page_toggles_with_switch_key() {
-        let (mut app, dir) = app_with_photo((320, 180));
-        app.on_key(KeyPress::Switch);
-        assert_eq!(screen(&app), DETAILS);
+    fn menu_selects_a_screen() {
+        let mut app = three_screens();
+        app.on_key(KeyPress::Next);
+        app.on_key(KeyPress::Next);
+        app.on_key(KeyPress::Next);
+        assert_eq!(app.screen_id(), "status", "3 画面を巡回して戻る");
+        app.on_key(KeyPress::Menu);
+        assert!(app.menu_open());
+        app.on_key(KeyPress::Down);
+        app.on_key(KeyPress::Down);
+        app.on_key(KeyPress::Down);
+        // 0 → 0(3 つ進んで一周)→ 2(戻ると最後へ折り返す)→ 0 → 2
+        app.on_key(KeyPress::Up);
+        app.on_key(KeyPress::Next);
         app.on_key(KeyPress::Prev);
-        assert_eq!(screen(&app), DETAILS, "4 は何もしない");
-        app.on_key(KeyPress::Switch);
-        assert_eq!(screen(&app), OVERVIEW);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(app.screen_id(), "status", "選んでいる間は移らない");
+        app.on_key(KeyPress::Select);
+        assert!(!app.menu_open());
+        assert_eq!(app.screen_id(), "blank2");
+        app.on_key(KeyPress::Prev);
+        app.on_key(KeyPress::Prev);
+        app.on_key(KeyPress::Menu);
+        app.on_key(KeyPress::Select);
+        assert_eq!(
+            screen(&app),
+            OVERVIEW,
+            "開いたときは表示中の画面を選んでいる。メニューの 5 はページを切り替えない"
+        );
+        app.on_key(KeyPress::Menu);
+        app.on_key(KeyPress::Down);
+        app.on_key(KeyPress::Menu);
+        assert!(!app.menu_open());
+        assert_eq!(app.screen_id(), "status", "0 で閉じると移らない");
+    }
+
+    /// 操作パネルの `POST /api/v1/screen`: 登録されている id だけに移り、メニューとアラートは閉じる。
+    #[test]
+    fn show_screen_by_id() {
+        let mut app = three_screens();
+        app.on_key(KeyPress::Menu);
+        assert!(app.show_screen("blank2"));
+        assert_eq!(app.screen_id(), "blank2");
+        assert!(!app.menu_open());
+        assert!(!app.show_screen("room"), "登録されていない");
+        assert_eq!(app.screen_id(), "blank2");
     }
 
     #[test]
@@ -196,7 +278,7 @@ mod tests {
             v.feed_online,
             "最初の tick より前から、今までどおり接続中として出す"
         );
-        app.on_key(KeyPress::Switch);
+        app.on_key(KeyPress::Select);
         assert_eq!(app.panel_view().unwrap().page, Some("DETAILS"));
         app.on_key(KeyPress::Next);
         assert!(pump_until(&mut app, |a| photo_position(a) == 1));
@@ -281,7 +363,7 @@ mod tests {
                 let mut want = Canvas::new(size.0, size.1);
                 miharashi_render::screens::status(&mut want, &mut text, app.world(), page);
                 assert!(got.pixmap.data() == want.pixmap.data(), "{size:?} {page:?}");
-                app.on_key(KeyPress::Switch);
+                app.on_key(KeyPress::Select);
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -372,7 +454,7 @@ mod tests {
                 ..
             }
         ));
-        app.on_key(KeyPress::Prev);
+        app.on_key(KeyPress::Down);
         assert!(matches!(
             app.render_composite(&mut overlay),
             Composite::Photo {
@@ -380,6 +462,69 @@ mod tests {
                 ..
             }
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写真画面の 5 で写真の情報を消し、もう一度押すと戻す。GPU 経路の重ね絵にも反映する。
+    #[test]
+    fn select_toggles_the_photo_info() {
+        let size = (640u32, 270u32);
+        let (mut app, dir) = app_with_photo(size);
+        app.on_key(KeyPress::Next);
+        assert!(pump_until(&mut app, |a| photo_position(a) == 1));
+        std::thread::sleep(Duration::from_millis(900));
+        app.tick(Instant::now());
+        let draw = |app: &mut ScreenManager| {
+            let mut c = Canvas::new(size.0, size.1);
+            app.render(&mut c);
+            c.pixmap.data().to_vec()
+        };
+        let with_info = draw(&mut app);
+        app.on_key(KeyPress::Select);
+        let without = draw(&mut app);
+        assert!(with_info != without, "情報が消える");
+        let mut overlay = Canvas::new(size.0, size.1);
+        assert!(matches!(
+            app.render_composite(&mut overlay),
+            Composite::Photo {
+                overlay_changed: true,
+                ..
+            }
+        ));
+        app.on_key(KeyPress::Select);
+        assert!(draw(&mut app) == with_info, "もう一度押すと戻る");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// メニューは写真の重ね絵の上に描き、GPU 経路でも CPU 経路と同じ絵になる。
+    #[test]
+    fn menu_is_drawn_over_the_photo_overlay() {
+        let size = (640u32, 270u32);
+        let (mut app, dir) = app_with_photo(size);
+        app.on_key(KeyPress::Next);
+        assert!(pump_until(&mut app, |a| photo_position(a) == 1));
+        std::thread::sleep(Duration::from_millis(900));
+        app.tick(Instant::now());
+        let mut overlay = Canvas::new(size.0, size.1);
+        app.render_composite(&mut overlay);
+        app.on_key(KeyPress::Menu);
+        let mut cpu = Canvas::new(size.0, size.1);
+        app.render(&mut cpu);
+        let frame = match app.render_composite(&mut overlay) {
+            Composite::Photo {
+                photo,
+                overlay_changed: true,
+                ..
+            } => match photo.data {
+                PhotoData::Frame(f) => f.data().to_vec(),
+                _ => panic!("CPU 経路の写真は完成フレーム"),
+            },
+            _ => panic!("メニューを開いたら重ね絵を描き直す"),
+        };
+        assert!(
+            over_diff(&overlay, &frame, &cpu) <= 2,
+            "メニューも重ね絵に入る"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -539,7 +684,7 @@ mod tests {
                     // ページ指示のシアン色の文字が見出しにある。
                     assert!(has_color(&c, [64, 200, 255, 255], 300..700, 20..60));
                 }
-                app.on_key(KeyPress::Switch);
+                app.on_key(KeyPress::Select);
             }
             let _ = std::fs::remove_dir_all(&dir);
         }

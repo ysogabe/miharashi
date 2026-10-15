@@ -471,7 +471,7 @@ fn overview(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot) {
     footer(
         c,
         t,
-        "5: 詳細    6: フォトフレーム",
+        "5: 詳細    4/6: 画面の切替    0: メニュー",
         Some("* CPU の W は推定値(RAPL)。CPU+GPU のみ"),
     );
 }
@@ -696,5 +696,5 @@ fn details(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot) {
         fit_left(c, t, label, bx + 20.0, ry, 30.0, label_w, FG);
     }
 
-    footer(c, t, "5: 概要    6: フォトフレーム", None);
+    footer(c, t, "5: 概要    4/6: 画面の切替    0: メニュー", None);
 }

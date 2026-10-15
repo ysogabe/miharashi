@@ -1,10 +1,12 @@
-//! 画面の登録と切り替え、アラート層の重ね描き、共有データ(`World`)の更新。runtime からは `App` として見える。
+//! 画面の登録と切り替え、メニュー、アラート層の重ね描き、共有データ(`World`)の更新。runtime からは `App` として見える。
+//! キーは docs/DESIGN-screens.md §4.1: 4/6 = 画面の巡回、0 = メニュー、5・8/2 = 表示中の画面の中の操作。
 use super::DataSource;
 use crate::screen::{
-    App, Composite, KeyPress, Outcome, PanelView, Provider, RenderContext, Screen, ScreenAction,
-    ScreenInfo, World,
+    App, Composite, KeyPress, PanelView, Provider, RenderContext, Screen, ScreenAction, ScreenInfo,
+    World,
 };
 use miharashi_render::alert::{self, AlertView};
+use miharashi_render::menu;
 use miharashi_render::{Canvas, TextEngine};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -23,6 +25,8 @@ pub struct ScreenManager {
     tick_len: Duration,
     /// GPU 経路の重ね絵を次の描画で描き直させる(時刻の更新、キー、アラートの変化)
     force_overlay: bool,
+    /// メニューを開いているときの、選んでいる画面の添字
+    menu: Option<usize>,
     /// アラート(地震・災害)の受け口(無効なら None)
     alerts: Option<Receiver<AlertView>>,
     /// 表示中のアラートと、閉じる時刻
@@ -58,6 +62,7 @@ impl ScreenManager {
             next_tick: now,
             tick_len: Duration::from_secs(1),
             force_overlay: true,
+            menu: None,
             alerts: None,
             alert: None,
             alert_len,
@@ -107,6 +112,12 @@ impl ScreenManager {
         self.screens[i].on_enter(now);
     }
 
+    /// メニューを開いているか(テスト用)。
+    #[cfg(test)]
+    pub fn menu_open(&self) -> bool {
+        self.menu.is_some()
+    }
+
     /// 戻り値: 再描画が必要か。
     pub fn on_key(&mut self, key: KeyPress) -> bool {
         self.keys += 1;
@@ -116,21 +127,52 @@ impl ScreenManager {
             return true;
         }
         let now = Instant::now();
-        let action = match key {
-            KeyPress::Prev => ScreenAction::Up,
-            KeyPress::Switch => ScreenAction::Select,
-            KeyPress::Next => ScreenAction::Down,
-        };
-        if self.screens[self.current].handle_action(action, now) == Outcome::Ignored {
-            // 画面で使わなかったキー。S2(docs/DESIGN-screens.md §4.1)で 4/6 = 画面の巡回、0 = メニューに変える。
-            // それまでは今の操作のまま: 6 = 次の画面、4 = 前の画面(端で止まる)、5 = 先頭(状況画面)へ戻る
-            let to = match action {
-                ScreenAction::Down => (self.current + 1).min(self.screens.len() - 1),
-                ScreenAction::Up => self.current.saturating_sub(1),
-                ScreenAction::Select => 0,
-            };
-            self.switch_to(to, now);
+        let n = self.screens.len();
+        // メニュー中は画面に操作を渡さない。8/2(と 4/6)で選び、5 で移り、0 で閉じる
+        if let Some(sel) = self.menu {
+            match key {
+                KeyPress::Up | KeyPress::Prev => self.menu = Some((sel + n - 1) % n),
+                KeyPress::Down | KeyPress::Next => self.menu = Some((sel + 1) % n),
+                KeyPress::Select => {
+                    self.menu = None;
+                    self.switch_to(sel, now);
+                }
+                KeyPress::Menu => self.menu = None,
+            }
+            return true;
         }
+        let action = match key {
+            KeyPress::Prev => {
+                self.switch_to((self.current + n - 1) % n, now);
+                return true;
+            }
+            KeyPress::Next => {
+                self.switch_to((self.current + 1) % n, now);
+                return true;
+            }
+            KeyPress::Menu => {
+                self.menu = Some(self.current);
+                return true;
+            }
+            KeyPress::Select => ScreenAction::Select,
+            KeyPress::Up => ScreenAction::Up,
+            KeyPress::Down => ScreenAction::Down,
+        };
+        // 画面で使わない操作は何もしない
+        let _ = self.screens[self.current].handle_action(action, now);
+        true
+    }
+
+    /// 指定した id の画面にする(操作パネル)。登録に無い id なら何もしない。戻り値: 再描画が必要か。
+    pub fn show_screen(&mut self, id: &str) -> bool {
+        let Some(i) = self.screens.iter().position(|s| s.id() == id) else {
+            return false;
+        };
+        self.keys += 1;
+        self.force_overlay = true;
+        self.alert = None;
+        self.menu = None;
+        self.switch_to(i, Instant::now());
         true
     }
 
@@ -177,43 +219,56 @@ impl ScreenManager {
     }
 
     pub fn render(&mut self, canvas: &mut Canvas) {
+        let titles = self.titles();
         let Self {
             screens,
             current,
             world,
             text,
             alert,
+            menu,
             ..
         } = self;
         let mut ctx = RenderContext {
             canvas,
             text,
             world,
-            alert: alert.is_some(),
+            covered: alert.is_some() || menu.is_some(),
             force_overlay: true,
         };
         screens[*current].render(&mut ctx);
-        if let Some((view, _)) = alert {
-            alert::overlay(ctx.canvas, ctx.text, view);
-        }
+        layers(
+            ctx.canvas,
+            ctx.text,
+            &titles,
+            *current,
+            *menu,
+            alert.as_ref(),
+        );
     }
 
-    /// GPU 経路の描画。アラートは画面の完成画面か、写真の重ね絵の上に描く。
+    fn titles(&self) -> Vec<&'static str> {
+        self.screens.iter().map(|s| s.title()).collect()
+    }
+
+    /// GPU 経路の描画。メニューとアラートは画面の完成画面か、写真の重ね絵の上に描く。
     pub fn render_composite(&mut self, canvas: &mut Canvas) -> Composite<'_> {
         let force_overlay = std::mem::take(&mut self.force_overlay);
+        let titles = self.titles();
         let Self {
             screens,
             current,
             world,
             text,
             alert,
+            menu,
             ..
         } = self;
         let mut ctx = RenderContext {
             canvas,
             text,
             world,
-            alert: alert.is_some(),
+            covered: alert.is_some() || menu.is_some(),
             force_overlay,
         };
         let comp = screens[*current].render_composite(&mut ctx);
@@ -222,13 +277,37 @@ impl ScreenManager {
             Composite::Photo {
                 overlay_changed, ..
             } => *overlay_changed,
-            // 航空機の画面はアラート中は Canvas で返る
+            // 航空機の画面は、重ねるものがあるときは Canvas で返る
             Composite::Radar { .. } => false,
         };
-        if draw_alert && let Some((view, _)) = alert {
-            alert::overlay(ctx.canvas, ctx.text, view);
+        if draw_alert {
+            layers(
+                ctx.canvas,
+                ctx.text,
+                &titles,
+                *current,
+                *menu,
+                alert.as_ref(),
+            );
         }
         comp
+    }
+}
+
+/// 画面の上に重ねるもの。メニューの上にアラート。
+fn layers(
+    canvas: &mut Canvas,
+    text: &mut TextEngine,
+    titles: &[&str],
+    current: usize,
+    menu: Option<usize>,
+    alert: Option<&(AlertView, Instant)>,
+) {
+    if let Some(sel) = menu {
+        menu::menu(canvas, text, titles, current, sel);
+    }
+    if let Some((view, _)) = alert {
+        alert::overlay(canvas, text, view);
     }
 }
 
@@ -247,6 +326,10 @@ impl App for ScreenManager {
 
     fn render_composite(&mut self, canvas: &mut Canvas) -> Composite<'_> {
         ScreenManager::render_composite(self, canvas)
+    }
+
+    fn show_screen(&mut self, id: &str) -> bool {
+        ScreenManager::show_screen(self, id)
     }
 
     fn wants_screen(&self) -> bool {

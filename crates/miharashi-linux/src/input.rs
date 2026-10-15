@@ -4,9 +4,18 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    /// 4: 前の画面
     Prev,
-    Switch,
+    /// 5: 決定・詳細
+    Select,
+    /// 6: 次の画面
     Next,
+    /// 8: 前の項目
+    Up,
+    /// 2: 次の項目
+    Down,
+    /// 0: メニュー
+    Menu,
     Quit,
 }
 
@@ -151,8 +160,11 @@ impl Keys {
 pub fn map_key(k: KeyCode) -> Option<Action> {
     match k {
         KeyCode::KEY_KP4 | KeyCode::KEY_LEFT | KeyCode::KEY_4 => Some(Action::Prev),
-        KeyCode::KEY_KP5 | KeyCode::KEY_5 => Some(Action::Switch),
+        KeyCode::KEY_KP5 | KeyCode::KEY_5 => Some(Action::Select),
         KeyCode::KEY_KP6 | KeyCode::KEY_RIGHT | KeyCode::KEY_6 => Some(Action::Next),
+        KeyCode::KEY_KP8 | KeyCode::KEY_UP | KeyCode::KEY_8 => Some(Action::Up),
+        KeyCode::KEY_KP2 | KeyCode::KEY_DOWN | KeyCode::KEY_2 => Some(Action::Down),
+        KeyCode::KEY_KP0 | KeyCode::KEY_INSERT | KeyCode::KEY_0 => Some(Action::Menu),
         KeyCode::KEY_ESC | KeyCode::KEY_Q => Some(Action::Quit),
         _ => None,
     }
@@ -166,8 +178,11 @@ mod tests {
     fn numpad_keys_map_regardless_of_numlock() {
         // NumLock の状態はカーネルの evdev には影響せず、テンキーは常に KEY_KP* として届く。
         assert_eq!(map_key(KeyCode::KEY_KP4), Some(Action::Prev));
-        assert_eq!(map_key(KeyCode::KEY_KP5), Some(Action::Switch));
+        assert_eq!(map_key(KeyCode::KEY_KP5), Some(Action::Select));
         assert_eq!(map_key(KeyCode::KEY_KP6), Some(Action::Next));
+        assert_eq!(map_key(KeyCode::KEY_KP8), Some(Action::Up));
+        assert_eq!(map_key(KeyCode::KEY_KP2), Some(Action::Down));
+        assert_eq!(map_key(KeyCode::KEY_KP0), Some(Action::Menu));
     }
 
     #[test]
@@ -176,6 +191,16 @@ mod tests {
         assert_eq!(map_key(KeyCode::KEY_RIGHT), Some(Action::Next));
         assert_eq!(map_key(KeyCode::KEY_4), Some(Action::Prev));
         assert_eq!(map_key(KeyCode::KEY_6), Some(Action::Next));
+        assert_eq!(map_key(KeyCode::KEY_UP), Some(Action::Up));
+        assert_eq!(map_key(KeyCode::KEY_DOWN), Some(Action::Down));
+        assert_eq!(map_key(KeyCode::KEY_8), Some(Action::Up));
+        assert_eq!(map_key(KeyCode::KEY_2), Some(Action::Down));
+        assert_eq!(map_key(KeyCode::KEY_0), Some(Action::Menu));
+        assert_eq!(
+            map_key(KeyCode::KEY_INSERT),
+            Some(Action::Menu),
+            "NumLock OFF の 0"
+        );
         assert_eq!(map_key(KeyCode::KEY_ESC), Some(Action::Quit));
         assert_eq!(map_key(KeyCode::KEY_A), None);
     }
