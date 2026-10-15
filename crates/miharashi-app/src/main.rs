@@ -141,9 +141,8 @@ fn run(cli: Cli) -> Result<(), String> {
     let planes = aircraft::start(&cfg.aircraft);
     runtime::run(&cfg, |out| {
         Box::new(
-            app::KioskApp::new(&cfg, out.size, out.gpu_max_texture, src, data, snap)
-                .with_alerts(Some(alerts))
-                .with_aircraft(planes),
+            app::kiosk(&cfg, out.size, out.gpu_max_texture, src, data, snap, planes)
+                .with_alerts(Some(alerts)),
         )
     })
 }
@@ -247,8 +246,14 @@ fn png(cli: Cli) -> Result<(), String> {
     // 旅のカード(一覧に旅があればそのうち最大のもの、なければ見本)
     std::fs::write(out.join("groups.txt"), catalog.group_summary()).map_err(|e| e.to_string())?;
     let cards = [
-        (catalog.sample_card(false).unwrap_or_else(album::demo_card), "trip-card"),
-        (catalog.sample_card(true).unwrap_or_else(album::demo_card), "everyday-card"),
+        (
+            catalog.sample_card(false).unwrap_or_else(album::demo_card),
+            "trip-card",
+        ),
+        (
+            catalog.sample_card(true).unwrap_or_else(album::demo_card),
+            "everyday-card",
+        ),
     ];
     for (card, name) in cards {
         miharashi_render::trip_card::trip_card(&mut overlay, &mut text, &card);
@@ -394,7 +399,10 @@ fn bench_metrics(cli: Cli) -> Result<(), String> {
         interval.as_secs(),
         rd("scaling_cur_freq"),
         rd("scaling_governor"),
-        load.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+        load.split_whitespace()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ")
     );
     let costs = profile(rounds, interval, &gpu, &opts);
     let (mut wall, mut cpu) = (0.0, 0.0);

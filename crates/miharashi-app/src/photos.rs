@@ -1,12 +1,12 @@
 //! 写真の取得元(GEOFRAME か単一ファイル)、並び順、デコードを担当する。
 //! `Feed` は別スレッドで取得・縮小するので、描画ループをブロックしない。
+use crate::album::{self, Group, Meta, Scheduler, Slot};
 use crate::screen::{PhotoData, PhotoRef};
 use chrono::{Datelike, NaiveDate};
 use image::DynamicImage;
 use miharashi_render::photo_layout::{self, PhotoLayout};
-use miharashi_render::{Pixmap, photo, screens::PhotoInfo};
-use crate::album::{self, Group, Meta, Scheduler, Slot};
 use miharashi_render::trip_card::TripCard;
+use miharashi_render::{Pixmap, photo, screens::PhotoInfo};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::Duration;
@@ -238,8 +238,7 @@ impl Catalog {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0x9e3779b97f4a7c15, |d| d.as_nanos() as u64);
         let mut sched = Scheduler::new(seed);
-        cat.state = std::env::var_os("STATE_DIRECTORY")
-            .map(|d| PathBuf::from(d).join("play.json"));
+        cat.state = std::env::var_os("STATE_DIRECTORY").map(|d| PathBuf::from(d).join("play.json"));
         if let Some(path) = &cat.state
             && let Ok(text) = std::fs::read_to_string(path)
         {
@@ -329,7 +328,11 @@ impl Catalog {
         }
         self.pos = next as usize;
         if self.pos >= self.queue.len() {
-            let round = sched.next_round(&self.groups, &self.metas, chrono::Local::now().naive_local());
+            let round = sched.next_round(
+                &self.groups,
+                &self.metas,
+                chrono::Local::now().naive_local(),
+            );
             self.queue.extend(round);
             self.save_state();
         }
@@ -377,15 +380,11 @@ impl Catalog {
         let layout = photo_layout::plan(&mut self.slot, w, h, img.width(), img.height());
         let pixels = match self.gpu_max {
             // GPU 経路: デコードだけして、縮小と合成は GPU に任せる
-            Some(max) if img.width().max(img.height()) <= max => {
-                PhotoPixels::Source(match img {
-                    DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => img,
-                    other if other.color().has_alpha() => {
-                        DynamicImage::ImageRgba8(other.to_rgba8())
-                    }
-                    other => DynamicImage::ImageRgb8(other.to_rgb8()),
-                })
-            }
+            Some(max) if img.width().max(img.height()) <= max => PhotoPixels::Source(match img {
+                DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => img,
+                other if other.color().has_alpha() => DynamicImage::ImageRgba8(other.to_rgba8()),
+                other => DynamicImage::ImageRgb8(other.to_rgb8()),
+            }),
             // 背景と写真の合成は、新しい写真ごとにここ(取得スレッド)で 1 回だけ行う。
             _ => PhotoPixels::Frame(photo::compose_image(&img, w, h, &layout)?),
         };
@@ -541,86 +540,89 @@ impl Feed {
     ) -> Self {
         let (tx, cmd_rx) = channel::<Cmd>();
         let (ev_tx, rx) = channel();
-        let spawned = std::thread::Builder::new().name("photos".into()).spawn(move || {
-            let mut grouping = Grouping {
-                home: None,
-                radius_km: home.as_ref().map_or(50.0, |h| h.radius_km),
-            };
-            let mut backoff = Backoff::new(min, max);
-            let mut catalog: Option<Catalog> = None;
-            let mut delta = 1isize;
-            let mut offline = false;
-            let mut photo_failures = 0u32;
-            loop {
-                let loaded = (|| {
-                    if catalog.is_none() {
-                        if grouping.home.is_none() && matches!(source, Source::Geoframe(_)) {
-                            grouping.home = home.as_ref().and_then(HomeLookup::resolve);
-                        }
-                        let mut c = Catalog::open(&source, size, &grouping)?;
-                        c.gpu_max = gpu_max;
-                        catalog = Some(c);
-                    }
-                    catalog
-                        .as_mut()
-                        .map_or_else(|| Err("catalog".to_string()), Catalog::current)
-                })();
-                match loaded {
-                    Ok(item) => {
-                        if offline && ev_tx.send(FeedEvent::Status(FeedStatus::Online)).is_err() {
-                            return;
-                        }
-                        offline = false;
-                        backoff.reset();
-                        photo_failures = 0;
-                        let ev = match item {
-                            Shown::Photo(p) => FeedEvent::Photo(p),
-                            Shown::Card(c) => FeedEvent::Card(c),
-                        };
-                        if ev_tx.send(ev).is_err() {
-                            return;
-                        }
-                        match cmd_rx.recv() {
-                            Ok(Cmd::Next) => delta = 1,
-                            Ok(Cmd::Prev) => delta = -1,
-                            Err(_) => return,
-                        }
-                        if let Some(c) = catalog.as_mut() {
-                            c.advance(delta);
-                        }
-                    }
-                    Err(error) => {
-                        photo_failures += 1;
-                        // 一覧は取れているのに写真だけ失敗したときは、2 回までは別の写真を試す。
-                        // それでも続くなら、一覧ごと取り直す(サーバー再起動後に一覧が変わりうる)。
-                        if let Some(c) = catalog.as_mut() {
-                            if photo_failures < 3 {
-                                c.advance(delta);
-                                continue;
+        let spawned = std::thread::Builder::new()
+            .name("photos".into())
+            .spawn(move || {
+                let mut grouping = Grouping {
+                    home: None,
+                    radius_km: home.as_ref().map_or(50.0, |h| h.radius_km),
+                };
+                let mut backoff = Backoff::new(min, max);
+                let mut catalog: Option<Catalog> = None;
+                let mut delta = 1isize;
+                let mut offline = false;
+                let mut photo_failures = 0u32;
+                loop {
+                    let loaded = (|| {
+                        if catalog.is_none() {
+                            if grouping.home.is_none() && matches!(source, Source::Geoframe(_)) {
+                                grouping.home = home.as_ref().and_then(HomeLookup::resolve);
                             }
-                            catalog = None;
+                            let mut c = Catalog::open(&source, size, &grouping)?;
+                            c.gpu_max = gpu_max;
+                            catalog = Some(c);
                         }
-                        let wait = backoff.next_delay();
-                        offline = true;
-                        let status = FeedStatus::Retrying {
-                            attempt: backoff.attempts(),
-                            retry_in: wait,
-                            error,
-                        };
-                        if ev_tx.send(FeedEvent::Status(status)).is_err() {
-                            return;
+                        catalog
+                            .as_mut()
+                            .map_or_else(|| Err("catalog".to_string()), Catalog::current)
+                    })();
+                    match loaded {
+                        Ok(item) => {
+                            if offline && ev_tx.send(FeedEvent::Status(FeedStatus::Online)).is_err()
+                            {
+                                return;
+                            }
+                            offline = false;
+                            backoff.reset();
+                            photo_failures = 0;
+                            let ev = match item {
+                                Shown::Photo(p) => FeedEvent::Photo(p),
+                                Shown::Card(c) => FeedEvent::Card(c),
+                            };
+                            if ev_tx.send(ev).is_err() {
+                                return;
+                            }
+                            match cmd_rx.recv() {
+                                Ok(Cmd::Next) => delta = 1,
+                                Ok(Cmd::Prev) => delta = -1,
+                                Err(_) => return,
+                            }
+                            if let Some(c) = catalog.as_mut() {
+                                c.advance(delta);
+                            }
                         }
-                        // 待機中でも、キー操作(次/前)が来たら即座に再試行する。
-                        match cmd_rx.recv_timeout(wait) {
-                            Ok(Cmd::Next) => delta = 1,
-                            Ok(Cmd::Prev) => delta = -1,
-                            Err(RecvTimeoutError::Timeout) => {}
-                            Err(RecvTimeoutError::Disconnected) => return,
+                        Err(error) => {
+                            photo_failures += 1;
+                            // 一覧は取れているのに写真だけ失敗したときは、2 回までは別の写真を試す。
+                            // それでも続くなら、一覧ごと取り直す(サーバー再起動後に一覧が変わりうる)。
+                            if let Some(c) = catalog.as_mut() {
+                                if photo_failures < 3 {
+                                    c.advance(delta);
+                                    continue;
+                                }
+                                catalog = None;
+                            }
+                            let wait = backoff.next_delay();
+                            offline = true;
+                            let status = FeedStatus::Retrying {
+                                attempt: backoff.attempts(),
+                                retry_in: wait,
+                                error,
+                            };
+                            if ev_tx.send(FeedEvent::Status(status)).is_err() {
+                                return;
+                            }
+                            // 待機中でも、キー操作(次/前)が来たら即座に再試行する。
+                            match cmd_rx.recv_timeout(wait) {
+                                Ok(Cmd::Next) => delta = 1,
+                                Ok(Cmd::Prev) => delta = -1,
+                                Err(RecvTimeoutError::Timeout) => {}
+                                Err(RecvTimeoutError::Disconnected) => return,
+                            }
                         }
                     }
                 }
-            }
-        });
+            });
         if let Err(e) = spawned {
             eprintln!("photos: スレッドを起動できない: {e}");
         }
@@ -767,7 +769,11 @@ mod tests {
             "末尾の次は先頭へ戻る"
         );
         cat.advance(-1);
-        assert_eq!(cat.current_photo().unwrap().info.place, "p2", "先頭の前は末尾へ");
+        assert_eq!(
+            cat.current_photo().unwrap().info.place,
+            "p2",
+            "先頭の前は末尾へ"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

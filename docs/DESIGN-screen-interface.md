@@ -1,6 +1,6 @@
 # 画面管理インターフェースの最小設計(Issue #9)
 
-状態: **設計(未実装)**。2026-10-13 作成。対象: [#9](https://github.com/ysogabe/miharashi/issues/9)。
+状態: **S1 を実装**(2026-10-15、[#5](https://github.com/ysogabe/miharashi/issues/5))。実装で変えた点は §10。2026-10-13 作成。対象: [#9](https://github.com/ysogabe/miharashi/issues/9)。
 基準にしたコード: ブランチ `trial/poc-002-kiosk-runtime`([PR #8](https://github.com/ysogabe/miharashi/pull/8))の `crates/miharashi-app`(`runtime.rs` / `app.rs` / `data.rs` / `photos.rs`)。`main` の `miharashi-poc` ではない。
 
 [DESIGN.md](DESIGN.md) §3 のワークスペース案(`core` / `screens` / `data` crate)と §4 の trait 例は実装前の案で、実際の crate は `render` / `linux` / `app` の 3 つである。この文書は、その現実のコードを起点に、画面を追加するための最小の契約を決める。§4 の trait 例はこの文書で置き換える。
@@ -214,3 +214,25 @@ Provider のスレッド(`metrics::Sampler`、写真の `Feed`)は今と同じ�
 - 状態ログの `stats()` 化と `soak_summary.py` の互換テスト。
 - 設定: `ui.start_screen` の id 照合、`runtime.quit_key`。
 - DESIGN.md §3 のワークスペース案を実際の crate 構成に合わせて更新(この文書の §2 を反映)。
+
+## 10. 実装(S1、2026-10-15)
+
+[DESIGN-screens.md](DESIGN-screens.md) §7 の S1(今の 2 画面とアラート層・操作パネルを、動作を変えずに分ける)を実装した。
+
+| 場所 | 中身 |
+|---|---|
+| `src/screen.rs` | `App`(runtime との境界、変更なし)に加えて `Screen` / `ScreenAction` / `Outcome` / `RenderContext` / `World` / `FeedState` / `Provider` |
+| `src/app.rs` | `kiosk()`: 画面の登録(並び順 = 切り替わる順)。画面を足すときはここだけを変える。`DataSource` / `set_clock` / `text_engine` |
+| `src/app/manager.rs` | `ScreenManager`(`App` を実装)。画面の切り替え、アラート層、1 秒ごとの実測値と時刻、Provider、状態ログ、操作パネルの状態 |
+| `src/app/screens/status.rs` | `StatusScreen`。ページ(OVERVIEW / DETAILS)を自分で持つ |
+| `src/app/screens/photo.rs` | `PhotoScreen`。写真フィード、フェード、カード、写真の合間の航空機の画面(S3 で独立させるまでここに置く)。`FeedStateProvider` |
+
+§3 の案から変えた点:
+
+- **`Screen` に足したもの**: GPU 経路の `render_composite`(PoC-005 で入った `Composite` を返す)、`animating`(航空機の回る線)、`page`(操作パネルのページ名)。`RenderContext` には、アラートを重ねるか(`alert`)と、GPU 経路の重ね絵を描き直させるか(`force_overlay`)を足した。アラートは ScreenManager が画面の上に描くので、写真画面の重ね絵を描き直させないと GPU 経路で消える。
+- **`Outcome` に redraw を持たせない**: キーを受けたら必ず描き直す(今の動作)。
+- **キー**: `KeyPress` は今の Prev / Switch / Next のまま(S2 で 0・8・2 を足す)。ScreenManager は Prev → `Up`、Switch → `Select`、Next → `Down` にして表示中の画面へ渡し、画面が使わなかったら今の操作どおりに切り替える(6 = 次の画面、4 = 前の画面で端で止まる、5 = 先頭の状況画面)。写真画面は `Up` / `Down` を前後の写真に使うので、写真画面の 4/6 は今までどおり写真の前後になる。
+- **データ**: `World` は `system`(今の `Snapshot`。日付と時刻もここ)と `photo_feed` の 2 つ。実測値は今の `DataSource` のまま 1 秒ごとに ScreenManager が呼ぶ。`Provider::update(&mut World)` は毎周期呼び、写真フィードの状態だけを写す(写真画面が共有ハンドルに書き、`FeedStateProvider` が `World` に写す。`Feed` から受け取るのは写真画面だけ)。
+- **非表示の画面**: `tick` は全画面に呼び、再描画の要求は表示中の画面の分だけ使う。写真画面は非表示の間、写真を自動で進めず、航空機の画面も挟まない(今と同じ)。戻ったときの自動切替のタイマーは戻さない(今と同じ)。
+- **状態ログ**: `screen=` を画面の id(`status` / `photo`)にした。今までの `screen=Status(Overview)` のページは、末尾の `page=overview` / `page=details` に分けた。ほかの項目と並び順は変えていない(`tools/soak_summary.py` はそのまま読める)。
+- **まだのもの**: `png` コマンドのレジストリー化と `variants()`、`KeyPress` の統一と 0・8・2、メニュー、`runtime.quit_key`(S2 以降)。
