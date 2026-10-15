@@ -97,6 +97,10 @@ pub trait Screen {
     fn handle_action(&mut self, _action: ScreenAction, _now: Instant) -> Outcome {
         Outcome::Ignored
     }
+    /// 今 5・8・2 を押すと何が起きるか(操作パネルのボタンのラベル)。`handle_action` で何もしないキーは None。
+    fn key_labels(&self) -> KeyLabels {
+        KeyLabels::default()
+    }
     /// CPU で完成画面を描く。
     fn render(&mut self, ctx: &mut RenderContext<'_>);
     /// GPU 経路(`App::render_composite`)の描画。既定は `render` と同じで、Canvas が完成画面になる。
@@ -183,6 +187,25 @@ pub struct ScreenInfo {
     pub title: &'static str,
 }
 
+/// 画面の中の操作(5・8・2)の今の意味。値は全角 6 文字までの短いラベル。None は押しても何もしない。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyLabels {
+    pub select: Option<&'static str>,
+    pub up: Option<&'static str>,
+    pub down: Option<&'static str>,
+}
+
+/// 操作パネルの 6 つのキー(`/api/v1/input` の `key` と同じ名前)の今の意味。None は押しても何もしない。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PanelKeys {
+    pub prev: Option<&'static str>,
+    pub next: Option<&'static str>,
+    pub select: Option<&'static str>,
+    pub up: Option<&'static str>,
+    pub down: Option<&'static str>,
+    pub menu: Option<&'static str>,
+}
+
 /// 操作パネルに見せる画面の状態(docs/panel/DESIGN.md §5.2)。変わったときだけパネルへ送る。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelView {
@@ -198,6 +221,10 @@ pub struct PanelView {
     pub feed_online: bool,
     /// 自動巡回の状態。巡回が無効なら None
     pub rotation: Option<PanelRotation>,
+    /// メニューで選んでいる画面(`screens` の添字)。メニューが閉じていれば None
+    pub menu: Option<usize>,
+    /// 今のキーの意味(アラート・メニュー・表示中の画面で変わる)
+    pub keys: PanelKeys,
 }
 
 /// 操作パネルに見せる自動巡回の状態。
@@ -257,4 +284,33 @@ pub enum Composite<'a> {
         scrim_alpha: f32,
         focus_card_id: Option<u64>,
     },
+}
+
+/// 画面のテストで使う: `key_labels()` が None のキーは `handle_action` でも何もしない(Ignored)、
+/// ラベルのあるキーは必ず処理する(Consumed)。押すたびに意味が変わる画面もあるので、毎回ラベルを取り直す。
+#[cfg(test)]
+pub fn assert_key_labels_match_actions(screen: &mut dyn Screen, now: Instant) {
+    for action in [
+        ScreenAction::Select,
+        ScreenAction::Up,
+        ScreenAction::Down,
+        ScreenAction::Select,
+    ] {
+        let labels = screen.key_labels();
+        let label = match action {
+            ScreenAction::Select => labels.select,
+            ScreenAction::Up => labels.up,
+            ScreenAction::Down => labels.down,
+        };
+        if let Some(label) = label {
+            assert!(label.chars().count() <= 6, "{label} は 6 文字まで");
+        }
+        let outcome = screen.handle_action(action, now);
+        assert_eq!(
+            outcome == Outcome::Consumed,
+            label.is_some(),
+            "{}: {action:?} のラベル {label:?} と処理 {outcome:?} が食い違う",
+            screen.id()
+        );
+    }
 }

@@ -3,7 +3,8 @@
 use crate::config::Config;
 use crate::photos::{Feed, FeedEvent, FeedStatus, HomeLookup, PhotoItem, PhotoPixels, Source};
 use crate::screen::{
-    Composite, FeedState, Outcome, Provider, RenderContext, Screen, ScreenAction, ScreenId, World,
+    Composite, FeedState, KeyLabels, Outcome, Provider, RenderContext, Screen, ScreenAction,
+    ScreenId, World,
 };
 use miharashi_render::canvas::rgba;
 use miharashi_render::screens;
@@ -193,6 +194,18 @@ impl Screen for PhotoScreen {
         Outcome::Consumed
     }
 
+    fn key_labels(&self) -> KeyLabels {
+        KeyLabels {
+            select: Some(if self.show_info {
+                "情報を隠す"
+            } else {
+                "情報を表示"
+            }),
+            up: Some("前の写真"),
+            down: Some("次の写真"),
+        }
+    }
+
     fn render(&mut self, ctx: &mut RenderContext<'_>) {
         // GPU 経路の写真(デコードしただけ)は、CPU で描くときにここで合成する
         let size = (ctx.canvas.width(), ctx.canvas.height());
@@ -339,6 +352,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("落ち着かない");
+    }
+
+    /// 5 は写真の情報の表示・非表示で、ラベルも今の状態から反対の操作になる。8 / 2 は前後の写真。
+    #[test]
+    fn key_labels_match_actions() {
+        let (mut s, _w, dir) = screen((640, 270));
+        assert_eq!(s.key_labels().select, Some("情報を隠す"));
+        s.handle_action(ScreenAction::Select, Instant::now());
+        assert_eq!(s.key_labels().select, Some("情報を表示"));
+        crate::screen::assert_key_labels_match_actions(&mut s, Instant::now());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 非表示のあいだは写真を自動で進めず、表示に戻ると続きから進める。
