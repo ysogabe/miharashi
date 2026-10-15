@@ -632,6 +632,46 @@ mod tests {
         );
     }
 
+    /// 操作パネルの `/status` の keys(#53)。モニターが消えているあいだ、runtime はキーを `on_key` に渡さず
+    /// 点けるだけにする(force_off なら何もしない)ので、アラートやメニューより先にそれを出す。点けば元に戻る。
+    #[test]
+    fn panel_view_keys_follow_the_display_power() {
+        use crate::screen::PanelKeys;
+        let mut app = three_screens();
+        let keys = |app: &ScreenManager| app.panel_view().unwrap().keys;
+        let all = |label: Option<&'static str>| PanelKeys {
+            prev: label,
+            next: label,
+            select: label,
+            up: label,
+            down: label,
+            menu: label,
+        };
+        app.on_key(KeyPress::Menu);
+        let menu = keys(&app);
+        assert_eq!(menu.select, Some("移動"));
+
+        app.set_display_on(false, Instant::now());
+        assert_eq!(
+            keys(&app),
+            all(Some("画面を点ける")),
+            "自動で消えている: どのキーも点けるだけ(メニュー中でも)"
+        );
+        app.set_display_forced_off(true);
+        assert_eq!(keys(&app), all(None), "常に消灯: どのキーも何もしない");
+
+        app.set_display_forced_off(false);
+        app.set_display_on(true, Instant::now());
+        assert_eq!(keys(&app), menu, "点いたら元のラベルに戻る");
+
+        app.set_display_forced_off(true);
+        assert_eq!(
+            keys(&app),
+            menu,
+            "force_off でも点いているあいだ(アラートで点けたときなど)は、ふつうのラベル"
+        );
+    }
+
     /// 操作パネルの `POST /api/v1/screen`: 登録されている id だけに移り、メニューとアラートは閉じる。
     #[test]
     fn show_screen_by_id() {
