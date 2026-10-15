@@ -249,10 +249,11 @@ pub struct Aircraft {
     pub poll_secs: u64,
     /// 受信機からこの距離(km)以内の機体を出す
     pub radius_km: f64,
-    /// 写真をこの枚数出すごとに、半径内に機体がいれば航空機の画面を挟む
-    pub every_photos: u32,
-    /// 航空機の画面を出す秒数
-    pub show_secs: u64,
+    /// 使わない(#5 の S3 で航空機の画面を独立させ、写真の合間に挟むのをやめた)。古い設定ファイルが
+    /// 起動できるよう読むだけ読み、警告を出す
+    pub every_photos: Option<u32>,
+    /// 使わない(every_photos と同じ)
+    pub show_secs: Option<u64>,
 }
 
 impl Default for Aircraft {
@@ -262,8 +263,8 @@ impl Default for Aircraft {
             url: "https://ads-b.dam-lab.work/tar1090/data/aircraft.json".into(),
             poll_secs: 5,
             radius_km: 50.0,
-            every_photos: 10,
-            show_secs: 30,
+            every_photos: None,
+            show_secs: None,
         }
     }
 }
@@ -330,14 +331,12 @@ impl Config {
             );
         }
         let a = &self.aircraft;
-        if a.poll_secs < 2
-            || a.every_photos == 0
-            || a.show_secs == 0
-            || !(1.0..=400.0).contains(&a.radius_km)
-        {
-            return Err(
-                "aircraft.poll_secs は 2 以上、every_photos と show_secs は 1 以上、radius_km は 1〜400"
-                    .into(),
+        if a.poll_secs < 2 || !(1.0..=400.0).contains(&a.radius_km) {
+            return Err("aircraft.poll_secs は 2 以上、radius_km は 1〜400".into());
+        }
+        if a.every_photos.is_some() || a.show_secs.is_some() {
+            eprintln!(
+                "config: aircraft.every_photos と show_secs は使わなくなった(航空機は独立した画面)。消してよい"
             );
         }
         if self.geoframe.card_secs == 0 || !(1.0..=1000.0).contains(&self.geoframe.home_radius_km) {
@@ -406,6 +405,13 @@ mod tests {
     #[test]
     fn empty_config_uses_defaults() {
         assert_eq!(Config::parse("").unwrap(), Config::default());
+    }
+
+    /// 写真の合間の航空機(S3 でやめた)の設定が残っていても起動できる。
+    #[test]
+    fn old_aircraft_interlude_keys_are_still_accepted() {
+        let c = Config::parse("[aircraft]\nevery_photos = 10\nshow_secs = 30\n").unwrap();
+        assert_eq!(c.aircraft.every_photos, Some(10));
     }
 
     #[test]

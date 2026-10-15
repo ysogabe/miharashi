@@ -352,7 +352,26 @@ pub fn demo_view() -> AircraftView {
         total: 9,
         planes,
         time: "22:41:05".into(),
+        ..Default::default()
     }
+}
+
+/// 取得してから `secs` 秒たった位置に、速度と進行方向で機体を進める(位置は 5 秒ごとにしか届かないので、
+/// その間も滑らかに動かす)。地上の機体と、速度か進行方向が分からない機体は動かさない。
+pub fn advanced(view: &AircraftView, secs: f64) -> AircraftView {
+    let mut v = view.clone();
+    for p in &mut v.planes {
+        let (Some(gs), Some(track), false) = (p.gs_kt, p.track, p.ground) else {
+            continue;
+        };
+        let km = gs * 1.852 / 3600.0 * secs;
+        let t = track.to_radians();
+        p.lat += km * t.cos() / 111.0;
+        p.lon += km * t.sin() / (111.0 * p.lat.to_radians().cos().max(0.2));
+        p.dist_km = distance_km(v.receiver, (p.lat, p.lon));
+        p.bearing = bearing(v.receiver, (p.lat, p.lon));
+    }
+    v
 }
 
 /// 取得を始める。無効なら None。
@@ -405,6 +424,7 @@ fn run(out: Shared, cfg: Config) {
                         planes,
                         total,
                         time: chrono::Local::now().format("%H:%M:%S").to_string(),
+                        ..Default::default()
                     };
                     if let Ok(mut g) = out.lock() {
                         *g = Some((Instant::now(), view));
@@ -475,6 +495,27 @@ mod tests {
             "XYZ Somewhere"
         );
         assert_eq!(airport_label(&json!({})), "");
+    }
+
+    #[test]
+    fn advanced_moves_planes_along_their_track() {
+        let v = demo_view();
+        let a = advanced(&v, 10.0);
+        for (p, q) in v.planes.iter().zip(&a.planes) {
+            if p.ground {
+                assert_eq!((p.lat, p.lon), (q.lat, q.lon), "地上の機体は動かさない");
+                continue;
+            }
+            // 450 kt で 10 秒 = 約 2.3 km
+            let moved = distance_km((p.lat, p.lon), (q.lat, q.lon));
+            assert!((moved - 2.315).abs() < 0.05, "{moved}");
+            assert!(
+                (bearing((p.lat, p.lon), (q.lat, q.lon)) - p.track.unwrap()).abs() < 1.0,
+                "進行方向へ進む"
+            );
+            assert!((q.dist_km - distance_km(v.receiver, (q.lat, q.lon))).abs() < 1e-9);
+        }
+        assert_eq!(advanced(&v, 0.0), v);
     }
 
     #[test]

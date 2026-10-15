@@ -278,8 +278,21 @@ fn png(cli: Cli) -> Result<(), String> {
         air::sweep_cpu(&mut c, &geom, air::STILL_SWEEP, trail);
         save(&c, Layers::Radar(&bg, &geom, trail), name)?;
     }
+    // 8/2 で 3 番目に近い機体に注目したところと、半径内に機体がいないところ
+    let focused = air::AircraftView {
+        focus: 2,
+        ..view.clone()
+    };
+    air::aircraft_screen(&mut c, &mut text, &focused);
+    save(&c, Layers::Image, "aircraft-focus")?;
+    let empty = air::AircraftView {
+        planes: Vec::new(),
+        ..view.clone()
+    };
+    air::aircraft_screen(&mut c, &mut text, &empty);
+    save(&c, Layers::Image, "aircraft-empty")?;
     println!(
-        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long}}.png ({}x{})",
+        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty}}.png ({}x{})",
         out.display(),
         size.0,
         size.1
