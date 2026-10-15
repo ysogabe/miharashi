@@ -225,8 +225,8 @@ pub fn home_location(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<(f64, f6
     }
 }
 
-/// 自宅の位置から住んでいる地方を決める。
-fn detect_region(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<Region, String> {
+/// 自宅の位置の市区町村コード(5 桁。先頭 2 桁が都道府県)。国土地理院の逆ジオコーダーで引く。
+pub fn home_muni_code(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<String, String> {
     let (lat, lon) = home_location(agent, ha)?;
     let rg = get_json(agent, &format!("{GSI_RGEO}?lat={lat}&lon={lon}"), None)?;
     let muni = rg
@@ -234,12 +234,17 @@ fn detect_region(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<Region, Stri
         .and_then(|r| r.get("muniCd"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    // 市区町村コードは 5 桁(先頭 2 桁が都道府県)。先頭の 0 が落ちた 4 桁でも返ってくる
-    let pref = match muni.len() {
-        5 => muni[0..2].to_string(),
-        4 => format!("0{}", &muni[0..1]),
-        _ => return Err(format!("市区町村コードを得られない({muni:?})")),
-    };
+    // 先頭の 0 が落ちた 4 桁でも返ってくる
+    match muni.len() {
+        5 if muni.bytes().all(|b| b.is_ascii_digit()) => Ok(muni.to_string()),
+        4 if muni.bytes().all(|b| b.is_ascii_digit()) => Ok(format!("0{muni}")),
+        _ => Err(format!("市区町村コードを得られない({muni:?})")),
+    }
+}
+
+/// 自宅の位置から住んでいる地方を決める。
+fn detect_region(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<Region, String> {
+    let pref = home_muni_code(agent, ha)?[0..2].to_string();
     let area = get_json(agent, AREA_URL, None)?;
     region_from_area(&area, &pref)
         .ok_or_else(|| format!("都道府県 {pref} の地方が area.json にない"))

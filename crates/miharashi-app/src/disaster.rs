@@ -9,13 +9,18 @@
 //! 対象の市町村は、Home Assistant の自宅の位置と気象庁の市町村の外接矩形(class20relm.json)から、
 //! 矩形の最も近い点までの距離で選ぶ。警報は市町村を受け持つ気象台ごとのファイルを
 //! ETag 付きで読み、変わっていなければ 304 で済ませる。
+//!
+//! 同じ取得で、自宅の市町村に出ている警報・注意報(全種類)を `HomeWarnings` に写す
+//! (室内環境と天気の画面の下の帯。docs/DESIGN-screens.md §2.1)。
 //! ネットワークの応答はすべて欠けうるものとして扱い、読めない項目は飛ばす(パニックさせない)。
 use crate::config::{Alerts, HomeAssistant};
-use crate::quake::{AREA_URL, get_json, home_location};
+use crate::env::FeedStatus;
+use crate::quake::{AREA_URL, get_json, home_location, home_muni_code};
 use miharashi_render::alert::{AlertView, DisasterArea, DisasterKind, DisasterView};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const RELM_URL: &str = "https://www.jma.go.jp/bosai/common/const/class20relm.json";
@@ -104,6 +109,55 @@ pub struct Watch {
     pub munis: HashMap<String, Muni>,
     /// 警報を読む気象台のコード
     pub offices: Vec<String>,
+    /// 自宅の市町村(コード, 名前, 受け持つ気象台)。決められなければ None
+    pub home_muni: Option<(String, String, String)>,
+}
+
+/// 自宅の市町村に出ている警報・注意報(室内環境と天気の画面の下の帯)。
+#[derive(Debug, Clone, Default)]
+pub struct HomeWarnings {
+    /// 自宅の市町村の名前。まだ分からなければ空
+    pub area: String,
+    /// 発表中の (名前, 警戒レベル)。レベルの高い順。まだ読めていなければ None
+    pub kinds: Option<Vec<(String, u8)>>,
+    /// 気象台の最新の発表時刻("2026-10-15T10:39:00+09:00")
+    pub report: String,
+    pub status: FeedStatus,
+}
+
+pub type HomeShared = Arc<Mutex<HomeWarnings>>;
+
+/// 気象台のファイルのうち、いちばん新しい発表の時刻。
+fn latest_report(doc: &Value) -> String {
+    doc.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.get("reportDatetime").and_then(Value::as_str))
+        .max()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 市町村 `code` に発表中の警報・注意報 (名前, レベル)。レベルの高い順。表に無いコードは出さない。
+fn kinds_for(doc: &Value, code: &str) -> Vec<(String, u8)> {
+    let only: HashMap<String, Muni> = [(
+        code.to_string(),
+        Muni {
+            name: String::new(),
+            sw: (0.0, 0.0),
+            ne: (0.0, 0.0),
+        },
+    )]
+    .into();
+    let (mut hits, mut unknown) = (BTreeMap::new(), BTreeSet::new());
+    active_hits(doc, &only, &mut hits, &mut unknown);
+    let mut out: Vec<(String, u8)> = hits
+        .keys()
+        .filter_map(|h| kind(&h.code).map(|k| (k.name.to_string(), k.level)))
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out.dedup();
+    out
 }
 
 fn haversine_km(a: (f64, f64), b: (f64, f64)) -> f64 {
@@ -365,9 +419,10 @@ pub fn demo_view() -> DisasterView {
 }
 
 /// 災害アラートの問い合わせを始める。アラートは `tx` へ送る。
-pub fn start(alerts: &Alerts, ha: &HomeAssistant, tx: Sender<AlertView>) {
+/// 戻り値: 自宅の市町村の警報・注意報(無効なら None)。
+pub fn start(alerts: &Alerts, ha: &HomeAssistant, tx: Sender<AlertView>) -> Option<HomeShared> {
     if !alerts.disaster {
-        return;
+        return None;
     }
     if alerts.demo_after_secs > 0 {
         // 地震のテスト表示の 30 秒後に出す
@@ -385,12 +440,16 @@ pub fn start(alerts: &Alerts, ha: &HomeAssistant, tx: Sender<AlertView>) {
         Duration::from_secs(alerts.disaster_poll_secs),
         alerts.disaster_radius_km,
     );
+    let home: HomeShared = Arc::default();
+    let out = home.clone();
     let spawned = std::thread::Builder::new()
         .name("disaster".into())
-        .spawn(move || run(tx, ha, poll, km));
+        .spawn(move || run(tx, ha, poll, km, out));
     if let Err(e) = spawned {
         eprintln!("disaster: スレッドを起動できない: {e}");
+        return None;
     }
+    Some(home)
 }
 
 fn find_watch(agent: &ureq::Agent, ha: &HomeAssistant, km: f64) -> Result<Watch, String> {
@@ -399,15 +458,57 @@ fn find_watch(agent: &ureq::Agent, ha: &HomeAssistant, km: f64) -> Result<Watch,
     if munis.is_empty() {
         return Err("半径内に市町村が見つからない".into());
     }
-    let offices = offices_for(&get_json(agent, AREA_URL, None)?, munis.keys());
+    let area = get_json(agent, AREA_URL, None)?;
+    // 自宅の市町村(帯に出す)。決められなくてもアラートは続ける
+    let home_muni = match home_muni_code(agent, ha) {
+        Ok(muni) => crate::weather::class20_for(&area, &muni).and_then(|(code, name)| {
+            let office = offices_for(&area, std::iter::once(&code)).pop()?;
+            Some((code, name, office))
+        }),
+        Err(e) => {
+            eprintln!("disaster: 自宅の市町村を決められない: {e}");
+            None
+        }
+    };
+    let mut offices = offices_for(&area, munis.keys());
     if offices.is_empty() {
         return Err("市町村を受け持つ気象台が area.json にない".into());
+    }
+    if let Some((_, _, o)) = &home_muni
+        && !offices.contains(o)
+    {
+        offices.push(o.clone());
     }
     Ok(Watch {
         home,
         munis,
         offices,
+        home_muni,
     })
+}
+
+/// 自宅の市町村の警報・注意報を写す。`ok` は今回すべての気象台を読めたか。
+fn publish_home(
+    out: &HomeShared,
+    w: &Watch,
+    docs: &HashMap<String, (Value, Option<String>)>,
+    ok: bool,
+) {
+    let Ok(mut g) = out.lock() else { return };
+    let Some((code, name, office)) = &w.home_muni else {
+        g.status.fail("自宅の市町村を決められない".into());
+        return;
+    };
+    g.area = name.clone();
+    if let Some((doc, _)) = docs.get(office) {
+        g.kinds = Some(kinds_for(doc, code));
+        g.report = latest_report(doc);
+    }
+    if ok && g.kinds.is_some() {
+        g.status.ok();
+    } else {
+        g.status.fail("気象庁から警報を読めない".into());
+    }
 }
 
 /// 気象台のファイルを読む。前回と同じ(304)なら None。
@@ -439,7 +540,7 @@ fn fetch_office(
     Ok(Some((v, tag)))
 }
 
-fn run(tx: Sender<AlertView>, ha: HomeAssistant, poll: Duration, km: f64) {
+fn run(tx: Sender<AlertView>, ha: HomeAssistant, poll: Duration, km: f64, home: HomeShared) {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(15)))
         .build()
@@ -470,6 +571,11 @@ fn run(tx: Sender<AlertView>, ha: HomeAssistant, poll: Duration, km: f64) {
                 Err(e) => {
                     eprintln!("disaster: 見張る範囲を決められない(再試行する): {e}");
                     next_watch = Instant::now() + AREA_RETRY;
+                    if watch.is_none()
+                        && let Ok(mut g) = home.lock()
+                    {
+                        g.status.fail(format!("見張る範囲を決められない: {e}"));
+                    }
                 }
             }
         }
@@ -496,6 +602,7 @@ fn run(tx: Sender<AlertView>, ha: HomeAssistant, poll: Duration, km: f64) {
             eprintln!("disaster: 警報の取得が回復");
         }
         warned = !ok;
+        publish_home(&home, w, &docs, ok);
         // すべての気象台を一度は読めてから判定する(欠けたまま比べると解除と見分けられない)
         if w.offices.iter().all(|o| docs.contains_key(o)) {
             let mut hits = BTreeMap::new();
@@ -599,7 +706,56 @@ mod tests {
             home: HOME,
             munis: munis_within(&relm(), HOME, 50.0),
             offices: vec!["120000".into()],
+            home_muni: Some(("1310100".into(), "千代田区".into(), "120000".into())),
         }
+    }
+
+    /// 自宅の市町村の分だけを、レベルの高い順に。解除と表に無いコードは出さない。
+    #[test]
+    fn home_kinds_and_latest_report() {
+        let d = json!([
+            {"reportDatetime": "2026-10-13T21:00:00+09:00", "warning": {"class20Items": [
+                {"areaCode": "1310100", "kinds": [
+                    {"code": "14", "status": "発表"},
+                    {"code": "03", "status": "継続"},
+                    {"code": "10", "status": "解除"},
+                    {"code": "77", "status": "発表"},
+                ]},
+                {"areaCode": "1220600", "kinds": [{"code": "33", "status": "発表"}]},
+            ]}},
+            {"reportDatetime": "2026-10-13T21:30:00+09:00", "warning": {"class20Items": [
+                {"areaCode": "1310100", "kinds": [{"code": "14", "status": "継続"}]},
+            ]}},
+        ]);
+        assert_eq!(
+            kinds_for(&d, "1310100"),
+            [("大雨警報".to_string(), 3), ("雷注意報".to_string(), 2)]
+        );
+        assert!(kinds_for(&d, "0000000").is_empty());
+        assert_eq!(latest_report(&d), "2026-10-13T21:30:00+09:00");
+        assert_eq!(latest_report(&json!({})), "");
+
+        let home: HomeShared = Arc::default();
+        let docs: HashMap<String, (Value, Option<String>)> =
+            [("120000".to_string(), (d, None))].into();
+        publish_home(&home, &watch(), &docs, true);
+        let g = home.lock().unwrap().clone();
+        assert_eq!(
+            (g.area.as_str(), g.kinds.map(|k| k.len())),
+            ("千代田区", Some(2))
+        );
+        assert!(!g.status.failing);
+        // 読めなくなったら、最後の内容を残して失敗にする
+        publish_home(&home, &watch(), &HashMap::new(), false);
+        let g = home.lock().unwrap().clone();
+        assert!(g.status.failing && g.kinds.is_some());
+        let no_home = Watch {
+            home_muni: None,
+            ..watch()
+        };
+        let fresh: HomeShared = Arc::default();
+        publish_home(&fresh, &no_home, &docs, true);
+        assert!(fresh.lock().unwrap().status.failing);
     }
 
     fn doc(report: &str, items: Value) -> Value {

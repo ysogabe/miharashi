@@ -83,9 +83,29 @@
 # poll_secs = 5
 # radius_km = 50.0
 
+[room]
+# 室内環境と天気の画面(4/6 で切り替える画面の 1 つ。写真の次)。左に室内センサー(HA)の値と過去の折れ線、
+# 右に気象庁の府県予報(今日・明日)と週間予報、下の帯に自宅の市町村の警報・注意報([alerts] disaster の取得を使う)。
+# HA や気象庁に届かないときは最後の値と取得時刻を黄色で出す。HA の url も forecast_area も無ければ画面ごと出さない。
+# enabled = true
+# 室内センサーのタイル(表示順、最大 6 枚)。単位は HA のもの(mbar は hPa と書く)。
+#   warn / alert: この値以上で黄 / 赤。second: 値の右に並べる 2 つ目の entity。trend_hours: この時間前からの上昇・下降
+# tiles = [
+#   { label = "温度", entity = "sensor.living_temperature" },
+#   { label = "CO2",  entity = "sensor.living_co2", warn = 1000, alert = 1500 },
+#   { label = "気圧", entity = "sensor.living_pressure", trend_hours = 3 },
+#   { label = "玄関", entity = "sensor.door_temperature", second = "sensor.door_humidity" },
+# ]
+# history_hours = 24       # 折れ線に出す過去の時間(1〜168)
+# 天気予報の地域(気象庁 area.json の class10。東京都東京地方なら "130010")。空なら HA の自宅の位置から決める
+# forecast_area = ""
+# poll_secs = 60           # センサーの値を読む間隔(10 以上)
+# history_minutes = 10     # 折れ線の履歴を読み直す間隔
+# forecast_minutes = 30    # 天気予報を読む間隔(5 以上。気象庁の発表は 1 日 3 回)
+
 [ui]
 # font = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
-# start_screen = "status"  # status / photo / aircraft
+# start_screen = "status"  # status / photo / room / aircraft
 # 焼き付き対策: refresh_minutes 分ごとに、refresh_screens の画面をグリッチ → 暗転 → 再表示(約 1.6 秒)で
 # 描き直し、そのたびに画面全体を数 px ずらす(9 か所を順に回る)。0 なら行わない。動かない線が多い画面に使う(状況画面も入れるなら ["aircraft", "status"])
 # refresh_minutes = 5

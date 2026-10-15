@@ -16,6 +16,7 @@ pub struct Config {
     pub screen_power: ScreenPower,
     pub alerts: Alerts,
     pub aircraft: Aircraft,
+    pub room: Room,
     pub ui: Ui,
     pub panel: Panel,
 }
@@ -134,7 +135,7 @@ pub struct Alerts {
 pub struct Ui {
     /// 日本語フォントファイル。空ならシステムフォントを使う。
     pub font: String,
-    /// status / photo / aircraft
+    /// status / photo / room / aircraft
     pub start_screen: String,
     /// 焼き付き対策: この分数ごとに、`refresh_screens` の画面をグリッチで暗転して描き直す。0 なら行わない
     pub refresh_minutes: u64,
@@ -273,6 +274,57 @@ impl Default for Aircraft {
     }
 }
 
+/// 室内環境と天気の画面(docs/DESIGN-screens.md §2.1・§6)。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Room {
+    /// false なら画面ごと出さない。true でも、HA の url も forecast_area も無ければ出さない
+    pub enabled: bool,
+    /// 室内センサーのタイル(表示順。最大 6 枚)
+    pub tiles: Vec<RoomTile>,
+    /// 折れ線に出す過去の時間
+    pub history_hours: u64,
+    /// 天気予報の地域(気象庁 area.json の class10 のコード。"130010" など)。空なら自宅の位置から決める
+    pub forecast_area: String,
+    /// センサーの値を読む間隔(秒)
+    pub poll_secs: u64,
+    /// 折れ線の履歴を読み直す間隔(分)
+    pub history_minutes: u64,
+    /// 天気予報を読む間隔(分)。気象庁の発表は 1 日 3 回
+    pub forecast_minutes: u64,
+}
+
+/// 室内センサーのタイル 1 枚。単位は HA のもの(mbar は hPa と書く)。
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RoomTile {
+    pub label: String,
+    pub entity: String,
+    /// 値の右に並べる 2 つ目の entity(玄関の湿度など)
+    #[serde(default)]
+    pub second: String,
+    /// この値以上で黄
+    pub warn: Option<f64>,
+    /// この値以上で赤
+    pub alert: Option<f64>,
+    /// この時間前からの変化で上昇・下降を出す(気圧)
+    pub trend_hours: Option<u64>,
+}
+
+impl Default for Room {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tiles: Vec::new(),
+            history_hours: 24,
+            forecast_area: String::new(),
+            poll_secs: 60,
+            history_minutes: 10,
+            forecast_minutes: 30,
+        }
+    }
+}
+
 impl Default for Ui {
     fn default() -> Self {
         Self {
@@ -357,9 +409,9 @@ impl Config {
         if !matches!(self.display.renderer.as_str(), "auto" | "cpu" | "gles") {
             return Err("display.renderer は auto / cpu / gles".into());
         }
-        const SCREENS: [&str; 3] = ["status", "photo", "aircraft"];
+        const SCREENS: [&str; 4] = ["status", "photo", "room", "aircraft"];
         if !SCREENS.contains(&self.ui.start_screen.as_str()) {
-            return Err("ui.start_screen は status / photo / aircraft".into());
+            return Err("ui.start_screen は status / photo / room / aircraft".into());
         }
         if let Some(id) = self
             .ui
@@ -368,8 +420,39 @@ impl Config {
             .find(|id| !SCREENS.contains(&id.as_str()))
         {
             return Err(format!(
-                "ui.refresh_screens に未知の画面 {id:?}(status / photo / aircraft)"
+                "ui.refresh_screens に未知の画面 {id:?}(status / photo / room / aircraft)"
             ));
+        }
+        let r = &self.room;
+        if r.poll_secs < 10
+            || !(1..=168).contains(&r.history_hours)
+            || r.history_minutes == 0
+            || r.forecast_minutes < 5
+        {
+            return Err(
+                "room.poll_secs は 10 以上、history_hours は 1〜168、history_minutes は 1 以上、forecast_minutes は 5 以上"
+                    .into(),
+            );
+        }
+        if !r.forecast_area.is_empty()
+            && !(r.forecast_area.len() == 6 && r.forecast_area.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(
+                "room.forecast_area は気象庁の class10 のコード(6 桁。\"130010\" など)か空".into(),
+            );
+        }
+        if let Some(t) = r
+            .tiles
+            .iter()
+            .find(|t| t.label.is_empty() || t.entity.is_empty())
+        {
+            return Err(format!("room.tiles の label と entity は必須({t:?})"));
+        }
+        if r.tiles.len() > miharashi_render::room::MAX_TILES {
+            eprintln!(
+                "config: room.tiles は {} 枚まで出す(残りは出さない)",
+                miharashi_render::room::MAX_TILES
+            );
         }
         if !self.home_assistant.url.is_empty() {
             crate::screen_power::check_url(&self.home_assistant.url)
@@ -545,6 +628,32 @@ mod tests {
         assert!(Config::parse("[alerts]\ndisaster_poll_secs = 5\n").is_err());
         assert!(Config::parse("[alerts]\ndisaster_radius_km = 0.0\n").is_err());
         assert!(Config::parse("[alerts]\ndisaster_radius_km = 30.0\n").is_ok());
+    }
+
+    #[test]
+    fn room_section_defaults_and_bad_values() {
+        let c = Config::default();
+        assert!(c.room.enabled && c.room.tiles.is_empty());
+        assert_eq!((c.room.history_hours, c.room.poll_secs), (24, 60));
+        let c = Config::parse(
+            "[room]\nforecast_area = \"130010\"\ntiles = [\n  { label = \"CO₂\", entity = \"sensor.co2\", warn = 1000, alert = 1500 },\n  { label = \"玄関\", entity = \"sensor.t\", second = \"sensor.h\" },\n  { label = \"気圧\", entity = \"sensor.p\", trend_hours = 3 },\n]\n[ui]\nstart_screen = \"room\"\nrefresh_screens = [\"room\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.room.tiles.len(), 3);
+        assert_eq!(c.room.tiles[0].alert, Some(1500.0));
+        assert_eq!(c.room.tiles[1].second, "sensor.h");
+        assert_eq!(c.room.tiles[2].trend_hours, Some(3));
+        for bad in [
+            "[room]\nforecast_area = \"千葉\"\n",
+            "[room]\nforecast_area = \"12001\"\n",
+            "[room]\npoll_secs = 5\n",
+            "[room]\nhistory_hours = 0\n",
+            "[room]\nforecast_minutes = 1\n",
+            "[room]\ntiles = [{ label = \"x\", entity = \"\" }]\n",
+            "[room]\ntiles = [{ label = \"x\", entity = \"sensor.x\", colour = 1 }]\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
