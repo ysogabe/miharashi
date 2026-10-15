@@ -4,6 +4,7 @@ pub mod manager;
 pub mod screens {
     pub mod aircraft;
     pub mod photo;
+    pub mod room;
     pub mod status;
 }
 
@@ -14,6 +15,7 @@ use miharashi_render::TextEngine;
 use miharashi_render::screens::Snapshot;
 use screens::aircraft::AircraftScreen;
 use screens::photo::PhotoScreen;
+use screens::room::{RoomFeeds, RoomScreen};
 use screens::status::StatusScreen;
 use std::time::Duration;
 
@@ -44,8 +46,9 @@ pub fn set_clock(s: &mut Snapshot) {
 }
 
 /// キオスクの画面を登録する。並び順が切り替わる順になる(docs/DESIGN-screens.md §2)。
-/// `gpu_max` は GPU 経路のとき Some(GPU で扱える写真の最大の幅と高さ)。航空機の取得が無効(`aircraft` が None)なら
-/// 航空機の画面は登録しない。
+/// `gpu_max` は GPU 経路のとき Some(GPU で扱える写真の最大の幅と高さ)。室内環境と天気の取得が無い(`room` が None)なら
+/// その画面は、航空機の取得が無効(`aircraft` が None)なら航空機の画面は登録しない。
+#[allow(clippy::too_many_arguments)]
 pub fn kiosk(
     cfg: &Config,
     size: (u32, u32),
@@ -53,12 +56,16 @@ pub fn kiosk(
     source: Source,
     data: Box<dyn DataSource>,
     snap: Snapshot,
+    room: Option<RoomFeeds>,
     aircraft: Option<crate::aircraft::Shared>,
 ) -> ScreenManager {
     let photo = PhotoScreen::new(cfg, size, gpu_max, source);
     let feed = photo.feed_provider();
     let mut screens: Vec<Box<dyn crate::screen::Screen>> =
         vec![Box::new(StatusScreen::new()), Box::new(photo)];
+    if let Some(feeds) = room {
+        screens.push(Box::new(RoomScreen::new(cfg.room.tiles.clone(), feeds)));
+    }
     if let Some(shared) = aircraft {
         screens.push(Box::new(AircraftScreen::new(shared, gpu_max.is_some())));
     }
@@ -121,6 +128,7 @@ mod tests {
             Source::File(p, Some("テスト".into())),
             Box::new(DummyData::new()),
             dummy_snapshot(0.0),
+            None,
             None,
         );
         (app, dir)
@@ -325,6 +333,7 @@ mod tests {
             Box::new(DummyData::new()),
             dummy_snapshot(0.0),
             None,
+            None,
         );
         assert_eq!(screen(&app), PHOTO);
         let _ = std::fs::remove_dir_all(&dir);
@@ -345,6 +354,7 @@ mod tests {
             Source::File(p, None),
             Box::new(DummyData::new()),
             dummy_snapshot(0.0),
+            None,
             Some(planes),
         );
         app.tick(Instant::now());
@@ -425,6 +435,7 @@ mod tests {
             Source::File(p, None),
             Box::new(DummyData::new()),
             dummy_snapshot(0.0),
+            None,
             Some(planes),
         )
         .with_refresh(Duration::from_secs(60), vec!["aircraft".into()]);

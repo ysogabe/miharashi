@@ -7,6 +7,7 @@ mod bench;
 mod config;
 mod data;
 mod disaster;
+mod env;
 #[cfg(target_os = "linux")]
 mod gpu_bench;
 mod panel;
@@ -16,6 +17,7 @@ mod quake;
 mod runtime;
 mod screen;
 mod screen_power;
+mod weather;
 
 use config::Config;
 use miharashi_render::aircraft as air;
@@ -137,14 +139,46 @@ fn run(cli: Cli) -> Result<(), String> {
     let (data, snap) = data_source(&cfg, cli.dummy)?;
     let (alert_tx, alerts) = std::sync::mpsc::channel();
     quake::start(&cfg.alerts, &cfg.home_assistant, alert_tx.clone());
-    disaster::start(&cfg.alerts, &cfg.home_assistant, alert_tx);
+    let warnings = disaster::start(&cfg.alerts, &cfg.home_assistant, alert_tx);
+    let room = room_feeds(&cfg, warnings);
     let planes = aircraft::start(&cfg.aircraft);
     runtime::run(&cfg, |out| {
         Box::new(
-            app::kiosk(&cfg, out.size, out.gpu_max_texture, src, data, snap, planes)
-                .with_alerts(Some(alerts)),
+            app::kiosk(
+                &cfg,
+                out.size,
+                out.gpu_max_texture,
+                src,
+                data,
+                snap,
+                room,
+                planes,
+            )
+            .with_alerts(Some(alerts)),
         )
     })
+}
+
+/// 室内環境と天気の取得を始める。画面を出さない設定(無効、または HA も予報の地域も無い)なら None。
+fn room_feeds(
+    cfg: &Config,
+    warnings: Option<disaster::HomeShared>,
+) -> Option<app::screens::room::RoomFeeds> {
+    if !cfg.room.enabled {
+        return None;
+    }
+    let feeds = app::screens::room::RoomFeeds {
+        env: env::start(&cfg.home_assistant, &cfg.room),
+        weather: weather::start(&cfg.home_assistant, &cfg.room),
+        warnings,
+    };
+    if feeds.env.is_none() && feeds.weather.is_none() {
+        eprintln!(
+            "room: HA の url も room.forecast_area も無いので、室内環境と天気の画面は出さない"
+        );
+        return None;
+    }
+    Some(feeds)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -206,7 +240,13 @@ fn png(cli: Cli) -> Result<(), String> {
     save(&c, Layers::Image, "status-details")?;
     // メニュー(0)を状況画面の上に開いたところ。2 つ目(写真)を選んでいる
     screens::status(&mut c, &mut text, &snap, screens::StatusPage::Overview);
-    miharashi_render::menu::menu(&mut c, &mut text, &["STATUS", "PHOTO FRAME"], 0, 1);
+    miharashi_render::menu::menu(
+        &mut c,
+        &mut text,
+        &["STATUS", "PHOTO FRAME", "ROOM & WEATHER", "AIRCRAFT"],
+        0,
+        1,
+    );
     save(&c, Layers::Image, "menu")?;
     screens::photo_frame(
         &mut c,
@@ -291,6 +331,35 @@ fn png(cli: Cli) -> Result<(), String> {
     };
     air::aircraft_screen(&mut c, &mut text, &empty);
     save(&c, Layers::Image, "aircraft-empty")?;
+    // 室内環境と天気の画面。見本と、HA・気象庁に届かないとき(最後の値と取得時刻)と、まだ何も取れていないとき
+    let room = miharashi_render::room::demo_view();
+    miharashi_render::room::room_screen(&mut c, &mut text, &room);
+    save(&c, Layers::Image, "room")?;
+    let offline = app::screens::room::offline_demo(&room);
+    miharashi_render::room::room_screen(&mut c, &mut text, &offline);
+    save(&c, Layers::Image, "room-offline")?;
+    let first = app::screens::room::first_demo();
+    miharashi_render::room::room_screen(&mut c, &mut text, &first);
+    save(&c, Layers::Image, "room-empty")?;
+    if cli.live {
+        // --live では実際の HA と気象庁から取って描く(取れるか、失敗が分かるまで最大 40 秒待つ)
+        let (tx, _alerts) = std::sync::mpsc::channel();
+        let warnings = disaster::start(&cfg.alerts, &cfg.home_assistant, tx);
+        if let Some(feeds) = room_feeds(&cfg, warnings) {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(40);
+            while std::time::Instant::now() < end && !app::screens::room::settled(&feeds) {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            let screen = app::screens::room::RoomScreen::new(cfg.room.tiles.clone(), feeds);
+            let v = screen.view(&chrono::Local::now());
+            miharashi_render::room::room_screen(&mut c, &mut text, &v);
+            save(&c, Layers::Image, "room-live")?;
+            println!(
+                "room-live: {} / {} / {}",
+                v.env.text, v.weather_feed.text, v.warn_feed.text
+            );
+        }
+    }
     // 焼き付き対策の演出(グリッチが強まる途中と、再表示の途中)
     air::aircraft_screen(&mut c, &mut text, &view);
     let clean = Canvas {
@@ -301,7 +370,7 @@ fn png(cli: Cli) -> Result<(), String> {
         save(&c, Layers::Image, name)?;
     }
     println!(
-        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,refresh-glitch,refresh-return}}.png ({}x{})",
+        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,room,room-offline,room-empty,refresh-glitch,refresh-return}}.png ({}x{})",
         out.display(),
         size.0,
         size.1

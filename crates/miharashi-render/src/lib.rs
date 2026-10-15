@@ -9,6 +9,7 @@ pub mod menu;
 pub mod photo;
 pub mod photo_layout;
 pub mod photo_screen;
+pub mod room;
 pub mod screens;
 pub mod status;
 pub mod text;
