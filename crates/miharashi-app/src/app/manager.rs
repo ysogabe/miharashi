@@ -1,11 +1,14 @@
 //! 画面の登録と切り替え、メニュー、アラート層の重ね描き、共有データ(`World`)の更新。runtime からは `App` として見える。
 //! キーは docs/DESIGN-screens.md §4.1: 4/6 = 画面の巡回、0 = メニュー、5・8/2 = 表示中の画面の中の操作。
+//! 動かない線が多い画面には、数分に一度、焼き付き対策の演出(グリッチ → 暗転 → 再表示)を入れ、
+//! そのたびに画面全体の位置を数 px ずらす。
 use super::DataSource;
 use crate::screen::{
     App, Composite, KeyPress, PanelView, Provider, RenderContext, Screen, ScreenAction, ScreenInfo,
     World,
 };
 use miharashi_render::alert::{self, AlertView};
+use miharashi_render::glitch;
 use miharashi_render::menu;
 use miharashi_render::{Canvas, TextEngine};
 use std::sync::mpsc::Receiver;
@@ -32,6 +35,16 @@ pub struct ScreenManager {
     /// 表示中のアラートと、閉じる時刻
     alert: Option<(AlertView, Instant)>,
     alert_len: Duration,
+    /// 焼き付き対策の間隔と、入れる画面の id(無効なら None)
+    refresh: Option<(Duration, Vec<String>)>,
+    /// 次の演出の時刻(対象の画面を続けて出しているあいだだけ近づく)
+    refresh_due: Instant,
+    /// 演出中なら (開始時刻, フレームの番号)
+    refreshing: Option<(Instant, u32)>,
+    /// 演出の元にする画面(演出の最初に 1 回だけ描く)
+    clean: Option<Canvas>,
+    /// 演出をした回数。画面全体をずらす位置(`glitch::shift_offset`)もこれで決める
+    refreshes: usize,
     pub ticks: u64,
     pub keys: u64,
 }
@@ -66,6 +79,11 @@ impl ScreenManager {
             alerts: None,
             alert: None,
             alert_len,
+            refresh: None,
+            refresh_due: now,
+            refreshing: None,
+            clean: None,
+            refreshes: 0,
             ticks: 0,
             keys: 0,
         };
@@ -79,6 +97,95 @@ impl ScreenManager {
         p.update(&mut self.world);
         self.providers.push(p);
         self
+    }
+
+    /// 焼き付き対策: `ids` の画面を `every` ごとに暗転して描き直す。
+    pub fn with_refresh(mut self, every: Duration, ids: Vec<String>) -> Self {
+        self.refresh_due = Instant::now() + every;
+        self.refresh = Some((every, ids));
+        self
+    }
+
+    /// 焼き付き対策の演出中か(テスト用)。
+    #[cfg(test)]
+    pub fn refreshing(&self) -> bool {
+        self.refreshing.is_some()
+    }
+
+    /// 演出をやめ(途中なら打ち切り)、次の演出までの時間を数え直す。
+    fn reset_refresh(&mut self, now: Instant) {
+        if self.refreshing.take().is_some() {
+            self.clean = None;
+            // GPU 経路の背景や重ね絵は、演出のあいだ使っていないので描き直させる
+            self.screens[self.current].invalidate();
+            self.force_overlay = true;
+        }
+        if let Some((every, _)) = &self.refresh {
+            self.refresh_due = now + *every;
+        }
+    }
+
+    /// 焼き付き対策を進める。戻り値: 再描画が必要か。
+    fn tick_refresh(&mut self, now: Instant) -> bool {
+        let Some((_, ids)) = &self.refresh else {
+            return false;
+        };
+        if let Some((t0, _)) = self.refreshing {
+            if now.duration_since(t0).as_secs_f32() >= glitch::REFRESH_SECS {
+                self.reset_refresh(now);
+            }
+            return true;
+        }
+        let eligible = ids.iter().any(|id| id == self.screen_id())
+            && self.alert.is_none()
+            && self.menu.is_none();
+        if !eligible {
+            self.reset_refresh(now);
+        } else if now >= self.refresh_due {
+            self.refreshing = Some((now, 0));
+            // 位置を次へ。乱れと暗転のあいだに動くので、ずれた瞬間は目立たない
+            self.refreshes += 1;
+            return true;
+        }
+        false
+    }
+
+    /// 表示中の画面をずらす量 [px]。焼き付き対策の対象の画面だけ。
+    fn offset(&self, canvas_h: u32) -> (i32, i32) {
+        match &self.refresh {
+            Some((_, ids)) if ids.iter().any(|id| id == self.screen_id()) => {
+                glitch::shift_offset(self.refreshes, canvas_h)
+            }
+            _ => (0, 0),
+        }
+    }
+
+    /// 演出の 1 フレームを描く。元の画面は最初に 1 回だけ描いて取っておく。
+    fn render_refresh(&mut self, canvas: &mut Canvas) {
+        let Some((t0, frame)) = self.refreshing.as_mut() else {
+            return;
+        };
+        *frame = frame.wrapping_add(1);
+        let (t, seed) = (t0.elapsed().as_secs_f32(), *frame);
+        if self
+            .clean
+            .as_ref()
+            .is_none_or(|c| (c.width(), c.height()) != (canvas.width(), canvas.height()))
+        {
+            let (dx, dy) = self.offset(canvas.height());
+            let mut c = Canvas::new(canvas.width(), canvas.height());
+            let mut ctx = RenderContext {
+                canvas: &mut c,
+                text: &mut self.text,
+                world: &self.world,
+                covered: true,
+                force_overlay: true,
+            };
+            self.screens[self.current].render(&mut ctx);
+            glitch::shift(&mut c, dx, dy);
+            self.clean = Some(c);
+        }
+        glitch::refresh_frame(canvas, self.clean.as_ref().expect("上で描いた"), t, seed);
     }
 
     /// アラートの受け口をつなぐ。
@@ -107,6 +214,7 @@ impl ScreenManager {
         if i == self.current {
             return;
         }
+        self.reset_refresh(now);
         self.screens[self.current].on_leave(now);
         self.current = i;
         self.screens[i].on_enter(now);
@@ -122,11 +230,13 @@ impl ScreenManager {
     pub fn on_key(&mut self, key: KeyPress) -> bool {
         self.keys += 1;
         self.force_overlay = true;
+        let now = Instant::now();
+        // 演出中のキーは演出を打ち切ってから、ふつうに扱う
+        self.reset_refresh(now);
         // アラート表示中のキーは閉じるだけにする
         if self.alert.take().is_some() {
             return true;
         }
-        let now = Instant::now();
         let n = self.screens.len();
         // メニュー中は画面に操作を渡さない。8/2(と 4/6)で選び、5 で移り、0 で閉じる
         if let Some(sel) = self.menu {
@@ -215,11 +325,15 @@ impl ScreenManager {
         for p in &mut self.providers {
             p.update(&mut self.world);
         }
-        redraw
+        redraw | self.tick_refresh(now)
     }
 
     pub fn render(&mut self, canvas: &mut Canvas) {
+        if self.refreshing.is_some() {
+            return self.render_refresh(canvas);
+        }
         let titles = self.titles();
+        let (dx, dy) = self.offset(canvas.height());
         let Self {
             screens,
             current,
@@ -237,6 +351,7 @@ impl ScreenManager {
             force_overlay: true,
         };
         screens[*current].render(&mut ctx);
+        glitch::shift(ctx.canvas, dx, dy);
         layers(
             ctx.canvas,
             ctx.text,
@@ -253,8 +368,13 @@ impl ScreenManager {
 
     /// GPU 経路の描画。メニューとアラートは画面の完成画面か、写真の重ね絵の上に描く。
     pub fn render_composite(&mut self, canvas: &mut Canvas) -> Composite<'_> {
+        if self.refreshing.is_some() {
+            self.render_refresh(canvas);
+            return Composite::Canvas;
+        }
         let force_overlay = std::mem::take(&mut self.force_overlay);
         let titles = self.titles();
+        let (dx, dy) = self.offset(canvas.height());
         let Self {
             screens,
             current,
@@ -271,7 +391,26 @@ impl ScreenManager {
             covered: alert.is_some() || menu.is_some(),
             force_overlay,
         };
-        let comp = screens[*current].render_composite(&mut ctx);
+        let mut comp = screens[*current].render_composite(&mut ctx);
+        // 焼き付き対策の位置のずらし。写真(重ね絵つき)は対象にしない
+        match &mut comp {
+            Composite::Canvas => glitch::shift(ctx.canvas, dx, dy),
+            Composite::Radar {
+                background_changed,
+                geom,
+                ..
+            } => {
+                if *background_changed {
+                    glitch::shift(ctx.canvas, dx, dy);
+                }
+                let (fx, fy) = (dx as f32, dy as f32);
+                geom.center = (geom.center.0 + fx, geom.center.1 + fy);
+                for b in &mut geom.blips {
+                    (b.x, b.y) = (b.x + fx, b.y + fy);
+                }
+            }
+            Composite::Photo { .. } => {}
+        }
         let draw_alert = match &comp {
             Composite::Canvas => true,
             Composite::Photo {
@@ -337,7 +476,7 @@ impl App for ScreenManager {
     }
 
     fn animating(&self) -> bool {
-        self.screens[self.current].animating()
+        self.refreshing.is_some() || self.screens[self.current].animating()
     }
 
     fn stats(&self) -> Vec<(&'static str, String)> {
@@ -370,6 +509,9 @@ impl App for ScreenManager {
         ]);
         if let Some(p) = self.screens[self.current].page() {
             out.push(("page", p.to_lowercase()));
+        }
+        if self.refresh.is_some() {
+            out.push(("refreshes", self.refreshes.to_string()));
         }
         out
     }

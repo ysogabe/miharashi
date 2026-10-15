@@ -291,8 +291,17 @@ fn png(cli: Cli) -> Result<(), String> {
     };
     air::aircraft_screen(&mut c, &mut text, &empty);
     save(&c, Layers::Image, "aircraft-empty")?;
+    // 焼き付き対策の演出(グリッチが強まる途中と、再表示の途中)
+    air::aircraft_screen(&mut c, &mut text, &view);
+    let clean = Canvas {
+        pixmap: c.pixmap.clone(),
+    };
+    for (name, t) in [("refresh-glitch", 0.45), ("refresh-return", 1.35)] {
+        miharashi_render::glitch::refresh_frame(&mut c, &clean, t, 3);
+        save(&c, Layers::Image, name)?;
+    }
     println!(
-        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty}}.png ({}x{})",
+        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,refresh-glitch,refresh-return}}.png ({}x{})",
         out.display(),
         size.0,
         size.1

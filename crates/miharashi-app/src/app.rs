@@ -62,7 +62,7 @@ pub fn kiosk(
     if let Some(shared) = aircraft {
         screens.push(Box::new(AircraftScreen::new(shared, gpu_max.is_some())));
     }
-    ScreenManager::new(
+    let m = ScreenManager::new(
         screens,
         &cfg.ui.start_screen,
         data,
@@ -70,7 +70,15 @@ pub fn kiosk(
         text_engine(&cfg.ui.font),
         Duration::from_secs(cfg.alerts.show_minutes * 60),
     )
-    .with_provider(Box::new(feed))
+    .with_provider(Box::new(feed));
+    if cfg.ui.refresh_minutes > 0 {
+        m.with_refresh(
+            Duration::from_secs(cfg.ui.refresh_minutes * 60),
+            cfg.ui.refresh_screens.clone(),
+        )
+    } else {
+        m
+    }
 }
 
 #[cfg(test)]
@@ -344,8 +352,17 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "ticks", "keys", "screen", "photo", "aircraft", "feed", "cpu", "gpu", "gpus",
-                "page"
+                "ticks",
+                "keys",
+                "screen",
+                "photo",
+                "aircraft",
+                "feed",
+                "cpu",
+                "gpu",
+                "gpus",
+                "page",
+                "refreshes"
             ]
         );
         let get = |app: &ScreenManager, k: &str| {
@@ -381,6 +398,80 @@ mod tests {
             .map(|s| s.id)
             .collect();
         assert_eq!(ids, ["status", "photo", "aircraft"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 焼き付き対策: 対象の画面を続けて出していると、間隔ごとにグリッチ → 暗転 → 再表示の演出が入り、
+    /// 約 1.6 秒で終わる。キーで打ち切る。対象でない画面や、アラート中には入れない。
+    #[test]
+    fn refresh_effect_on_listed_screens_only() {
+        let (dir, p) = test_photo();
+        let planes: crate::aircraft::Shared = std::sync::Arc::new(std::sync::Mutex::new(Some((
+            Instant::now(),
+            crate::aircraft::demo_view(),
+        ))));
+        let cfg = Config {
+            ui: crate::config::Ui {
+                start_screen: "aircraft".into(),
+                refresh_minutes: 0,
+                ..Config::default().ui
+            },
+            ..Config::default()
+        };
+        let mut app = kiosk(
+            &cfg,
+            (1280, 540),
+            None,
+            Source::File(p, None),
+            Box::new(DummyData::new()),
+            dummy_snapshot(0.0),
+            Some(planes),
+        )
+        .with_refresh(Duration::from_secs(60), vec!["aircraft".into()]);
+        let t0 = Instant::now();
+        app.tick(t0);
+        assert!(!app.refreshing());
+        let center = |app: &mut ScreenManager| {
+            let mut c = Canvas::new(1280, 540);
+            match app.render_composite(&mut c) {
+                Composite::Radar {
+                    background_changed,
+                    geom,
+                    ..
+                } => (background_changed, geom.center),
+                _ => panic!("航空機の画面は Radar"),
+            }
+        };
+        let (_, before) = center(&mut app);
+        assert!(app.tick(t0 + Duration::from_secs(61)), "間隔が来たら演出");
+        assert!(
+            app.refreshing() && app.animating(),
+            "演出中は毎フレーム描く"
+        );
+        let mut c = Canvas::new(1280, 540);
+        assert!(matches!(app.render_composite(&mut c), Composite::Canvas));
+        let mut normal = Canvas::new(1280, 540);
+        app.render(&mut normal);
+        app.tick(t0 + Duration::from_secs(63));
+        assert!(!app.refreshing(), "1.6 秒で終わる");
+        let (redrawn, after) = center(&mut app);
+        assert!(redrawn, "終わったら GPU 経路の背景を描き直す");
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (3.0, 0.0),
+            "演出のたびに画面全体を 6px(1080p 換算)ずらす"
+        );
+        // キーで打ち切る(画面はキーのとおりに動く)
+        app.tick(t0 + Duration::from_secs(130));
+        assert!(app.refreshing());
+        app.on_key(KeyPress::Down);
+        assert!(!app.refreshing());
+        assert_eq!(app.screen_id(), "aircraft");
+        // 対象でない画面では入れない
+        app.on_key(KeyPress::Next);
+        assert_eq!(app.screen_id(), "status");
+        app.tick(t0 + Duration::from_secs(400));
+        assert!(!app.refreshing(), "状況画面は対象でない");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
