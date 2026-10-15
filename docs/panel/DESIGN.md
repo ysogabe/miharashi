@@ -177,19 +177,19 @@ flowchart LR
 | P0(済) | 設計と LP | — |
 | P1(済、#26) | miharashi に `[panel]` と API(既定 OFF)。`KeyPress` の注入、`/status`、SSE、トークン、レート制限。#5 より先に、今の `KeyPress`(Prev / Switch / Next)へ直接つなぐ最小版を入れた。キーは `prev` / `next` / `select` だけで、`up` / `down` / `menu` は `400`(#5 で `KeyPress` が増えたら受け付ける)。`/api/v1/screen` は P3 | **Echo なしで検証できる**: `curl -H "Authorization: Bearer ..." -d '{"key":"next"}'` で画面が切り替わり、`/status` が変わる。24 時間試験のログに `panel=` が出る |
 | P2(済、miharashi-panel v0.1.0) | 単体アプリ `miharashi-panel` の最小版。4 / 5 / 6、現在画面の表示、自動起動、全画面。あとから足したもの: モニターの消灯・点灯・自動(`/api/v1/display`、#32、miharashi-panel#1)、触らなければ操作盤を消灯(miharashi-panel#2)。画面一覧のレールは、タップで遷移できないうちは不要としてやめ、その場所にモニターのボタンを置いた | 実機で 4 / 6 の往復。Wi-Fi 切断 → 復帰で `OFFLINE` → `API` 点灯。端末を再起動すると自動で前面に出る |
-| P3 | 8 / 2 / 0、写真 n/N、レールからの直接遷移(`/api/v1/screen`)、夜間の減光 | PoC-003 の後 |
-| P4 | LLM 管理(gpu-eval#19)とエージェントの状態を手元に表示 | gpu-eval 側の `/status` をキオスクが中継するか、パネルが直接読むかを決める |
+| P3(済、miharashi-panel v0.2.0、2026-10-15) | 8 / 2 / 0(miharashi-panel#4)。ボタンは数字をやめてアイコンと「今押すと何が起きるか」のラベルに(miharashi-panel#5、ラベルはキオスクの `keys`、#51・#53)。キオスクのメニューの一覧を出し、行をタップでその画面へ直接移る(`/api/v1/screen`、miharashi-panel#6、#49)。自動巡回の状態と戻るまでの残り(miharashi-panel#3、#45)。写真 n/N は P2 から出ている。夜間の減光は作らず、触らなければ操作盤を消灯(miharashi-panel#2)で代える(§7) | 実機(Echo Show 5)で、メニューを開く → ▼ で選択が動く → 行のタップで閉じて移る、ラベルが画面ごとに変わる、巡回の停止と残りの数え下げ |
+| P4(#55) | LLM 管理(local-model-lab#19、旧 gpu-eval#19)とエージェントの状態を手元に表示 | LLM 管理の状態をキオスクが中継するか、パネルが直接読むかを決める(#55 の案はキオスクが中継) |
 
 ## 7. 未決・未検証
 
 | 項目 | 状況 |
 |---|---|
-| Echo の Wi-Fi の安定性(2.4 / 5GHz) | 未検証。P2 で 24 時間の `API` 点灯率を測る |
+| Echo の Wi-Fi の安定性(2.4 / 5GHz) | 測定中。2026-10-14 23:00〜10-15 23:00 は、キオスクの 1 分ごとの状態ログで `panel=connected` が 1,433 / 1,433 件(100%)。SSE のつなぎ直しのうち、キオスクの再起動・アプリの入れ直しで説明できないものは 05:26 の 1 回だけ(表示は途切れていない)。1 分ごとのログでは 30 秒より短い途切れが見えないので、10-15 23:00 から 24 時間、ホストから Echo へ 5 秒ごとの ping でも測る |
 | `listen` の既定インターフェース | **決定(P1)**: LAN(`enp11s0`)だけで待ち受ける。Tailscale では待ち受けない |
-| 8 / 2 / 0 | PoC-003(#5)の統一操作が前提 |
-| ホストの発見 | 最初は手入力。mDNS(`_miharashi._tcp`)での自動発見は P3 で検討(キオスク側に依存が増える) |
+| 8 / 2 / 0 | **済**: PoC-003(#5)の S2(#40)で統一操作が入り、パネルでも有効にした(miharashi-panel#4) |
+| ホストの発見 | **見送り(2026-10-15)**: キオスクは固定 IP(192.168.0.132)なので、手入力のままでよい。mDNS(`_miharashi._tcp`)での自動発見は作らない |
 | UI の技術 | View と Canvas を推奨(§5.6)。Compose の起動時間とメモリを測ってから決めてよい |
-| 夜間の減光 | 時刻範囲か照度センサーか。Echo の照度センサーが LineageOS で読めるかは未確認 |
+| 夜間の減光 | **作らない(2026-10-15)**: 触らずに 3 分(設定で変えられる)たつと操作盤を真っ黒にし、バックライトを最小にする(miharashi-panel#2)。これで夜間の眩しさと焼き付きの両方に足りる |
 
 ## 付録 A. A 案(BLE キーボード)をやる場合に要るもの
 
@@ -208,6 +208,6 @@ flowchart LR
 | `PanelView` | Canvas 描画。レール、現在画面、大きなボタン、側キー、ヘッダーの点灯。タップの判定と押下音・触覚 |
 | `KioskClient` | `/status` の取得、`/events` の SSE 受信、`/input` と `/screen` の送信。Bearer、タイムアウト、再接続の間隔 |
 | `PanelState` | `/status` の JSON を写した不変オブジェクト。鮮度(`fresh` / `stale` / `offline`)と取得時刻を持つ |
-| `Settings` | ホスト URL、トークン、減光の時刻範囲。SharedPreferences |
+| `Settings` | ホスト URL、トークン、操作盤を消灯するまでの分。SharedPreferences |
 | `BootReceiver` | `BOOT_COMPLETED` と `MY_PACKAGE_REPLACED` で `PanelActivity` を起動 |
 | `fixtures/` | miharashi の `/status` の JSON 例をコピーし、`PanelState` と描画のテストに使う |
