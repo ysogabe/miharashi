@@ -1,77 +1,24 @@
-//! 画面ロジック(PC 状況 + フォトフレーム)。実行ループ(runtime)からは `App` として見える。
-use crate::config::Config;
-use crate::photos::{Feed, FeedEvent, FeedStatus, HomeLookup, PhotoItem, PhotoPixels, Source};
-#[cfg(test)]
-use crate::screen::PhotoData;
-use crate::screen::{App, Composite, KeyPress, PanelView, ScreenInfo};
-use miharashi_render::aircraft;
-use miharashi_render::alert::{self, AlertView};
-use miharashi_render::canvas::rgba;
-use miharashi_render::screens::{self, StatusPage};
-use miharashi_render::trip_card::{self, TripCard};
-use miharashi_render::{Canvas, TextEngine};
-use std::sync::mpsc::Receiver;
-use std::time::{Duration, Instant};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Screen {
-    /// 状況画面(OVERVIEW / DETAILS)
-    Status(StatusPage),
-    Photo,
+//! 画面ロジック。`ScreenManager`(manager.rs)が登録した画面(screens/)を切り替え、runtime からは `App` として見える。
+//! 画面を足すときは `kiosk` の登録に足す(docs/DESIGN-screen-interface.md)。
+pub mod manager;
+pub mod screens {
+    pub mod photo;
+    pub mod status;
 }
+
+use crate::config::Config;
+use crate::photos::Source;
+use manager::ScreenManager;
+use miharashi_render::TextEngine;
+use miharashi_render::screens::Snapshot;
+use screens::photo::PhotoScreen;
+use screens::status::StatusScreen;
+use std::time::Duration;
 
 /// データ収集(実測値)の抽象。実行ループも画面も具体的な収集方法を知らない。
 pub trait DataSource {
     /// 1 秒ごとなど、更新の時期に呼ぶ。
-    fn update(&mut self, snap: &mut screens::Snapshot);
-}
-
-pub struct KioskApp {
-    screen: Screen,
-    /// フォトフレームから戻るときの、最後に見ていた状況ページ
-    status_page: StatusPage,
-    snap: screens::Snapshot,
-    data: Box<dyn DataSource>,
-    feed: Feed,
-    current: Option<PhotoItem>,
-    /// 表示中の写真の通し番号(GPU のテクスチャの識別に使う)
-    current_id: u64,
-    /// フェード中の (旧フレーム, その通し番号, 開始時刻)
-    fade: Option<(PhotoItem, u64, Instant)>,
-    /// GPU 経路で、重ね絵(時刻や写真の情報)を描き直す必要があるか。フェードの途中では描き直さない
-    overlay_dirty: bool,
-    notice: Option<String>,
-    /// 表示中の、旅・季節の切り替わりのカード
-    card: Option<TripCard>,
-    card_len: Duration,
-    last_photo_change: Instant,
-    photo_interval: Duration,
-    fade_len: Duration,
-    next_tick: Instant,
-    tick_len: Duration,
-    text: TextEngine,
-    /// 航空機の最新の取得結果(無効なら None)
-    aircraft: Option<crate::aircraft::Shared>,
-    /// 前回の航空機の画面から出した写真の枚数と、航空機の画面を閉じる時刻
-    photos_since_air: u32,
-    air_until: Option<Instant>,
-    air_every: u32,
-    air_len: Duration,
-    /// GPU 経路(GLES)か。航空機の画面の回る線を毎フレーム描く
-    gpu: bool,
-    /// 航空機の画面を CPU で最後に描いた内容(CPU 経路は変わったときだけ描き直す)
-    air_drawn: Option<aircraft::AircraftView>,
-    /// GPU 経路で、レーダーの背景を最後に描いた内容
-    radar_bg: Option<aircraft::AircraftView>,
-    /// レーダーの下地(地図と距離の輪)。受信機と半径が同じ間は描き直さない
-    radar_base: Option<aircraft::RadarBase>,
-    /// アラート(地震・災害)の受け口(無効なら None)
-    alerts: Option<Receiver<AlertView>>,
-    /// 表示中のアラートと、閉じる時刻
-    alert: Option<(AlertView, Instant)>,
-    alert_len: Duration,
-    pub ticks: u64,
-    pub keys: u64,
+    fn update(&mut self, snap: &mut Snapshot);
 }
 
 pub fn text_engine(font: &str) -> TextEngine {
@@ -85,7 +32,7 @@ pub fn text_engine(font: &str) -> TextEngine {
     TextEngine::new("Noto Sans CJK JP")
 }
 
-pub fn set_clock(s: &mut screens::Snapshot) {
+pub fn set_clock(s: &mut Snapshot) {
     use chrono::Datelike;
     let now = chrono::Local::now();
     let wd =
@@ -94,495 +41,40 @@ pub fn set_clock(s: &mut screens::Snapshot) {
     s.time = now.format("%H:%M:%S").to_string();
 }
 
-fn describe(status: &FeedStatus) -> Option<String> {
-    match status {
-        FeedStatus::Online => None,
-        FeedStatus::Retrying { retry_in, .. } => Some(format!(
-            "GEOFRAME に接続できません({}秒後に再試行)",
-            retry_in.as_secs().max(1)
-        )),
-    }
-}
-
-impl KioskApp {
-    /// `gpu_max` は GPU 経路のとき Some(GPU で扱える写真の最大の幅と高さ)。写真の合成を GPU に任せる。
-    pub fn new(
-        cfg: &Config,
-        size: (u32, u32),
-        gpu_max: Option<u32>,
-        source: Source,
-        data: Box<dyn DataSource>,
-        snap: screens::Snapshot,
-    ) -> Self {
-        let g = &cfg.geoframe;
-        let feed = Feed::spawn(
-            source,
-            size,
-            gpu_max,
-            Duration::from_secs(g.reconnect_min_secs),
-            Duration::from_secs(g.reconnect_max_secs),
-            Some(HomeLookup {
-                ha: cfg.home_assistant.clone(),
-                radius_km: g.home_radius_km,
-            }),
-        );
-        Self {
-            screen: if cfg.ui.start_screen == "photo" {
-                Screen::Photo
-            } else {
-                Screen::Status(StatusPage::Overview)
-            },
-            status_page: StatusPage::Overview,
-            snap,
-            data,
-            feed,
-            current: None,
-            current_id: 0,
-            fade: None,
-            overlay_dirty: true,
-            notice: None,
-            card: None,
-            card_len: Duration::from_secs(g.card_secs),
-            last_photo_change: Instant::now(),
-            photo_interval: Duration::from_secs(g.photo_interval_secs),
-            fade_len: Duration::from_millis(800),
-            next_tick: Instant::now(),
-            tick_len: Duration::from_secs(1),
-            text: text_engine(&cfg.ui.font),
-            aircraft: None,
-            photos_since_air: 0,
-            air_until: None,
-            air_every: cfg.aircraft.every_photos,
-            air_len: Duration::from_secs(cfg.aircraft.show_secs),
-            gpu: gpu_max.is_some(),
-            air_drawn: None,
-            radar_bg: None,
-            radar_base: None,
-            alerts: None,
-            alert: None,
-            alert_len: Duration::from_secs(cfg.alerts.show_minutes * 60),
-            ticks: 0,
-            keys: 0,
-        }
-    }
-
-    /// 航空機の取得結果をつなぐ。
-    pub fn with_aircraft(mut self, shared: Option<crate::aircraft::Shared>) -> Self {
-        self.aircraft = shared;
-        self
-    }
-
-    /// 航空機の画面を出しているか。
-    pub fn showing_aircraft(&self) -> bool {
-        self.air_until.is_some()
-    }
-
-    /// 新しい(30 秒以内の)取得結果で、半径内に機体がいるときの内容。
-    fn aircraft_view(&self) -> Option<aircraft::AircraftView> {
-        let g = self.aircraft.as_ref()?.lock().ok()?;
-        let (at, view) = g.as_ref()?;
-        (at.elapsed() < Duration::from_secs(30) && !view.planes.is_empty()).then(|| view.clone())
-    }
-
-    /// アラートの受け口をつなぐ。
-    pub fn with_alerts(mut self, rx: Option<Receiver<AlertView>>) -> Self {
-        self.alerts = rx;
-        self
-    }
-
-    /// アラートを表示中か(画面を消していても点ける)。
-    pub fn alert_active(&self) -> bool {
-        self.alert.is_some()
-    }
-
-    pub fn screen(&self) -> Screen {
-        self.screen
-    }
-
-    pub fn photo_position(&self) -> usize {
-        self.current.as_ref().map_or(0, |p| p.info.position.0)
-    }
-
-    pub fn feed_notice(&self) -> Option<&str> {
-        self.notice.as_deref()
-    }
-
-    pub fn snapshot(&self) -> &screens::Snapshot {
-        &self.snap
-    }
-
-    /// 戻り値: 再描画が必要か。
-    pub fn on_key(&mut self, key: KeyPress) -> bool {
-        self.keys += 1;
-        self.overlay_dirty = true;
-        // アラート表示中のキーは閉じるだけにする
-        if self.alert.take().is_some() {
-            return true;
-        }
-        // 航空機の画面のキーは写真へ戻るだけにする
-        if self.air_until.take().is_some() {
-            self.last_photo_change = Instant::now();
-            return true;
-        }
-        match (key, self.screen) {
-            // 状況画面: 5 でページ切替、6 / → でフォトフレームへ。
-            (KeyPress::Switch, Screen::Status(p)) => {
-                self.status_page = p.toggled();
-                self.screen = Screen::Status(self.status_page);
-            }
-            (KeyPress::Next, Screen::Status(p)) => {
-                self.status_page = p;
-                self.screen = Screen::Photo;
-            }
-            (KeyPress::Switch, Screen::Photo) => self.screen = Screen::Status(self.status_page),
-            (KeyPress::Next, Screen::Photo) => {
-                self.feed.next();
-                self.last_photo_change = Instant::now();
-            }
-            (KeyPress::Prev, Screen::Photo) => {
-                self.feed.prev();
-                self.last_photo_change = Instant::now();
-            }
-            (KeyPress::Prev, Screen::Status(_)) => {}
-        }
-        true
-    }
-
-    /// 実行ループから毎周期呼ぶ。戻り値: 再描画が必要か。
-    pub fn tick(&mut self, now: Instant) -> bool {
-        let mut redraw = false;
-        while let Some(ev) = self.feed.try_recv() {
-            match ev {
-                FeedEvent::Photo(item) => {
-                    if let Some(old) = self.current.take() {
-                        self.fade = Some((old, self.current_id, now));
-                    }
-                    self.current = Some(item);
-                    self.current_id += 1;
-                    self.card = None;
-                    self.photos_since_air += 1;
-                    self.last_photo_change = now;
-                    if self.notice.is_none() {
-                        self.snap.feed_status = Some("online".into());
-                    }
-                    redraw = true;
-                }
-                FeedEvent::Card(c) => {
-                    self.card = Some(c);
-                    self.last_photo_change = now;
-                    redraw = true;
-                }
-                FeedEvent::Status(s) => {
-                    self.notice = describe(&s);
-                    // 状況画面の HEALTH にも同じ状態を出す
-                    let state = if self.notice.is_some() {
-                        "再接続中"
-                    } else {
-                        "online"
-                    };
-                    self.snap.feed_status = Some(state.into());
-                    redraw = true;
-                }
-            }
-        }
-        // 新しいアラートは前のものを置き換え、表示時間も数え直す
-        let mut latest = None;
-        while let Some(v) = self.alerts.as_ref().and_then(|rx| rx.try_recv().ok()) {
-            latest = Some(v);
-        }
-        if let Some(v) = latest {
-            self.alert = Some((v, now + self.alert_len));
-            redraw = true;
-        }
-        // 表示時間が過ぎたら、ほかの入力が無くても必ず閉じる
-        if self.alert.as_ref().is_some_and(|(_, until)| now >= *until) {
-            self.alert = None;
-            redraw = true;
-        }
-        // 写真画面で写真を every_photos 枚出したら、半径内に機体がいれば航空機の画面を挟む
-        if self.screen == Screen::Photo
-            && self.air_until.is_none()
-            && self.card.is_none()
-            && self.photos_since_air >= self.air_every
-            && now.duration_since(self.last_photo_change) >= self.photo_interval
-            && self.aircraft_view().is_some()
-        {
-            self.air_until = Some(now + self.air_len);
-            self.photos_since_air = 0;
-            redraw = true;
-        }
-        if let Some(until) = self.air_until {
-            if now >= until || self.screen != Screen::Photo {
-                self.air_until = None;
-                self.air_drawn = None;
-                self.radar_bg = None;
-                // 閉じたらすぐ次の写真へ
-                self.feed.next();
-                self.last_photo_change = now;
-                redraw = true;
-            }
-            // GPU 経路は回る線を毎フレーム描く。CPU 経路は内容が変わったときだけ描き直す
-            if self.gpu || (self.air_until.is_some() && self.aircraft_view() != self.air_drawn) {
-                redraw = true;
-            }
-        }
-        let dwell = if self.card.is_some() {
-            self.card_len
-        } else {
-            self.photo_interval
-        };
-        if self.screen == Screen::Photo
-            && self.air_until.is_none()
-            && now.duration_since(self.last_photo_change) >= dwell
-        {
-            self.feed.next();
-            self.last_photo_change = now;
-        }
-        if self
-            .fade
-            .as_ref()
-            .is_some_and(|(_, _, t0)| now.duration_since(*t0) >= self.fade_len)
-        {
-            self.fade = None;
-        }
-        if now >= self.next_tick {
-            self.data.update(&mut self.snap);
-            set_clock(&mut self.snap);
-            self.ticks += 1;
-            self.next_tick += self.tick_len;
-            if self.next_tick < now {
-                self.next_tick = now + self.tick_len;
-            }
-            redraw = true;
-        }
-        self.overlay_dirty |= redraw;
-        redraw || (self.screen == Screen::Photo && self.fade.is_some())
-    }
-
-    /// フェードの進み具合(新フレームの不透明度 0〜1)。
-    fn fade_alpha(&self, t0: Instant) -> f32 {
-        (Instant::now().duration_since(t0).as_secs_f32() / self.fade_len.as_secs_f32()).min(1.0)
-    }
-
-    /// GPU 経路の描画。写真画面は写真と重ね絵に分け、重ね絵は変わったときだけ描き直す。
-    pub fn render_composite(&mut self, canvas: &mut Canvas) -> Composite<'_> {
-        // 航空機の画面: 背景は内容が変わったときだけ描き、回る線と点は GPU に任せる。
-        // アラートを重ねるときは CPU で完成画面を描く
-        if let (Some(until), None) = (self.air_until, &self.alert)
-            && self.screen == Screen::Photo
-            && let Some(v) = self.aircraft_view()
-        {
-            let changed = self.radar_bg.as_ref() != Some(&v);
-            if changed {
-                aircraft::aircraft_background_cached(
-                    canvas,
-                    &mut self.text,
-                    &v,
-                    &mut self.radar_base,
-                );
-            }
-            let geom = aircraft::radar_geometry(&v, (canvas.width(), canvas.height()));
-            self.radar_bg = Some(v);
-            self.overlay_dirty = true;
-            let start = until.checked_sub(self.air_len).unwrap_or(until);
-            let turns = start.elapsed().as_secs_f32() / aircraft::SWEEP_PERIOD_SECS;
-            return Composite::Radar {
-                background_changed: changed,
-                geom,
-                sweep: turns.fract() * std::f32::consts::TAU,
-            };
-        }
-        if self.screen != Screen::Photo || self.current.is_none() || self.air_until.is_some() {
-            // 状況画面と、写真がまだ 1 枚もないときは Canvas が完成画面
-            self.render(canvas);
-            // 次に写真画面になったら重ね絵を描き直す
-            self.overlay_dirty = true;
-            return Composite::Canvas;
-        }
-        // デコードしただけの写真は 1 回だけ GPU に渡し、次からは GPU 側の完成フレームを使う
-        // (CPU 側の画素は捨てる。12MP の写真で 1 枚約 36MB)
-        let fade_item = self.fade.as_mut().map(|f| &mut f.0);
-        for it in self.current.iter_mut().chain(fade_item) {
-            if it.sent && matches!(it.pixels, PhotoPixels::Source(_)) {
-                it.pixels = PhotoPixels::Resident;
-            }
-            it.sent = true;
-        }
-        let overlay_changed = std::mem::take(&mut self.overlay_dirty);
-        let item = self.current.as_ref().expect("上で確かめた");
-        if overlay_changed {
-            canvas.clear(rgba(0, 0, 0, 0));
-            screens::photo_overlay(
-                canvas,
-                &mut self.text,
-                &self.snap,
-                &item.layout,
-                Some(&item.info),
-                self.notice.as_deref(),
-            );
-            if let Some(card) = &self.card {
-                trip_card::trip_card(canvas, &mut self.text, card);
-            }
-            if let Some((view, _)) = &self.alert {
-                alert::overlay(canvas, &mut self.text, view);
-            }
-        }
-        let old = self
-            .fade
-            .as_ref()
-            .map(|(it, id, t0)| (it.photo_ref(*id), self.fade_alpha(*t0)));
-        Composite::Photo {
-            photo: item.photo_ref(self.current_id),
-            old,
-            overlay_changed,
-        }
-    }
-
-    pub fn render(&mut self, canvas: &mut Canvas) {
-        if self.air_until.is_some() {
-            self.air_drawn = self.aircraft_view();
-        }
-        if self.screen == Screen::Photo
-            && self.air_until.is_some()
-            && let Some(v) = self.air_drawn.clone()
-        {
-            aircraft::aircraft_screen(canvas, &mut self.text, &v);
-            if let Some((view, _)) = &self.alert {
-                alert::overlay(canvas, &mut self.text, view);
-            }
-            return;
-        }
-        self.render_screen(canvas);
-        if self.screen == Screen::Photo
-            && let Some(card) = &self.card
-        {
-            trip_card::trip_card(canvas, &mut self.text, card);
-        }
-        if let Some((view, _)) = &self.alert {
-            alert::overlay(canvas, &mut self.text, view);
-        }
-    }
-
-    fn render_screen(&mut self, canvas: &mut Canvas) {
-        match self.screen {
-            Screen::Status(page) => screens::status(canvas, &mut self.text, &self.snap, page),
-            Screen::Photo => {
-                // GPU 経路の写真(デコードしただけ)は、CPU で描くときにここで合成する
-                let size = (canvas.width(), canvas.height());
-                let fade_item = self.fade.as_mut().map(|f| &mut f.0);
-                for it in self.current.iter_mut().chain(fade_item) {
-                    it.ensure_frame(size);
-                }
-                let fade = self
-                    .fade
-                    .as_ref()
-                    .and_then(|(old, _, t0)| Some((old.frame()?, self.fade_alpha(*t0))));
-                let (photo, info) = (
-                    self.current
-                        .as_ref()
-                        .and_then(|p| Some((p.frame()?, &p.layout))),
-                    self.current.as_ref().map(|p| &p.info),
-                );
-                screens::photo_frame(
-                    canvas,
-                    &mut self.text,
-                    &self.snap,
-                    photo,
-                    info,
-                    fade,
-                    self.notice.as_deref(),
-                );
-            }
-        }
-    }
-}
-
-impl App for KioskApp {
-    fn on_key(&mut self, key: KeyPress) -> bool {
-        KioskApp::on_key(self, key)
-    }
-
-    fn tick(&mut self, now: Instant) -> bool {
-        KioskApp::tick(self, now)
-    }
-
-    fn render(&mut self, canvas: &mut Canvas) {
-        KioskApp::render(self, canvas)
-    }
-
-    fn render_composite(&mut self, canvas: &mut Canvas) -> Composite<'_> {
-        KioskApp::render_composite(self, canvas)
-    }
-
-    fn wants_screen(&self) -> bool {
-        self.alert_active()
-    }
-
-    fn animating(&self) -> bool {
-        self.gpu && self.showing_aircraft()
-    }
-
-    fn stats(&self) -> Vec<(&'static str, String)> {
-        let s = self.snapshot();
-        vec![
-            ("ticks", self.ticks.to_string()),
-            ("keys", self.keys.to_string()),
-            ("screen", format!("{:?}", self.screen())),
-            ("photo", self.photo_position().to_string()),
-            ("aircraft", self.showing_aircraft().to_string()),
-            ("feed", self.feed_notice().unwrap_or("online").to_string()),
-            ("cpu", format!("{:?}", s.cpu.map(|v| v.round()))),
-            ("gpu", format!("{:?}", s.gpu.map(|v| v.round()))),
-            (
-                "gpus",
-                s.gpus
-                    .iter()
-                    .map(|g| {
-                        let u = g.usage.map_or("--".to_string(), |v| format!("{v:.0}"));
-                        format!("{}:{u}", g.label)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(","),
-            ),
-        ]
-    }
-
-    fn panel_view(&self) -> Option<PanelView> {
-        let (current, page) = match self.screen {
-            Screen::Status(StatusPage::Overview) => (0, Some("OVERVIEW")),
-            Screen::Status(StatusPage::Details) => (0, Some("DETAILS")),
-            Screen::Photo => (1, None),
-        };
-        Some(PanelView {
-            screens: vec![
-                ScreenInfo {
-                    id: "status",
-                    title: "STATUS",
-                },
-                ScreenInfo {
-                    id: "photo",
-                    title: "PHOTO FRAME",
-                },
-            ],
-            current,
-            page,
-            photo: self.current.as_ref().map(|p| p.info.position),
-            feed_online: self.notice.is_none(),
-        })
-    }
+/// キオスクの画面を登録する。並び順が切り替わる順になる(docs/DESIGN-screens.md §2)。
+/// `gpu_max` は GPU 経路のとき Some(GPU で扱える写真の最大の幅と高さ)。
+pub fn kiosk(
+    cfg: &Config,
+    size: (u32, u32),
+    gpu_max: Option<u32>,
+    source: Source,
+    data: Box<dyn DataSource>,
+    snap: Snapshot,
+    aircraft: Option<crate::aircraft::Shared>,
+) -> ScreenManager {
+    let photo = PhotoScreen::new(cfg, size, gpu_max, source).with_aircraft(aircraft);
+    let feed = photo.feed_provider();
+    ScreenManager::new(
+        vec![Box::new(StatusScreen::new()), Box::new(photo)],
+        &cfg.ui.start_screen,
+        data,
+        snap,
+        text_engine(&cfg.ui.font),
+        Duration::from_secs(cfg.alerts.show_minutes * 60),
+    )
+    .with_provider(Box::new(feed))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data::{DummyData, dummy_snapshot};
+    use crate::screen::{App, Composite, KeyPress, PhotoData};
+    use miharashi_render::Canvas;
+    use std::time::Instant;
 
-    fn app_with_photo(size: (u32, u32)) -> (KioskApp, std::path::PathBuf) {
-        app_with_photo_on(size, None)
-    }
-
-    /// `gpu_max` が Some なら GPU 経路(写真はデコードしただけで届く)。
-    fn app_with_photo_on(size: (u32, u32), gpu_max: Option<u32>) -> (KioskApp, std::path::PathBuf) {
+    /// テスト用の写真(緑の 4:3)を置いたディレクトリ。
+    pub(crate) fn test_photo() -> (std::path::PathBuf, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "miharashi-app-{}-{:?}",
             std::process::id(),
@@ -593,19 +85,42 @@ mod tests {
         image::RgbaImage::from_pixel(64, 48, image::Rgba([30, 120, 60, 255]))
             .save(&p)
             .unwrap();
-        let cfg = Config::default();
-        let app = KioskApp::new(
-            &cfg,
+        (dir, p)
+    }
+
+    fn app_with_photo(size: (u32, u32)) -> (ScreenManager, std::path::PathBuf) {
+        app_with_photo_on(size, None)
+    }
+
+    /// `gpu_max` が Some なら GPU 経路(写真はデコードしただけで届く)。
+    fn app_with_photo_on(
+        size: (u32, u32),
+        gpu_max: Option<u32>,
+    ) -> (ScreenManager, std::path::PathBuf) {
+        let (dir, p) = test_photo();
+        let app = kiosk(
+            &Config::default(),
             size,
             gpu_max,
             Source::File(p, Some("テスト".into())),
             Box::new(DummyData::new()),
             dummy_snapshot(0.0),
+            None,
         );
         (app, dir)
     }
 
-    fn pump_until(app: &mut KioskApp, cond: impl Fn(&KioskApp) -> bool) -> bool {
+    fn photo_position(app: &ScreenManager) -> usize {
+        app.panel_view().unwrap().photo.map_or(0, |p| p.0)
+    }
+
+    /// (画面の id, 状況画面のページ)
+    fn screen(app: &ScreenManager) -> (&'static str, Option<&'static str>) {
+        let v = app.panel_view().unwrap();
+        (app.screen_id(), v.page)
+    }
+
+    fn pump_until(app: &mut ScreenManager, cond: impl Fn(&ScreenManager) -> bool) -> bool {
         let end = Instant::now() + Duration::from_secs(5);
         while Instant::now() < end {
             app.tick(Instant::now());
@@ -617,40 +132,44 @@ mod tests {
         false
     }
 
-    const OVERVIEW: Screen = Screen::Status(StatusPage::Overview);
-    const DETAILS: Screen = Screen::Status(StatusPage::Details);
+    const OVERVIEW: (&str, Option<&str>) = ("status", Some("OVERVIEW"));
+    const DETAILS: (&str, Option<&str>) = ("status", Some("DETAILS"));
+    const PHOTO: (&str, Option<&str>) = ("photo", None);
 
     #[test]
     fn key_flow_between_status_and_photo() {
         let (mut app, dir) = app_with_photo((320, 180));
-        assert_eq!(app.screen(), OVERVIEW);
+        assert_eq!(screen(&app), OVERVIEW);
         app.on_key(KeyPress::Prev);
-        assert_eq!(app.screen(), OVERVIEW, "状況画面の 4 は何もしない");
+        assert_eq!(screen(&app), OVERVIEW, "状況画面の 4 は何もしない");
         app.on_key(KeyPress::Next);
-        assert_eq!(
-            app.screen(),
-            Screen::Photo,
-            "状況画面の 6 でフォトフレームへ"
-        );
+        assert_eq!(screen(&app), PHOTO, "状況画面の 6 でフォトフレームへ");
         app.on_key(KeyPress::Switch);
-        assert_eq!(app.screen(), OVERVIEW, "5 で状況画面へ戻る");
+        assert_eq!(screen(&app), OVERVIEW, "5 で状況画面へ戻る");
         app.on_key(KeyPress::Switch);
-        assert_eq!(app.screen(), DETAILS, "状況画面の 5 でページ切替");
+        assert_eq!(screen(&app), DETAILS, "状況画面の 5 でページ切替");
         assert!(
-            pump_until(&mut app, |a| a.photo_position() == 1),
+            pump_until(&mut app, |a| photo_position(a) == 1),
             "写真が読み込まれる"
         );
         app.on_key(KeyPress::Next);
-        assert_eq!(app.screen(), Screen::Photo);
+        assert_eq!(screen(&app), PHOTO);
         app.on_key(KeyPress::Switch);
-        assert_eq!(app.screen(), DETAILS, "最後に見ていたページへ戻る");
+        assert_eq!(screen(&app), DETAILS, "最後に見ていたページへ戻る");
         app.on_key(KeyPress::Next);
         app.on_key(KeyPress::Next);
+        assert_eq!(
+            screen(&app),
+            PHOTO,
+            "写真画面の 6 は次の写真で、画面は変わらない"
+        );
+        app.on_key(KeyPress::Prev);
+        assert_eq!(screen(&app), PHOTO, "写真画面の 4 は前の写真");
         assert!(
-            pump_until(&mut app, |a| a.photo_position() == 1),
+            pump_until(&mut app, |a| photo_position(a) == 1),
             "写真切替後も位置が有効"
         );
-        assert_eq!(app.keys, 8);
+        assert_eq!(app.keys, 9);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -658,41 +177,110 @@ mod tests {
     fn status_page_toggles_with_switch_key() {
         let (mut app, dir) = app_with_photo((320, 180));
         app.on_key(KeyPress::Switch);
-        assert_eq!(app.screen(), DETAILS);
+        assert_eq!(screen(&app), DETAILS);
         app.on_key(KeyPress::Prev);
-        assert_eq!(app.screen(), DETAILS, "4 は何もしない");
+        assert_eq!(screen(&app), DETAILS, "4 は何もしない");
         app.on_key(KeyPress::Switch);
-        assert_eq!(app.screen(), OVERVIEW);
+        assert_eq!(screen(&app), OVERVIEW);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn panel_view_follows_the_screen() {
         let (mut app, dir) = app_with_photo((320, 180));
-        let v = App::panel_view(&app).unwrap();
-        let ids: Vec<_> = v.screens.iter().map(|s| s.id).collect();
-        assert_eq!(ids, ["status", "photo"]);
+        let v = app.panel_view().unwrap();
+        let ids: Vec<_> = v.screens.iter().map(|s| (s.id, s.title)).collect();
+        assert_eq!(ids, [("status", "STATUS"), ("photo", "PHOTO FRAME")]);
         assert_eq!((v.current, v.page), (0, Some("OVERVIEW")));
         app.on_key(KeyPress::Switch);
-        assert_eq!(App::panel_view(&app).unwrap().page, Some("DETAILS"));
+        assert_eq!(app.panel_view().unwrap().page, Some("DETAILS"));
         app.on_key(KeyPress::Next);
-        assert!(pump_until(&mut app, |a| a.photo_position() == 1));
-        let v = App::panel_view(&app).unwrap();
+        assert!(pump_until(&mut app, |a| photo_position(a) == 1));
+        let v = app.panel_view().unwrap();
         assert_eq!((v.current, v.page, v.photo), (1, None, Some((1, 1))));
         assert!(v.feed_online);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn start_screen_status_starts_on_overview() {
+    fn start_screen_picks_the_registered_id() {
         let (app, dir) = app_with_photo((320, 180));
-        assert_eq!(app.screen(), OVERVIEW);
+        assert_eq!(screen(&app), OVERVIEW);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (dir, p) = test_photo();
+        let cfg = Config {
+            ui: crate::config::Ui {
+                start_screen: "photo".into(),
+                ..Config::default().ui
+            },
+            ..Config::default()
+        };
+        let app = kiosk(
+            &cfg,
+            (320, 180),
+            None,
+            Source::File(p, None),
+            Box::new(DummyData::new()),
+            dummy_snapshot(0.0),
+            None,
+        );
+        assert_eq!(screen(&app), PHOTO);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 状態ログ: tools/soak_summary.py が読む順に並び、screen= は画面の id。
+    #[test]
+    fn stats_use_screen_ids_in_soak_summary_order() {
+        let (mut app, dir) = app_with_photo((320, 180));
+        app.tick(Instant::now());
+        let keys: Vec<_> = app.stats().iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            [
+                "ticks", "keys", "screen", "photo", "aircraft", "feed", "cpu", "gpu", "gpus",
+                "page"
+            ]
+        );
+        let get = |app: &ScreenManager, k: &str| {
+            app.stats()
+                .into_iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v)
+        };
+        assert_eq!(get(&app, "screen").as_deref(), Some("status"));
+        assert_eq!(get(&app, "page").as_deref(), Some("overview"));
+        assert_eq!(get(&app, "feed").as_deref(), Some("online"));
+        app.on_key(KeyPress::Next);
+        assert_eq!(get(&app, "screen").as_deref(), Some("photo"));
+        assert_eq!(get(&app, "page"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn px(c: &Canvas, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * c.width() + x) * 4) as usize;
         c.pixmap.data()[i..i + 4].try_into().unwrap()
+    }
+
+    /// ScreenManager を通して描いた状況画面は、描画関数を直接呼んだものと 1 画素も違わない。
+    #[test]
+    fn status_render_matches_the_render_function() {
+        for size in [(1920u32, 1080u32), (2560, 1080)] {
+            let (mut app, dir) = app_with_photo(size);
+            app.tick(Instant::now());
+            let mut text = text_engine("");
+            for page in [
+                miharashi_render::screens::StatusPage::Overview,
+                miharashi_render::screens::StatusPage::Details,
+            ] {
+                let mut got = Canvas::new(size.0, size.1);
+                app.render(&mut got);
+                let mut want = Canvas::new(size.0, size.1);
+                miharashi_render::screens::status(&mut want, &mut text, app.world(), page);
+                assert!(got.pixmap.data() == want.pixmap.data(), "{size:?} {page:?}");
+                app.on_key(KeyPress::Switch);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
@@ -719,7 +307,7 @@ mod tests {
         assert!(found, "CPU 使用率の折れ線");
 
         app.on_key(KeyPress::Next);
-        assert!(pump_until(&mut app, |a| a.photo_position() == 1));
+        assert!(pump_until(&mut app, |a| photo_position(a) == 1));
         // 写真が拡大されて全面に出る。フェードが終わるまで待って確認する。
         std::thread::sleep(Duration::from_millis(900));
         app.tick(Instant::now());
@@ -748,7 +336,7 @@ mod tests {
             "状況画面は Canvas が完成画面"
         );
         app.on_key(KeyPress::Next);
-        assert!(pump_until(&mut app, |a| a.photo_position() == 1));
+        assert!(pump_until(&mut app, |a| photo_position(a) == 1));
         std::thread::sleep(Duration::from_millis(900));
         app.tick(Instant::now());
 
@@ -770,23 +358,7 @@ mod tests {
             _ => panic!("写真画面は Photo になる"),
         };
         assert!(changed, "最初は重ね絵を描く");
-        // premultiplied の source-over: out = src + dst × (1 - src_a)
-        let mut max = 0u8;
-        for ((o, f), want) in overlay
-            .pixmap
-            .data()
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .zip(frame.as_chunks::<4>().0)
-            .zip(cpu.pixmap.data().as_chunks::<4>().0)
-        {
-            for i in 0..3 {
-                let v = o[i] as f32 + f[i] as f32 * (1.0 - o[3] as f32 / 255.0);
-                max = max.max((v.round() as i32 - want[i] as i32).unsigned_abs() as u8);
-            }
-        }
-        assert!(max <= 2, "CPU 経路との差 {max}");
+        assert!(over_diff(&overlay, &frame, &cpu) <= 2, "CPU 経路との差");
 
         // 時刻などが変わらなければ描き直さない。キーを押すと描き直す
         assert!(matches!(
@@ -807,12 +379,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 重ね絵(premultiplied)を写真のフレームに source-over で重ねたものと、CPU の完成画面との最大の差。
+    fn over_diff(overlay: &Canvas, frame: &[u8], cpu: &Canvas) -> u8 {
+        let mut max = 0u8;
+        for ((o, f), want) in overlay
+            .pixmap
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(frame.as_chunks::<4>().0)
+            .zip(cpu.pixmap.data().as_chunks::<4>().0)
+        {
+            for i in 0..3 {
+                let v = o[i] as f32 + f[i] as f32 * (1.0 - o[3] as f32 / 255.0);
+                max = max.max((v.round() as i32 - want[i] as i32).unsigned_abs() as u8);
+            }
+        }
+        max
+    }
+
+    /// アラートは写真の重ね絵の上に描き、開いたとき・閉じたときに重ね絵を描き直させる。
+    /// キーを押すと閉じる。CPU 経路の完成画面とも一致する。
+    #[test]
+    fn alert_layer_redraws_the_photo_overlay() {
+        let size = (640u32, 270u32);
+        let (app, dir) = app_with_photo(size);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = app.with_alerts(Some(rx));
+        app.on_key(KeyPress::Next);
+        assert!(pump_until(&mut app, |a| photo_position(a) == 1));
+        std::thread::sleep(Duration::from_millis(900));
+        app.tick(Instant::now());
+        let mut overlay = Canvas::new(size.0, size.1);
+        app.render_composite(&mut overlay);
+        assert!(matches!(
+            app.render_composite(&mut overlay),
+            Composite::Photo {
+                overlay_changed: false,
+                ..
+            }
+        ));
+        tx.send(miharashi_render::alert::AlertView::Quake(
+            crate::quake::demo_view(),
+        ))
+        .unwrap();
+        assert!(app.tick(Instant::now()), "アラートが来たら描き直す");
+        assert!(app.wants_screen(), "アラート中は画面を点ける");
+        let mut cpu = Canvas::new(size.0, size.1);
+        app.render(&mut cpu);
+        let frame = match app.render_composite(&mut overlay) {
+            Composite::Photo {
+                photo,
+                overlay_changed: true,
+                ..
+            } => match photo.data {
+                PhotoData::Frame(f) => f.data().to_vec(),
+                _ => panic!("CPU 経路の写真は完成フレーム"),
+            },
+            _ => panic!("アラートが来たら重ね絵を描き直す"),
+        };
+        assert!(
+            over_diff(&overlay, &frame, &cpu) <= 2,
+            "アラートも重ね絵に入る"
+        );
+        app.on_key(KeyPress::Next);
+        assert!(!app.wants_screen(), "キーで閉じる");
+        assert_eq!(screen(&app), PHOTO, "閉じるだけで、写真は進めない");
+        assert!(matches!(
+            app.render_composite(&mut overlay),
+            Composite::Photo {
+                overlay_changed: true,
+                ..
+            }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// GPU 経路: 写真はデコードしただけで 1 回だけ渡し、次からは GPU 側のフレームを使う
     /// (CPU 側の画素は捨てる)。CPU で描くときは、その場で完成フレームを作る。
     #[test]
     fn gpu_path_sends_source_once_then_resident() {
         let size = (640u32, 270u32);
-        let kind = |app: &mut KioskApp| {
+        let kind = |app: &mut ScreenManager| {
             let mut c = Canvas::new(size.0, size.1);
             match app.render_composite(&mut c) {
                 Composite::Photo { photo, .. } => match photo.data {
@@ -825,7 +474,7 @@ mod tests {
         };
         let (mut app, dir) = app_with_photo_on(size, Some(16384));
         app.on_key(KeyPress::Next);
-        assert!(pump_until(&mut app, |a| a.photo_position() == 1));
+        assert!(pump_until(&mut app, |a| photo_position(a) == 1));
         assert_eq!(kind(&mut app), "source", "1 回目はデコードしただけの写真");
         assert_eq!(kind(&mut app), "resident", "2 回目からは GPU 側のもの");
         let _ = std::fs::remove_dir_all(&dir);
@@ -833,76 +482,19 @@ mod tests {
         // 上限より大きい写真は、取得スレッドで完成フレームまで作る
         let (mut app, dir) = app_with_photo_on(size, Some(32));
         app.on_key(KeyPress::Next);
-        assert!(pump_until(&mut app, |a| a.photo_position() == 1));
+        assert!(pump_until(&mut app, |a| photo_position(a) == 1));
         assert_eq!(kind(&mut app), "frame");
         let _ = std::fs::remove_dir_all(&dir);
 
         // GPU 経路の写真でも CPU の render は描ける
         let (mut app, dir) = app_with_photo_on(size, Some(16384));
         app.on_key(KeyPress::Next);
-        assert!(pump_until(&mut app, |a| a.photo_position() == 1));
+        assert!(pump_until(&mut app, |a| photo_position(a) == 1));
         std::thread::sleep(Duration::from_millis(900));
         app.tick(Instant::now());
         let mut c = Canvas::new(size.0, size.1);
         app.render(&mut c);
         assert_eq!(px(&c, 320, 100), [30, 120, 60, 255], "写真(緑)");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 写真を every_photos 枚出したら、半径内に機体がいるときだけ航空機の画面を挟み、時間で閉じる。
-    #[test]
-    fn aircraft_interlude_between_photos() {
-        let (mut app, dir) = app_with_photo((640, 270));
-        app.air_every = 1;
-        app.air_len = Duration::from_secs(5);
-        let shared: crate::aircraft::Shared = std::sync::Arc::new(std::sync::Mutex::new(None));
-        app.aircraft = Some(shared.clone());
-        app.on_key(KeyPress::Next);
-        assert!(pump_until(&mut app, |a| a.photo_position() == 1));
-        let later = Instant::now() + Duration::from_secs(31);
-        app.tick(later);
-        assert!(!app.showing_aircraft(), "機体がいなければ挟まない");
-        // 上の tick で次の写真へ進んだので、もう 1 枚分の時間をおく
-        let later = later + Duration::from_secs(31);
-        app.photos_since_air = 1;
-        *shared.lock().unwrap() = Some((Instant::now(), crate::aircraft::demo_view()));
-        app.tick(later);
-        assert!(app.showing_aircraft(), "機体がいれば挟む");
-        // CPU 経路: 1 回描いたら、内容が変わるまで描き直さない
-        let mut c = Canvas::new(640, 270);
-        app.render(&mut c);
-        assert!(!app.tick(later), "CPU 経路は止まった絵を描き直さない");
-        app.gpu = true;
-        assert!(app.tick(later), "GPU 経路は回る線を毎フレーム描く");
-        assert!(app.animating(), "回る線の間は vsync だけで間隔をとる");
-        // GPU 経路: 背景は 1 回だけ描き、回る線と点は GPU に任せる
-        match app.render_composite(&mut c) {
-            Composite::Radar {
-                background_changed,
-                geom,
-                sweep,
-            } => {
-                assert!(background_changed);
-                assert_eq!(geom.blips.len(), 5);
-                assert!((0.0..std::f32::consts::TAU).contains(&sweep));
-            }
-            _ => panic!("航空機の画面は Radar"),
-        }
-        assert!(matches!(
-            app.render_composite(&mut c),
-            Composite::Radar {
-                background_changed: false,
-                ..
-            }
-        ));
-        app.tick(later + Duration::from_secs(6));
-        assert!(!app.showing_aircraft(), "時間で閉じる");
-        // キーでも閉じる
-        app.photos_since_air = 1;
-        app.tick(later + Duration::from_secs(40));
-        assert!(app.showing_aircraft());
-        app.on_key(KeyPress::Next);
-        assert!(!app.showing_aircraft());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -921,7 +513,7 @@ mod tests {
         for size in [(1920u32, 1080u32), (2560, 1080)] {
             let (mut app, dir) = app_with_photo(size);
             for page in [OVERVIEW, DETAILS] {
-                assert_eq!(app.screen(), page);
+                assert_eq!(screen(&app), page);
                 let mut c = Canvas::new(size.0, size.1);
                 app.render(&mut c);
                 assert_eq!(px(&c, 5, 540), [8, 12, 20, 255], "背景 {size:?}");

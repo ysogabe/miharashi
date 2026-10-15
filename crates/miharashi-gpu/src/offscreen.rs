@@ -259,7 +259,10 @@ mod tests {
             }))
         };
         let size = (1920u32, 1080u32);
-        for (img, mode) in [(photo(1600, 1200), Mode::Left), (photo(2000, 1125), Mode::Cover)] {
+        for (img, mode) in [
+            (photo(1600, 1200), Mode::Left),
+            (photo(2000, 1125), Mode::Cover),
+        ] {
             let l = photo_layout::plan(&mut 0, size.0, size.1, img.width(), img.height());
             assert_eq!(l.mode, mode);
             let cpu = compose_image(&img, size.0, size.1, &l).unwrap();
@@ -345,6 +348,9 @@ mod tests {
         assert!(before[1] < 20, "線の手前は暗い: {before:?}");
         assert_eq!(px(10, 10), [8, 8, 8], "円の外は背景のまま");
         let (swept, coming) = (px(250, 100), px(250, 200));
-        assert!(swept[1] > coming[1] + 40, "通った直後の点が明るい: {swept:?} {coming:?}");
+        assert!(
+            swept[1] > coming[1] + 40,
+            "通った直後の点が明るい: {swept:?} {coming:?}"
+        );
     }
 }

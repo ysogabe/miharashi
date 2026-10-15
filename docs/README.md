@@ -38,7 +38,7 @@
 | PoC-005 GPU Render Baseline | 完了(写真画面の CPU 使用率 0.8%、重いエフェクトの予算は GPU 50% 以下)。[#16](https://github.com/ysogabe/miharashi/issues/16) |
 | アラート・電源・写真・航空機 | 実装済み(地震・災害アラート、在宅判定でのモニター消灯、旅ごとの写真、写真の合間の航空機) |
 | 操作パネル | P2 まで完了(API、Echo Show 5 のアプリ、モニターの消灯・点灯、操作盤の自動消灯) |
-| PoC-003 Screen Plugins | 未着手。[#5](https://github.com/ysogabe/miharashi/issues/5) |
+| PoC-003 Screen Plugins | S1(`ScreenManager` / `Screen` への分割、動作は変えない)を実装。S2(4/6 = 画面の巡回など)は次。[#5](https://github.com/ysogabe/miharashi/issues/5) |
 | 室内環境と天気・航空機の画面・自動巡回 | 未着手。[#30](https://github.com/ysogabe/miharashi/issues/30)、[#29](https://github.com/ysogabe/miharashi/issues/29)、[#31](https://github.com/ysogabe/miharashi/issues/31) |
 | PoC-004 Agent Monitor | 作らない(Hermes 連携をやめたため。[画面の全体構成](DESIGN-screens.md) §1) |
 

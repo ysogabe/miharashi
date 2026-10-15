@@ -319,9 +319,16 @@ impl PhotoBuilder {
             n => return Err(format!("写真のチャンネル数 {n} には対応していない")),
         };
         if iw.max(ih) > self.max_texture {
-            return Err(format!("写真 {iw}x{ih} が GPU の上限 {} を超える", self.max_texture));
+            return Err(format!(
+                "写真 {iw}x{ih} が GPU の上限 {} を超える",
+                self.max_texture
+            ));
         }
-        assert_eq!(img.pixels.len(), (iw * ih * img.channels) as usize, "写真の大きさが違う");
+        assert_eq!(
+            img.pixels.len(),
+            (iw * ih * img.channels) as usize,
+            "写真の大きさが違う"
+        );
         let src = texture(gl, internal, img.size, glow::NEAREST)?;
         unsafe {
             gl.disable(glow::BLEND);
