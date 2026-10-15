@@ -110,6 +110,10 @@ pub trait Screen {
     fn animating(&self) -> bool {
         false
     }
+    /// 出すものが無いか(自動巡回の `skip_if_empty`。航空機の画面で半径内に機体がいないとき)。
+    fn is_empty(&self) -> bool {
+        false
+    }
     /// 操作パネルに出す画面の中のページ名(状況画面の OVERVIEW / DETAILS)。
     fn page(&self) -> Option<&'static str> {
         None

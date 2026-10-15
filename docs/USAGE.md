@@ -59,6 +59,9 @@ ffmpeg -framerate 15 -i work/agents-demo/frame-%06d.png -pix_fmt yuv420p work/ag
 
 アラート(地震・災害)が出ているときは、どのキーも閉じるだけです。
 
+自動巡回(`[rotation] enabled = true`)のときは、キーや操作パネルの操作で巡回が `pause_after_input_secs`(既定 5 分)止まり、
+最後の操作から時間がたつと次の手順の画面から巡回に戻ります。状態ログの `rotation=on` / `paused` で分かります。
+
 航空機の画面を 5 分続けて出していると、焼き付き対策に約 1.6 秒の演出(グリッチ → 暗転 → 再表示)が入り、そのたびに画面全体が数 px ずれます(9 か所を順に回る)。間隔と対象の画面は `[ui] refresh_minutes` / `refresh_screens` で変えられます。T3 Agent 画面はこの焼き付き対策演出に未対応です。
 
 ## 3. 常駐(systemd)

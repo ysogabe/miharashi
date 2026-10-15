@@ -17,6 +17,7 @@ pub struct Config {
     pub alerts: Alerts,
     pub aircraft: Aircraft,
     pub room: Room,
+    pub rotation: Rotation,
     pub ui: Ui,
     pub panel: Panel,
     pub agents: ConfigAgents,
@@ -339,6 +340,50 @@ impl Default for Room {
     }
 }
 
+/// 無人のときの自動巡回(docs/DESIGN-screens.md §4.2)。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Rotation {
+    /// true なら起動時から巡回する(`ui.start_screen` ではなく最初の手順の画面から)
+    pub enabled: bool,
+    /// 画面 id と表示する秒数。上から順に繰り返す
+    pub steps: Vec<RotationStep>,
+    /// キー・操作パネルで操作したら、この秒数のあいだ巡回を止める
+    pub pause_after_input_secs: u64,
+}
+
+/// 巡回の手順 1 つ。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RotationStep {
+    pub screen: String,
+    pub secs: u64,
+    /// 画面に出すものが無ければ飛ばす(航空機の画面で、半径内に機体がいないとき)
+    #[serde(default)]
+    pub skip_if_empty: bool,
+}
+
+impl Default for Rotation {
+    fn default() -> Self {
+        let step = |screen: &str, secs, skip_if_empty| RotationStep {
+            screen: screen.into(),
+            secs,
+            skip_if_empty,
+        };
+        Self {
+            enabled: false,
+            steps: vec![
+                step("photo", 600, false),
+                step("room", 60, false),
+                step("photo", 600, false),
+                step("aircraft", 60, true),
+                step("status", 30, false),
+            ],
+            pause_after_input_secs: 300,
+        }
+    }
+}
+
 impl Default for Ui {
     fn default() -> Self {
         Self {
@@ -485,6 +530,23 @@ impl Config {
                 "config: room.tiles は {} 枚まで出す(残りは出さない)",
                 miharashi_render::room::MAX_TILES
             );
+        }
+        let rot = &self.rotation;
+        if let Some(st) = rot
+            .steps
+            .iter()
+            .find(|st| !START_SCREENS.contains(&st.screen.as_str()))
+        {
+            return Err(format!(
+                "rotation.steps に未知の画面 {:?}(status / photo / room / aircraft / agents)",
+                st.screen
+            ));
+        }
+        if rot.steps.iter().any(|st| st.secs < 5) {
+            return Err("rotation.steps の secs は 5 以上".into());
+        }
+        if rot.enabled && rot.steps.is_empty() {
+            return Err("rotation.enabled = true なら steps が要る".into());
         }
         if !self.home_assistant.url.is_empty() {
             crate::screen_power::check_url(&self.home_assistant.url)
@@ -703,6 +765,33 @@ mod tests {
             "[room]\nforecast_minutes = 1\n",
             "[room]\ntiles = [{ label = \"x\", entity = \"\" }]\n",
             "[room]\ntiles = [{ label = \"x\", entity = \"sensor.x\", colour = 1 }]\n",
+        ] {
+            assert!(Config::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rotation_defaults_and_bad_values() {
+        let r = Config::default().rotation;
+        assert!(!r.enabled, "既定は巡回しない(今までどおり)");
+        let ids: Vec<&str> = r.steps.iter().map(|s| s.screen.as_str()).collect();
+        assert_eq!(ids, ["photo", "room", "photo", "aircraft", "status"]);
+        assert!(r.steps[3].skip_if_empty);
+        assert_eq!(r.pause_after_input_secs, 300);
+        let c = Config::parse(
+            "[rotation]\nenabled = true\npause_after_input_secs = 60\nsteps = [{ screen = \"status\", secs = 10 }]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            (c.rotation.steps.len(), c.rotation.pause_after_input_secs),
+            (1, 60)
+        );
+        for bad in [
+            "[rotation]\nsteps = [{ screen = \"radar\", secs = 10 }]\n",
+            "[rotation]\nsteps = [{ screen = \"photo\", secs = 1 }]\n",
+            "[rotation]\nsteps = [{ screen = \"photo\" }]\n",
+            "[rotation]\nenabled = true\nsteps = []\n",
+            "[rotation]\nsteps = [{ screen = \"photo\", secs = 10, skip = true }]\n",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
         }
