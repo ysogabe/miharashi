@@ -42,7 +42,7 @@
 | 操作パネル | P2 まで完了(API、Echo Show 5 のアプリ、モニターの消灯・点灯、操作盤の自動消灯) |
 | PoC-003 Screen Plugins | S1〜S5 を実装・本番稼働(画面の分割、4/6 = 画面の巡回・8/2・5 = 画面の中・0 = メニュー、航空機の独立、室内環境と天気、自動巡回)。操作パネルの `/api/v1/status` に巡回の状態(#45)。残りは終了キー(Esc/q)の扱いと、物理テンキーの 0・NumLock OFF の確認。[#5](https://github.com/ysogabe/miharashi/issues/5) |
 | 画面 | `status`・`photo`・`room`・`aircraft`・`agents` の 5 つ([画面の全体構成](DESIGN-screens.md))。アラートはすべての画面の上に重ねる層 |
-| T3 Agent カードボード | 旧 Hermes 連携の PoC-004 は中止。代わりに、T3 サーバーを取得元とする `agents` 画面を[承認済み設計](DESIGN-t3-agent-monitor.md)に沿って実装し、本番に配備済み(既定は無効)。([検証記録](poc/T3-AGENTS.md)) |
+| T3 Agent カードボード | PoC-004 は Hermes 連携をやめ、T3 向けに改訂した([#6](https://github.com/ysogabe/miharashi/issues/6))。T3 サーバーを取得元とする `agents` 画面を[承認済み設計](DESIGN-t3-agent-monitor.md)に沿って実装し、本番に配備済み(既定は無効)。残りはトークンの更新手順(30 日のトークンが 11 月 14 日ごろに切れる)と実データでの確認。([検証記録](poc/T3-AGENTS.md)) |
 | MVP(日常運用) | 未完了。今の版での長時間試験、ブート時の自動起動、写真のディスクキャッシュ、テストの CI、モニターのつなぎ替え、MVP のリリースノートが残り。[#7](https://github.com/ysogabe/miharashi/issues/7) |
 
 全体の順序は [ロードマップ(#3)](https://github.com/ysogabe/miharashi/issues/3) に従います。PRD は要件の基準、技術設計書は実装案です。実機で確かめていない項目は実装済みとして扱わず、結果が出た段階で文書を更新します。
