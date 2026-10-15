@@ -1,7 +1,9 @@
 //! 航空機の画面(docs/DESIGN-screens.md §2.2)。左に受信機中心のレーダー、右に注目する機体の諸元と一覧。
 //! 8/2 = 注目する機体を近い順に切り替え、5 = いちばん近い機体に戻す。
 use crate::aircraft::{Shared, advanced};
-use crate::screen::{Composite, Outcome, RenderContext, Screen, ScreenAction, ScreenId, World};
+use crate::screen::{
+    Composite, KeyLabels, Outcome, RenderContext, Screen, ScreenAction, ScreenId, World,
+};
 use miharashi_render::aircraft::{self, AircraftView};
 use std::time::{Duration, Instant};
 
@@ -105,14 +107,27 @@ impl Screen for AircraftScreen {
     fn handle_action(&mut self, action: ScreenAction, now: Instant) -> Outcome {
         let v = self.view(now);
         let n = v.planes.len();
+        if n == 0 {
+            return Outcome::Ignored;
+        }
         let pick = match action {
             ScreenAction::Select => None,
-            _ if n == 0 => None,
             ScreenAction::Down => Some((v.focus + 1) % n),
             ScreenAction::Up => Some((v.focus + n - 1) % n),
         };
         self.focus = pick.filter(|&i| i != 0).map(|i| v.planes[i].hex.clone());
         Outcome::Consumed
+    }
+
+    fn key_labels(&self) -> KeyLabels {
+        if self.planes() == 0 {
+            return KeyLabels::default();
+        }
+        KeyLabels {
+            select: Some("最寄りの機体"),
+            up: Some("前の機体"),
+            down: Some("次の機体"),
+        }
     }
 
     /// CPU で完成画面を描く。回る線は止めて描く。下地(地図)は取っておいて、毎回は作り直さない。
@@ -237,6 +252,18 @@ mod tests {
         );
         assert_eq!(focus(&s), 0, "5 でいちばん近い機体");
         assert_eq!(s.focus, None);
+    }
+
+    /// 機体がいなければ 5・8・2 は何もしない(パネルのボタンも灰色)。いればラベルどおりに動く。
+    #[test]
+    fn key_labels_follow_the_planes() {
+        let (mut s, shared) = screen(false);
+        let now = Instant::now();
+        assert_eq!(s.key_labels(), KeyLabels::default(), "受信前");
+        crate::screen::assert_key_labels_match_actions(&mut s, now);
+        *shared.lock().unwrap() = Some((Instant::now(), crate::aircraft::demo_view()));
+        assert_eq!(s.key_labels().up, Some("前の機体"));
+        crate::screen::assert_key_labels_match_actions(&mut s, Instant::now());
     }
 
     /// CPU 経路は 1 秒ごとに進める位置が変わったときだけ描き直す。GPU 経路は背景を変わったときだけ描き、

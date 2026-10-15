@@ -176,6 +176,14 @@ impl Shared {
             "feed": if view.feed_online { "online" } else { "retrying" },
             "rotation": view.rotation.map(|r| rotation_json(r, Instant::now())),
             "menu": view.menu.and_then(|i| view.screens.get(i).map(|s| json!({"index": i, "id": s.id}))),
+            "keys": {
+                "prev": view.keys.prev,
+                "next": view.keys.next,
+                "select": view.keys.select,
+                "up": view.keys.up,
+                "down": view.keys.down,
+                "menu": view.keys.menu,
+            },
             "display": {
                 "on": display.on,
                 "mode": display.mode,
@@ -548,7 +556,7 @@ fn events(req: Request, shared: &Shared) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::screen::ScreenInfo;
+    use crate::screen::{PanelKeys, ScreenInfo};
     use std::io::BufRead;
 
     const TOKEN: &str = "test-token-0123456789";
@@ -571,6 +579,7 @@ mod tests {
             feed_online: true,
             rotation: None,
             menu: None,
+            keys: PanelKeys::default(),
         }
     }
 
@@ -688,6 +697,30 @@ mod tests {
         assert_eq!(menu(&p, None), Value::Null, "閉じている");
         assert_eq!(menu(&p, Some(1)), json!({"index": 1, "id": "photo"}));
         assert_eq!(menu(&p, Some(0)), json!({"index": 0, "id": "status"}));
+    }
+
+    #[test]
+    fn status_reports_the_keys() {
+        let (p, base) = start(20);
+        p.publish(
+            Some(PanelView {
+                keys: PanelKeys {
+                    prev: Some("前の画面"),
+                    next: Some("次の画面"),
+                    select: Some("詳細"),
+                    up: None,
+                    down: None,
+                    menu: Some("メニュー"),
+                },
+                ..view(0)
+            }),
+            DisplayStatus::default(),
+        );
+        let v: Value = serde_json::from_str(&get(&base, "/api/v1/status", true).1).unwrap();
+        assert_eq!(
+            v["keys"],
+            json!({"prev": "前の画面", "next": "次の画面", "select": "詳細", "up": null, "down": null, "menu": "メニュー"})
+        );
     }
 
     #[test]
@@ -963,6 +996,21 @@ mod tests {
         );
         p.publish(Some(view(1)), on);
         assert_eq!(data()["menu"], Value::Null, "閉じたときも送る");
+        let keys = PanelView {
+            keys: PanelKeys {
+                select: Some("概要"),
+                ..PanelKeys::default()
+            },
+            ..view(1)
+        };
+        p.publish(Some(keys), on);
+        assert_eq!(
+            data()["keys"]["select"],
+            "概要",
+            "キーの意味だけ変わっても送る"
+        );
+        p.publish(Some(view(1)), on);
+        assert_eq!(data()["keys"]["select"], Value::Null);
         let until = Instant::now() + Duration::from_secs(300);
         let paused = |until| PanelView {
             rotation: Some(PanelRotation::Paused { until }),
