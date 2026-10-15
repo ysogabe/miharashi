@@ -130,6 +130,16 @@ pub fn run(
             c.clear(miharashi_render::canvas::rgba(0, 0, 0, 0));
             screens::photo_overlay(&mut c, text, &snap, &layout, Some(&info), None)
         }));
+        // 航空機の画面: 位置を 1 秒ごとに進めるので、背景(下地を写して文字と諸元を描く)を毎秒描き直す。
+        // 下地(地図と距離の輪)は受信機と半径が同じ間は作り直さない。`aircraft-base` は初回の 1 回分
+        let air = crate::aircraft::demo_view();
+        rows.push(measure("aircraft-base", size, heavy, || {
+            miharashi_render::aircraft::aircraft_background(&mut c, text, &air)
+        }));
+        let mut base = None;
+        rows.push(measure("aircraft-bg", size, frames, || {
+            miharashi_render::aircraft::aircraft_background_cached(&mut c, text, &air, &mut base)
+        }));
         // dumb buffer への変換コピー(runtime の present と同じ処理)
         let pitch = w as usize * 4;
         let mut buf = vec![0u8; pitch * h as usize];
@@ -194,6 +204,8 @@ mod tests {
                 "photo-static",
                 "photo-fade",
                 "photo-overlay",
+                "aircraft-base",
+                "aircraft-bg",
                 "present-xrgb8888",
                 "photo-decode",
                 "photo-blur-bg",
