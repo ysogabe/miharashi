@@ -134,8 +134,12 @@ pub struct Alerts {
 pub struct Ui {
     /// 日本語フォントファイル。空ならシステムフォントを使う。
     pub font: String,
-    /// status / photo
+    /// status / photo / aircraft
     pub start_screen: String,
+    /// 焼き付き対策: この分数ごとに、`refresh_screens` の画面をグリッチで暗転して描き直す。0 なら行わない
+    pub refresh_minutes: u64,
+    /// 焼き付き対策の演出を入れる画面の id(動かない線が多い画面)
+    pub refresh_screens: Vec<String>,
 }
 
 /// 手元の操作パネル(Echo Show 5 など)向けの API(docs/panel/DESIGN.md §5.2)。
@@ -274,6 +278,8 @@ impl Default for Ui {
         Self {
             font: "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc".into(),
             start_screen: "status".into(),
+            refresh_minutes: 5,
+            refresh_screens: vec!["aircraft".into()],
         }
     }
 }
@@ -351,8 +357,19 @@ impl Config {
         if !matches!(self.display.renderer.as_str(), "auto" | "cpu" | "gles") {
             return Err("display.renderer は auto / cpu / gles".into());
         }
-        if !matches!(self.ui.start_screen.as_str(), "status" | "photo") {
-            return Err("ui.start_screen は status か photo".into());
+        const SCREENS: [&str; 3] = ["status", "photo", "aircraft"];
+        if !SCREENS.contains(&self.ui.start_screen.as_str()) {
+            return Err("ui.start_screen は status / photo / aircraft".into());
+        }
+        if let Some(id) = self
+            .ui
+            .refresh_screens
+            .iter()
+            .find(|id| !SCREENS.contains(&id.as_str()))
+        {
+            return Err(format!(
+                "ui.refresh_screens に未知の画面 {id:?}(status / photo / aircraft)"
+            ));
         }
         if !self.home_assistant.url.is_empty() {
             crate::screen_power::check_url(&self.home_assistant.url)
@@ -445,6 +462,13 @@ mod tests {
             Config::parse("[geoframe]\nreconnect_min_secs = 10\nreconnect_max_secs = 5\n").is_err()
         );
         assert!(Config::parse("[ui]\nstart_screen = \"menu\"\n").is_err());
+        assert!(Config::parse("[ui]\nstart_screen = \"aircraft\"\n").is_ok());
+        assert!(Config::parse("[ui]\nrefresh_screens = [\"status\", \"radar\"]\n").is_err());
+        let c = Config::parse(
+            "[ui]\nrefresh_minutes = 0\nrefresh_screens = [\"status\", \"aircraft\"]\n",
+        )
+        .unwrap();
+        assert_eq!((c.ui.refresh_minutes, c.ui.refresh_screens.len()), (0, 2));
         assert!(Config::parse("[metrics]\ngpu = \"rtx\"\n").is_err());
         assert!(Config::parse("[display]\nrenderer = \"vulkan\"\n").is_err());
     }

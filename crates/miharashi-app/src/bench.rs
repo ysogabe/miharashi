@@ -140,6 +140,15 @@ pub fn run(
         rows.push(measure("aircraft-bg", size, frames, || {
             miharashi_render::aircraft::aircraft_background_cached(&mut c, text, &air, &mut base)
         }));
+        // 焼き付き対策の演出の 1 フレーム(いちばん強いグリッチ)。数分に一度、約 1.6 秒だけ毎フレーム作る
+        let clean = Canvas {
+            pixmap: c.pixmap.clone(),
+        };
+        let mut seed = 0;
+        rows.push(measure("refresh-glitch", size, frames, || {
+            seed += 1;
+            miharashi_render::glitch::refresh_frame(&mut c, &clean, 0.59, seed)
+        }));
         // dumb buffer への変換コピー(runtime の present と同じ処理)
         let pitch = w as usize * 4;
         let mut buf = vec![0u8; pitch * h as usize];
@@ -206,6 +215,7 @@ mod tests {
                 "photo-overlay",
                 "aircraft-base",
                 "aircraft-bg",
+                "refresh-glitch",
                 "present-xrgb8888",
                 "photo-decode",
                 "photo-blur-bg",

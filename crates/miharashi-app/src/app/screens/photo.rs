@@ -125,6 +125,10 @@ impl Screen for PhotoScreen {
         self.visible = false;
     }
 
+    fn invalidate(&mut self) {
+        self.overlay_dirty = true;
+    }
+
     fn tick(&mut self, _world: &World, now: Instant) -> bool {
         let mut redraw = false;
         while let Some(ev) = self.feed.try_recv() {
