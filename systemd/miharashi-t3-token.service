@@ -1,0 +1,21 @@
+[Unit]
+Description=Miharashi: renew the read-only T3 token for the agents screen
+Documentation=https://github.com/ysogabe/miharashi/blob/main/docs/DESIGN-t3-token.md
+# 任意機能([agents] を使う場合のみ)。miharashi-t3-token.timer から週 1 回動かす。
+# 手で動かす: systemctl start miharashi-t3-token / 結果: journalctl -u miharashi-t3-token
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# T3 を動かしているユーザー(キオスクの実行ユーザーと同じ)。t3 CLI は ~/.t3 の認証情報を読み書きする。
+# HOME は User= から決まり、t3 CLI は既定で $HOME/.local/bin/t3(T3_CLI で変えられる)。
+User=@USER@
+ExecStart=@BINDIR@/miharashi-t3-token
+# /var/lib/miharashi(キオスクと共用、User= の所有)。[agents] token_file はここに置く。
+StateDirectory=miharashi
+
+# ~/.t3 に書くので ProtectHome は使わない。/usr・/etc などは読み取りだけにする。
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
