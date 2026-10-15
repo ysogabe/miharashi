@@ -526,15 +526,16 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
         }
 
         // 画面を消していてもパネルの表示は追従させる(モニターの点灯・消灯も知らせる)
-        if let Some(p) = &panel {
-            let ds = display_status(screen_on, power.as_deref());
-            // 消えているあいだのキーのラベル(点けるだけ / force_off なら何もしない)に使う。
-            // mode が変われば ds も変わるので、下でパネルへ送り直す
-            app.set_display_forced_off(ds.mode == Some(PowerMode::ForceOff.as_str()));
-            if redraw || ds != published_display {
-                p.publish(app.panel_view(), ds);
-                published_display = ds;
-            }
+        let ds = display_status(screen_on, power.as_deref());
+        // 消えているあいだのキーのラベル(点けるだけ / force_off なら何もしない)に使う。
+        // パネルが無くても毎周期渡す(後からパネルを起動したときの最初の送信に間に合わせる)。
+        // mode が変われば ds も変わるので、下でパネルへ送り直す
+        app.set_display_forced_off(ds.mode == Some(PowerMode::ForceOff.as_str()));
+        if let Some(p) = &panel
+            && (redraw || ds != published_display)
+        {
+            p.publish(app.panel_view(), ds);
+            published_display = ds;
         }
 
         if redraw && screen_on {
