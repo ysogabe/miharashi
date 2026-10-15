@@ -174,6 +174,7 @@ impl Shared {
             "screens": view.screens.iter().map(|s| json!({"id": s.id, "title": s.title})).collect::<Vec<_>>(),
             "photo": view.photo.map(|(position, total)| json!({"position": position, "total": total})),
             "feed": if view.feed_online { "online" } else { "retrying" },
+            "rotation": view.rotation.map(|state| json!({ "state": state })),
             "display": {
                 "on": display.on,
                 "mode": display.mode,
@@ -555,6 +556,7 @@ mod tests {
             page: (current == 0).then_some("OVERVIEW"),
             photo: Some((12, 187)),
             feed_online: true,
+            rotation: None,
         }
     }
 
@@ -656,6 +658,25 @@ mod tests {
             v["display"],
             json!({"on": true, "mode": null, "control": false})
         );
+    }
+
+    #[test]
+    fn status_reports_the_rotation() {
+        let (p, base) = start(20);
+        let rotation = |p: &Panel, state| {
+            p.publish(
+                Some(PanelView {
+                    rotation: state,
+                    ..view(1)
+                }),
+                DisplayStatus::default(),
+            );
+            let v: Value = serde_json::from_str(&get(&base, "/api/v1/status", true).1).unwrap();
+            v["rotation"].clone()
+        };
+        assert_eq!(rotation(&p, None), Value::Null, "巡回が無効");
+        assert_eq!(rotation(&p, Some("on")), json!({"state": "on"}));
+        assert_eq!(rotation(&p, Some("paused")), json!({"state": "paused"}));
     }
 
     fn agent() -> ureq::Agent {
@@ -870,6 +891,16 @@ mod tests {
         };
         p.publish(Some(view(1)), on);
         assert_eq!(data()["display"]["on"], true, "モニターだけ変わっても送る");
+        let paused = PanelView {
+            rotation: Some("paused"),
+            ..view(1)
+        };
+        p.publish(Some(paused), on);
+        assert_eq!(
+            data()["rotation"],
+            json!({"state": "paused"}),
+            "巡回の状態だけ変わっても送る"
+        );
         assert_eq!(p.stat(), "connected");
         let _ = base;
     }
