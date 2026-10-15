@@ -10,7 +10,7 @@
 //! モニターの消灯・点灯(`POST /api/v1/display`)は、HA の手動オーバーライド(input_select)を書き換える。
 //! キオスクの中だけで切り替えると HA の画面と食い違うので、実際の切り替えは `DisplayControl` に任せる。
 use crate::config;
-use crate::screen::{KeyPress, PanelView};
+use crate::screen::{KeyPress, PanelRotation, PanelView};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -174,7 +174,7 @@ impl Shared {
             "screens": view.screens.iter().map(|s| json!({"id": s.id, "title": s.title})).collect::<Vec<_>>(),
             "photo": view.photo.map(|(position, total)| json!({"position": position, "total": total})),
             "feed": if view.feed_online { "online" } else { "retrying" },
-            "rotation": view.rotation.map(|state| json!({ "state": state })),
+            "rotation": view.rotation.map(|r| rotation_json(r, Instant::now())),
             "display": {
                 "on": display.on,
                 "mode": display.mode,
@@ -192,6 +192,18 @@ impl Shared {
             st.view.as_ref().map(|v| self.status_json(v, st.display)),
             st.generation,
         )
+    }
+}
+
+/// `/status` の `rotation`。戻るまでの残り秒数は切り上げ(過ぎていて、まだ戻していなければ 0)。
+fn rotation_json(r: PanelRotation, now: Instant) -> Value {
+    match r {
+        PanelRotation::On => json!({ "state": "on", "resume_in_s": null }),
+        PanelRotation::Paused { until } => {
+            let left = until.saturating_duration_since(now);
+            let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+            json!({ "state": "paused", "resume_in_s": secs })
+        }
     }
 }
 
@@ -663,10 +675,10 @@ mod tests {
     #[test]
     fn status_reports_the_rotation() {
         let (p, base) = start(20);
-        let rotation = |p: &Panel, state| {
+        let rotation = |p: &Panel, r| {
             p.publish(
                 Some(PanelView {
-                    rotation: state,
+                    rotation: r,
                     ..view(1)
                 }),
                 DisplayStatus::default(),
@@ -675,8 +687,38 @@ mod tests {
             v["rotation"].clone()
         };
         assert_eq!(rotation(&p, None), Value::Null, "巡回が無効");
-        assert_eq!(rotation(&p, Some("on")), json!({"state": "on"}));
-        assert_eq!(rotation(&p, Some("paused")), json!({"state": "paused"}));
+        assert_eq!(
+            rotation(&p, Some(PanelRotation::On)),
+            json!({"state": "on", "resume_in_s": null})
+        );
+        let until = Instant::now() + Duration::from_secs(240);
+        let v = rotation(&p, Some(PanelRotation::Paused { until }));
+        assert_eq!(v["state"], "paused");
+        let left = v["resume_in_s"].as_u64().unwrap();
+        assert!((1..=240).contains(&left), "{left}");
+    }
+
+    #[test]
+    fn resume_in_s_rounds_up_and_stops_at_zero() {
+        let now = Instant::now();
+        let at = |ms| {
+            rotation_json(
+                PanelRotation::Paused {
+                    until: now + Duration::from_millis(ms),
+                },
+                now,
+            )["resume_in_s"]
+                .clone()
+        };
+        assert_eq!(at(240_000), 240);
+        assert_eq!(at(239_001), 240, "切り上げ");
+        assert_eq!(at(1), 1);
+        assert_eq!(at(0), 0);
+        let past = rotation_json(
+            PanelRotation::Paused { until: now },
+            now + Duration::from_secs(3),
+        );
+        assert_eq!(past["resume_in_s"], 0, "過ぎていても 0 未満にしない");
     }
 
     fn agent() -> ureq::Agent {
@@ -891,15 +933,32 @@ mod tests {
         };
         p.publish(Some(view(1)), on);
         assert_eq!(data()["display"]["on"], true, "モニターだけ変わっても送る");
-        let paused = PanelView {
-            rotation: Some("paused"),
+        let until = Instant::now() + Duration::from_secs(300);
+        let paused = |until| PanelView {
+            rotation: Some(PanelRotation::Paused { until }),
             ..view(1)
         };
-        p.publish(Some(paused), on);
+        p.publish(Some(paused(until)), on);
+        let v = data();
         assert_eq!(
-            data()["rotation"],
-            json!({"state": "paused"}),
+            v["rotation"]["state"], "paused",
             "巡回の状態だけ変わっても送る"
+        );
+        let first = v["rotation"]["resume_in_s"].as_u64().unwrap();
+        let generation = p.shared.state.lock().unwrap().generation;
+        std::thread::sleep(Duration::from_millis(1100));
+        p.publish(Some(paused(until)), on);
+        assert_eq!(
+            p.shared.state.lock().unwrap().generation,
+            generation,
+            "止めている間、時間が進むだけでは送らない"
+        );
+        p.publish(Some(paused(until + Duration::from_secs(5))), on);
+        let v = data();
+        assert_eq!(v["rotation"]["state"], "paused");
+        assert!(
+            v["rotation"]["resume_in_s"].as_u64().unwrap() > first,
+            "もう一度操作して止める時間が延びたら送る"
         );
         assert_eq!(p.stat(), "connected");
         let _ = base;

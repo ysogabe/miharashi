@@ -6,8 +6,8 @@
 use super::DataSource;
 use crate::config::RotationStep;
 use crate::screen::{
-    App, Composite, KeyPress, PanelView, Provider, RenderContext, Screen, ScreenAction, ScreenInfo,
-    World,
+    App, Composite, KeyPress, PanelRotation, PanelView, Provider, RenderContext, Screen,
+    ScreenAction, ScreenInfo, World,
 };
 use miharashi_render::alert::{self, AlertView};
 use miharashi_render::glitch;
@@ -691,7 +691,10 @@ impl App for ScreenManager {
             page: self.screens[self.current].page(),
             photo: self.world.photo_feed.position,
             feed_online: self.world.photo_feed.online,
-            rotation: self.rotation_state(),
+            rotation: self.rotation.as_ref().map(|r| match r.paused_until {
+                Some(until) => PanelRotation::Paused { until },
+                None => PanelRotation::On,
+            }),
         })
     }
 }
