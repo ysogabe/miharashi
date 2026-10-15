@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>T3 Agent カードボード — 動きのモック</title>
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #080c14; }
+    body { display: grid; place-items: center; }
+    svg { width: 100%; height: 100%; max-height: 100vh; display: block; }
+  </style>
+</head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" role="img" aria-labelledby="title desc">
+  <title id="title">T3 Agent カードボードの画面案</title>
+  <desc id="desc">操作不要の仮データによる動きのモック。状態をカードの色、活動度を大きさで示す。新着は右から中央を経て着地し、状態変化は元の位置から中央へ浮き上がって戻る。</desc>
+  <style>
+    text { font-family: "Noto Sans CJK JP", "Noto Sans JP", sans-serif; font-weight: 400; fill: #dfe7f0; }
+    .muted { fill: #8fa3b7; }
+    .small { font-size: 24px; }
+    .card { will-change: transform; }
+  </style>
+  <defs>
+    <filter id="cardShadow" x="-30%" y="-40%" width="160%" height="200%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#000" flood-opacity=".5"/>
+    </filter>
+  </defs>
+  <rect width="1920" height="1080" fill="#080c14"/>
+  <text x="32" y="56" font-size="38">T3 AGENTS</text>
+  <text x="280" y="54" font-size="26" fill="#40c8ff" style="fill:#40c8ff">OVERVIEW</text>
+  <text x="1888" y="51" text-anchor="end" font-size="23" class="muted">画面案 / 仮データ・時間短縮</text>
+  <path d="M0 80H1920" stroke="#304357"/>
+  <text x="32" y="122" font-size="25">geoframe-n100</text>
+  <text x="285" y="122" font-size="24" style="fill:#67d9ad">● LIVE</text>
+  <text x="408" y="122" font-size="24" class="muted">T3 の作業を自動表示</text>
+  <text id="clock" x="1888" y="122" text-anchor="end" font-size="25" class="muted">2026/10/15 (木) 16:20:00</text>
+  <g id="legend" transform="translate(32 174)"></g>
+  <text id="boardCount" x="1888" y="174" text-anchor="end" font-size="23" class="muted"></text>
+  <g id="homeMarkers"></g>
+  <g id="board"></g>
+  <rect id="scrim" x="0" y="199" width="1920" height="797" fill="#080c14" opacity="0"/>
+  <g id="focusLayer"></g>
+  <path d="M0 1008H1920" stroke="#304357"/>
+  <text id="narration" x="32" y="1052" font-size="25" class="muted"></text>
+  <text x="1888" y="1052" text-anchor="end" font-size="23" class="muted">自動表示 · 操作は手元の T3 で</text>
+</svg>
+<script>
+(() => {
+  'use strict';
+  // Design-only animation. No network, credentials, or real T3 data.
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.querySelector('svg');
+  const board = document.querySelector('#board');
+  const focusLayer = document.querySelector('#focusLayer');
+  const scrim = document.querySelector('#scrim');
+  const palette = {
+    running: { name: '実行中', color: '#40c8ff', tint: '#10212d', floor: .75 },
+    approval: { name: '承認待ち', color: '#ffbc66', tint: '#251e18', floor: .60 },
+    input: { name: '入力・計画待ち', color: '#c4a0ff', tint: '#201c30', floor: .60 },
+    error: { name: '異常', color: '#ff7f8c', tint: '#291b24', floor: .60 },
+    completed: { name: '応答完了', color: '#67d9ad', tint: '#14251f', floor: 0 }
+  };
+  const homes = [[330, 390], [960, 390], [1590, 390], [330, 780], [960, 780], [1590, 780]];
+  const initial = [
+    { id: 'agent-screen', project: 'miharashi', title: 'Agent 画面の追加', state: 'running', detail: '画面構成を整理中 · 2 / 4', age: 0, progress: .5 },
+    { id: 'photo-order', project: 'geoframe', title: '写真の並べ替え', state: 'approval', detail: '手元の T3 で承認', age: 60 },
+    { id: 'panel-layout', project: 'miharashi-panel', title: '画面選択の表示', state: 'input', detail: '計画の確認を待っています', age: 120 },
+    { id: 'dependencies', project: 'miharashi', title: '依存関係の更新', state: 'error', detail: '接続エラーの詳細あり', age: 120 },
+    { id: 'fetch-check', project: 'geoframe', title: '取得処理の確認', state: 'completed', detail: '直近の応答が終了', age: 100 },
+    { id: 'long-test', project: 'gpu-eval', title: '長時間試験の確認', state: 'running', detail: 'テストを準備しています', age: 0, born: 2 }
+  ];
+  const events = [
+    { at: 2, card: 5, kind: 'new', hold: 3, label: '新しいスレッド', change: 'gpu-eval に新しい作業が誕生' },
+    { at: 11, card: 0, kind: 'change', hold: 5, label: '状態が変わりました', change: '実行中 → 承認待ち', state: 'approval', detail: '手元の T3 で承認してください' },
+    { at: 24, card: 0, kind: 'change', hold: 3, label: '作業が再開しました', change: '承認待ち → 実行中', state: 'running', detail: '表示を調整中 · 3 / 4', progress: .75 },
+    { at: 35, card: 0, kind: 'change', hold: 3, label: '応答が終了しました', change: '実行中 → 応答完了', state: 'completed', detail: '直近の応答が終了', progress: 1 }
+  ];
+  const cycle = 64;
+  function el(tag, attrs = {}, value) {
+    const node = document.createElementNS(ns, tag);
+    for (const [key, item] of Object.entries(attrs)) node.setAttribute(key, item);
+    if (value !== undefined) node.textContent = value;
+    return node;
+  }
+  const nodes = initial.map((card, index) => {
+    const group = el('g', { class: 'card', 'data-card': card.id });
+    const background = el('rect', { x: -300, y: -150, width: 600, height: 300, rx: 16, 'stroke-width': 2 });
+    const accent = el('rect', { x: -300, y: -134, width: 6, height: 268, rx: 3 });
+    const project = el('text', { x: -270, y: -108, 'font-size': 30 }, card.project);
+    const status = el('text', { x: 270, y: -108, 'font-size': 26, 'text-anchor': 'end' });
+    const title = el('text', { x: -270, y: -42, 'font-size': 36 }, card.title);
+    const detail = el('text', { x: -270, y: 14, 'font-size': 27 });
+    const provider = el('text', { x: -270, y: 65, 'font-size': 24, class: 'muted' }, 'Codex / 選択モデル名');
+    const barBase = el('rect', { x: -270, y: 84, width: 540, height: 5, rx: 2.5, fill: '#304357' });
+    const bar = el('rect', { x: -270, y: 84, height: 5, rx: 2.5 });
+    const age = el('text', { x: -270, y: 125, 'font-size': 24, class: 'muted' });
+    const badge = el('text', { x: -270, y: -182, 'font-size': 27 });
+    group.append(background, accent, project, status, title, detail, provider, barBase, bar, age, badge);
+    board.append(group);
+    const [x, y] = homes[index];
+    const marker = el('rect', { x: x - 278, y: y - 132, width: 556, height: 264, rx: 16, fill: 'none', stroke: '#304357', 'stroke-dasharray': '8 12', opacity: 0 });
+    document.querySelector('#homeMarkers').append(marker);
+    return { group, background, accent, project, status, detail, provider, barBase, bar, age, badge, marker };
+  });
+  const legend = document.querySelector('#legend');
+  const legendNodes = Object.entries(palette).map(([state, p], index) => {
+    const group = el('g', { transform: `translate(${index * 270} 0)` });
+    group.append(el('circle', { cx: 6, cy: -8, r: 5, fill: p.color }));
+    const label = el('text', { x: 22, y: 0, 'font-size': 24 });
+    label.style.fill = p.color;
+    group.append(label);
+    legend.append(group);
+    return { state, label };
+  });
+  const ease = v => { v = Math.max(0, Math.min(1, v)); return v * v * (3 - 2 * v); };
+  const mix = (a, b, t) => a + (b - a) * t;
+  const geometry = (x, y, scale, opacity = 1) => ({ x, y, scale, opacity });
+  function interpolate(a, b, t) {
+    return geometry(mix(a.x, b.x, t), mix(a.y, b.y, t), mix(a.scale, b.scale, t), mix(a.opacity, b.opacity, t));
+  }
+  function renderAt(seconds) {
+    const t = Math.max(0, seconds % cycle);
+    const models = initial.map((card, index) => {
+      const model = { ...card, index, changed: card.born ?? -card.age / 8 };
+      for (const event of events) if (event.card === index && t >= event.at) {
+        model.changed = event.at;
+        if (event.state) model.state = event.state;
+        if (event.detail) model.detail = event.detail;
+        if (event.progress !== undefined) model.progress = event.progress;
+      }
+      const age = Math.max(0, (t - model.changed) * 8);
+      const floor = palette[model.state].floor;
+      model.weight = floor + (1 - floor) * Math.pow(2, -age / 90);
+      model.scale = .70 + .30 * model.weight;
+      model.visible = card.born === undefined || t >= card.born;
+      model.age = age;
+      return model;
+    });
+    const current = events.find(event => t >= event.at && t < event.at + .7 + event.hold + .8);
+    let shade = 0;
+    for (const model of models) {
+      const node = nodes[model.index];
+      const p = palette[model.state];
+      let pose = geometry(...homes[model.index], model.scale);
+      let focused = false;
+      let badgeOpacity = 0;
+      if (current?.card === model.index) {
+        focused = true;
+        const phase = t - current.at;
+        const center = geometry(960, 565, 1.48);
+        if (phase < .7) {
+          const start = current.kind === 'new' ? geometry(2290, 565, .70, 0) : pose;
+          const blend = ease(phase / .7);
+          pose = interpolate(start, center, blend);
+          shade = .46 * blend;
+          badgeOpacity = blend;
+        } else if (phase < .7 + current.hold) {
+          pose = center;
+          shade = .46;
+          badgeOpacity = 1;
+        } else {
+          const blend = ease((phase - .7 - current.hold) / .8);
+          pose = interpolate(center, pose, blend);
+          shade = .46 * (1 - blend);
+          badgeOpacity = 1 - blend;
+        }
+      }
+      const layer = focused ? focusLayer : board;
+      if (node.group.parentNode !== layer) layer.append(node.group);
+      node.group.setAttribute('display', model.visible ? 'inline' : 'none');
+      node.group.setAttribute('transform', `translate(${pose.x.toFixed(2)} ${pose.y.toFixed(2)}) scale(${pose.scale.toFixed(4)})`);
+      node.group.setAttribute('opacity', pose.opacity.toFixed(3));
+      if (focused) node.group.setAttribute('filter', 'url(#cardShadow)'); else node.group.removeAttribute('filter');
+      node.background.setAttribute('fill', p.tint);
+      node.background.setAttribute('stroke', p.color);
+      node.accent.setAttribute('fill', p.color);
+      node.status.style.fill = p.color;
+      node.status.textContent = p.name;
+      node.detail.textContent = focused ? current.change : model.detail;
+      node.detail.style.fill = focused ? p.color : '#dfe7f0';
+      node.provider.textContent = focused && ['approval', 'input'].includes(model.state) ? '対応は手元の T3 で' : 'Codex / 選択モデル名';
+      node.provider.setAttribute('opacity', focused || model.scale >= .84 ? 1 : 0);
+      node.barBase.setAttribute('opacity', model.progress === undefined ? 0 : 1);
+      node.bar.setAttribute('width', 540 * (model.progress ?? 0));
+      node.bar.setAttribute('fill', p.color);
+      node.age.textContent = model.age < 15 ? 'たった今、動きがありました'
+        : model.age < 60 ? `最後の動きから ${Math.floor(model.age)} 秒`
+        : `最後の動きから ${Math.floor(model.age / 60)} 分`;
+      node.badge.textContent = focused ? current.label : '';
+      node.badge.style.fill = p.color;
+      node.badge.setAttribute('opacity', badgeOpacity.toFixed(3));
+      node.marker.setAttribute('opacity', focused ? .6 : 0);
+    }
+    scrim.setAttribute('opacity', shade.toFixed(3));
+    const visible = models.filter(card => card.visible);
+    for (const { state, label } of legendNodes) label.textContent = `${palette[state].name}  ${visible.filter(card => card.state === state).length}`;
+    document.querySelector('#boardCount').textContent = `${visible.length} スレッド`;
+    const secondsPart = String(Math.floor(t) % 60).padStart(2, '0');
+    document.querySelector('#clock').textContent = `2026/10/15 (木) 16:20:${secondsPart}`;
+    document.querySelector('#narration').textContent = current
+      ? `${current.kind === 'new' ? '新着' : '変更'}：${current.change}`
+      : t > 39.5 ? '動きがなければ、ゆっくり小さく。承認待ち・異常は埋もれない大きさに。'
+      : '色は状態、大きさは活動度。変化があれば中央で知らせ、元の場所へ戻ります。';
+    return { time: t, activeEvent: current?.kind ?? null, activeCard: current ? initial[current.card].id : null, models };
+  }
+  let paused = false;
+  let anchor = performance.now();
+  let offset = 0;
+  let lastState;
+  function frame(now) {
+    if (!paused) lastState = renderAt(offset + (now - anchor) / 1000);
+    requestAnimationFrame(frame);
+  }
+  // Deterministic review hooks; there are no card controls in the screen itself.
+  window.agentMotionDemo = {
+    seek(seconds) { paused = true; offset = seconds; lastState = renderAt(seconds); return lastState; },
+    play() { anchor = performance.now(); paused = false; },
+    pause() { offset = lastState?.time ?? 0; paused = true; },
+    get state() { return lastState; }
+  };
+  lastState = renderAt(0);
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

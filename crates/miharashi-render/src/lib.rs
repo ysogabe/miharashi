@@ -1,4 +1,5 @@
 //! デバイスを開かない共通レンダラー。出力は premultiplied RGBA8 の `Canvas`。
+pub mod agents;
 pub mod aircraft;
 pub mod alert;
 pub mod canvas;

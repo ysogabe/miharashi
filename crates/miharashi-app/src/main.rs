@@ -1,5 +1,7 @@
-//! Miharashi: Linux キオスク・ダッシュボード。`run`(実機)、`png`(ヘッドレス)、`kms-info`、
+//! Miharashi: Linux キオスク・ダッシュボード。`run`(実機)、`png`(ヘッドレス)、`agents-demo`、`kms-info`、
 //! `bench`(CPU 描画のベースライン)、`bench-gpu`(重い描画の GPU ベンチマーク)。
+mod agent_demo;
+mod agents;
 mod aircraft;
 mod album;
 mod app;
@@ -369,13 +371,45 @@ fn png(cli: Cli) -> Result<(), String> {
         miharashi_render::glitch::refresh_frame(&mut c, &clean, t, 3);
         save(&c, Layers::Image, name)?;
     }
+    agent_png_fixtures(&out, size, &mut text)?;
     println!(
-        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,room,room-offline,room-empty,refresh-glitch,refresh-return}}.png ({}x{})",
+        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,room,room-offline,room-empty,refresh-glitch,refresh-return,agents-overview,agents-new-*,agents-changed-*,agents-stale,agents-empty}}.png ({}x{})",
         out.display(),
         size.0,
         size.1
     );
     Ok(())
+}
+
+fn agents_demo(cli: Cli) -> Result<(), String> {
+    // Synthetic data only: this command deliberately does not discover settings or contact T3.
+    let cfg = Config::default();
+    let size = cli.size.unwrap_or((1920, 1080));
+    let out = cli.out.unwrap_or_else(|| "work/agents-demo".into());
+    let seconds = cli.seconds.unwrap_or(45);
+    let fps = cli.fps.unwrap_or(15);
+    let frames = agent_demo::render_sequence(&cfg, size, &out, seconds, fps)?;
+    println!(
+        "wrote {frames} AgentScreen frames to {} ({}x{}, {fps} fps, {seconds}s)",
+        out.display(),
+        size.0,
+        size.1
+    );
+    println!(
+        "ffmpeg: ffmpeg -framerate {fps} -i {}/frame-%06d.png -pix_fmt yuv420p {}/agents-demo.mp4",
+        out.display(),
+        out.display()
+    );
+    Ok(())
+}
+
+/// Deterministic, network-free review frames from the same AgentScreen state machine used at runtime.
+fn agent_png_fixtures(
+    out: &std::path::Path,
+    size: (u32, u32),
+    text: &mut miharashi_render::TextEngine,
+) -> Result<(), String> {
+    agent_demo::write_fixtures(out, size, text, 30)
 }
 
 /// `png --renderer gles|auto` の検証。GLES 経路(表示と同じ合成器)で表示カードの render node に
@@ -634,13 +668,14 @@ fn main() -> Result<(), String> {
     match cmd.as_str() {
         "run" => run(cli),
         "png" => png(cli),
+        "agents-demo" => agents_demo(cli),
         "bench" => bench(cli),
         "bench-gpu" => bench_gpu(cli),
         "bench-metrics" => bench_metrics(cli),
         "kms-info" => kms_info(cli),
         "check-config" => load_config(&cli).map(|_| println!("OK")),
         other => Err(format!(
-            "unknown command {other}(run / png / bench / bench-gpu / bench-metrics / kms-info / check-config)"
+            "unknown command {other}(run / png / agents-demo / bench / bench-gpu / bench-metrics / kms-info / check-config)"
         )),
     }
 }
