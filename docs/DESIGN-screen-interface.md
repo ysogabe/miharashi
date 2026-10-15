@@ -1,6 +1,6 @@
 # 画面管理インターフェースの最小設計(Issue #9)
 
-状態: **S1 を実装**(2026-10-15、[#5](https://github.com/ysogabe/miharashi/issues/5))。実装で変えた点は §10。2026-10-13 作成。対象: [#9](https://github.com/ysogabe/miharashi/issues/9)。
+状態: **S1・S2 を実装**(2026-10-15、[#5](https://github.com/ysogabe/miharashi/issues/5))。実装で変えた点は §10・§11。2026-10-13 作成。対象: [#9](https://github.com/ysogabe/miharashi/issues/9)。
 基準にしたコード: ブランチ `trial/poc-002-kiosk-runtime`([PR #8](https://github.com/ysogabe/miharashi/pull/8))の `crates/miharashi-app`(`runtime.rs` / `app.rs` / `data.rs` / `photos.rs`)。`main` の `miharashi-poc` ではない。
 
 [DESIGN.md](DESIGN.md) §3 のワークスペース案(`core` / `screens` / `data` crate)と §4 の trait 例は実装前の案で、実際の crate は `render` / `linux` / `app` の 3 つである。この文書は、その現実のコードを起点に、画面を追加するための最小の契約を決める。§4 の trait 例はこの文書で置き換える。
@@ -213,7 +213,7 @@ Provider のスレッド(`metrics::Sampler`、写真の `Feed`)は今と同じ�
 - `png` のレジストリー化と `variants()`。
 - 状態ログの `stats()` 化と `soak_summary.py` の互換テスト。
 - 設定: `ui.start_screen` の id 照合、`runtime.quit_key`。
-- DESIGN.md §3 のワークスペース案を実際の crate 構成に合わせて更新(この文書の §2 を反映)。
+- DESIGN.md §3 のワークスペース案を実際の crate 構成に合わせて更新(この文書の §2 を反映)。 → 2026-10-15 に更新済み(S2)。
 
 ## 10. 実装(S1、2026-10-15)
 
@@ -236,3 +236,23 @@ Provider のスレッド(`metrics::Sampler`、写真の `Feed`)は今と同じ�
 - **非表示の画面**: `tick` は全画面に呼び、再描画の要求は表示中の画面の分だけ使う。写真画面は非表示の間、写真を自動で進めず、航空機の画面も挟まない(今と同じ)。戻ったときの自動切替のタイマーは戻さない(今と同じ)。
 - **状態ログ**: `screen=` を画面の id(`status` / `photo`)にした。今までの `screen=Status(Overview)` のページは、末尾の `page=overview` / `page=details` に分けた。ほかの項目と並び順は変えていない(`tools/soak_summary.py` はそのまま読める)。
 - **まだのもの**: `png` コマンドのレジストリー化と `variants()`、`KeyPress` の統一と 0・8・2、メニュー、`runtime.quit_key`(S2 以降)。
+
+## 11. 実装(S2、2026-10-15)
+
+[DESIGN-screens.md](DESIGN-screens.md) §4.1 の操作に変えた(2026-10-15 にユーザーが承認)。
+
+| キー | `KeyPress` | 動き |
+|---|---|---|
+| 4 / ← / 主列 4 | `Prev` | 前の画面(先頭では最後へ折り返す) |
+| 6 / → / 主列 6 | `Next` | 次の画面(最後では先頭へ折り返す) |
+| 5 / 主列 5 | `Select` | 表示中の画面へ `ScreenAction::Select`。状況画面はページ切替、写真画面は写真の情報(撮影地・日付)の表示切替 |
+| 8 / ↑ / 主列 8 | `Up` | `ScreenAction::Up`。写真画面は前の写真 |
+| 2 / ↓ / 主列 2 | `Down` | `ScreenAction::Down`。写真画面は次の写真 |
+| 0 / Insert / 主列 0 | `Menu` | メニューを開く・閉じる |
+
+- `input::Action` と `KeyPress` に Up / Down / Menu を足し、Switch を Select に改めた。テンキーは NumLock に関係なく `KEY_KP*` で届く(evdev)。物理テンキーでの実測は本番に入れてから行う。
+- **メニュー**: ScreenManager が持つ。開いたときは表示中の画面を選んでいる。8/2(4/6 も)で選び、5 で移る、0 で閉じる(移らない)。メニュー中は画面に操作を渡さない。描画は `miharashi_render::menu`(画面の上に重ね、その上にアラート)。GPU 経路では写真の重ね絵に描き、航空機のレーダーはメニュー中は CPU の完成画面にする(`RenderContext::covered`)。
+- **操作パネル**: `POST /api/v1/input` は `up` / `down` / `menu` も受け付ける。`POST /api/v1/screen {"id": "..."}` で画面を直接選ぶ(登録されていない id は 404、起動直後で画面の一覧がまだ無ければ 503)。パネルのスレッドは公開済みの画面一覧で id を確かめ、実行ループへ `PanelInput::Screen` を送る。実行ループは `App::show_screen` を呼ぶ(メニューとアラートは閉じる)。`/api/v1/status` の形は変えていない(`schema_version` は 1 のまま)。
+- 状況画面の下のキーの案内を「4/6: 画面の切替  0: メニュー」にした。
+- `Outcome` は残した(S3 の航空機の画面などで、画面が使わない操作を区別するため)。今の ScreenManager は `Ignored` でも何もしない。
+- まだのもの: `png` コマンドのレジストリー化と `variants()`(S3 で航空機の画面を足すときに合わせる)、`runtime.quit_key`。

@@ -204,6 +204,10 @@ fn png(cli: Cli) -> Result<(), String> {
     save(&c, Layers::Image, "status")?;
     screens::status(&mut c, &mut text, &snap, screens::StatusPage::Details);
     save(&c, Layers::Image, "status-details")?;
+    // メニュー(0)を状況画面の上に開いたところ。2 つ目(写真)を選んでいる
+    screens::status(&mut c, &mut text, &snap, screens::StatusPage::Overview);
+    miharashi_render::menu::menu(&mut c, &mut text, &["STATUS", "PHOTO FRAME"], 0, 1);
+    save(&c, Layers::Image, "menu")?;
     screens::photo_frame(
         &mut c,
         &mut text,
@@ -275,7 +279,7 @@ fn png(cli: Cli) -> Result<(), String> {
         save(&c, Layers::Radar(&bg, &geom, trail), name)?;
     }
     println!(
-        "wrote {}/{{status,status-details,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long}}.png ({}x{})",
+        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long}}.png ({}x{})",
         out.display(),
         size.0,
         size.1
