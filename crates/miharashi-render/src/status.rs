@@ -102,7 +102,7 @@ fn swap_text(s: &Snapshot) -> String {
 }
 
 /// 幅 `max_w` に収まる文字列と文字サイズ。まず 65% まで縮め、それでも入らなければ末尾を「…」で切る。
-fn fit(t: &mut TextEngine, text: &str, size: f32, max_w: f32) -> (String, f32) {
+pub(crate) fn fit(t: &mut TextEngine, text: &str, size: f32, max_w: f32) -> (String, f32) {
     let w = t.measure(text, size);
     if w <= max_w {
         return (text.to_string(), size);
@@ -124,7 +124,7 @@ fn fit(t: &mut TextEngine, text: &str, size: f32, max_w: f32) -> (String, f32) {
 
 /// 左寄せで描き、幅に収まらなければ縮める(縦は元のサイズの中央に揃える)。描いた幅を返す。
 #[allow(clippy::too_many_arguments)]
-fn fit_left(
+pub(crate) fn fit_left(
     c: &mut Canvas,
     t: &mut TextEngine,
     text: &str,
@@ -141,7 +141,7 @@ fn fit_left(
 
 /// 右寄せ版の `fit_left`。
 #[allow(clippy::too_many_arguments)]
-fn fit_right(
+pub(crate) fn fit_right(
     c: &mut Canvas,
     t: &mut TextEngine,
     text: &str,
