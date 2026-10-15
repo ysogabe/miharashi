@@ -528,6 +528,39 @@ mod tests {
         assert_eq!(app.screen_id(), "status", "0 で閉じると移らない");
     }
 
+    /// 操作パネルの `/status` の menu。開く・選ぶ・閉じるが `panel_view()` に出る(#49)。
+    #[test]
+    fn panel_view_follows_the_menu() {
+        let mut app = three_screens();
+        let menu = |app: &ScreenManager| app.panel_view().unwrap().menu;
+        assert_eq!(menu(&app), None);
+        app.on_key(KeyPress::Next);
+        app.on_key(KeyPress::Menu);
+        assert_eq!(menu(&app), Some(1), "開いたときは表示中の画面");
+        app.on_key(KeyPress::Down);
+        assert_eq!(menu(&app), Some(2));
+        app.on_key(KeyPress::Down);
+        assert_eq!(menu(&app), Some(0), "下の端で一周");
+        app.on_key(KeyPress::Up);
+        assert_eq!(menu(&app), Some(2), "上の端で一周");
+        app.on_key(KeyPress::Prev);
+        assert_eq!(menu(&app), Some(1), "4 でも動く");
+        app.on_key(KeyPress::Next);
+        assert_eq!(menu(&app), Some(2), "6 でも動く");
+        app.on_key(KeyPress::Select);
+        assert_eq!(menu(&app), None, "5 で閉じる");
+        assert_eq!(app.panel_view().unwrap().current, 2, "選んだ画面へ移る");
+        app.on_key(KeyPress::Menu);
+        app.on_key(KeyPress::Up);
+        app.on_key(KeyPress::Menu);
+        assert_eq!(menu(&app), None, "0 でも閉じる");
+        assert_eq!(app.panel_view().unwrap().current, 2, "0 では移らない");
+        app.on_key(KeyPress::Menu);
+        assert_eq!(menu(&app), Some(2));
+        app.show_screen("status");
+        assert_eq!(menu(&app), None, "POST /api/v1/screen でも閉じる");
+    }
+
     /// 操作パネルの `POST /api/v1/screen`: 登録されている id だけに移り、メニューとアラートは閉じる。
     #[test]
     fn show_screen_by_id() {

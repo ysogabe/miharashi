@@ -691,6 +691,7 @@ impl App for ScreenManager {
             page: self.screens[self.current].page(),
             photo: self.world.photo_feed.position,
             feed_online: self.world.photo_feed.online,
+            menu: self.menu,
             rotation: self.rotation.as_ref().map(|r| match r.paused_until {
                 Some(until) => PanelRotation::Paused { until },
                 None => PanelRotation::On,

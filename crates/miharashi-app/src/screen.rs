@@ -198,6 +198,8 @@ pub struct PanelView {
     pub feed_online: bool,
     /// 自動巡回の状態。巡回が無効なら None
     pub rotation: Option<PanelRotation>,
+    /// メニューで選んでいる画面(`screens` の添字)。メニューが閉じていれば None
+    pub menu: Option<usize>,
 }
 
 /// 操作パネルに見せる自動巡回の状態。
