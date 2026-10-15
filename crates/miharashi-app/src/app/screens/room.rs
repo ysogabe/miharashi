@@ -408,6 +408,13 @@ mod tests {
     }
 
     #[test]
+    fn room_keys_do_nothing() {
+        let mut s = RoomScreen::new(Vec::new(), RoomFeeds::default());
+        assert_eq!(s.key_labels(), crate::screen::KeyLabels::default());
+        crate::screen::assert_key_labels_match_actions(&mut s, std::time::Instant::now());
+    }
+
+    #[test]
     fn feed_texts() {
         let t = Local::now();
         let ok = FeedStatus {

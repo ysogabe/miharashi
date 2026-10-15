@@ -561,6 +561,77 @@ mod tests {
         assert_eq!(menu(&app), None, "POST /api/v1/screen でも閉じる");
     }
 
+    /// 操作パネルの `/status` の keys(#51)。アラート → メニュー → 画面の順に決まり、`on_key` と同じ意味になる。
+    #[test]
+    fn panel_view_keys_follow_the_alert_menu_and_screen() {
+        use crate::screen::PanelKeys;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = three_screens().with_alerts(Some(rx));
+        let keys = |app: &ScreenManager| app.panel_view().unwrap().keys;
+        assert_eq!(
+            keys(&app),
+            PanelKeys {
+                prev: Some("前の画面"),
+                next: Some("次の画面"),
+                select: Some("詳細"),
+                up: None,
+                down: None,
+                menu: Some("メニュー"),
+            },
+            "状況の画面(概要)"
+        );
+        app.on_key(KeyPress::Select);
+        assert_eq!(
+            keys(&app).select,
+            Some("概要"),
+            "5 で詳細へ移ると意味が変わる"
+        );
+        app.on_key(KeyPress::Next);
+        assert_eq!(
+            (keys(&app).select, keys(&app).up, keys(&app).down),
+            (None, None, None),
+            "画面の中の操作が無い画面"
+        );
+        app.on_key(KeyPress::Menu);
+        assert_eq!(
+            keys(&app),
+            PanelKeys {
+                prev: Some("上を選ぶ"),
+                next: Some("下を選ぶ"),
+                select: Some("移動"),
+                up: Some("上を選ぶ"),
+                down: Some("下を選ぶ"),
+                menu: Some("閉じる"),
+            },
+            "メニュー中"
+        );
+        tx.send(miharashi_render::alert::AlertView::Disaster(
+            crate::disaster::demo_view(),
+        ))
+        .unwrap();
+        app.tick(Instant::now());
+        assert!(app.alert_active());
+        let close = Some("閉じる");
+        assert_eq!(
+            keys(&app),
+            PanelKeys {
+                prev: close,
+                next: close,
+                select: close,
+                up: close,
+                down: close,
+                menu: close,
+            },
+            "アラート中はどのキーも閉じるだけ"
+        );
+        app.on_key(KeyPress::Down);
+        assert_eq!(
+            keys(&app).select,
+            Some("移動"),
+            "アラートを閉じるとメニューに戻る"
+        );
+    }
+
     /// 操作パネルの `POST /api/v1/screen`: 登録されている id だけに移り、メニューとアラートは閉じる。
     #[test]
     fn show_screen_by_id() {

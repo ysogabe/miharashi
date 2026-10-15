@@ -1967,6 +1967,13 @@ mod tests {
     }
 
     #[test]
+    fn agent_keys_do_nothing() {
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        assert_eq!(screen.key_labels(), crate::screen::KeyLabels::default());
+        crate::screen::assert_key_labels_match_actions(&mut screen, Instant::now());
+    }
+
+    #[test]
     fn focused_card_names_its_project_and_board_cards_do_not() {
         let now = Instant::now();
         let screen = AgentScreen::new((1920, 1080), false, 30);

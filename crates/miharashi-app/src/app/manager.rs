@@ -6,7 +6,7 @@
 use super::DataSource;
 use crate::config::RotationStep;
 use crate::screen::{
-    App, Composite, KeyPress, PanelRotation, PanelView, Provider, RenderContext, Screen,
+    App, Composite, KeyPress, PanelKeys, PanelRotation, PanelView, Provider, RenderContext, Screen,
     ScreenAction, ScreenInfo, World,
 };
 use miharashi_render::alert::{self, AlertView};
@@ -367,6 +367,40 @@ impl ScreenManager {
         }
     }
 
+    /// 今 6 つのキーを押すと何が起きるか(`on_key` と同じ順で決める: アラート → メニュー → 画面)。
+    fn panel_keys(&self) -> PanelKeys {
+        if self.alert.is_some() {
+            let close = Some("閉じる");
+            return PanelKeys {
+                prev: close,
+                next: close,
+                select: close,
+                up: close,
+                down: close,
+                menu: close,
+            };
+        }
+        if self.menu.is_some() {
+            return PanelKeys {
+                prev: Some("上を選ぶ"),
+                next: Some("下を選ぶ"),
+                select: Some("移動"),
+                up: Some("上を選ぶ"),
+                down: Some("下を選ぶ"),
+                menu: Some("閉じる"),
+            };
+        }
+        let screen = self.screens[self.current].key_labels();
+        PanelKeys {
+            prev: Some("前の画面"),
+            next: Some("次の画面"),
+            select: screen.select,
+            up: screen.up,
+            down: screen.down,
+            menu: Some("メニュー"),
+        }
+    }
+
     /// メニューを開いているか(テスト用)。
     #[cfg(test)]
     pub fn menu_open(&self) -> bool {
@@ -692,6 +726,7 @@ impl App for ScreenManager {
             photo: self.world.photo_feed.position,
             feed_online: self.world.photo_feed.online,
             menu: self.menu,
+            keys: self.panel_keys(),
             rotation: self.rotation.as_ref().map(|r| match r.paused_until {
                 Some(until) => PanelRotation::Paused { until },
                 None => PanelRotation::On,
