@@ -2,7 +2,7 @@
 //! seat/VT の有効・無効、SIGINT/SIGTERM、入力、描画、画面の電源(DPMS)、状態ログを扱う。
 //! 状態ログは共通部分(t / rss / fds / frames / worst_frame)に `App::stats()` の `k=v` を続けて出す。
 use crate::config::Config;
-use crate::panel::{DisplayControl, DisplayStatus, Panel};
+use crate::panel::{DisplayControl, DisplayStatus, Panel, PanelInput};
 use crate::screen::{App, Composite, KeyPress, PhotoData, PhotoRef};
 use crate::screen_power::{Mode as PowerMode, ScreenPower};
 use miharashi_gpu::{Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, Radar, SourceImage};
@@ -424,8 +424,11 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                     break;
                 }
                 Action::Prev => KeyPress::Prev,
-                Action::Switch => KeyPress::Switch,
+                Action::Select => KeyPress::Select,
                 Action::Next => KeyPress::Next,
+                Action::Up => KeyPress::Up,
+                Action::Down => KeyPress::Down,
+                Action::Menu => KeyPress::Menu,
             };
             eprintln!("key: {a:?}");
             if let Some(p) = &power {
@@ -463,13 +466,16 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             }
         }
         // パネルのキーもキーボードと同じに扱う(消えている画面では点けるだけ)
-        for key in panel.iter().flat_map(Panel::keys) {
-            eprintln!("key: panel {key:?}");
+        for input in panel.iter().flat_map(Panel::inputs) {
+            eprintln!("key: panel {input:?}");
             if let Some(p) = &power {
                 p.on_key();
             }
             if screen_on {
-                redraw |= app.on_key(key);
+                redraw |= match input {
+                    PanelInput::Key(key) => app.on_key(key),
+                    PanelInput::Screen(id) => app.show_screen(id),
+                };
             }
         }
         let tick_t0 = Instant::now();

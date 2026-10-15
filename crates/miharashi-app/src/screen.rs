@@ -62,8 +62,8 @@ pub struct RenderContext<'a> {
     pub canvas: &'a mut Canvas,
     pub text: &'a mut TextEngine,
     pub world: &'a World,
-    /// アラートを重ねるか。重ねるときは ScreenManager が画面の上に描く
-    pub alert: bool,
+    /// アラートかメニューを重ねるか。重ねるときは ScreenManager が画面の上に描く
+    pub covered: bool,
     /// GPU 経路の重ね絵を描き直させる(アラートが開いた・閉じた、キーが押された)
     pub force_overlay: bool,
 }
@@ -104,12 +104,21 @@ pub trait Screen {
     fn stats(&self, _out: &mut Vec<(&'static str, String)>) {}
 }
 
-/// 画面ロジックに渡すキー操作。今の動作に必要な最小限。#5 で設計メモ(DESIGN-screen-interface)に沿って拡張する。
+/// 画面ロジックに渡すキー操作(テンキーと操作パネルで共通。docs/DESIGN-screens.md §4.1)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyPress {
+    /// 4: 前の画面
     Prev,
-    Switch,
+    /// 6: 次の画面
     Next,
+    /// 5: 決定・詳細
+    Select,
+    /// 8: 前の項目
+    Up,
+    /// 2: 次の項目
+    Down,
+    /// 0: メニュー
+    Menu,
 }
 
 /// runtime から見た画面ロジック。
@@ -137,6 +146,10 @@ pub trait App {
     }
     /// 状態ログ用。runtime は中身を解釈せず、`k=v` を並べて出す。
     fn stats(&self) -> Vec<(&'static str, String)>;
+    /// 指定した id の画面にする(操作パネルの `POST /api/v1/screen`)。戻り値: 再描画が必要か。
+    fn show_screen(&mut self, _id: &str) -> bool {
+        false
+    }
     /// 操作パネルの `/api/v1/status` に出す画面の状態。出さない画面ロジックは None。
     fn panel_view(&self) -> Option<PanelView> {
         None
