@@ -196,6 +196,9 @@ pub struct PanelView {
     pub photo: Option<(usize, usize)>,
     /// 写真の取得元に接続できているか
     pub feed_online: bool,
+    /// 自動巡回の状態("on" / "paused")。巡回が無効なら None。
+    /// 戻るまでの残り秒数のような毎秒変わる値は入れない(変わるたびに SSE を送るので)
+    pub rotation: Option<&'static str>,
 }
 
 /// 写真のフレームの中身。

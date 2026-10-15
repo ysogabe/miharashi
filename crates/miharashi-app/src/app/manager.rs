@@ -691,6 +691,7 @@ impl App for ScreenManager {
             page: self.screens[self.current].page(),
             photo: self.world.photo_feed.position,
             feed_online: self.world.photo_feed.online,
+            rotation: self.rotation_state(),
         })
     }
 }

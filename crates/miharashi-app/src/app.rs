@@ -409,6 +409,36 @@ mod tests {
         );
     }
 
+    /// 操作パネルの `/status` の rotation。runtime は tick が再描画を求めた周期に `panel_view()` を送るので、
+    /// 戻ったときに画面が変わらなくても(次の手順が同じ画面・メニューを開いている)、その周期の tick は true。
+    #[test]
+    fn panel_view_follows_the_rotation_state() {
+        let (mut app, _) = rotating(&[step("status", 10, false), step("blank", 10, false)], 60);
+        assert_eq!(app.panel_view().unwrap().rotation, Some("on"));
+
+        // 次の手順の画面(blank)へ操作パネルで移って止める。戻っても画面は blank のまま
+        app.show_screen("blank");
+        assert_eq!(app.panel_view().unwrap().rotation, Some("paused"));
+        let mut t = Instant::now();
+        run_for(&mut app, &mut t, 59);
+        assert_eq!(app.panel_view().unwrap().rotation, Some("paused"));
+        t += Duration::from_secs(1);
+        assert!(app.tick(t), "戻った周期は再描画(パネルへ送る)");
+        assert_eq!(app.screen_id(), "blank");
+        assert_eq!(app.panel_view().unwrap().rotation, Some("on"));
+
+        // メニューを開いたまま戻る(キーは実時刻で止めるので、時計を合わせるため作り直す)
+        let (mut app, _) = rotating(&[step("status", 10, false), step("blank", 10, false)], 60);
+        app.on_key(KeyPress::Menu);
+        assert_eq!(app.panel_view().unwrap().rotation, Some("paused"));
+        let mut t = Instant::now();
+        run_for(&mut app, &mut t, 59);
+        t += Duration::from_secs(1);
+        assert!(app.tick(t), "メニュー中に戻った周期も再描画");
+        assert!(app.menu_open());
+        assert_eq!(app.panel_view().unwrap().rotation, Some("on"));
+    }
+
     /// アラートの間は手順の時間を進めない(メニューは開くキーで巡回が止まる)。
     #[test]
     fn alerts_freeze_the_rotation_clock() {
@@ -433,6 +463,7 @@ mod tests {
     fn no_rotation_by_default() {
         let app = three_screens();
         assert_eq!(app.rotation_state(), None);
+        assert_eq!(app.panel_view().unwrap().rotation, None);
         assert!(app.stats().iter().all(|(k, _)| *k != "rotation"));
     }
 
