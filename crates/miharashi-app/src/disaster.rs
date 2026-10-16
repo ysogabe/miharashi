@@ -500,6 +500,25 @@ fn find_watch(
     ))
 }
 
+/// 決め直しで自宅の市町村だけが決まらなかったら、自宅が同じ位置のうちは前の値を使い続ける
+/// (受け持つ気象台も読む)。前の値を使ったら true。
+fn keep_home_muni(w: &mut Watch, old: Option<&Watch>) -> bool {
+    if w.home_muni.is_some() {
+        return false;
+    }
+    let Some(prev) = old
+        .filter(|o| o.home == w.home)
+        .and_then(|o| o.home_muni.clone())
+    else {
+        return false;
+    };
+    if !w.offices.contains(&prev.2) {
+        w.offices.push(prev.2.clone());
+    }
+    w.home_muni = Some(prev);
+    true
+}
+
 /// 見張る範囲を次に決め直すまでの時間。自宅の市町村が決まっていなければ、範囲を作れていても早めに問い合わせ直す
 /// (国土地理院の逆ジオコーダーだけが止まっていたときに、帯が 24 時間「決められない」のままにならないように)。
 fn refresh_after(w: &Watch) -> Duration {
@@ -590,19 +609,11 @@ fn run(tx: Sender<AlertView>, ha: HomeAssistant, poll: Duration, km: f64, home: 
         if Instant::now() >= next_watch {
             match find_watch(&agent, &ha, km) {
                 Ok((mut w, err)) => {
-                    home_err = err;
-                    // 決め直しで自宅の市町村だけが決まらなかったら、自宅が同じ位置のうちは前の値を使い続ける
-                    if w.home_muni.is_none()
-                        && let Some(old) = watch.as_ref().filter(|o| o.home == w.home)
-                    {
-                        w.home_muni = old.home_muni.clone();
-                        home_err = None;
-                        if let Some((_, _, o)) = &w.home_muni
-                            && !w.offices.contains(o)
-                        {
-                            w.offices.push(o.clone());
-                        }
-                    }
+                    home_err = if keep_home_muni(&mut w, watch.as_ref()) {
+                        None
+                    } else {
+                        err
+                    };
                     if w.home_muni.is_some()
                         && watch.as_ref().is_some_and(|o| o.home_muni.is_none())
                     {
@@ -826,6 +837,36 @@ mod tests {
         };
         assert_eq!(refresh_after(&no_home), AREA_RETRY);
         assert!(AREA_RETRY <= Duration::from_secs(600));
+    }
+
+    #[test]
+    fn keeps_the_previous_home_municipality_only_at_the_same_place() {
+        let lost = || Watch {
+            home_muni: None,
+            offices: vec![],
+            ..watch()
+        };
+        // 前の値があれば使い続け、受け持つ気象台も読む
+        let mut w = lost();
+        assert!(keep_home_muni(&mut w, Some(&watch())));
+        assert_eq!(w.home_muni, watch().home_muni);
+        assert_eq!(w.offices, ["130000"]);
+        // 前も決まっていなければ何もしない(失敗の理由を残す)
+        let mut w = lost();
+        assert!(!keep_home_muni(&mut w, Some(&lost())));
+        assert!(w.home_muni.is_none());
+        assert!(!keep_home_muni(&mut w, None));
+        // 自宅の位置が変わったら使わない
+        let moved = Watch {
+            home: (36.0, 140.0),
+            ..lost()
+        };
+        let mut w = moved.clone();
+        assert!(!keep_home_muni(&mut w, Some(&watch())));
+        // 今回決まったなら今回の値
+        let mut w = watch();
+        assert!(!keep_home_muni(&mut w, Some(&lost())));
+        assert!(w.home_muni.is_some());
     }
 
     fn doc(report: &str, items: Value) -> Value {
