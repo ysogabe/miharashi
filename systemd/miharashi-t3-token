@@ -2,7 +2,7 @@
 # T3 Agent 画面(agents)のトークンを、読み取りだけの権限で発行し直す。
 # miharashi-t3-token.timer から週 1 回、キオスクと同じ一般ユーザー(T3 を動かしているユーザー)で動かす。
 #
-# T3 v0.0.45 の bearer は 30 日で切れ、延長や refresh の API が無い。そこで毎回次の手順で作り直す
+# T3 の bearer は 30 日で切れ、延長や refresh の API が無い(v0.0.45・v0.1.0 で確認)。そこで毎回次の手順で作り直す
 # (docs/DESIGN-t3-token.md):
 #   1. t3 CLI でペアリング用のトークンを作る(1 回だけ使える、5 分)
 #   2. T3 の POST /oauth/token で、orchestration:read だけのトークンに交換する
@@ -96,7 +96,9 @@ printf 'Authorization: Bearer ' >"$work/auth"
 cat "$work/token" >>"$work/auth"
 
 # 3. 使えることを確かめる
+# T3 V2(v0.1.0 以降)は、protocol のヘッダーが無いと 400 を返す。
 code=$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' -H "@$work/auth" \
+    -H "x-t3-orchestration-protocol: 2" \
     "$URL/api/orchestration/shell" 2>"$work/err") || die "T3 に届きません($URL): $(head -c 300 "$work/err")"
 [ "$code" = 200 ] || die "新しいトークンで一覧を読めません(HTTP $code)。トークンは置き換えません"
 

@@ -97,7 +97,7 @@ pub struct AgentScreen {
     last_activity: HashMap<String, Instant>,
     poses: HashMap<String, PoseTween>,
     board: layout::Layout,
-    progress_notified: HashMap<String, Instant>,
+    goal_notified: HashMap<String, Instant>,
     stale: bool,
     overflow_updates: usize,
     queue: VecDeque<QueuedEvent>,
@@ -137,7 +137,7 @@ impl AgentScreen {
             last_activity: HashMap::new(),
             poses: HashMap::new(),
             board: layout::Layout::default(),
-            progress_notified: HashMap::new(),
+            goal_notified: HashMap::new(),
             stale: false,
             overflow_updates: 0,
             queue: VecDeque::new(),
@@ -281,7 +281,7 @@ impl AgentScreen {
             self.entry_keys.remove(&id);
             self.last_activity.remove(&id);
             self.poses.remove(&id);
-            self.progress_notified.remove(&id);
+            self.goal_notified.remove(&id);
             self.id_map.remove(&id);
             self.pending_new.remove(&id);
             self.background_dirty = true;
@@ -309,30 +309,23 @@ impl AgentScreen {
                     } else {
                         EventKind::Changed
                     };
-                    if change.kind == AgentChangeKind::Progress {
-                        if self
-                            .progress_notified
-                            .get(&change.thread_id)
-                            .is_some_and(|t| {
-                                now.saturating_duration_since(*t) < Duration::from_secs(15)
-                            })
-                        {
+                    if change.kind == AgentChangeKind::Goal {
+                        if self.goal_notified.get(&change.thread_id).is_some_and(|t| {
+                            now.saturating_duration_since(*t) < Duration::from_secs(15)
+                        }) {
                             continue;
                         }
-                        self.progress_notified.insert(change.thread_id.clone(), now);
+                        self.goal_notified.insert(change.thread_id.clone(), now);
                     }
                     let before = describe_change(
                         change.before_state,
-                        change.before_progress.as_ref(),
+                        change.before_goal.as_deref(),
                         change.before_title.as_deref(),
                         change.kind,
                     );
                     let after = describe_change(
                         change.after_state.or(Some(entry.state)),
-                        change
-                            .after_progress
-                            .as_ref()
-                            .or(entry.plan_progress.as_ref()),
+                        change.after_goal.as_deref().or(entry.goal.as_deref()),
                         change.after_title.as_deref().or(Some(entry.title.as_str())),
                         change.kind,
                     );
@@ -345,7 +338,7 @@ impl AgentScreen {
                                 | AgentChangeKind::Resumed
                         ) {
                         2
-                    } else if change.kind == AgentChangeKind::Progress {
+                    } else if change.kind == AgentChangeKind::Goal {
                         0
                     } else {
                         1
@@ -808,24 +801,18 @@ impl AgentScreen {
         focused: bool,
     ) -> draw::AgentCardContent {
         let state = draw_state(e.state);
-        let progress = e
-            .plan_progress
-            .as_ref()
-            .and_then(|p| Some((p.completed_steps? as f32) / (p.total_steps? as f32)))
-            .filter(|p| p.is_finite() && (0.0..=1.0).contains(p));
-        let mut detail = if let Some(p) = &e.plan_progress {
-            match (&p.step, p.completed_steps, p.total_steps) {
-                (Some(s), Some(c), Some(t)) => format!("{s} · {c} / {t}"),
-                (_, Some(c), Some(t)) => format!("計画 · {c} / {t}"),
-                (Some(s), _, _) => s.clone(),
-                _ => state.label().to_string(),
-            }
-        } else if e.has_pending_approvals {
+        // T3 V2 の一覧には計画の進み具合(何手中の何手目)が無いので、進捗バーは出さない。
+        let progress = None;
+        let mut detail = if e.has_pending_approvals {
             "手元の T3 で承認".into()
         } else if e.has_pending_user_input {
             "手元の T3 で入力".into()
-        } else if e.error_summary.is_some() {
-            e.error_summary.clone().unwrap_or_default()
+        } else if let Some(error) = &e.error_summary {
+            error.clone()
+        } else if let Some(goal) = &e.goal {
+            format!("目標 · {goal}")
+        } else if e.background_tasks > 0 {
+            format!("バックグラウンドの作業 {} 件を待機", e.background_tasks)
         } else {
             state.label().into()
         };
@@ -1328,21 +1315,14 @@ fn state_label(s: crate::agents::AgentState) -> String {
 }
 fn describe_change(
     state: Option<crate::agents::AgentState>,
-    progress: Option<&crate::agents::PlanProgress>,
+    goal: Option<&str>,
     title: Option<&str>,
     kind: AgentChangeKind,
 ) -> String {
     match kind {
-        AgentChangeKind::Progress => progress
-            .map(
-                |p| match (p.step.as_deref(), p.completed_steps, p.total_steps) {
-                    (Some(s), Some(c), Some(t)) => format!("計画 {c}/{t} · {s}"),
-                    (_, Some(c), Some(t)) => format!("計画 {c}/{t}"),
-                    (Some(s), _, _) => format!("計画 · {s}"),
-                    _ => "計画進捗".into(),
-                },
-            )
-            .unwrap_or_else(|| "計画進捗".into()),
+        AgentChangeKind::Goal => goal
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| "目標なし".into(), |g| format!("目標 · {g}")),
         AgentChangeKind::Title => title
             .filter(|s| !s.is_empty())
             .unwrap_or("無題")
@@ -1357,15 +1337,16 @@ fn describe_change(
 }
 fn content_key(e: &AgentEntry) -> String {
     format!(
-        "{:?}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{}{}{}",
+        "{:?}|{}|{}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{}{}{}",
         e.state,
         e.project_title,
         e.title,
-        e.plan_progress,
+        e.goal,
+        e.background_tasks,
         e.provider,
         e.model,
         e.error_summary,
-        e.raw_session_status,
+        e.raw_status,
         e.has_pending_approvals as u8,
         e.has_pending_user_input as u8,
         e.has_actionable_proposed_plan as u8
@@ -1389,7 +1370,7 @@ fn content_key_from_display(c: &draw::AgentCardContent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::{AgentChange, AgentChangeKind, AgentState, PlanProgress};
+    use crate::agents::{AgentChange, AgentChangeKind, AgentState};
     use std::time::UNIX_EPOCH;
     fn entry(id: &str, state: AgentState) -> AgentEntry {
         AgentEntry {
@@ -1489,8 +1470,8 @@ mod tests {
                 kind: AgentChangeKind::State,
                 before_state: Some(AgentState::Running),
                 after_state: Some(AgentState::Approval),
-                before_progress: None,
-                after_progress: None,
+                before_goal: None,
+                after_goal: None,
                 before_title: None,
                 after_title: None,
                 observed_at: SystemTime::now(),
@@ -1535,8 +1516,8 @@ mod tests {
             kind: AgentChangeKind::New,
             before_state: None,
             after_state: Some(AgentState::Running),
-            before_progress: None,
-            after_progress: Some(PlanProgress::default()),
+            before_goal: None,
+            after_goal: Some("目標".into()),
             before_title: None,
             after_title: Some("a".into()),
             observed_at: UNIX_EPOCH,
@@ -1706,15 +1687,14 @@ mod tests {
         assert!(!s.surfaces.contains_key("t5"));
     }
     #[test]
-    fn change_descriptions_keep_progress_and_title_differences() {
-        let p = PlanProgress {
-            step: Some("実装".into()),
-            completed_steps: Some(2),
-            total_steps: Some(4),
-        };
+    fn change_descriptions_keep_goal_and_title_differences() {
         assert_eq!(
-            describe_change(None, Some(&p), None, AgentChangeKind::Progress),
-            "計画 2/4 · 実装"
+            describe_change(None, Some("実装"), None, AgentChangeKind::Goal),
+            "目標 · 実装"
+        );
+        assert_eq!(
+            describe_change(None, None, None, AgentChangeKind::Goal),
+            "目標なし"
         );
         assert_eq!(
             describe_change(None, None, Some("変更後"), AgentChangeKind::Title),
