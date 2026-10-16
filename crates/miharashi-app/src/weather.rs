@@ -1,11 +1,13 @@
 //! 天気予報(docs/DESIGN-screens.md §2.1)。気象庁の府県予報と週間予報(`bosai/forecast/data/forecast/{office}.json`。
 //! 1 つのファイルに両方入っている)を別スレッドで定期的に読んで共有する。予報の地域(class10)は、Home Assistant の
-//! 自宅の位置 → 国土地理院の逆ジオコーダーの市区町村 → 気象庁の area.json とたどって決める(設定で固定もできる)。
+//! 自宅の位置 → 国土地理院の逆ジオコーダーの市区町村(届かなければ `home` が覚えている前回の値)→ 気象庁の
+//! area.json とたどって決める(設定で固定もできる)。
 //! 気象庁に届かないときは最後の予報を残し、取得の状態(`FeedStatus`)だけを変える。
 //! ネットワークの応答はすべて欠けうるものとして扱い、読めない項目は飛ばす(パニックさせない)。
 use crate::config::{HomeAssistant, Room};
 use crate::env::FeedStatus;
-use crate::quake::{AREA_URL, get_json, home_muni_code};
+use crate::home::home_muni_code;
+use crate::quake::{AREA_URL, get_json};
 use chrono::NaiveDate;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};

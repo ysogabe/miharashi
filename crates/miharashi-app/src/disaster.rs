@@ -15,7 +15,8 @@
 //! ネットワークの応答はすべて欠けうるものとして扱い、読めない項目は飛ばす(パニックさせない)。
 use crate::config::{Alerts, HomeAssistant};
 use crate::env::FeedStatus;
-use crate::quake::{AREA_URL, get_json, home_location, home_muni_code};
+use crate::home::{home_location, home_muni_code};
+use crate::quake::{AREA_URL, get_json};
 use miharashi_render::alert::{AlertView, DisasterArea, DisasterKind, DisasterView};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

@@ -4,7 +4,8 @@
 //! - 全国のどこかで震度 5 弱以上
 //!
 //! 住んでいる地方は、Home Assistant の自宅の位置 → 国土地理院の逆ジオコーダ(市区町村コード)→
-//! 気象庁の地域定義(area.json)の順にたどって決める。どこかで失敗したら全国の条件だけで動く。
+//! 気象庁の地域定義(area.json)の順にたどって決める(逆ジオコーダーに届かなければ、`home` が覚えている前回の
+//! 市区町村コード)。どこかで失敗したら全国の条件だけで動く。
 //! ネットワークの応答はすべて欠けうるものとして扱い、読めない項目は飛ばす(パニックさせない)。
 use crate::config::{Alerts, HomeAssistant};
 use miharashi_render::alert::{
@@ -17,7 +18,6 @@ use std::time::{Duration, Instant};
 
 const LIST_URL: &str = "https://www.jma.go.jp/bosai/quake/data/list.json";
 pub const AREA_URL: &str = "https://www.jma.go.jp/bosai/common/const/area.json";
-const GSI_RGEO: &str = "https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress";
 /// 起動時に、これより古い発表はアラートにしない(再起動のたびに出さない)
 const STARTUP_MAX_AGE_MIN: i64 = 10;
 /// 地方の判定をやり直す間隔(成功時)と、失敗時の再試行間隔
@@ -204,47 +204,9 @@ pub fn get_json(agent: &ureq::Agent, url: &str, auth: Option<&str>) -> Result<Va
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
-/// Home Assistant に登録された自宅の (緯度, 経度)。
-pub fn home_location(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<(f64, f64), String> {
-    if ha.url.is_empty() {
-        return Err("home_assistant.url が未設定".into());
-    }
-    let token = crate::screen_power::read_token(&ha.token_file)?;
-    let base = ha.url.trim_end_matches('/');
-    let conf = get_json(
-        agent,
-        &format!("{base}/api/config"),
-        Some(&format!("Bearer {token}")),
-    )?;
-    match (
-        conf.get("latitude").and_then(Value::as_f64),
-        conf.get("longitude").and_then(Value::as_f64),
-    ) {
-        (Some(a), Some(b)) => Ok((a, b)),
-        _ => Err("HA の設定に自宅の緯度経度がない".into()),
-    }
-}
-
-/// 自宅の位置の市区町村コード(5 桁。先頭 2 桁が都道府県)。国土地理院の逆ジオコーダーで引く。
-pub fn home_muni_code(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<String, String> {
-    let (lat, lon) = home_location(agent, ha)?;
-    let rg = get_json(agent, &format!("{GSI_RGEO}?lat={lat}&lon={lon}"), None)?;
-    let muni = rg
-        .get("results")
-        .and_then(|r| r.get("muniCd"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    // 先頭の 0 が落ちた 4 桁でも返ってくる
-    match muni.len() {
-        5 if muni.bytes().all(|b| b.is_ascii_digit()) => Ok(muni.to_string()),
-        4 if muni.bytes().all(|b| b.is_ascii_digit()) => Ok(format!("0{muni}")),
-        _ => Err(format!("市区町村コードを得られない({muni:?})")),
-    }
-}
-
 /// 自宅の位置から住んでいる地方を決める。
 fn detect_region(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<Region, String> {
-    let pref = home_muni_code(agent, ha)?[0..2].to_string();
+    let pref = crate::home::home_muni_code(agent, ha)?[0..2].to_string();
     let area = get_json(agent, AREA_URL, None)?;
     region_from_area(&area, &pref)
         .ok_or_else(|| format!("都道府県 {pref} の地方が area.json にない"))
