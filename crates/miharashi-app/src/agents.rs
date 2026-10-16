@@ -16,6 +16,9 @@ const BODY_LIMIT: u64 = 4 * 1024 * 1024;
 const THREAD_LIMIT: usize = 2048;
 const ENTRY_TEXT_LIMIT: usize = 512;
 const CHANGE_LIMIT: usize = 64;
+/// 対応する T3 の orchestration protocol(T3 v0.1.0 以降の V2)。
+const PROTOCOL_VERSION: u64 = 2;
+const PROTOCOL_HEADER: &str = "x-t3-orchestration-protocol";
 
 pub type Shared = Arc<RwLock<AgentSnapshot>>;
 
@@ -52,18 +55,11 @@ pub enum AgentChangeKind {
     New,
     State,
     Flags,
-    Progress,
+    Goal,
     Title,
     Error,
     TurnCompleted,
     Resumed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct PlanProgress {
-    pub step: Option<String>,
-    pub completed_steps: Option<u32>,
-    pub total_steps: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -75,15 +71,21 @@ pub struct AgentEntry {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub state: AgentState,
-    pub raw_session_status: Option<String>,
-    pub raw_turn_state: Option<String>,
+    /// thread.status(最新 run の状態、run が無ければ idle)。
+    pub raw_status: Option<String>,
+    /// thread.activityRunStatus(活動中の run の状態)。
+    pub raw_activity_status: Option<String>,
     pub has_pending_approvals: bool,
     pub has_pending_user_input: bool,
+    /// 入力待ちのうち、T3 が provider の認証のし直しを待っている(auth_refresh)。
+    pub needs_reauth: bool,
     pub has_actionable_proposed_plan: bool,
-    pub background_liveness: Option<String>,
-    pub active_turn_id: Option<String>,
-    pub latest_turn_id: Option<String>,
-    pub plan_progress: Option<PlanProgress>,
+    /// 完了を引き留めるバックグラウンドの仕事(subagent・monitor・background_task)の数。
+    pub background_tasks: usize,
+    pub active_run_id: Option<String>,
+    pub latest_run_id: Option<String>,
+    /// 進行中の provider の目標(goal.objective)。完了した目標は持たない。
+    pub goal: Option<String>,
     pub branch: Option<String>,
     pub worktree_path: Option<String>,
     pub updated_at: Option<String>,
@@ -100,8 +102,8 @@ pub struct AgentChange {
     pub kind: AgentChangeKind,
     pub before_state: Option<AgentState>,
     pub after_state: Option<AgentState>,
-    pub before_progress: Option<PlanProgress>,
-    pub after_progress: Option<PlanProgress>,
+    pub before_goal: Option<String>,
+    pub after_goal: Option<String>,
     pub before_title: Option<String>,
     pub after_title: Option<String>,
     pub observed_at: SystemTime,
@@ -402,7 +404,7 @@ fn fetch_environment(agent: &ureq::Agent, endpoint: &str) -> Result<Environment,
     let protocol = value
         .get("orchestrationProtocolVersion")
         .and_then(Value::as_u64);
-    if protocol != Some(1) {
+    if protocol != Some(PROTOCOL_VERSION) {
         return Err(FetchError::Invalid(format!(
             "未対応の orchestration protocol ({})",
             protocol.map_or_else(|| "不明".into(), |v| v.to_string())
@@ -438,6 +440,7 @@ fn fetch(
     let mut response = agent
         .get(endpoint)
         .header("Authorization", &format!("Bearer {token}"))
+        .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
         .call()
         .map_err(|e| FetchError::Transport(format!("T3 へ接続できません: {e}")))?;
     match response.status().as_u16() {
@@ -494,6 +497,8 @@ fn parse_shell_recent(
         .get("projects")
         .and_then(Value::as_array)
         .ok_or("projects が配列ではありません")?;
+    // schemaVersion はサーバー内部の保存形式の版で(v0.1.0 で 2)、通信の形とは別に上がる。
+    // T3 の client も確かめていないので、ここでも見ない。通信の形は protocol ヘッダーで決まる。
     let threads = obj
         .get("threads")
         .and_then(Value::as_array)
@@ -528,39 +533,37 @@ fn parse_shell_recent(
         if project_id.is_empty() {
             return Err("空の thread projectId があります".into());
         }
-        let session = thread.get("session").filter(|v| v.is_object());
-        let latest = thread.get("latestTurn").filter(|v| v.is_object());
         let selection = thread.get("modelSelection").filter(|v| v.is_object());
-        let raw_session_status = nested_str(session, "status");
-        let raw_turn_state = nested_str(latest, "state");
-        let active_turn_id = nested_str(session, "activeTurnId");
-        let latest_turn_id = nested_str(latest, "id").or_else(|| nested_str(latest, "turnId"));
-        let approval = bool_field(thread, "hasPendingApprovals");
-        let input = bool_field(thread, "hasPendingUserInput");
+        let request = thread
+            .get("pendingRuntimeRequest")
+            .filter(|v| v.is_object());
+        let raw_status = field_str(thread, "status");
+        let raw_activity_status = field_str(thread, "activityRunStatus");
         let plan = bool_field(thread, "hasActionableProposedPlan");
-        let background_liveness = field_str(thread, "backgroundLiveness").map(|s| sanitize(s, 64));
+        let background_tasks = holding_background_tasks(thread);
         let state = normalize_state(
-            raw_session_status.as_deref(),
-            raw_turn_state.as_deref(),
-            active_turn_id.as_deref(),
-            latest_turn_id.as_deref(),
-            approval,
-            input,
+            raw_status,
+            raw_activity_status,
+            request.and_then(|r| field_str(r, "kind")),
             plan,
-            background_liveness.as_deref(),
+            background_tasks > 0,
         );
         let archived = thread.get("archivedAt").is_some_and(|v| !v.is_null());
+        // T3 のサーバー・client と同じく、settledOverride だけで片付け済みかを決める。
+        let settled = field_str(thread, "settledOverride") == Some("settled");
         let updated = field_str(thread, "updatedAt");
-        if archived || !is_target(state, updated, recent_hours, now) {
+        if archived || !is_target(state, settled, updated, recent_hours, now) {
             continue;
         }
-        let progress = thread.get("planProgress").and_then(parse_progress);
         let project_title = project_names
             .get(project_id)
             .cloned()
             .unwrap_or_else(|| short_id(project_id));
-        let error_summary = nested_str(session, "lastError")
-            .map(|s| sanitize(&s, 240))
+        let goal = thread
+            .get("goal")
+            .filter(|g| g.is_object() && field_str(g, "status") != Some("complete"))
+            .and_then(|g| field_str(g, "objective"))
+            .map(|s| sanitize(s, ENTRY_TEXT_LIMIT))
             .filter(|s| !s.is_empty());
         entries.push(AgentEntry {
             thread_id: sanitize(id, 256),
@@ -570,27 +573,27 @@ fn parse_shell_recent(
                 || "無題".into(),
                 |v| nonempty(sanitize(v, ENTRY_TEXT_LIMIT), "無題"),
             ),
-            provider: nested_str(session, "providerName")
-                .or_else(|| nested_str(selection, "instanceId"))
-                .map(|s| sanitize(&s, 128)),
+            provider: field_str(thread, "providerInstanceId")
+                .map(|s| provider_label(&sanitize(s, 128))),
             model: nested_str(selection, "model").map(|s| sanitize(&s, 128)),
             state,
-            raw_session_status: raw_session_status.map(|s| sanitize(&s, 64)),
-            raw_turn_state: raw_turn_state.map(|s| sanitize(&s, 64)),
-            has_pending_approvals: approval,
-            has_pending_user_input: input,
+            raw_status: raw_status.map(|s| sanitize(s, 64)),
+            raw_activity_status: raw_activity_status.map(|s| sanitize(s, 64)),
+            has_pending_approvals: state == AgentState::Approval,
+            has_pending_user_input: state == AgentState::Input,
+            needs_reauth: request.and_then(|r| field_str(r, "kind")) == Some("auth_refresh"),
             has_actionable_proposed_plan: plan,
-            background_liveness,
-            active_turn_id: active_turn_id.map(|s| sanitize(&s, 256)),
-            latest_turn_id: latest_turn_id.map(|s| sanitize(&s, 256)),
-            plan_progress: progress,
+            background_tasks,
+            active_run_id: field_str(thread, "activeRunId").map(|s| sanitize(s, 256)),
+            latest_run_id: field_str(thread, "latestRunId").map(|s| sanitize(s, 256)),
+            goal,
             branch: field_str(thread, "branch").map(|s| sanitize(s, 256)),
             worktree_path: field_str(thread, "worktreePath").map(|s| sanitize(s, 512)),
-            updated_at: field_str(thread, "updatedAt").map(|s| sanitize(s, 64)),
-            requested_at: nested_str(latest, "requestedAt").map(|s| sanitize(&s, 64)),
-            started_at: nested_str(latest, "startedAt").map(|s| sanitize(&s, 64)),
-            completed_at: nested_str(latest, "completedAt").map(|s| sanitize(&s, 64)),
-            error_summary,
+            updated_at: updated.map(|s| sanitize(s, 64)),
+            requested_at: field_str(thread, "latestRunRequestedAt").map(|s| sanitize(s, 64)),
+            started_at: field_str(thread, "latestRunStartedAt").map(|s| sanitize(s, 64)),
+            completed_at: field_str(thread, "latestRunCompletedAt").map(|s| sanitize(s, 64)),
+            error_summary: error_summary(thread),
         });
     }
     entries.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
@@ -604,13 +607,55 @@ fn parse_shell_recent(
     })
 }
 
+/// V2 の一覧は provider の表示名を持たず instance ID だけなので、既定の instance は名前に直す。
+/// 利用者が追加した instance(例: `codex_work`)は ID のまま出す。
+fn provider_label(instance_id: &str) -> String {
+    match instance_id {
+        "claudeAgent" => "Claude",
+        "codex" => "Codex",
+        "cursor" => "Cursor",
+        "opencode" => "OpenCode",
+        "grok" => "Grok",
+        "pi" => "Pi",
+        other => other,
+    }
+    .to_string()
+}
+
+/// 利用上限で止まった run は、いつ再開できるかを添える。
+fn error_summary(thread: &Value) -> Option<String> {
+    if field_str(thread, "lastErrorClass") == Some("usage_limit") {
+        return Some(match field_str(thread, "usageLimitResetAt") {
+            Some(at) => format!("利用上限 · {} に再開", sanitize(at, 64)),
+            None => "利用上限".into(),
+        });
+    }
+    field_str(thread, "lastError")
+        .map(|s| sanitize(s, 240))
+        .filter(|s| !s.is_empty())
+}
+
+/// T3 の client と同じく、command は完了を引き留めない(dev server など、誰も待っていないことが多い)。
+fn holding_background_tasks(thread: &Value) -> usize {
+    thread
+        .get("pendingBackgroundTasks")
+        .and_then(Value::as_array)
+        .map_or(0, |tasks| {
+            tasks
+                .iter()
+                .filter(|t| field_str(t, "kind") != Some("command"))
+                .count()
+        })
+}
+
 fn is_target(
     state: AgentState,
+    settled: bool,
     updated_at: Option<&str>,
     recent_hours: u64,
     now: SystemTime,
 ) -> bool {
-    if matches!(
+    let live = matches!(
         state,
         AgentState::Starting
             | AgentState::Running
@@ -618,8 +663,9 @@ fn is_target(
             | AgentState::Approval
             | AgentState::Input
             | AgentState::Plan
-            | AgentState::Error
-    ) {
+    );
+    // 片付け済み(settled)の失敗は、もう注意を引かない。
+    if live || state == AgentState::Error && !settled {
         return true;
     }
     let Some(raw) = updated_at else {
@@ -637,28 +683,36 @@ fn validate_thread(thread: &Value) -> Result<(), String> {
     if !thread.is_object() {
         return Err("thread item が object ではありません".into());
     }
+    for key in ["status", "providerInstanceId"] {
+        if !thread.get(key).is_some_and(Value::is_string) {
+            return Err(format!("thread.{key} が文字列ではありません"));
+        }
+    }
     for key in [
         "title",
         "projectId",
         "branch",
         "worktreePath",
         "updatedAt",
-        "backgroundLiveness",
+        "activityRunStatus",
+        "lastError",
+        "lastErrorClass",
+        "usageLimitResetAt",
+        "latestRunId",
+        "activeRunId",
+        "latestRunRequestedAt",
+        "latestRunStartedAt",
+        "latestRunCompletedAt",
+        "settledOverride",
     ] {
         validate_string_or_null(thread, key)?;
     }
-    for key in [
-        "hasPendingApprovals",
-        "hasPendingUserInput",
-        "hasActionableProposedPlan",
-    ] {
-        if let Some(value) = thread.get(key)
-            && !value.is_boolean()
-        {
-            return Err(format!("thread.{key} が boolean ではありません"));
-        }
+    if let Some(value) = thread.get("hasActionableProposedPlan")
+        && !value.is_boolean()
+    {
+        return Err("thread.hasActionableProposedPlan が boolean ではありません".into());
     }
-    for key in ["session", "latestTurn", "modelSelection", "planProgress"] {
+    for key in ["modelSelection", "pendingRuntimeRequest", "goal"] {
         if let Some(value) = thread.get(key)
             && !value.is_null()
             && !value.is_object()
@@ -667,23 +721,9 @@ fn validate_thread(thread: &Value) -> Result<(), String> {
         }
     }
     for (parent, fields) in [
-        (
-            "session",
-            &["status", "providerName", "activeTurnId", "lastError"][..],
-        ),
-        (
-            "latestTurn",
-            &[
-                "id",
-                "turnId",
-                "state",
-                "requestedAt",
-                "startedAt",
-                "completedAt",
-            ][..],
-        ),
         ("modelSelection", &["instanceId", "model"][..]),
-        ("planProgress", &["step"][..]),
+        ("pendingRuntimeRequest", &["kind"][..]),
+        ("goal", &["objective", "status"][..]),
     ] {
         let Some(value) = thread.get(parent).filter(|v| v.is_object()) else {
             continue;
@@ -693,16 +733,17 @@ fn validate_thread(thread: &Value) -> Result<(), String> {
                 .map_err(|e| format!("thread.{parent}.{field}: {e}"))?;
         }
     }
-    if let Some(progress) = thread.get("planProgress").filter(|v| v.is_object()) {
-        for key in ["completedSteps", "totalSteps"] {
-            if let Some(value) = progress.get(key)
-                && !value.is_null()
-                && value.as_u64().is_none()
-            {
-                return Err(format!(
-                    "thread.planProgress.{key} が非負整数ではありません"
-                ));
-            }
+    if let Some(tasks) = thread.get("pendingBackgroundTasks")
+        && !tasks.is_null()
+    {
+        let tasks = tasks
+            .as_array()
+            .ok_or("thread.pendingBackgroundTasks が配列ではありません")?;
+        if tasks
+            .iter()
+            .any(|t| !t.get("kind").is_some_and(Value::is_string))
+        {
+            return Err("thread.pendingBackgroundTasks に kind の無い項目があります".into());
         }
     }
     Ok(())
@@ -718,87 +759,39 @@ fn validate_string_or_null(value: &Value, key: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_progress(value: &Value) -> Option<PlanProgress> {
-    if !value.is_object() || value.as_object().is_some_and(|obj| obj.is_empty()) {
-        return None;
-    }
-    let completed = value
-        .get("completedSteps")
-        .and_then(Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok());
-    let total = value
-        .get("totalSteps")
-        .and_then(Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok());
-    if let (Some(c), Some(t)) = (completed, total)
-        && (t == 0 || c > t)
-    {
-        return None;
-    }
-    Some(PlanProgress {
-        step: field_str(value, "step").map(|s| sanitize(s, 256)),
-        completed_steps: completed,
-        total_steps: total,
-    })
-}
-
-// Server status dimensions are independent and their precedence is intentionally explicit.
-#[allow(clippy::too_many_arguments)]
+/// T3 v0.1.0 の client(`presentThreadShell`・`shellRuntime`)と同じ優先順で状態を決める。
 fn normalize_state(
-    session: Option<&str>,
-    turn: Option<&str>,
-    active: Option<&str>,
-    latest: Option<&str>,
-    approval: bool,
-    input: bool,
+    status: Option<&str>,
+    activity: Option<&str>,
+    request_kind: Option<&str>,
     plan: bool,
-    background: Option<&str>,
+    holds_background: bool,
 ) -> AgentState {
-    if approval {
-        return AgentState::Approval;
+    match request_kind {
+        // auth_refresh は手元で認証し直すまで進まないので、入力待ちとして扱う。
+        Some("user_input" | "auth_refresh") => return AgentState::Input,
+        Some(_) => return AgentState::Approval,
+        None => {}
     }
-    if input {
-        return AgentState::Input;
-    }
-    if plan {
+    // 計画を受け入れて run が動き出したら、旗が残っていても実行中として扱う。
+    if plan && activity.is_none() {
         return AgentState::Plan;
     }
-    if session.is_some_and(|v| {
-        !matches!(
-            v,
-            "idle" | "starting" | "running" | "ready" | "interrupted" | "stopped" | "error"
-        )
-    }) || turn.is_some_and(|v| !matches!(v, "running" | "interrupted" | "completed" | "error"))
-        || background.is_some_and(|v| !matches!(v, "working" | "monitoring"))
-    {
-        return AgentState::Unknown;
-    }
-    let newer_active = active.is_some() && latest.is_some() && active != latest;
-    if session == Some("error") && !newer_active || turn == Some("error") && !newer_active {
-        return AgentState::Error;
-    }
-    if session == Some("starting") {
-        return AgentState::Starting;
-    }
-    if background == Some("monitoring") {
+    if holds_background && status != Some("failed") {
         return AgentState::Monitoring;
     }
-    if session == Some("running") || active.is_some() || background == Some("working") {
-        return AgentState::Running;
+    match activity.or(status) {
+        Some("preparing" | "queued" | "starting") => AgentState::Starting,
+        Some("running") => AgentState::Running,
+        // run の中で subagent や monitor の結果を待っている。
+        Some("waiting") => AgentState::Monitoring,
+        Some("completed") => AgentState::Completed,
+        Some("interrupted") => AgentState::Interrupted,
+        Some("failed") => AgentState::Error,
+        Some("cancelled" | "rolled_back") => AgentState::Stopped,
+        Some("idle") => AgentState::Idle,
+        _ => AgentState::Unknown,
     }
-    if session == Some("interrupted") || turn == Some("interrupted") {
-        return AgentState::Interrupted;
-    }
-    if session == Some("stopped") {
-        return AgentState::Stopped;
-    }
-    if turn == Some("completed") {
-        return AgentState::Completed;
-    }
-    if matches!(session, Some("idle" | "ready")) {
-        return AgentState::Idle;
-    }
-    AgentState::Unknown
 }
 
 fn diff(
@@ -833,20 +826,21 @@ fn diff(
             } else {
                 AgentChangeKind::State
             })
-        } else if previous.error_summary != entry.error_summary {
-            Some(AgentChangeKind::Error)
-        } else if previous.active_turn_id != entry.active_turn_id
-            || previous.raw_session_status != entry.raw_session_status
-            || previous.raw_turn_state != entry.raw_turn_state
+        } else if entry.state == AgentState::Error && previous.error_summary != entry.error_summary
         {
+            Some(AgentChangeKind::Error)
+        } else if previous.active_run_id != entry.active_run_id
+            || previous.latest_run_id != entry.latest_run_id
+        {
+            // 新しい run が始まった。preparing → queued → starting のような同じ状態の中の移り変わりは知らせない。
             Some(AgentChangeKind::Resumed)
         } else if previous.has_pending_approvals != entry.has_pending_approvals
             || previous.has_pending_user_input != entry.has_pending_user_input
             || previous.has_actionable_proposed_plan != entry.has_actionable_proposed_plan
         {
             Some(AgentChangeKind::Flags)
-        } else if previous.plan_progress != entry.plan_progress {
-            Some(AgentChangeKind::Progress)
+        } else if previous.goal != entry.goal {
+            Some(AgentChangeKind::Goal)
         } else if previous.title != entry.title {
             Some(AgentChangeKind::Title)
         } else {
@@ -878,8 +872,8 @@ fn push_change(
         kind,
         before_state: previous.map(|e| e.state),
         after_state: Some(entry.state),
-        before_progress: previous.and_then(|e| e.plan_progress.clone()),
-        after_progress: entry.plan_progress.clone(),
+        before_goal: previous.and_then(|e| e.goal.clone()),
+        after_goal: entry.goal.clone(),
         before_title: previous.map(|e| e.title.clone()),
         after_title: Some(entry.title.clone()),
         observed_at: now,
@@ -977,44 +971,176 @@ mod tests {
 
     fn shell(threads: Vec<Value>, sequence: u64) -> Value {
         serde_json::json!({
+            "schemaVersion": 2,
             "snapshotSequence": sequence,
-            "environment": {"id":"env-1", "label":"test T3", "serverVersion":"0.0.45"},
-            "projects":[{"id":"p1", "title":"Project"}], "threads":threads
+            "projects":[{"id":"p1", "title":"Project"}], "threads":threads,
+            "archivedThreads":[]
         })
     }
 
+    /// T3 v0.1.0 の OrchestrationV2ThreadShell のうち、miharashi が読む項目。
     fn mock_thread(id: &str, status: &str, updated: &str) -> Value {
         let updated = if DateTime::parse_from_rfc3339(updated).is_ok() {
             updated.to_owned()
         } else {
             Utc::now().to_rfc3339()
         };
+        let active = matches!(
+            status,
+            "preparing" | "queued" | "starting" | "running" | "waiting"
+        );
         serde_json::json!({
             "id":id, "projectId":"p1", "title":"Thread", "updatedAt":updated,
-            "session":{"status":status,"providerName":"Codex","activeTurnId":null,"lastError":null},
-            "latestTurn":{"id":"turn-1","state":"running","requestedAt":"2026-10-15T00:00:00Z"},
-            "modelSelection":{"model":"gpt"}, "hasPendingApprovals":false,
-            "hasPendingUserInput":false,"hasActionableProposedPlan":false,
-            "planProgress":{"step":"step 1","completedSteps":1,"totalSteps":3}
+            "providerInstanceId":"codex",
+            "modelSelection":{"instanceId":"codex","model":"gpt","options":[]},
+            "status":status,
+            "activityRunStatus": if active { Value::String(status.into()) } else { Value::Null },
+            "latestRunId":"run-1",
+            "activeRunId": if active { Value::String("run-1".into()) } else { Value::Null },
+            "latestRunRequestedAt":"2026-10-15T00:00:00Z",
+            "latestRunStartedAt":"2026-10-15T00:00:01Z",
+            "latestRunCompletedAt":null,
+            "lastError":null, "lastErrorClass":null, "usageLimitResetAt":null,
+            "pendingRuntimeRequest":null, "hasActionableProposedPlan":false,
+            "pendingBackgroundTasks":[], "goal":null,
+            "archivedAt":null, "settledOverride":null, "settledAt":null
         })
     }
 
+    fn state_of(thread: Value) -> AgentState {
+        parse_shell(&shell(vec![thread], 1)).unwrap().entries[0].state
+    }
+
     #[test]
-    fn maps_schema_prioritizes_flags_and_sanitizes_strings() {
-        let value = shell(vec![mock_thread("t1", "running", "today")], 42);
-        let parsed = parse_shell(&value).unwrap();
+    fn maps_schema_prioritizes_requests_and_sanitizes_strings() {
+        let mut running = mock_thread("t1", "running", "today");
+        running["title"] = Value::String("Thr\u{7}ead".into());
+        running["goal"] = serde_json::json!({"objective":"テストを通す","status":"active"});
+        let parsed = parse_shell(&shell(vec![running], 42)).unwrap();
         assert_eq!(parsed.sequence, Some(42));
         let e = &parsed.entries[0];
         assert_eq!(e.project_title, "Project");
+        assert_eq!(e.title, "Thread");
         assert_eq!(e.state, AgentState::Running);
         assert_eq!(e.provider.as_deref(), Some("Codex"));
-        assert_eq!(e.plan_progress.as_ref().unwrap().total_steps, Some(3));
+        assert_eq!(e.model.as_deref(), Some("gpt"));
+        assert_eq!(e.active_run_id.as_deref(), Some("run-1"));
+        assert_eq!(e.goal.as_deref(), Some("テストを通す"));
 
         let mut approval = mock_thread("t1", "running", "today");
-        approval["hasPendingApprovals"] = Value::Bool(true);
+        approval["pendingRuntimeRequest"] =
+            serde_json::json!({"id":"r1","kind":"command","createdAt":"2026-10-15T00:00:00Z"});
+        let parsed = parse_shell(&shell(vec![approval], 43)).unwrap();
+        assert_eq!(parsed.entries[0].state, AgentState::Approval);
+        assert!(parsed.entries[0].has_pending_approvals);
+
+        for kind in ["user_input", "auth_refresh"] {
+            let mut input = mock_thread("t1", "waiting", "today");
+            input["pendingRuntimeRequest"] =
+                serde_json::json!({"id":"r1","kind":kind,"createdAt":"2026-10-15T00:00:00Z"});
+            assert_eq!(state_of(input), AgentState::Input, "{kind}");
+        }
+
+        let mut reauth = mock_thread("t1", "waiting", "today");
+        reauth["pendingRuntimeRequest"] =
+            serde_json::json!({"id":"r1","kind":"auth_refresh","createdAt":"2026-10-15T00:00:00Z"});
+        assert!(parse_shell(&shell(vec![reauth], 1)).unwrap().entries[0].needs_reauth);
+
+        let mut plan = mock_thread("t1", "completed", "today");
+        plan["hasActionableProposedPlan"] = Value::Bool(true);
+        assert_eq!(state_of(plan), AgentState::Plan);
+        // 計画を受け入れて run が動き出したら、旗が残っていても実行中。
+        let mut accepted = mock_thread("t1", "running", "today");
+        accepted["hasActionableProposedPlan"] = Value::Bool(true);
+        assert_eq!(state_of(accepted), AgentState::Running);
+    }
+
+    #[test]
+    fn missing_provider_is_rejected() {
+        let mut no_provider = mock_thread("t", "running", "now");
+        no_provider["providerInstanceId"] = Value::Null;
+        assert!(parse_shell(&shell(vec![no_provider], 1)).is_err());
+    }
+
+    #[test]
+    fn steps_inside_one_state_and_stale_errors_are_not_reported() {
+        let parse = |thread: Value| parse_shell(&shell(vec![thread], 1)).unwrap().entries;
+        let mut cursor = 0;
+        // preparing → starting は同じ「起動中」で、同じ run なので知らせない。
+        let preparing = parse(mock_thread("t", "preparing", "now"));
+        let starting = parse(mock_thread("t", "starting", "now"));
+        assert!(diff(&preparing, &starting, &mut cursor, SystemTime::now()).is_empty());
+        // 終わった thread の lastError が消えても、異常として知らせない。
+        let mut with_error = mock_thread("t", "completed", "now");
+        with_error["lastError"] = Value::String("old".into());
+        let cleared = parse(mock_thread("t", "completed", "now"));
+        assert!(diff(&parse(with_error), &cleared, &mut cursor, SystemTime::now()).is_empty());
+    }
+
+    #[test]
+    fn run_statuses_map_like_the_t3_client() {
+        for (status, expected) in [
+            ("idle", AgentState::Idle),
+            ("preparing", AgentState::Starting),
+            ("queued", AgentState::Starting),
+            ("starting", AgentState::Starting),
+            ("running", AgentState::Running),
+            ("waiting", AgentState::Monitoring),
+            ("completed", AgentState::Completed),
+            ("interrupted", AgentState::Interrupted),
+            ("failed", AgentState::Error),
+            ("cancelled", AgentState::Stopped),
+            ("rolled_back", AgentState::Stopped),
+            ("mystery", AgentState::Unknown),
+        ] {
+            assert_eq!(
+                state_of(mock_thread("t", status, "now")),
+                expected,
+                "{status}"
+            );
+        }
+        // activityRunStatus は、最新 run の status より優先する(wake で続きの仕事をしている)。
+        let mut woke = mock_thread("t", "completed", "now");
+        woke["activityRunStatus"] = Value::String("running".into());
+        assert_eq!(state_of(woke), AgentState::Running);
+    }
+
+    #[test]
+    fn background_work_holds_completion_except_commands_and_failures() {
+        let mut monitor = mock_thread("t", "completed", "now");
+        monitor["pendingBackgroundTasks"] = serde_json::json!([{"taskId":"m1","kind":"monitor"}]);
+        let parsed = parse_shell(&shell(vec![monitor.clone()], 1)).unwrap();
+        assert_eq!(parsed.entries[0].state, AgentState::Monitoring);
+        assert_eq!(parsed.entries[0].background_tasks, 1);
+
+        let mut command = mock_thread("t", "completed", "now");
+        command["pendingBackgroundTasks"] = serde_json::json!([{"taskId":"c1","kind":"command"}]);
+        assert_eq!(state_of(command), AgentState::Completed);
+
+        monitor["status"] = Value::String("failed".into());
+        assert_eq!(state_of(monitor), AgentState::Error);
+    }
+
+    #[test]
+    fn usage_limit_error_shows_reset_time() {
+        let mut limited = mock_thread("t", "failed", "now");
+        limited["lastError"] = Value::String("rate limited".into());
+        limited["lastErrorClass"] = Value::String("usage_limit".into());
+        limited["usageLimitResetAt"] = Value::String("2026-10-16T09:00:00.000Z".into());
+        let e = &parse_shell(&shell(vec![limited], 1)).unwrap().entries[0];
+        assert_eq!(e.state, AgentState::Error);
         assert_eq!(
-            parse_shell(&shell(vec![approval], 43)).unwrap().entries[0].state,
-            AgentState::Approval
+            e.error_summary.as_deref(),
+            Some("利用上限 · 2026-10-16T09:00:00.000Z に再開")
+        );
+
+        let mut failed = mock_thread("t", "failed", "now");
+        failed["lastError"] = Value::String("boom\n".into());
+        assert_eq!(
+            parse_shell(&shell(vec![failed], 1)).unwrap().entries[0]
+                .error_summary
+                .as_deref(),
+            Some("boom")
         );
     }
 
@@ -1034,9 +1160,7 @@ mod tests {
             )
             .is_empty()
         );
-        let mut completed = mock_thread("t1", "ready", "c");
-        completed["latestTurn"]["state"] = Value::String("completed".into());
-        let third = parse_shell(&shell(vec![completed], 3)).unwrap();
+        let third = parse_shell(&shell(vec![mock_thread("t1", "completed", "c")], 3)).unwrap();
         assert_eq!(
             diff(
                 &first.entries,
@@ -1050,15 +1174,15 @@ mod tests {
     }
 
     #[test]
-    fn active_turn_change_is_reported_even_when_running_state_is_unchanged() {
+    fn new_run_is_reported_even_when_running_state_is_unchanged() {
         let a = AgentEntry {
             thread_id: "t".into(),
             state: AgentState::Running,
-            active_turn_id: Some("turn-a".into()),
+            active_run_id: Some("run-a".into()),
             ..AgentEntry::default()
         };
         let mut b = a.clone();
-        b.active_turn_id = Some("turn-b".into());
+        b.active_run_id = Some("run-b".into());
         let mut cursor = 0;
         let changes = diff(
             std::slice::from_ref(&a),
@@ -1071,18 +1195,57 @@ mod tests {
     }
 
     #[test]
-    fn archived_and_old_settled_threads_are_filtered_but_attention_items_remain() {
+    fn goal_change_is_its_own_change_kind() {
+        let a = AgentEntry {
+            thread_id: "t".into(),
+            state: AgentState::Running,
+            goal: Some("前".into()),
+            ..AgentEntry::default()
+        };
+        let mut b = a.clone();
+        b.goal = Some("後".into());
+        let mut cursor = 0;
+        let changes = diff(
+            std::slice::from_ref(&a),
+            &[b],
+            &mut cursor,
+            SystemTime::now(),
+        );
+        assert_eq!(changes[0].kind, AgentChangeKind::Goal);
+        assert_eq!(changes[0].before_goal.as_deref(), Some("前"));
+        assert_eq!(changes[0].after_goal.as_deref(), Some("後"));
+    }
+
+    #[test]
+    fn archived_settled_and_old_threads_are_filtered_but_attention_items_remain() {
         let now = SystemTime::now();
         let recent = DateTime::<Utc>::from(now).to_rfc3339();
         let old = DateTime::<Utc>::from(now - Duration::from_secs(48 * 3600)).to_rfc3339();
         let mut archived = mock_thread("archived", "running", &recent);
         archived["archivedAt"] = Value::String(recent.clone());
-        let mut old_running = mock_thread("running", "running", &old);
-        old_running["session"]["activeTurnId"] = Value::String("turn-1".into());
+        let old_running = mock_thread("running", "running", &old);
         let old_idle = mock_thread("idle-old", "idle", &old);
         let recent_idle = mock_thread("idle-recent", "idle", &recent);
+        let old_failed = mock_thread("failed-old", "failed", &old);
+        let mut old_failed_settled = mock_thread("failed-settled", "failed", &old);
+        old_failed_settled["settledOverride"] = Value::String("settled".into());
+        // settledAt だけ残っていても、settledOverride が settled でなければ片付け済みではない。
+        let mut old_failed_reopened = mock_thread("failed-reopened", "failed", &old);
+        old_failed_reopened["settledAt"] = Value::String(old.clone());
+        old_failed_reopened["settledOverride"] = Value::String("active".into());
         let parsed = parse_shell_recent(
-            &shell(vec![archived, old_running, old_idle, recent_idle], 1),
+            &shell(
+                vec![
+                    archived,
+                    old_running,
+                    old_idle,
+                    recent_idle,
+                    old_failed,
+                    old_failed_settled,
+                    old_failed_reopened,
+                ],
+                1,
+            ),
             24,
             now,
         )
@@ -1092,28 +1255,31 @@ mod tests {
             .iter()
             .map(|e| e.thread_id.as_str())
             .collect();
-        assert_eq!(ids, ["idle-recent", "running"]);
+        assert_eq!(
+            ids,
+            ["failed-old", "failed-reopened", "idle-recent", "running"]
+        );
     }
 
     #[test]
-    fn malformed_ids_and_unknown_enums_are_not_silently_accepted() {
+    fn malformed_ids_and_v1_shapes_are_not_silently_accepted() {
         let duplicate = mock_thread("same", "running", "now");
         assert!(parse_shell(&shell(vec![duplicate.clone(), duplicate], 1)).is_err());
-        let mut unknown = mock_thread("unknown", "mystery", "now");
-        unknown["latestTurn"]["state"] = Value::String("completed".into());
-        assert_eq!(
-            parse_shell(&shell(vec![unknown], 1)).unwrap().entries[0].state,
-            AgentState::Unknown
-        );
-        assert!(parse_progress(&serde_json::json!({})).is_none());
-        assert!(parse_progress(&Value::Null).is_none());
-        assert!(parse_progress(&serde_json::json!({"completedSteps":3,"totalSteps":0})).is_none());
+        // V1 の thread(session・latestTurn だけで status が無い)は受け付けない。
+        let v1 = serde_json::json!({
+            "id":"v1", "projectId":"p1", "title":"Thread",
+            "session":{"status":"running"}, "latestTurn":{"id":"turn-1","state":"running"}
+        });
+        assert!(parse_shell(&shell(vec![v1], 1)).is_err());
         let mut malformed = mock_thread("bad", "running", "now");
-        malformed["session"] = Value::String("partial parse".into());
+        malformed["pendingRuntimeRequest"] = Value::String("partial parse".into());
         assert!(parse_shell(&shell(vec![malformed], 1)).is_err());
         let mut malformed_flag = mock_thread("bad-flag", "running", "now");
-        malformed_flag["hasPendingApprovals"] = Value::String("false".into());
+        malformed_flag["hasActionableProposedPlan"] = Value::String("false".into());
         assert!(parse_shell(&shell(vec![malformed_flag], 1)).is_err());
+        let mut malformed_tasks = mock_thread("bad-tasks", "running", "now");
+        malformed_tasks["pendingBackgroundTasks"] = serde_json::json!([{"taskId":"x"}]);
+        assert!(parse_shell(&shell(vec![malformed_tasks], 1)).is_err());
     }
 
     #[test]
@@ -1131,7 +1297,7 @@ mod tests {
         assert!(shared.read().unwrap().changes.is_empty());
         let remote = parse_shell(&shell(
             vec![
-                mock_thread("t1", "ready", "b"),
+                mock_thread("t1", "completed", "b"),
                 mock_thread("t2", "idle", "b"),
             ],
             2,
@@ -1154,6 +1320,7 @@ mod tests {
             let n = stream.read(&mut buf).unwrap();
             let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
             assert!(request.contains("authorization: bearer mock-token"));
+            assert!(request.contains("x-t3-orchestration-protocol: 2"));
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", server_body.len(), server_body).unwrap();
         });
         let agent = ureq::Agent::config_builder()
@@ -1185,7 +1352,7 @@ mod tests {
             let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
             assert!(request.starts_with("get /.well-known/t3/environment "));
             assert!(!request.contains("authorization:"));
-            let body = r#"{"environmentId":"env-a","label":"T3 host","serverVersion":"0.0.45","orchestrationProtocolVersion":1}"#;
+            let body = r#"{"environmentId":"env-a","label":"T3 host","serverVersion":"0.1.0","orchestrationProtocolVersion":2}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1207,7 +1374,7 @@ mod tests {
         .unwrap();
         assert_eq!(environment.environment_id.as_deref(), Some("env-a"));
         assert_eq!(environment.environment_label.as_deref(), Some("T3 host"));
-        assert_eq!(environment.protocol_version, Some(1));
+        assert_eq!(environment.protocol_version, Some(2));
         server.join().unwrap();
     }
 

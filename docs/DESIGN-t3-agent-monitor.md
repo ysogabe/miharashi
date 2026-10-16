@@ -4,6 +4,10 @@
 実装と検証の記録は [T3 Agent カードボード — 実装・検証記録](poc/T3-AGENTS.md) を参照。
 基準: miharashi `4267f7c`、起動中の T3 Code **0.0.45 / orchestration protocol 1**。
 
+> **2026-10-16 更新: T3 v0.1.0(Orchestrator V2、orchestration protocol 2)専用に作り直した。**
+> protocol 1 のサーバーには対応しない。V2 で変わった契約は §2.3 にまとめ、§5・§7・§8 は V2 の値に書き換えた。
+> §2.1・§2.2 は 0.0.45 を調べたときの記録として残す。
+
 ## 1. 目的と提案
 
 T3 で動かしている作業について「何が実行中か」「自分の応答が必要か」「エラーが出たか」を、
@@ -60,6 +64,31 @@ miharashi の常設モニターで把握できるようにする。
 
 `latestTurn.completed` は **直近の応答が終わったこと**で、作業全体や PR の完了を保証しない。
 `session.ready` も作業完了とはみなさない。
+
+### 2.3 T3 v0.1.0(V2)で変わった契約
+
+github.com/pingdotgg/t3code@v0.1.0 のソースと、実サーバーの応答(2026-10-16、18 threads)で確認した。
+
+| 項目 | V2 での契約 |
+|---|---|
+| descriptor | `orchestrationProtocolVersion = 2`、`serverVersion = 0.1.0` |
+| 一覧 API | `GET /api/orchestration/shell` に **`x-t3-orchestration-protocol: 2` ヘッダーが必須**。無いと 400(`packages/contracts/src/environmentHttp.ts:81,616`) |
+| 応答 | `schemaVersion`、`snapshotSequence`、`threads`、`archivedThreads`、`projects` |
+| thread | `session`・`latestTurn`・`hasPendingApprovals`・`hasPendingUserInput`・`backgroundLiveness`・`planProgress` は無くなった |
+
+V2 の thread(`OrchestrationV2ThreadShell`、`packages/contracts/src/orchestrationV2.ts`)のうち、miharashi が読む項目:
+
+- `status`: `idle`(run が無い)、または最新 run の状態 `preparing / queued / starting / running / waiting / completed / interrupted / failed / cancelled / rolled_back`。
+- `activityRunStatus`: 活動中の run の状態(`preparing / starting / running / waiting`)。wake で続きの仕事をしているときは `status` より新しい。
+- `pendingRuntimeRequest`: 待っている要求(`kind` は `command / file-read / file-change / mcp-elicitation / permission / dynamic_tool_call / user_input / auth_refresh`)。
+- `hasActionableProposedPlan`、`pendingBackgroundTasks`(`kind` は `subagent / command / monitor / background_task`)。
+- `providerInstanceId`、`modelSelection`、`latestRunId`、`activeRunId`、`latestRunRequestedAt / StartedAt / CompletedAt`。
+- `lastError`、`lastErrorClass`(`usage_limit` など)、`usageLimitResetAt`、`goal`(provider の目標。`objective` と `status`)。
+- `archivedAt`、`settledOverride`(`settled` なら片付け済み。T3 のサーバー・client と同じく `settledAt` では判定しない)。
+- トップレベルの `schemaVersion` はサーバー内部の保存形式の版(v0.1.0 で 2)で、通信の形とは別に上がる。T3 の client も確かめないので、miharashi も見ない。
+
+`delegate_task` で作られた子エージェントは、それぞれ独立した thread として一覧に出る(`lineage.relationshipToParent = subagent`)。
+miharashi は親とまとめず、1 枚のカードとして扱う。
 
 ## 3. 初期実装の範囲
 
@@ -197,25 +226,33 @@ T3 の `updatedAt` の新しい順。初期案の「活動度でカードの大�
 T3 の値を表示用 `AgentState` に変換する。上から最初に一致した条件を主状態とする。
 承認・入力・計画のフラグは同時に立ちうるため、主状態以外もカードの補助バッジで示す。
 
+T3 v0.1.0 の client(`packages/client-runtime/src/state/models.ts` の `presentThreadShell`・`shellRuntime`)と同じ優先順にしている。
+下の「run の状態」は `activityRunStatus`、それが無ければ `status`。
+
 | 条件 | 表示 | 集計 |
 |---|---|---|
-| `hasPendingApprovals` | 承認待ち | 承認待ち |
-| `hasPendingUserInput` | 入力待ち | 入力・計画待ち |
-| `hasActionableProposedPlan` | 計画の確認待ち | 入力・計画待ち |
-| `session.status == error`、または直近 turn が error で、それより新しい active turn がない | 異常 | 異常 |
-| `session.status == starting` | 起動中 | 実行中 |
-| `backgroundLiveness == monitoring` | 監視中 | 実行中 |
-| `session.status == running`、active turn がある、または `backgroundLiveness == working` | 実行中 | 実行中 |
-| `session.status == interrupted / stopped` | 中断 / 停止 | その他 |
-| `latestTurn.state == interrupted` | 中断 | その他 |
-| `latestTurn.state == completed` | 応答完了 | 応答完了 |
-| `session.status == idle / ready` | 待機 | その他 |
-| セッションなし・未知の値・矛盾する情報 | 未開始 / 不明 | その他 |
+| `pendingRuntimeRequest.kind` が `user_input` / `auth_refresh` | 入力待ち | 入力・計画待ち |
+| `pendingRuntimeRequest` がそれ以外 | 承認待ち | 承認待ち |
+| `hasActionableProposedPlan`(`activityRunStatus` が無いとき) | 計画の確認待ち | 入力・計画待ち |
+| `pendingBackgroundTasks` に command 以外があり、`status != failed` | 監視中 | 実行中 |
+| run の状態が `preparing / queued / starting` | 起動中 | 実行中 |
+| run の状態が `running` | 実行中 | 実行中 |
+| run の状態が `waiting`(run の中で subagent・monitor を待つ) | 監視中 | 実行中 |
+| run の状態が `failed` | 異常 | 異常 |
+| run の状態が `interrupted` | 中断 | その他 |
+| run の状態が `cancelled / rolled_back` | 停止 | その他 |
+| run の状態が `completed` | 応答完了 | 応答完了 |
+| `status == idle` | 待機 | その他 |
+| 未知の値 | 不明 | その他 |
 
-異常の判定は active turn ID と latest turn ID も照合する。前回の失敗のあとに新しい turn が始まっていれば、
-過去の error で新しい実行を上書きしない。`lastError` という文字列が残っているだけでも異常とは判定しない。
-内部には raw status も保持する。未知の列挙値は正常や停止へ丸めず「不明」にする。
-「監視中」はフリーズの推測ではなく、取得元の明示値に限る。
+- `auth_refresh` は、T3 の client では承認にも入力にも数えない。手元で認証し直すまで進まないので、miharashi は入力待ちにし、詳細を「手元の T3 で認証」にする。
+- 計画を受け入れて run が動き出したあとは、`hasActionableProposedPlan` が残っていても実行中にする。
+- command だけのバックグラウンドの作業は、T3 と同じく完了を引き留めない(dev server など、誰も結果を待っていないことが多い)。
+- `lastError` は thread に残り続けるので、それだけでは異常と判定しない。エラー文は異常(`failed`)のカードにだけ出し、変化の通知も異常のときだけにする。
+  `lastErrorClass == usage_limit` のときは、詳細に「利用上限 · 〈再開時刻〉 に再開」を出す。
+- 片付け済み(`settledOverride == settled`)の失敗は、ほかの終わった thread と同じく、最近 24 時間だけ出す。
+- 「実行再開」の通知は、新しい run が始まったとき(`latestRunId`・`activeRunId` が変わったとき)だけ出す。`preparing → queued → starting` のような同じ状態の中の移り変わりでは出さない。
+- 内部には raw status も保持する。未知の列挙値は正常や停止へ丸めず「不明」にする。
 
 ## 6. データフロー
 
@@ -310,8 +347,8 @@ HTTP 方式では毎回完全な snapshot を受け取り、消えたカード�
 | 内部データ | 主な項目 |
 |---|---|
 | `AgentSnapshot` | environment ID / label、server version、sequence、`Arc<[AgentEntry]>`、上限付き変更記録、接続状態、最終成功の wall clock と `Instant`、取得エラー種別 |
-| `AgentEntry` | thread / project ID、project / thread 名、provider、model、正規化状態と raw status、待ちフラグ、step 進捗、branch、時刻、エラー要約 |
-| `AgentChange` | ローカル変更 ID、thread ID、種類、前後の状態と進捗、観測時刻。初回・再同期と通常更新を区別 |
+| `AgentEntry` | thread / project ID、project / thread 名、provider、model、正規化状態と raw status、待ちフラグ、バックグラウンドの作業の数、run ID、目標、branch、時刻、エラー要約 |
+| `AgentChange` | ローカル変更 ID、thread ID、種類、前後の状態と目標、観測時刻。初回・再同期と通常更新を区別 |
 | `AgentScreen` | カードの帰る場所、活動度の基準時刻、処理済み変更 ID、自動巡回、中央表示の待ち行列・段階・開始時刻 |
 | `AgentsView` | 凡例兼件数、カード面、各位置・大きさ・不透明度、中央に出す変更内容、取得状態の帯 |
 
@@ -320,24 +357,25 @@ HTTP 方式では毎回完全な snapshot を受け取り、消えたカード�
 | 環境名 / version | environment descriptor | 設定の接続先を表示 |
 | プロジェクト名 | `projects[].title` を `thread.projectId` で結合 | project ID の短縮形 |
 | 作業名 | `thread.title` | 無題 |
-| provider | `session.providerName`、なければ `modelSelection.instanceId` | `--`。instance ID を正式な製品名と決めつけない |
+| provider | `thread.providerInstanceId`、なければ `modelSelection.instanceId`。既定の instance(`claudeAgent`・`codex` など)は Claude・Codex などの名前にし、利用者が足した instance は ID のまま | `--` |
 | モデル | `thread.modelSelection.model` | 表示を省く。現在の選択値であり、実行時の使用モデルとは限らない |
 | 状態 / 待ち理由 | §5 の値 | 不明 |
-| 進捗 | `planProgress.step / completedSteps / totalSteps` | 進捗情報なし。擬似的な % は作らない |
-| 実行経過 | active turn と一致する `latestTurn.startedAt`、なければ `requestedAt` | `--` |
+| 目標 | `goal.objective`(`goal.status != complete` のとき) | 出さない。V2 の一覧には step 数が無いので、進捗バーは出さない |
+| 実行経過 | `latestRunStartedAt`、なければ `latestRunRequestedAt` | `--` |
 | 最終変更 | `thread.updatedAt` | `--` |
-| 応答終了 | `latestTurn.completedAt` | `--` |
-| エラー補足 | `session.lastError` | エラー詳細なし。中央の変更表示で短い要約を使う |
-| 新着・変更の表示 | 前回成功時との差、`createdAt`、状態・待ちフラグ・進捗等 | 未観測の途中経過を推測しない |
+| 応答終了 | `latestRunCompletedAt` | `--` |
+| エラー補足 | `lastError`(`lastErrorClass == usage_limit` なら `usageLimitResetAt`) | エラー詳細なし。中央の変更表示で短い要約を使う |
+| 新着・変更の表示 | 前回成功時との差、状態・待ちフラグ・run ID・目標等 | 未観測の途中経過を推測しない |
 
 branch / worktree は初期画面に出さない。中央ポップアップも同じ shell データで構成し、会話の要約を生成しない。
 
-進捗の全 step 数が 0、範囲が矛盾、時刻が未来の場合はバーや経過時間を `--` にし、異常な数値を描画しない。
+時刻が未来の場合は経過時間を `--` にし、異常な数値を描画しない。
 受信文字列は制御文字を除き、表示枠に合わせて省略する。会話本文・添付・承認 payload は取得しない。
 
 ## 8. 接続・認証・設定
 
 一覧 API は認証が必要。v0.0.45 の `t3 auth session issue` はscope指定に対応せず、発行tokenは `orchestration:operate` など更新系を含む広い権限を持つ。そこで、ペアリング用トークンを `POST /oauth/token` で `orchestration:read` だけのトークンに交換し、週 1 回作り直す([トークンの更新](DESIGN-t3-token.md))。Bearer tokenは `GET /api/orchestration/shell` にだけ使い、表示用の環境情報は認証なしの `GET /.well-known/t3/environment` で取得する。更新系APIは呼び出さない。
+一覧の取得には `x-t3-orchestration-protocol: 2` ヘッダーを付ける。v0.1.0 の `t3 auth session issue` は `--scope` を受け付けるようになったが、トークンの作り方は変えていない([トークンの更新](DESIGN-t3-token.md) §5)。
 
 ```toml
 [agents]
@@ -354,7 +392,7 @@ recent_hours = 24
 - 平文 HTTP は既存の HA 連携と同様、明示した IP / localhost に限定する。現在の LAN 宛て HTTP は暗号化されないため、
   信頼できる LAN 内の接続として扱う。外部へ接続する場合は HTTPS を使う。
 - Authorization 付きの他ホストへの redirect は追わない。認証エラー本文・URL の query に秘密を残さない。
-- descriptor は起動時と再接続時に確認する。0.0.45 を互換性検証の基準とし、更新時は契約を再確認する。
+- descriptor は起動時と再接続時に確認し、`orchestrationProtocolVersion` が 2 でなければ「T3 API を確認してください」を出して取得しない。v0.1.0 を互換性検証の基準とし、更新時は契約を再確認する。
 
 ## 9. 取得方式の比較
 
@@ -419,5 +457,9 @@ WS に移す場合は初期 snapshot と `thread/project-upserted`、`thread/pro
 - T3 **0.0.45 配布物**: `~/.t3/runtime/versions/0.0.45/client/assets/utils-OGVAI8-o.js`。
   HTTP `shellSnapshot` 定義、shell / thread / session / latestTurn スキーマ、認証 scope / token exchange 契約。
 - 同配布物 `atomRegistry-9jUeosI9.js`: protocol version 検査、WS ticket 発行と接続。
+
+- V2 対応(2026-10-16): github.com/pingdotgg/t3code@v0.1.0 の `packages/contracts/src/orchestrationV2.ts`(`OrchestrationV2ThreadShell`)、
+  `packages/contracts/src/environmentHttp.ts`(protocol ヘッダー)、`packages/client-runtime/src/state/models.ts`(状態の決め方)、
+  `packages/shared/src/orchestrationV2PendingBackgroundWork.ts`(完了を引き留める作業の種類)。
 
 参照したのは稼働バージョンの配布物で、upstream HEAD や公開 API の将来の互換性を保証するものではない。

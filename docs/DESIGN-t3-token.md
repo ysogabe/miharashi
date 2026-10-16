@@ -6,6 +6,10 @@ T3 Agent 画面(`agents`、[概要設計](DESIGN-t3-agent-monitor.md))は、T3 �
 調べたのは T3 Code **v0.0.45**(github.com/pingdotgg/t3code のタグ `v0.0.45`)のソース。v0.0.46 の preview でも、
 下の「延長・refresh の仕組みが無い」点は変わっていない。T3 を上げたときは §5 を見直す。
 
+**2026-10-16: T3 v0.1.0(V2)で確かめた。** bearer の既定の期限は 30 日のまま(`apps/server/src/auth/SessionStore.ts` の `DEFAULT_SESSION_TTL`)で、
+延長や refresh の仕組みも無い。ペアリング用トークンの交換もそのまま動く(実機でスクリプトを流し、`orchestration:read` だけのトークンができることを確認)。
+変わったのは、一覧 API に `x-t3-orchestration-protocol: 2` ヘッダーが必須になったことで、スクリプトの確認(手順 3)に付けた。
+
 ## 1. T3 の認証の仕組み(v0.0.45)
 
 ### 1.1 トークンの種類
@@ -119,3 +123,7 @@ miharashi の画面の部品の中で更新する案(部品から `t3` CLI を�
 1. `t3 auth pairing create --json` が `id` と `credential` を返すか。
 2. `POST /oauth/token` が上の項目で読み取りだけのトークンを返すか(`systemctl start miharashi-t3-token` で試せる)。
 3. セッションの延長・refresh の仕組みが入ったか。入っていれば、この仕組みをそれに置き換える。
+4. 一覧 API の protocol ヘッダーの値(`x-t3-orchestration-protocol`)が変わっていないか。変われば、スクリプトの手順 3 と miharashi の両方を直す。
+
+v0.1.0 では `t3 auth session issue --scope orchestration:read` で、読み取りだけのトークンを直接作れるようになった。
+交換の手順(§1.2)を省ける余地があるが、いまの仕組みで足りているので置き換えていない。
