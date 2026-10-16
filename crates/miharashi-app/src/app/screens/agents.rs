@@ -801,13 +801,18 @@ impl AgentScreen {
         focused: bool,
     ) -> draw::AgentCardContent {
         let state = draw_state(e.state);
-        // T3 V2 の一覧には計画の進み具合(何手中の何手目)が無いので、進捗バーは出さない。
-        let progress = None;
         let mut detail = if e.has_pending_approvals {
             "手元の T3 で承認".into()
+        } else if e.needs_reauth {
+            "手元の T3 で認証".into()
         } else if e.has_pending_user_input {
             "手元の T3 で入力".into()
-        } else if let Some(error) = &e.error_summary {
+        } else if let Some(error) = e
+            .error_summary
+            .as_ref()
+            .filter(|_| e.state == crate::agents::AgentState::Error)
+        {
+            // V2 の lastError は thread に残り続けるので、いまの run が失敗したときだけ出す。
             error.clone()
         } else if let Some(goal) = &e.goal {
             format!("目標 · {goal}")
@@ -848,7 +853,8 @@ impl AgentScreen {
                 _ => None,
             },
             age,
-            progress,
+            // T3 V2 の一覧には計画の進み具合(何手中の何手目)が無いので、進捗バーは出さない。
+            progress: None,
             badge: None,
             compact,
         }

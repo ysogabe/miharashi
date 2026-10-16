@@ -77,6 +77,8 @@ pub struct AgentEntry {
     pub raw_activity_status: Option<String>,
     pub has_pending_approvals: bool,
     pub has_pending_user_input: bool,
+    /// 入力待ちのうち、T3 が provider の認証のし直しを待っている(auth_refresh)。
+    pub needs_reauth: bool,
     pub has_actionable_proposed_plan: bool,
     /// 完了を引き留めるバックグラウンドの仕事(subagent・monitor・background_task)の数。
     pub background_tasks: usize,
@@ -495,6 +497,8 @@ fn parse_shell_recent(
         .get("projects")
         .and_then(Value::as_array)
         .ok_or("projects が配列ではありません")?;
+    // schemaVersion はサーバー内部の保存形式の版で(v0.1.0 で 2)、通信の形とは別に上がる。
+    // T3 の client も確かめていないので、ここでも見ない。通信の形は protocol ヘッダーで決まる。
     let threads = obj
         .get("threads")
         .and_then(Value::as_array)
@@ -545,8 +549,8 @@ fn parse_shell_recent(
             background_tasks > 0,
         );
         let archived = thread.get("archivedAt").is_some_and(|v| !v.is_null());
-        let settled = thread.get("settledAt").is_some_and(|v| !v.is_null())
-            && field_str(thread, "settledOverride") != Some("active");
+        // T3 のサーバー・client と同じく、settledOverride だけで片付け済みかを決める。
+        let settled = field_str(thread, "settledOverride") == Some("settled");
         let updated = field_str(thread, "updatedAt");
         if archived || !is_target(state, settled, updated, recent_hours, now) {
             continue;
@@ -570,15 +574,14 @@ fn parse_shell_recent(
                 |v| nonempty(sanitize(v, ENTRY_TEXT_LIMIT), "無題"),
             ),
             provider: field_str(thread, "providerInstanceId")
-                .map(str::to_owned)
-                .or_else(|| nested_str(selection, "instanceId"))
-                .map(|s| provider_label(&sanitize(&s, 128))),
+                .map(|s| provider_label(&sanitize(s, 128))),
             model: nested_str(selection, "model").map(|s| sanitize(&s, 128)),
             state,
             raw_status: raw_status.map(|s| sanitize(s, 64)),
             raw_activity_status: raw_activity_status.map(|s| sanitize(s, 64)),
             has_pending_approvals: state == AgentState::Approval,
             has_pending_user_input: state == AgentState::Input,
+            needs_reauth: request.and_then(|r| field_str(r, "kind")) == Some("auth_refresh"),
             has_actionable_proposed_plan: plan,
             background_tasks,
             active_run_id: field_str(thread, "activeRunId").map(|s| sanitize(s, 256)),
@@ -680,13 +683,14 @@ fn validate_thread(thread: &Value) -> Result<(), String> {
     if !thread.is_object() {
         return Err("thread item が object ではありません".into());
     }
-    if !thread.get("status").is_some_and(Value::is_string) {
-        return Err("thread.status が文字列ではありません".into());
+    for key in ["status", "providerInstanceId"] {
+        if !thread.get(key).is_some_and(Value::is_string) {
+            return Err(format!("thread.{key} が文字列ではありません"));
+        }
     }
     for key in [
         "title",
         "projectId",
-        "providerInstanceId",
         "branch",
         "worktreePath",
         "updatedAt",
@@ -769,7 +773,8 @@ fn normalize_state(
         Some(_) => return AgentState::Approval,
         None => {}
     }
-    if plan {
+    // 計画を受け入れて run が動き出したら、旗が残っていても実行中として扱う。
+    if plan && activity.is_none() {
         return AgentState::Plan;
     }
     if holds_background && status != Some("failed") {
@@ -821,13 +826,13 @@ fn diff(
             } else {
                 AgentChangeKind::State
             })
-        } else if previous.error_summary != entry.error_summary {
+        } else if entry.state == AgentState::Error && previous.error_summary != entry.error_summary
+        {
             Some(AgentChangeKind::Error)
         } else if previous.active_run_id != entry.active_run_id
             || previous.latest_run_id != entry.latest_run_id
-            || previous.raw_status != entry.raw_status
-            || previous.raw_activity_status != entry.raw_activity_status
         {
+            // 新しい run が始まった。preparing → queued → starting のような同じ状態の中の移り変わりは知らせない。
             Some(AgentChangeKind::Resumed)
         } else if previous.has_pending_approvals != entry.has_pending_approvals
             || previous.has_pending_user_input != entry.has_pending_user_input
@@ -966,7 +971,7 @@ mod tests {
 
     fn shell(threads: Vec<Value>, sequence: u64) -> Value {
         serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "snapshotSequence": sequence,
             "projects":[{"id":"p1", "title":"Project"}], "threads":threads,
             "archivedThreads":[]
@@ -1036,9 +1041,40 @@ mod tests {
             assert_eq!(state_of(input), AgentState::Input, "{kind}");
         }
 
+        let mut reauth = mock_thread("t1", "waiting", "today");
+        reauth["pendingRuntimeRequest"] =
+            serde_json::json!({"id":"r1","kind":"auth_refresh","createdAt":"2026-10-15T00:00:00Z"});
+        assert!(parse_shell(&shell(vec![reauth], 1)).unwrap().entries[0].needs_reauth);
+
         let mut plan = mock_thread("t1", "completed", "today");
         plan["hasActionableProposedPlan"] = Value::Bool(true);
         assert_eq!(state_of(plan), AgentState::Plan);
+        // 計画を受け入れて run が動き出したら、旗が残っていても実行中。
+        let mut accepted = mock_thread("t1", "running", "today");
+        accepted["hasActionableProposedPlan"] = Value::Bool(true);
+        assert_eq!(state_of(accepted), AgentState::Running);
+    }
+
+    #[test]
+    fn missing_provider_is_rejected() {
+        let mut no_provider = mock_thread("t", "running", "now");
+        no_provider["providerInstanceId"] = Value::Null;
+        assert!(parse_shell(&shell(vec![no_provider], 1)).is_err());
+    }
+
+    #[test]
+    fn steps_inside_one_state_and_stale_errors_are_not_reported() {
+        let parse = |thread: Value| parse_shell(&shell(vec![thread], 1)).unwrap().entries;
+        let mut cursor = 0;
+        // preparing → starting は同じ「起動中」で、同じ run なので知らせない。
+        let preparing = parse(mock_thread("t", "preparing", "now"));
+        let starting = parse(mock_thread("t", "starting", "now"));
+        assert!(diff(&preparing, &starting, &mut cursor, SystemTime::now()).is_empty());
+        // 終わった thread の lastError が消えても、異常として知らせない。
+        let mut with_error = mock_thread("t", "completed", "now");
+        with_error["lastError"] = Value::String("old".into());
+        let cleared = parse(mock_thread("t", "completed", "now"));
+        assert!(diff(&parse(with_error), &cleared, &mut cursor, SystemTime::now()).is_empty());
     }
 
     #[test]
@@ -1192,7 +1228,8 @@ mod tests {
         let recent_idle = mock_thread("idle-recent", "idle", &recent);
         let old_failed = mock_thread("failed-old", "failed", &old);
         let mut old_failed_settled = mock_thread("failed-settled", "failed", &old);
-        old_failed_settled["settledAt"] = Value::String(old.clone());
+        old_failed_settled["settledOverride"] = Value::String("settled".into());
+        // settledAt だけ残っていても、settledOverride が settled でなければ片付け済みではない。
         let mut old_failed_reopened = mock_thread("failed-reopened", "failed", &old);
         old_failed_reopened["settledAt"] = Value::String(old.clone());
         old_failed_reopened["settledOverride"] = Value::String("active".into());

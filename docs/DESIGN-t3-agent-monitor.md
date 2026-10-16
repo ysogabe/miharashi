@@ -84,7 +84,8 @@ V2 の thread(`OrchestrationV2ThreadShell`、`packages/contracts/src/orchestrati
 - `hasActionableProposedPlan`、`pendingBackgroundTasks`(`kind` は `subagent / command / monitor / background_task`)。
 - `providerInstanceId`、`modelSelection`、`latestRunId`、`activeRunId`、`latestRunRequestedAt / StartedAt / CompletedAt`。
 - `lastError`、`lastErrorClass`(`usage_limit` など)、`usageLimitResetAt`、`goal`(provider の目標。`objective` と `status`)。
-- `archivedAt`、`settledAt`、`settledOverride`(片付け済みかどうか)。
+- `archivedAt`、`settledOverride`(`settled` なら片付け済み。T3 のサーバー・client と同じく `settledAt` では判定しない)。
+- トップレベルの `schemaVersion` はサーバー内部の保存形式の版(v0.1.0 で 2)で、通信の形とは別に上がる。T3 の client も確かめないので、miharashi も見ない。
 
 `delegate_task` で作られた子エージェントは、それぞれ独立した thread として一覧に出る(`lineage.relationshipToParent = subagent`)。
 miharashi は親とまとめず、1 枚のカードとして扱う。
@@ -232,7 +233,7 @@ T3 v0.1.0 の client(`packages/client-runtime/src/state/models.ts` の `presentT
 |---|---|---|
 | `pendingRuntimeRequest.kind` が `user_input` / `auth_refresh` | 入力待ち | 入力・計画待ち |
 | `pendingRuntimeRequest` がそれ以外 | 承認待ち | 承認待ち |
-| `hasActionableProposedPlan` | 計画の確認待ち | 入力・計画待ち |
+| `hasActionableProposedPlan`(`activityRunStatus` が無いとき) | 計画の確認待ち | 入力・計画待ち |
 | `pendingBackgroundTasks` に command 以外があり、`status != failed` | 監視中 | 実行中 |
 | run の状態が `preparing / queued / starting` | 起動中 | 実行中 |
 | run の状態が `running` | 実行中 | 実行中 |
@@ -244,10 +245,13 @@ T3 v0.1.0 の client(`packages/client-runtime/src/state/models.ts` の `presentT
 | `status == idle` | 待機 | その他 |
 | 未知の値 | 不明 | その他 |
 
-- `auth_refresh` は、T3 の client では承認にも入力にも数えない。手元で認証し直すまで進まないので、miharashi は入力待ちにする。
+- `auth_refresh` は、T3 の client では承認にも入力にも数えない。手元で認証し直すまで進まないので、miharashi は入力待ちにし、詳細を「手元の T3 で認証」にする。
+- 計画を受け入れて run が動き出したあとは、`hasActionableProposedPlan` が残っていても実行中にする。
 - command だけのバックグラウンドの作業は、T3 と同じく完了を引き留めない(dev server など、誰も結果を待っていないことが多い)。
-- `lastError` という文字列が残っているだけでは異常と判定しない。`lastErrorClass == usage_limit` のときは、詳細に「利用上限 · 〈再開時刻〉 に再開」を出す。
-- 片付け済み(`settledAt` があり `settledOverride != active`)の失敗は、ほかの終わった thread と同じく、最近 24 時間だけ出す。
+- `lastError` は thread に残り続けるので、それだけでは異常と判定しない。エラー文は異常(`failed`)のカードにだけ出し、変化の通知も異常のときだけにする。
+  `lastErrorClass == usage_limit` のときは、詳細に「利用上限 · 〈再開時刻〉 に再開」を出す。
+- 片付け済み(`settledOverride == settled`)の失敗は、ほかの終わった thread と同じく、最近 24 時間だけ出す。
+- 「実行再開」の通知は、新しい run が始まったとき(`latestRunId`・`activeRunId` が変わったとき)だけ出す。`preparing → queued → starting` のような同じ状態の中の移り変わりでは出さない。
 - 内部には raw status も保持する。未知の列挙値は正常や停止へ丸めず「不明」にする。
 
 ## 6. データフロー
