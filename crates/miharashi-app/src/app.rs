@@ -579,6 +579,27 @@ mod tests {
         assert_eq!(app.rotation_state(), Some("off"));
     }
 
+    /// メニューを開いたまま再開しても、メニューの間は移らない。閉じるキーで一時停止になり、
+    /// あとは操作のあとと同じく pause 秒で次の手順から戻る。
+    #[test]
+    fn turning_rotation_on_during_the_menu_does_not_move_it() {
+        let (mut app, _) = rotating(&[step("status", 10, false), step("blank", 10, false)], 60);
+        app.set_rotation(false);
+        app.on_key(KeyPress::Menu);
+        assert!(app.menu_open());
+        let mut t = Instant::now();
+        assert!(app.set_rotation(true));
+        assert_eq!(
+            run_for(&mut app, &mut t, 30),
+            "status",
+            "メニュー中は移らない"
+        );
+        app.on_key(KeyPress::Menu);
+        assert!(!app.menu_open());
+        // メニューを閉じるキーで一時停止になる(on のときのキーと同じ)
+        assert_eq!(app.rotation_state(), Some("paused"));
+    }
+
     /// 巡回が無効なら、操作パネルから止める・再開するは何もしない。
     #[test]
     fn set_rotation_does_nothing_without_rotation() {
