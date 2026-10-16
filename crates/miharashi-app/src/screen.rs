@@ -179,7 +179,7 @@ pub trait App {
     }
     /// 自動巡回を再開する(`on`)・止めたままにする(`!on`)(操作パネルの `POST /api/v1/rotation`)。
     /// 戻り値: 再描画が必要か(パネルへ送り直す)。
-    fn set_rotation(&mut self, _on: bool, _now: Instant) -> bool {
+    fn set_rotation(&mut self, _on: bool) -> bool {
         false
     }
     /// 操作パネルの `/api/v1/status` に出す画面の状態。出さない画面ロジックは None。
@@ -241,7 +241,9 @@ pub struct PanelView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelRotation {
     On,
-    Paused { until: Instant },
+    Paused {
+        until: Instant,
+    },
     /// 操作パネルから止めたまま(`POST /api/v1/rotation`)。時間では戻らない
     Off,
 }

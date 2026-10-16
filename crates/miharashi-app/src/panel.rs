@@ -6,6 +6,8 @@
 //!
 //! キーは `prev` / `next` / `select` / `up` / `down` / `menu`(テンキーの 4 / 6 / 5 / 8 / 2 / 0)。
 //! `POST /api/v1/screen` で画面を直接選べる(P3、#5 の S2)。
+//! `POST /api/v1/rotation` で自動巡回を止めたままにする・再開する(#57)。`/status` の
+//! `rotation.control` はこれを受け付けるか(巡回が有効なら常に true)。
 //!
 //! モニターの消灯・点灯(`POST /api/v1/display`)は、HA の手動オーバーライド(input_select)を書き換える。
 //! キオスクの中だけで切り替えると HA の画面と食い違うので、実際の切り替えは `DisplayControl` に任せる。
@@ -207,14 +209,16 @@ impl Shared {
 }
 
 /// `/status` の `rotation`。戻るまでの残り秒数は切り上げ(過ぎていて、まだ戻していなければ 0)。
+/// `control` は `POST /api/v1/rotation` を受け付けるか。巡回が有効なら(= ここに来るなら)常に true。
+/// これが無い古いキオスクでは、パネルは止める・再開するボタンを灰色にする。
 fn rotation_json(r: PanelRotation, now: Instant) -> Value {
     match r {
-        PanelRotation::On => json!({ "state": "on", "resume_in_s": null }),
-        PanelRotation::Off => json!({ "state": "off", "resume_in_s": null }),
+        PanelRotation::On => json!({ "state": "on", "resume_in_s": null, "control": true }),
+        PanelRotation::Off => json!({ "state": "off", "resume_in_s": null, "control": true }),
         PanelRotation::Paused { until } => {
             let left = until.saturating_duration_since(now);
             let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
-            json!({ "state": "paused", "resume_in_s": secs })
+            json!({ "state": "paused", "resume_in_s": secs, "control": true })
         }
     }
 }
@@ -417,10 +421,23 @@ fn serve(
                     }
                 }
             }
+            (Method::Post, "/api/v1/rotation") => {
+                if !rate.allow(Instant::now()) {
+                    error(429, "操作が速すぎる")
+                } else {
+                    let (mode, result) = set_rotation(&mut req, &keys, &shared);
+                    let code = result.as_ref().map_or_else(|(c, _)| *c, |_| 204);
+                    eprintln!("panel: {} rotation {mode:?} -> {code}", peer(&req));
+                    match result {
+                        Ok(()) => Response::from_data(Vec::new()).with_status_code(204),
+                        Err((code, msg)) => error(code, &msg),
+                    }
+                }
+            }
             (
                 _,
                 "/api/v1/status" | "/api/v1/events" | "/api/v1/input" | "/api/v1/screen"
-                | "/api/v1/display",
+                | "/api/v1/display" | "/api/v1/rotation",
             ) => error(405, "メソッドが違う"),
             _ => error(404, "ない"),
         };
@@ -472,6 +489,37 @@ fn set_display(
                 .into(),
         ))
     };
+    (mode, result)
+}
+
+/// `POST /api/v1/rotation` の本文を読んで、自動巡回を再開する(on)・止めたままにする(off)。
+/// 巡回していない(`[rotation] enabled = false` か、回せる画面が無い)なら 409。戻り値: (mode(ログ用), 結果)。
+fn set_rotation(
+    req: &mut Request,
+    keys: &Sender<PanelInput>,
+    shared: &Shared,
+) -> (String, Result<(), HttpError>) {
+    let mode = match read_field(req, "mode", "off") {
+        Ok(m) => m,
+        Err(e) => return ("-".into(), Err(e)),
+    };
+    let on = match mode.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => return (mode, Err((400, "mode は on / off".into()))),
+    };
+    let enabled = match &shared.state.lock().unwrap().view {
+        None => Err((503, "起動中".to_string())),
+        Some(v) if v.rotation.is_none() => Err((
+            409,
+            "巡回していない([rotation] enabled = false か、回せる画面が無い)".to_string(),
+        )),
+        Some(_) => Ok(()),
+    };
+    let result = enabled.and_then(|()| {
+        keys.send(PanelInput::Rotation(on))
+            .map_err(|_| (503, "キオスクが終了中".to_string()))
+    });
     (mode, result)
 }
 
@@ -743,13 +791,21 @@ mod tests {
         assert_eq!(rotation(&p, None), Value::Null, "巡回が無効");
         assert_eq!(
             rotation(&p, Some(PanelRotation::On)),
-            json!({"state": "on", "resume_in_s": null})
+            json!({"state": "on", "resume_in_s": null, "control": true})
         );
         let until = Instant::now() + Duration::from_secs(240);
         let v = rotation(&p, Some(PanelRotation::Paused { until }));
         assert_eq!(v["state"], "paused");
+        assert_eq!(v["control"], true);
         let left = v["resume_in_s"].as_u64().unwrap();
         assert!((1..=240).contains(&left), "{left}");
+        assert_eq!(
+            rotation(&p, Some(PanelRotation::Off)),
+            json!({"state": "off", "resume_in_s": null, "control": true}),
+            "止めたまま"
+        );
+        let v: Value = serde_json::from_str(&get(&base, "/api/v1/status", true).1).unwrap();
+        assert_eq!(v["schema_version"], 1, "項目と値を足すだけ");
     }
 
     #[test]
@@ -890,6 +946,11 @@ mod tests {
         );
         assert_eq!(get(&base, "/api/v1/nothing", true).0, 404);
         assert_eq!(get(&base, "/api/v1/input", true).0, 405);
+        assert_eq!(get(&base, "/api/v1/rotation", true).0, 405);
+        assert_eq!(
+            post_to(&base, "/api/v1/rotation", None, r#"{"mode":"off"}"#),
+            401
+        );
     }
 
     #[test]
@@ -930,6 +991,49 @@ mod tests {
         assert_eq!(screen(r#"{"id":"room"}"#), 404, "登録されていない");
         assert_eq!(screen(r#"{"key":"photo"}"#), 400);
         assert_eq!(recv_key(&p), None, "拒否したものは届かない");
+    }
+
+    #[test]
+    fn rotation_on_off_reaches_the_run_loop() {
+        let (p, base) = start(20);
+        let rotation = |body: &str| post_to(&base, "/api/v1/rotation", Some(TOKEN), body);
+        assert_eq!(rotation(r#"{"mode":"off"}"#), 503, "まだ置かれていない");
+        p.publish(Some(view(0)), DisplayStatus::default());
+        assert_eq!(rotation(r#"{"mode":"off"}"#), 409, "巡回が無効");
+        assert_eq!(recv_key(&p), None, "拒否したものは届かない");
+        p.publish(
+            Some(PanelView {
+                rotation: Some(PanelRotation::On),
+                ..view(0)
+            }),
+            DisplayStatus::default(),
+        );
+        assert_eq!(rotation(r#"{"mode":"off"}"#), 204);
+        assert_eq!(recv_key(&p), Some(PanelInput::Rotation(false)));
+        assert_eq!(rotation(r#"{"mode":"on"}"#), 204);
+        assert_eq!(recv_key(&p), Some(PanelInput::Rotation(true)));
+        assert_eq!(rotation(r#"{"mode":"paused"}"#), 400, "知らない mode");
+        assert_eq!(rotation(r#"{"mode":"Off"}"#), 400);
+        assert_eq!(rotation(r#"{"key":"off"}"#), 400, "項目が違う");
+        assert_eq!(rotation(&"x".repeat(2000)), 413);
+        assert_eq!(recv_key(&p), None, "拒否したものは届かない");
+    }
+
+    #[test]
+    fn rotation_bursts_get_429() {
+        let (p, base) = start(2);
+        p.publish(
+            Some(PanelView {
+                rotation: Some(PanelRotation::On),
+                ..view(0)
+            }),
+            DisplayStatus::default(),
+        );
+        let codes: Vec<u16> = (0..3)
+            .map(|_| post_to(&base, "/api/v1/rotation", Some(TOKEN), r#"{"mode":"off"}"#))
+            .collect();
+        assert_eq!(codes, [204, 204, 429]);
+        assert_eq!(p.inputs().count(), 2);
     }
 
     #[test]
@@ -1041,6 +1145,20 @@ mod tests {
             v["rotation"]["resume_in_s"].as_u64().unwrap() > first,
             "もう一度操作して止める時間が延びたら送る"
         );
+        let rotation = |r| PanelView {
+            rotation: Some(r),
+            ..view(1)
+        };
+        p.publish(Some(rotation(PanelRotation::On)), on);
+        assert_eq!(data()["rotation"]["state"], "on");
+        p.publish(Some(rotation(PanelRotation::Off)), on);
+        assert_eq!(
+            data()["rotation"],
+            json!({"state": "off", "resume_in_s": null, "control": true}),
+            "止めたままにしたら送る"
+        );
+        p.publish(Some(rotation(PanelRotation::On)), on);
+        assert_eq!(data()["rotation"]["state"], "on", "再開したら送る");
         assert_eq!(p.stat(), "connected");
         let _ = base;
     }

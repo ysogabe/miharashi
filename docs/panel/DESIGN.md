@@ -97,14 +97,17 @@ flowchart LR
 
 | メソッド | パス | 内容 |
 |---|---|---|
-| GET | `/api/v1/status` | `{schema_version, host, screen: {id, title, index, count}, screens: [{id, title}], photo: {position, total} \| null, feed: "online" \| "retrying", rotation: {state: "on" \| "paused", resume_in_s} \| null, menu: {index, id} \| null, keys: {prev, next, select, up, down, menu}, display: {on, mode: "auto" \| "force_on" \| "force_off" \| null, control}, uptime_s, generated_at}` |
+| GET | `/api/v1/status` | `{schema_version, host, screen: {id, title, index, count}, screens: [{id, title}], photo: {position, total} \| null, feed: "online" \| "retrying", rotation: {state: "on" \| "paused" \| "off", resume_in_s, control} \| null, menu: {index, id} \| null, keys: {prev, next, select, up, down, menu}, display: {on, mode: "auto" \| "force_on" \| "force_off" \| null, control}, uptime_s, generated_at}` |
 | POST | `/api/v1/input` | `{"key": "prev" \| "next" \| "select" \| "up" \| "down" \| "menu"}` → `204`。`quit` は受け付けない |
 | POST | `/api/v1/screen` | `{"id": "photo"}` → `204`。登録されていない id は `404` |
 | POST | `/api/v1/display` | `{"mode": "force_off" \| "force_on" \| "auto"}` → `204`。キオスクのモニターの消灯・点灯。キオスクが HA の手動オーバーライド(`screen_power.mode_entity` の input_select)を書き換え、すぐ問い合わせ直して反映する。HA と表示が食い違わないよう、キオスクの中だけでは切り替えない。mode エンティティが未設定なら `409`、HA に届かなければ `502` |
+| POST | `/api/v1/rotation` | `{"mode": "off" \| "on"}` → `204`。自動巡回を止めたままにする(`off`)・再開する(`on`)。`on` はすぐ次の手順の画面へ移る(一時停止中に送ると今すぐ再開)。今と同じ状態を送っても `204`(何もしない)。`[rotation]` が無効なら `409`、知らない `mode` や読めない本文は `400`、起動中は `503`。この操作では巡回を一時停止にせず、モニターも点けない(画面は選んでいないので、`/api/v1/display` と同じ)。モニターが消えていても反映する(#57) |
 | GET | `/api/v1/events` | SSE。画面・モニター・巡回・メニュー・キーの意味が変わるたびに `status` と同じ JSON を 1 行。接続中は 15 秒ごとに `: keepalive` |
 | GET | `/api/v1/healthz` | 認証なし。`{"ok": true}` だけ |
 
 - `rotation`: 自動巡回(DESIGN-screens.md §7.2)の状態。`[rotation]` が無効なら `null`。操作で止まっている間は `paused`、戻ると `on`(#45)。`resume_in_s` は戻るまでの残り秒数(切り上げ、0 未満にしない。`on` なら `null`)。残り秒数は `/status` を組み立てるときに戻る時刻から計算するので、SSE は止まる・戻る・もう一度の操作で止める時間が延びる、のときだけ送り、毎秒は送らない。項目を足しただけなので `schema_version` は 1 のまま。
+  - `off` は `POST /api/v1/rotation` で止めたままにしている間(`resume_in_s` は `null`)。時間がたっても戻らず、キーや `POST /api/v1/screen` で操作しても `paused` にならない(`off` のまま)。`on` を送るまで止まったまま。止めた状態は保存しないので、キオスクを再起動すると設定どおり `on` に戻る。`off` になる・`off` から戻るときにも SSE を送る(#57)。
+  - `control`: キオスクが `/api/v1/rotation` を受け付けるか。これが無い古いキオスクでは、パネルは止める・再開するボタンを灰色にする(`display.control` と同じ判定の型)。古いパネルは知らない `state`(`off`)を「巡回なし」として扱い、巡回の行を出さなくなるだけで壊れない。`off` と `control` も項目と値を足しただけなので `schema_version` は 1 のまま。ボタンの置き場所は miharashi-panel 側で決める。
 - `menu`: キオスクのメニュー(0 で開く)が開いていれば、選んでいる画面の `{index, id}`(`screen` の `index` / `id` と同じ意味)。閉じていれば `null`。開く・8 / 2(と 4 / 6)で選択が動く・5 か 0 で閉じる・`POST /api/v1/screen` で閉じる、のたびに SSE を送る(#49)。キーは必ず再描画を求め、実行ループは再描画のたびにパネルへ状態を渡すので、1 秒以内に届く。項目を足しただけなので `schema_version` は 1 のまま。
 - `keys`: 今 6 つのキー(`/api/v1/input` の `key` と同じ名前)を押すと何が起きるかの短いラベル(全角 6 文字まで)。`null` は押しても何もしないキーで、パネルはボタンを灰色にする(#51)。決め方はキオスクの実行ループと `on_key` と同じ順:
   - モニターが消えているとき(`display.on` が false): 自動で消えている(不在など)なら 6 つとも「画面を点ける」(どのキーもモニターを点けるだけで、画面は変わらない)。`display.mode` が `force_off` なら 6 つとも `null`(点けられない)。アラートとメニューより先に見る。点くと下の意味に戻る(#53)。

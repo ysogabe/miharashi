@@ -496,7 +496,7 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             eprintln!("key: panel {input:?}");
             // 巡回の切り替えは画面を選ぶ操作ではない(`/api/v1/display` と同じ)。点けず、消えていても反映する
             if let PanelInput::Rotation(on) = input {
-                redraw |= app.set_rotation(on, Instant::now());
+                redraw |= app.set_rotation(on);
                 continue;
             }
             if let Some(p) = &power {
