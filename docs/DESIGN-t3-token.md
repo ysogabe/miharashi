@@ -7,16 +7,19 @@ T3 Agent 画面(`agents`、[概要設計](DESIGN-t3-agent-monitor.md))は、T3 �
 下の「延長・refresh の仕組みが無い」点は変わっていない。T3 を上げたときは §5 を見直す。
 
 **2026-10-16: T3 v0.1.0(V2)で確かめた。** bearer の既定の期限は 30 日のまま(`apps/server/src/auth/SessionStore.ts` の `DEFAULT_SESSION_TTL`)で、
-延長や refresh の仕組みも無い。ペアリング用トークンの交換もそのまま動く(実機でスクリプトを流し、`orchestration:read` だけのトークンができることを確認)。
-変わったのは、一覧 API に `x-t3-orchestration-protocol: 2` ヘッダーが必須になったことで、スクリプトの確認(手順 3)に付けた。
+延長や refresh の仕組みも無い。変わったのは次の 2 つ。
 
-## 1. T3 の認証の仕組み(v0.0.45)
+- `t3 auth session issue` が `--scope` を受け付けるようになり、読み取りだけのトークンを CLI で直接作れる(§1.1)。
+  スクリプトはペアリングと交換(§1.2)をやめ、これで作るようにした(§2)。そのため、スクリプトには **v0.1.0 以降**が要る。
+- 一覧 API に `x-t3-orchestration-protocol: 2` ヘッダーが必須になった。スクリプトの確認(手順 3)に付けた。
+
+## 1. T3 の認証の仕組み
 
 ### 1.1 トークンの種類
 
 | もの | 作り方 | 期限 | 使える回数 | 権限 |
 |---|---|---|---|---|
-| bearer セッション | `t3 auth session issue` | 既定 30 日。`--ttl` で変えられ、上限は無い | 期限まで何度でも | 管理者の権限すべて(`terminal:operate`・`access:write` など) |
+| bearer セッション | `t3 auth session issue` | 既定 30 日。`--ttl` で変えられ、上限は無い | 期限まで何度でも | 既定は管理者の権限すべて(`terminal:operate`・`access:write` など)。v0.1.0 からは `--scope` で絞れる(v0.0.45 では絞れない) |
 | ペアリング用トークン | `t3 auth pairing create`(または画面の「ペアリング」) | 既定 5 分 | **1 回だけ** | 交換するときに絞れる(§1.2) |
 | desktop-bootstrap | デスクトップアプリが、自分で起動したサーバーに渡す | 24 時間(起動のたびに作り直す) | 何度でも | 管理者の権限 |
 
@@ -25,9 +28,29 @@ T3 Agent 画面(`agents`、[概要設計](DESIGN-t3-agent-monitor.md))は、T3 �
 - 何度でも交換できる種は desktop-bootstrap だけで、デスクトップアプリのプロセスの中にしか無い。外から作ることはできない。
 
 参照: `apps/server/src/auth/SessionStore.ts`(既定の期限、期限切れの判定)、`apps/server/src/auth/PairingGrantStore.ts`
-(使用済みにする処理、desktop-bootstrap)、`apps/server/src/cli/auth.ts`(CLI が付ける権限)。
+(使用済みにする処理、desktop-bootstrap)、`apps/server/src/cli/auth.ts`(CLI が付ける権限)、`apps/server/src/cliAuthFormat.ts`(`--json` の出力)。
+
+`t3 auth session issue --scope orchestration:read --label <ラベル> --json` は、次の JSON を返す(v0.1.0 の実機で確認)。
+`--scope` は繰り返して複数を指定でき、指定すると既定の権限の代わりにそれだけが付く。
+
+```json
+{
+  "sessionId": "…",
+  "token": "…(bearer トークン)",
+  "method": "bearer-access-token",
+  "scopes": ["orchestration:read"],
+  "subject": "cli-issued-session",
+  "client": { "label": "<ラベル>", "deviceType": "bot" },
+  "expiresAt": "2026-11-15T00:00:00.000Z"
+}
+```
+
+このトークンで一覧 API は 200、書き込み系の `POST /api/auth/pairing-token` は 403(`insufficient_scope`、必要な権限 `access:write`)、
+`t3 auth session list` でも権限は `orchestration:read` だけ、失効させると 401 になる(いずれも実機で確認)。
 
 ### 1.2 ペアリング用トークンの交換(`POST /oauth/token`)
+
+v0.0.45 では、読み取りだけのトークンを作る方法はこれしかなかった。v0.1.0 からは `session issue --scope`(§1.1)で足りるので、スクリプトはこれを使っていない。
 
 OAuth のトークン交換(RFC 8693)の形で、フォーム(`application/x-www-form-urlencoded`)を送る。
 
@@ -41,7 +64,7 @@ OAuth のトークン交換(RFC 8693)の形で、フォーム(`application/x-www
 | `client_label`・`client_device_type` | セッションの一覧に出る名前と種類(任意) |
 
 - 返ってくるのは bearer トークンで、期限は 30 日(DPoP を使うときだけ 1 時間)。
-- `scope` で絞れるので、**読み取りだけ(`orchestration:read`)のトークン**を作れる。`session issue` ではできない。
+- `scope` で絞れるので、**読み取りだけ(`orchestration:read`)のトークン**を作れる。v0.0.45 の `session issue` ではできない。
 - 読み取りだけのトークンで書き込み系の API(例: `POST /api/auth/pairing-token`)を呼ぶと、403(`insufficient_scope`)になる(実機で確認)。
 
 参照: `packages/contracts/src/auth.ts`(`AuthTokenExchangeRequest`)、`apps/server/src/auth/http.ts`(`token`)、
@@ -60,7 +83,7 @@ miharashi は 3 つ目と同じ立場(LAN のサーバーを bearer で読む)�
 ## 2. 選んだ方法: 週 1 回、読み取りだけのトークンを作り直す
 
 miharashi は T3 と同じマシンで、T3 を動かしているのと同じユーザーとして動く。そのユーザーは手元の `t3` CLI で
-ペアリング用トークンを作れる。これを使い、systemd のタイマーで週 1 回、次の手順を回す(`systemd/miharashi-t3-token`)。
+読み取りだけのトークンを作れる(§1.1)。これを使い、systemd のタイマーで週 1 回、次の手順を回す(`systemd/miharashi-t3-token`)。
 
 ```mermaid
 sequenceDiagram
@@ -70,10 +93,8 @@ sequenceDiagram
     participant T3 as T3 サーバー
     participant MH as miharashi(agents)
     TM->>SH: 起動(実行ユーザー)
-    SH->>CLI: auth pairing create --ttl 5m --label miharashi-agent-monitor
-    CLI-->>SH: ペアリング用トークン(1 回だけ)
-    SH->>T3: POST /oauth/token(scope=orchestration:read)
-    T3-->>SH: 読み取りだけの bearer(30 日)
+    SH->>CLI: auth session issue --scope orchestration:read --label miharashi-agent-monitor --json
+    CLI-->>SH: 読み取りだけの bearer(30 日)とセッション ID
     SH->>T3: GET /api/orchestration/shell(使えるか確かめる)
     SH->>SH: token_file を置き換える(0600、mv で入れ替え)
     MH->>MH: 30 秒以内に token_file を読み直す
@@ -83,8 +104,10 @@ sequenceDiagram
 
 - 権限が `orchestration:read` だけになっていなければ、トークンを置き換えずに止める。
 - 新しいトークンで一覧を読めなければ、置き換えずに止める(古いトークンはそのまま使える)。
-- 交換の前に失敗したら、使わなかったペアリング用トークンを消す。
-- トークンはコマンドの引数・環境変数・ログに出さない。一時ファイル(0600、終わったら消す)で curl に渡す。
+- `token_file` を置き換える前に失敗したら、今回作ったセッションを失効させる(使わないトークンを残さない)。
+- 古いセッションは、ラベルが同じで今回のセッション ID と違うものを失効させる。今回のものが一覧に無ければ、何も失効させずに止める。
+- トークンはコマンドの引数・環境変数・ログに出さない。CLI の `--json` の出力は一時ファイル(0600、終わったら消す)で受け、
+  そこから curl に渡す。
 - 失敗するとサービスが failed になり、状況画面の DETAILS の「failed ユニット」に出る。トークンは 30 日もつので、
   週 1 回なら 3 回続けて失敗しても切れる前に気づける。
 
@@ -93,16 +116,16 @@ sequenceDiagram
 miharashi の画面の部品の中で更新する案(部品から `t3` CLI を呼ぶ)も考えた。外に出したのは次の理由。
 
 - miharashi の取得処理は、決めた URL に GET するだけにしておける(T3 の CLI や認証の手順に依存しない)。
-- T3 の CLI や交換の形が変わっても、直すのはスクリプト 1 本で、キオスクを作り直さずに済む。
+- T3 の CLI やトークンの作り方が変わっても、直すのはスクリプト 1 本で、キオスクを作り直さずに済む。
 - 手で差し替える運用(§3)と、ファイルを置き換えるという同じ仕組みを共有できる。
 
-設定ファイルにペアリング用トークンを置いて miharashi が交換する案は、ペアリング用トークンが 1 回しか使えない(§1.1)ので成り立たない。
+設定ファイルにペアリング用トークンを置いて miharashi が交換する案も、ペアリング用トークンが 1 回しか使えない(§1.1)ので成り立たない。
 
 ### 2.2 採らなかった方法
 
 | 方法 | 採らない理由 |
 |---|---|
-| `t3 auth session issue --ttl 3650d` で長い期限にする | 管理者の権限すべて(端末の操作を含む)を持つトークンが長く残る。LAN 上は平文の HTTP なので、漏れたときの影響が大きい |
+| `t3 auth session issue --ttl 3650d` で長い期限にする | 漏れたときに使える期間が長い。LAN 上は平文の HTTP なので、読み取りだけでも、作り直して古いものを失効させるほうがよい(v0.0.45 では管理者の権限すべてを持つトークンになった) |
 | T3 クラウド(relay)経由でつなぐ | T3 のアカウントと外部のサービスを経由する。家の中で閉じる構成に合わない |
 | 認証なしで読む | v0.0.45 には、ローカルからの接続を信用する設定が無い |
 
@@ -115,15 +138,13 @@ miharashi の画面の部品の中で更新する案(部品から `t3` CLI を�
 ## 4. 制約
 
 - T3 と同じマシン・同じユーザーで動かす前提。別のマシンの T3 を読むときは、この自動更新は使えない(手で差し替える)。
-- `t3` CLI の `--json` の出力と、`/oauth/token` の形に依存する。
+- `t3` CLI の `auth session issue --scope`・`auth session list` の `--json` の出力に依存する。`--scope` の無い v0.0.45 以前では動かない。
 - LAN でペアリングした他のクライアント(別の PC のデスクトップアプリなど)も 30 日で切れる。それは T3 の仕様で、この仕組みの対象外。
 
 ## 5. T3 を上げたときに確かめること
 
-1. `t3 auth pairing create --json` が `id` と `credential` を返すか。
-2. `POST /oauth/token` が上の項目で読み取りだけのトークンを返すか(`systemctl start miharashi-t3-token` で試せる)。
+1. `t3 auth session issue --scope orchestration:read --json` が `sessionId`・`token`・`scopes`・`expiresAt` を返し、
+   権限が `orchestration:read` だけになるか(`systemctl start miharashi-t3-token` で試せる)。
+2. `t3 auth session list --json` に `sessionId` と `client.label` があるか。
 3. セッションの延長・refresh の仕組みが入ったか。入っていれば、この仕組みをそれに置き換える。
 4. 一覧 API の protocol ヘッダーの値(`x-t3-orchestration-protocol`)が変わっていないか。変われば、スクリプトの手順 3 と miharashi の両方を直す。
-
-v0.1.0 では `t3 auth session issue --scope orchestration:read` で、読み取りだけのトークンを直接作れるようになった。
-交換の手順(§1.2)を省ける余地があるが、いまの仕組みで足りているので置き換えていない。

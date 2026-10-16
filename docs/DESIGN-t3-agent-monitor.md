@@ -374,8 +374,8 @@ branch / worktree は初期画面に出さない。中央ポップアップも�
 
 ## 8. 接続・認証・設定
 
-一覧 API は認証が必要。v0.0.45 の `t3 auth session issue` はscope指定に対応せず、発行tokenは `orchestration:operate` など更新系を含む広い権限を持つ。そこで、ペアリング用トークンを `POST /oauth/token` で `orchestration:read` だけのトークンに交換し、週 1 回作り直す([トークンの更新](DESIGN-t3-token.md))。Bearer tokenは `GET /api/orchestration/shell` にだけ使い、表示用の環境情報は認証なしの `GET /.well-known/t3/environment` で取得する。更新系APIは呼び出さない。
-一覧の取得には `x-t3-orchestration-protocol: 2` ヘッダーを付ける。v0.1.0 の `t3 auth session issue` は `--scope` を受け付けるようになったが、トークンの作り方は変えていない([トークンの更新](DESIGN-t3-token.md) §5)。
+一覧 API は認証が必要。`t3 auth session issue --scope orchestration:read`(v0.1.0 以降)で読み取りだけのトークンを作り、週 1 回作り直す([トークンの更新](DESIGN-t3-token.md))。v0.0.45 の `session issue` はscope指定に対応せず、ペアリング用トークンを `POST /oauth/token` で交換して作っていた。Bearer tokenは `GET /api/orchestration/shell` にだけ使い、表示用の環境情報は認証なしの `GET /.well-known/t3/environment` で取得する。更新系APIは呼び出さない。
+一覧の取得には `x-t3-orchestration-protocol: 2` ヘッダーを付ける。
 
 ```toml
 [agents]
