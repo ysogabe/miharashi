@@ -17,6 +17,42 @@ const GSI_RGEO: &str = "https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonL
 /// 同じ位置とみなす差(度。約 1m)
 const SAME_PLACE_DEG: f64 = 1e-5;
 
+/// 地域を決める処理の失敗。`source` は届かなかった相手(画面に「{source}に接続できません」と出す)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AreaError {
+    pub source: &'static str,
+    pub message: String,
+}
+
+impl AreaError {
+    pub fn ha(message: String) -> Self {
+        AreaError {
+            source: "HA",
+            message,
+        }
+    }
+
+    pub fn gsi(message: String) -> Self {
+        AreaError {
+            source: "国土地理院",
+            message,
+        }
+    }
+
+    pub fn jma(message: String) -> Self {
+        AreaError {
+            source: "気象庁",
+            message,
+        }
+    }
+}
+
+impl std::fmt::Display for AreaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.source, self.message)
+    }
+}
+
 /// 覚えている市区町村コード(引いたときの位置と組)。
 #[derive(Debug, Clone, PartialEq)]
 struct Known {
@@ -129,13 +165,13 @@ fn lookup_muni(agent: &ureq::Agent, (lat, lon): (f64, f64)) -> Result<String, St
 }
 
 /// 自宅の位置の市区町村コード(5 桁。先頭 2 桁が都道府県)。逆ジオコーダーに届かなければ、同じ位置で前回引けた値。
-pub fn home_muni_code(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<String, String> {
-    let here = home_location(agent, ha)?;
+pub fn home_muni_code(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<String, AreaError> {
+    let here = home_location(agent, ha).map_err(AreaError::ha)?;
     let looked_up = lookup_muni(agent, here);
     let Ok(mut known) = known().lock() else {
-        return looked_up;
+        return looked_up.map_err(AreaError::gsi);
     };
-    let (muni, stale) = choose(here, looked_up, known.as_ref())?;
+    let (muni, stale) = choose(here, looked_up, known.as_ref()).map_err(AreaError::gsi)?;
     match stale {
         Some(e) => eprintln!("home: 国土地理院に届かないため、前回の市区町村コードを使う: {e}"),
         None => {

@@ -8,6 +8,7 @@
 //! 市区町村コード)。どこかで失敗したら全国の条件だけで動く。
 //! ネットワークの応答はすべて欠けうるものとして扱い、読めない項目は飛ばす(パニックさせない)。
 use crate::config::{Alerts, HomeAssistant};
+use crate::home::{AreaError, home_muni_code};
 use miharashi_render::alert::{
     AlertView, Intensity, QuakeView, SHINDO_4, SHINDO_5_LOWER, parse_intensity,
 };
@@ -205,11 +206,11 @@ pub fn get_json(agent: &ureq::Agent, url: &str, auth: Option<&str>) -> Result<Va
 }
 
 /// 自宅の位置から住んでいる地方を決める。
-fn detect_region(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<Region, String> {
-    let pref = crate::home::home_muni_code(agent, ha)?[0..2].to_string();
-    let area = get_json(agent, AREA_URL, None)?;
+fn detect_region(agent: &ureq::Agent, ha: &HomeAssistant) -> Result<Region, AreaError> {
+    let pref = home_muni_code(agent, ha)?[0..2].to_string();
+    let area = get_json(agent, AREA_URL, None).map_err(AreaError::jma)?;
     region_from_area(&area, &pref)
-        .ok_or_else(|| format!("都道府県 {pref} の地方が area.json にない"))
+        .ok_or_else(|| AreaError::jma(format!("都道府県 {pref} の地方が area.json にない")))
 }
 
 /// アラートの実演用(設定の demo_after_secs と `png` の画像)。

@@ -20,6 +20,8 @@ pub struct FeedStatus {
     pub failing: bool,
     /// 失敗の理由、または取得できない設定の説明
     pub error: Option<String>,
+    /// 届かなかった相手(画面の「◯◯に接続できません」)。None なら画面ごとの既定(HA・気象庁)
+    pub source: Option<&'static str>,
     /// 書き換えるたびに増やす(画面の描き直しの判定)
     pub version: u64,
 }
@@ -30,14 +32,25 @@ impl FeedStatus {
         self.last_ok = Some(chrono::Local::now());
         self.failing = false;
         self.error = None;
+        self.source = None;
         self.version += 1;
     }
 
     /// 取得できなかった。最初の失敗なら true(ログに出す)。
     pub fn fail(&mut self, error: String) -> bool {
+        self.fail_from(None, error)
+    }
+
+    /// `source`(画面ごとの既定と違う相手。国土地理院など)に届かなかった。最初の失敗なら true。
+    pub fn fail_at(&mut self, source: &'static str, error: String) -> bool {
+        self.fail_from(Some(source), error)
+    }
+
+    fn fail_from(&mut self, source: Option<&'static str>, error: String) -> bool {
         let first = !self.failing;
         self.failing = true;
         self.error = Some(error);
+        self.source = source;
         self.version += 1;
         first
     }
