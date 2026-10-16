@@ -254,7 +254,7 @@ mod tests {
             count: points.len(),
             places: vec![],
             points,
-            home: Some((35.856, 139.767)),
+            home: Some(crate::sample::HOME),
             radius_km: 50.0,
         }
     }
@@ -267,7 +267,8 @@ mod tests {
         assert!((one.1 - one.0) > 0.399 && (one.3 - one.2) > 0.399);
         // いつもの暮らしは自宅まわり
         let e = bounds(&card(true, vec![(36.3, 139.0)]));
-        assert!(e.0 < 139.767 && 139.767 < e.1 && e.2 < 35.681 && 35.681 < e.3);
+        let h = crate::sample::HOME;
+        assert!(e.0 < h.1 && h.1 < e.1 && e.2 < h.0 && h.0 < e.3);
         assert!(e.3 - e.2 < 2.0);
         assert_eq!(bounds(&card(false, vec![])).0, 122.5);
     }
@@ -283,7 +284,8 @@ mod tests {
             "暮らし"
         );
         let b = locator_bounds(&card(false, vec![(39.65, 66.96), (41.31, 69.28)])).unwrap();
-        assert!(b.0 < 66.96 && b.1 > 139.767 && b.2 < 35.681 && b.3 > 41.31);
+        let h = crate::sample::HOME;
+        assert!(b.0 < 66.96 && b.1 > h.1 && b.2 < h.0 && b.3 > 41.31);
         let near = locator_bounds(&card(false, vec![(25.03, 121.56)])).unwrap();
         assert!(
             near.1 - near.0 >= 30.0 && near.3 - near.2 >= 20.0,
