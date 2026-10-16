@@ -414,6 +414,7 @@ mod tests {
         app.panel_view().unwrap().rotation.map(|r| match r {
             crate::screen::PanelRotation::On => "on",
             crate::screen::PanelRotation::Paused { .. } => "paused",
+            crate::screen::PanelRotation::Off => "off",
         })
     }
 
