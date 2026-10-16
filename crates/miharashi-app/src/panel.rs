@@ -62,6 +62,8 @@ pub enum PanelInput {
     Key(KeyPress),
     /// 画面の id(登録されているものだけ)
     Screen(&'static str),
+    /// 自動巡回を再開する(true)・止めたままにする(false)
+    Rotation(bool),
 }
 
 /// モニターの手動オーバーライド(auto / force_on / force_off)を切り替える先。実体は `ScreenPower`。
@@ -208,6 +210,7 @@ impl Shared {
 fn rotation_json(r: PanelRotation, now: Instant) -> Value {
     match r {
         PanelRotation::On => json!({ "state": "on", "resume_in_s": null }),
+        PanelRotation::Off => json!({ "state": "off", "resume_in_s": null }),
         PanelRotation::Paused { until } => {
             let left = until.saturating_duration_since(now);
             let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);

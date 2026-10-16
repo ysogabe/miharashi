@@ -188,6 +188,13 @@ impl ScreenManager {
         })
     }
 
+    /// 操作パネルから巡回を再開する(`on`)・止めたままにする(`!on`)。戻り値: 再描画が必要か(パネルへ送り直す)。
+    pub fn set_rotation(&mut self, on: bool, now: Instant) -> bool {
+        // TODO(#57): 実装する
+        let _ = (on, now);
+        false
+    }
+
     /// 操作があったので巡回を止める。
     fn pause_rotation(&mut self, now: Instant) {
         if let Some(r) = self.rotation.as_mut() {
@@ -677,6 +684,10 @@ impl App for ScreenManager {
 
     fn show_screen(&mut self, id: &str) -> bool {
         ScreenManager::show_screen(self, id)
+    }
+
+    fn set_rotation(&mut self, on: bool, now: Instant) -> bool {
+        ScreenManager::set_rotation(self, on, now)
     }
 
     fn wants_screen(&self) -> bool {
