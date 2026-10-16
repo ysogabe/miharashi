@@ -335,11 +335,9 @@ fn run(out: Shared, ha: HomeAssistant, room: Room) {
         if Instant::now() >= next_area {
             match find_area(&agent, &ha, &room.forecast_area) {
                 Ok(a) => {
+                    // 地域の名前とコードはログに出さない(ログを Issue に貼っても自宅の地域が分からないように)
                     if area.as_ref() != Some(&a) {
-                        eprintln!(
-                            "weather: 予報の地域 {}({} / 気象台 {})",
-                            a.name, a.class10, a.office
-                        );
+                        eprintln!("weather: 予報の地域が決まった(気象台 {})", a.office);
                     }
                     area = Some(a);
                     next_area = Instant::now() + AREA_REFRESH;
