@@ -28,7 +28,7 @@ const OFFICE_URL: &str = "https://www.jma.go.jp/bosai/warning/data/r8";
 /// 起動時に、これより前の発表はアラートにしない(再起動のたびに出さない)。
 /// そのため、発表から 10 分以上たってから再起動すると、続いている特別警報は出ない。
 const STARTUP_MAX_AGE_MIN: i64 = 10;
-/// 対象の市町村を決め直す間隔(成功時)と、失敗時の再試行間隔
+/// 対象の市町村を決め直す間隔(成功時)と、失敗時の再試行間隔。自宅の市町村だけが決まらなかったときも再試行の間隔にする
 const AREA_REFRESH: Duration = Duration::from_secs(24 * 3600);
 const AREA_RETRY: Duration = Duration::from_secs(600);
 
@@ -487,6 +487,16 @@ fn find_watch(agent: &ureq::Agent, ha: &HomeAssistant, km: f64) -> Result<Watch,
     })
 }
 
+/// 見張る範囲を次に決め直すまでの時間。自宅の市町村が決まっていなければ、範囲を作れていても早めに問い合わせ直す
+/// (国土地理院の逆ジオコーダーだけが止まっていたときに、帯が 24 時間「決められない」のままにならないように)。
+fn refresh_after(w: &Watch) -> Duration {
+    if w.home_muni.is_some() {
+        AREA_REFRESH
+    } else {
+        AREA_RETRY
+    }
+}
+
 /// 自宅の市町村の警報・注意報を写す。`ok` は今回すべての気象台を読めたか。
 fn publish_home(
     out: &HomeShared,
@@ -556,7 +566,23 @@ fn run(tx: Sender<AlertView>, ha: HomeAssistant, poll: Duration, km: f64, home: 
     loop {
         if Instant::now() >= next_watch {
             match find_watch(&agent, &ha, km) {
-                Ok(w) => {
+                Ok(mut w) => {
+                    // 決め直しで自宅の市町村だけが決まらなかったら、自宅が同じ位置のうちは前の値を使い続ける
+                    if w.home_muni.is_none()
+                        && let Some(old) = watch.as_ref().filter(|o| o.home == w.home)
+                    {
+                        w.home_muni = old.home_muni.clone();
+                        if let Some((_, _, o)) = &w.home_muni
+                            && !w.offices.contains(o)
+                        {
+                            w.offices.push(o.clone());
+                        }
+                    }
+                    if w.home_muni.is_some()
+                        && watch.as_ref().is_some_and(|o| o.home_muni.is_none())
+                    {
+                        eprintln!("disaster: 自宅の市町村が決まった");
+                    }
                     if watch.as_ref() != Some(&w) {
                         eprintln!(
                             "disaster: 自宅から{km}km以内の {} 市町村を見張る(気象台 {:?})",
@@ -565,8 +591,8 @@ fn run(tx: Sender<AlertView>, ha: HomeAssistant, poll: Duration, km: f64, home: 
                         );
                         docs.retain(|o, _| w.offices.contains(o));
                     }
+                    next_watch = Instant::now() + refresh_after(&w);
                     watch = Some(w);
-                    next_watch = Instant::now() + AREA_REFRESH;
                 }
                 Err(e) => {
                     eprintln!("disaster: 見張る範囲を決められない(再試行する): {e}");
@@ -756,6 +782,18 @@ mod tests {
         let fresh: HomeShared = Arc::default();
         publish_home(&fresh, &no_home, &docs, true);
         assert!(fresh.lock().unwrap().status.failing);
+    }
+
+    /// 逆ジオコーダーだけが失敗して自宅の市町村が決まらなかったら、範囲を作れていても 10 分後に問い合わせ直す。
+    #[test]
+    fn retries_soon_while_the_home_municipality_is_unknown() {
+        assert_eq!(refresh_after(&watch()), AREA_REFRESH);
+        let no_home = Watch {
+            home_muni: None,
+            ..watch()
+        };
+        assert_eq!(refresh_after(&no_home), AREA_RETRY);
+        assert!(AREA_RETRY <= Duration::from_secs(600));
     }
 
     fn doc(report: &str, items: Value) -> Value {
