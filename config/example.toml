@@ -97,7 +97,7 @@
 #   { label = "玄関", entity = "sensor.door_temperature", second = "sensor.door_humidity" },
 # ]
 # history_hours = 24       # 折れ線に出す過去の時間(1〜168)
-# 天気予報の地域(気象庁 area.json の class10。東京都東京地方なら "130010")。空なら HA の自宅の位置から決める
+# 天気予報の地域(気象庁 area.json の class10。東京地方なら "130010")。空なら HA の自宅の位置から決める
 # forecast_area = ""
 # poll_secs = 60           # センサーの値を読む間隔(10 以上)
 # history_minutes = 10     # 折れ線の履歴を読み直す間隔

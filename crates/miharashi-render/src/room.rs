@@ -753,7 +753,7 @@ pub fn demo_view() -> RoomView {
             stale: false,
         },
         weather: Some(Weather {
-            area: "東京都東京地方".into(),
+            area: crate::sample::FORECAST_AREA.into(),
             days: vec![
                 day(
                     "今日 14日(火)",
@@ -776,7 +776,7 @@ pub fn demo_view() -> RoomView {
             text: "気象庁 05:00 発表".into(),
             stale: false,
         },
-        warn_area: "千代田区".into(),
+        warn_area: crate::sample::MUNI.into(),
         warnings: Some(vec![
             Warning {
                 name: "大雨警報".into(),

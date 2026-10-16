@@ -308,7 +308,7 @@ pub fn demo_card() -> TripCard {
             (39.77, 64.42),
             (41.38, 60.36),
         ],
-        home: Some((35.856, 139.767)),
+        home: Some(miharashi_render::sample::HOME),
         radius_km: 50.0,
     }
 }
@@ -460,7 +460,7 @@ impl Scheduler {
 mod tests {
     use super::*;
 
-    const HOME: (f64, f64) = (35.856, 139.767);
+    const HOME: (f64, f64) = miharashi_render::sample::HOME;
 
     fn meta(lat: f64, lon: f64, time: &str, pref: &str, city: &str) -> Meta {
         Meta {
@@ -504,16 +504,16 @@ mod tests {
         let (a, b) = (north(49.9), north(50.1));
         let far = north(120.0);
         let metas = vec![
-            meta(a.0, a.1, "2026-09-20 10:00", "千葉県", "近所"),
+            meta(a.0, a.1, "2026-09-20 10:00", "埼玉県", "近所"),
             meta(b.0, b.1, "2026-09-21 10:00", "茨城県", "水戸市"),
             // 間に自宅近くの写真があっても旅は切れない
-            meta(HOME.0, HOME.1, "2026-09-22 09:00", "千葉県", "千代田区"),
+            meta(HOME.0, HOME.1, "2026-09-22 09:00", "東京都", "千代田区"),
             meta(far.0, far.1, "2026-09-22 20:00", "茨城県", "水戸市"),
             // 48 時間を超えて空いたら別の旅
             meta(far.0, far.1, "2026-09-25 21:00", "栃木県", "宇都宮市"),
-            meta(HOME.0, HOME.1, "2026-12-05 09:00", "千葉県", "千代田区"),
-            meta(HOME.0, HOME.1, "2027-01-05 09:00", "千葉県", "千代田区"),
-            meta(HOME.0, HOME.1, "", "千葉県", "千代田区"),
+            meta(HOME.0, HOME.1, "2026-12-05 09:00", "東京都", "千代田区"),
+            meta(HOME.0, HOME.1, "2027-01-05 09:00", "東京都", "千代田区"),
+            meta(HOME.0, HOME.1, "", "東京都", "千代田区"),
         ];
         let g = build_groups(&metas, &HashMap::new(), Some(HOME), 50.0);
         let trips: Vec<&Vec<usize>> = g
@@ -571,8 +571,8 @@ mod tests {
     #[test]
     fn without_home_the_server_trip_numbers_are_used() {
         let mut metas = vec![
-            meta(HOME.0, HOME.1, "2026-01-01 10:00", "千葉県", "千代田区"),
-            meta(HOME.0, HOME.1, "2026-03-01 10:00", "千葉県", "千代田区"),
+            meta(HOME.0, HOME.1, "2026-01-01 10:00", "東京都", "千代田区"),
+            meta(HOME.0, HOME.1, "2026-03-01 10:00", "東京都", "千代田区"),
         ];
         metas[0].trip = Some(7);
         metas[1].trip = Some(8);
@@ -591,7 +591,7 @@ mod tests {
                     HOME.0,
                     HOME.1,
                     &format!("20{:02}-05-01 {:02}:00", 10 + gi, j % 24),
-                    "千葉県",
+                    "東京都",
                     "千代田区",
                 );
                 m.id = format!("p{}", metas.len());
