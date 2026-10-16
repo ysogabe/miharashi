@@ -494,6 +494,11 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
         // パネルのキーもキーボードと同じに扱う(消えている画面では点けるだけ)
         for input in panel.iter().flat_map(Panel::inputs) {
             eprintln!("key: panel {input:?}");
+            // 巡回の切り替えは画面を選ぶ操作ではない(`/api/v1/display` と同じ)。点けず、消えていても反映する
+            if let PanelInput::Rotation(on) = input {
+                redraw |= app.set_rotation(on);
+                continue;
+            }
             if let Some(p) = &power {
                 p.on_key();
             }
@@ -501,6 +506,7 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                 redraw |= match input {
                     PanelInput::Key(key) => app.on_key(key),
                     PanelInput::Screen(id) => app.show_screen(id),
+                    PanelInput::Rotation(_) => unreachable!("上で扱った"),
                 };
             }
         }
