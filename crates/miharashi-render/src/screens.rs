@@ -11,6 +11,12 @@ pub struct GpuLoad {
     pub temp: Option<f32>,
     /// 使用率の時系列 [%](cpu_history と同じ長さ・間隔)
     pub history: Vec<f32>,
+    /// 使用中のメモリ [MiB]
+    pub mem_used_mib: Option<u32>,
+    /// 使えるメモリの全体 [MiB]
+    pub mem_total_mib: Option<u32>,
+    /// メモリ使用率の時系列 [%](cpu_history と同じ長さ・間隔)
+    pub mem_history: Vec<f32>,
 }
 
 impl GpuLoad {
@@ -20,6 +26,14 @@ impl GpuLoad {
             &self.label
         } else {
             &self.name
+        }
+    }
+
+    /// メモリの使用率 [%]。GPU ごとに全体の大きさが違うので、比べるときは % で見る。
+    pub fn mem_pct(&self) -> Option<f32> {
+        match (self.mem_used_mib, self.mem_total_mib) {
+            (Some(u), Some(t)) if t > 0 => Some(u as f32 / t as f32 * 100.0),
+            _ => None,
         }
     }
 }
