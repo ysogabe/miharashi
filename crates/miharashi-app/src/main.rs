@@ -12,6 +12,7 @@ mod disaster;
 mod env;
 #[cfg(target_os = "linux")]
 mod gpu_bench;
+mod home;
 mod panel;
 mod photos;
 mod quake;

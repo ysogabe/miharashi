@@ -1,11 +1,13 @@
 //! 天気予報(docs/DESIGN-screens.md §2.1)。気象庁の府県予報と週間予報(`bosai/forecast/data/forecast/{office}.json`。
 //! 1 つのファイルに両方入っている)を別スレッドで定期的に読んで共有する。予報の地域(class10)は、Home Assistant の
-//! 自宅の位置 → 国土地理院の逆ジオコーダーの市区町村 → 気象庁の area.json とたどって決める(設定で固定もできる)。
+//! 自宅の位置 → 国土地理院の逆ジオコーダーの市区町村(届かなければ `home` が覚えている前回の値)→ 気象庁の
+//! area.json とたどって決める(設定で固定もできる)。
 //! 気象庁に届かないときは最後の予報を残し、取得の状態(`FeedStatus`)だけを変える。
 //! ネットワークの応答はすべて欠けうるものとして扱い、読めない項目は飛ばす(パニックさせない)。
 use crate::config::{HomeAssistant, Room};
 use crate::env::FeedStatus;
-use crate::quake::{AREA_URL, get_json, home_muni_code};
+use crate::home::{AreaError, home_muni_code};
+use crate::quake::{AREA_URL, get_json};
 use chrono::NaiveDate;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
@@ -274,20 +276,26 @@ fn class10_of(area: &Value, class20: &str) -> Option<String> {
     parent(area, "class15s", &parent(area, "class20s", class20)?)
 }
 
-fn find_area(agent: &ureq::Agent, ha: &HomeAssistant, fixed: &str) -> Result<ForecastArea, String> {
+fn find_area(
+    agent: &ureq::Agent,
+    ha: &HomeAssistant,
+    fixed: &str,
+) -> Result<ForecastArea, AreaError> {
+    let jma = |e: String| AreaError::jma(e);
     let class10 = if fixed.is_empty() {
         let muni = home_muni_code(agent, ha)?;
-        let area = get_json(agent, AREA_URL, None)?;
+        let area = get_json(agent, AREA_URL, None).map_err(jma)?;
         let (c20, _) = class20_for(&area, &muni)
-            .ok_or_else(|| format!("市区町村 {muni} が area.json にない"))?;
-        class10_of(&area, &c20).ok_or_else(|| format!("{c20} の予報の地域が area.json にない"))?
+            .ok_or_else(|| jma("自宅の市区町村が area.json にない".into()))?;
+        class10_of(&area, &c20)
+            .ok_or_else(|| jma("自宅の市町村の予報の地域が area.json にない".into()))?
     } else {
         fixed.to_string()
     };
-    let area = get_json(agent, AREA_URL, None)?;
-    let fa = get_json(agent, FORECAST_AREA_URL, None)?;
+    let area = get_json(agent, AREA_URL, None).map_err(jma)?;
+    let fa = get_json(agent, FORECAST_AREA_URL, None).map_err(jma)?;
     forecast_area(&area, &fa, &class10)
-        .ok_or_else(|| format!("予報の地域 {class10} が area.json にない"))
+        .ok_or_else(|| jma(format!("予報の地域 {class10} が area.json にない")))
 }
 
 /// 天気予報の取得を始める。予報の地域を決められない設定(HA も forecast_area も無い)なら None。
@@ -315,22 +323,21 @@ fn run(out: Shared, ha: HomeAssistant, room: Room) {
     let every = Duration::from_secs(room.forecast_minutes * 60);
     let mut area: Option<ForecastArea> = None;
     let mut next_area = Instant::now();
-    let fail = |e: String| {
+    let fail_at = |source: &'static str, e: String| {
         if let Ok(mut g) = out.lock()
-            && g.status.fail(e.clone())
+            && g.status.fail_at(source, e.clone())
         {
-            eprintln!("weather: {e}(最後の予報を出し、再試行を続ける)");
+            eprintln!("weather: {source}: {e}(最後の予報を出し、再試行を続ける)");
         }
     };
+    let fail = |e: String| fail_at("気象庁", e);
     loop {
         if Instant::now() >= next_area {
             match find_area(&agent, &ha, &room.forecast_area) {
                 Ok(a) => {
+                    // 地域の名前とコードはログに出さない(ログを Issue に貼っても自宅の地域が分からないように)
                     if area.as_ref() != Some(&a) {
-                        eprintln!(
-                            "weather: 予報の地域 {}({} / 気象台 {})",
-                            a.name, a.class10, a.office
-                        );
+                        eprintln!("weather: 予報の地域が決まった(気象台 {})", a.office);
                     }
                     area = Some(a);
                     next_area = Instant::now() + AREA_REFRESH;
@@ -338,7 +345,7 @@ fn run(out: Shared, ha: HomeAssistant, room: Room) {
                 Err(e) => {
                     next_area = Instant::now() + AREA_RETRY;
                     if area.is_none() {
-                        fail(format!("予報の地域を決められない: {e}"));
+                        fail_at(e.source, format!("予報の地域を決められない: {}", e.message));
                     }
                 }
             }

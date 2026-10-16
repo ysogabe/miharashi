@@ -510,7 +510,7 @@ impl HomeLookup {
             .timeout_global(Some(Duration::from_secs(10)))
             .build()
             .into();
-        match crate::quake::home_location(&agent, &self.ha) {
+        match crate::home::home_location(&agent, &self.ha) {
             Ok(h) => Some(h),
             Err(e) => {
                 eprintln!("photos: 自宅の位置を取れない(GEOFRAME の旅番号でまとめる): {e}");

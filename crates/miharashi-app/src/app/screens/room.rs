@@ -38,7 +38,9 @@ fn hm(t: &DateTime<Local>) -> String {
 }
 
 /// 取得の状態の文。`what` は内容の時刻("11:00 発表")。無ければ取得した時刻を出す。
+/// 失敗のときは、届かなかった相手(`s.source`。無ければ `source`)を出す。
 fn feed_of(s: &FeedStatus, source: &str, what: Option<String>) -> Feed {
+    let failed = s.source.unwrap_or(source);
     match (&s.last_ok, s.failing) {
         (Some(t), false) => Feed {
             text: match what {
@@ -49,7 +51,7 @@ fn feed_of(s: &FeedStatus, source: &str, what: Option<String>) -> Feed {
         },
         (Some(t), true) => Feed {
             text: format!(
-                "{}最終取得 {} · {source}に接続できません",
+                "{}最終取得 {} · {failed}に接続できません",
                 what.map(|w| w + " · ").unwrap_or_default(),
                 hm(t)
             ),
@@ -61,8 +63,8 @@ fn feed_of(s: &FeedStatus, source: &str, what: Option<String>) -> Feed {
         },
         (None, true) => Feed {
             text: match &s.error {
-                Some(e) => format!("{source}に接続できません({e})"),
-                None => format!("{source}に接続できません"),
+                Some(e) => format!("{failed}に接続できません({e})"),
+                None => format!("{failed}に接続できません"),
             },
             stale: true,
         },
@@ -445,6 +447,32 @@ mod tests {
             ..FeedStatus::default()
         };
         assert_eq!(feed_of(&broken, "HA", None).text, "HAに接続できません(401)");
+        // 地域を決める段階で国土地理院に届かなかったときは、気象庁ではなく国土地理院と出す
+        let mut gsi = FeedStatus::default();
+        gsi.fail_at(
+            "国土地理院",
+            "予報の地域を決められない: timeout: global".into(),
+        );
+        assert_eq!(
+            feed_of(&gsi, "気象庁", None).text,
+            "国土地理院に接続できません(予報の地域を決められない: timeout: global)"
+        );
+        let mut jma = gsi.clone();
+        jma.fail("予報を取得できない: timeout: global".into());
+        assert_eq!(
+            feed_of(&jma, "気象庁", None).text,
+            "気象庁に接続できません(予報を取得できない: timeout: global)"
+        );
+        let mut later = FeedStatus::default();
+        later.ok();
+        later.fail_at("国土地理院", "x".into());
+        assert!(
+            feed_of(&later, "気象庁", Some("11:00 発表".into()))
+                .text
+                .ends_with("国土地理院に接続できません")
+        );
+        later.ok();
+        assert_eq!(later.source, None, "取れたら既定の相手に戻す");
         assert_eq!(
             issued("2026-10-15T11:00:00+09:00", d(15)).as_deref(),
             Some("11:00 発表")

@@ -29,7 +29,8 @@ TTYVTDisallocate=yes
 UtmpIdentifier=tty7
 UtmpMode=user
 
-# /var/lib/miharashi(User=@USER@ の所有)。電力量などの状態を /var/lib/miharashi/energy.json に保存する。
+# /var/lib/miharashi(User=@USER@ の所有)。電力量(energy.json)、写真の表示履歴(play.json)、
+# 自宅の市区町村コード(home.json。逆ジオコーダーが止まっていても前回の値で始めるため)を保存する。
 StateDirectory=miharashi
 
 # 起動前に VT7 へ切り替える。停止・異常終了後は VT1(通常のコンソール)へ戻す。

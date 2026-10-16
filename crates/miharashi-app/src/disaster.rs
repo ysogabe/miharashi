@@ -15,7 +15,8 @@
 //! ネットワークの応答はすべて欠けうるものとして扱い、読めない項目は飛ばす(パニックさせない)。
 use crate::config::{Alerts, HomeAssistant};
 use crate::env::FeedStatus;
-use crate::quake::{AREA_URL, get_json, home_location, home_muni_code};
+use crate::home::{AreaError, home_location, home_muni_code};
+use crate::quake::{AREA_URL, get_json};
 use miharashi_render::alert::{AlertView, DisasterArea, DisasterKind, DisasterView};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -28,7 +29,7 @@ const OFFICE_URL: &str = "https://www.jma.go.jp/bosai/warning/data/r8";
 /// 起動時に、これより前の発表はアラートにしない(再起動のたびに出さない)。
 /// そのため、発表から 10 分以上たってから再起動すると、続いている特別警報は出ない。
 const STARTUP_MAX_AGE_MIN: i64 = 10;
-/// 対象の市町村を決め直す間隔(成功時)と、失敗時の再試行間隔
+/// 対象の市町村を決め直す間隔(成功時)と、失敗時の再試行間隔。自宅の市町村だけが決まらなかったときも再試行の間隔にする
 const AREA_REFRESH: Duration = Duration::from_secs(24 * 3600);
 const AREA_RETRY: Duration = Duration::from_secs(600);
 
@@ -452,51 +453,100 @@ pub fn start(alerts: &Alerts, ha: &HomeAssistant, tx: Sender<AlertView>) -> Opti
     Some(home)
 }
 
-fn find_watch(agent: &ureq::Agent, ha: &HomeAssistant, km: f64) -> Result<Watch, String> {
-    let home = home_location(agent, ha)?;
-    let munis = munis_within(&get_json(agent, RELM_URL, None)?, home, km);
+/// 見張る範囲を決める。自宅の市町村を決められなかったときは、その理由も返す(帯に出す)。
+fn find_watch(
+    agent: &ureq::Agent,
+    ha: &HomeAssistant,
+    km: f64,
+) -> Result<(Watch, Option<AreaError>), AreaError> {
+    let jma = |e: String| AreaError::jma(e);
+    let home = home_location(agent, ha).map_err(AreaError::ha)?;
+    let munis = munis_within(&get_json(agent, RELM_URL, None).map_err(jma)?, home, km);
     if munis.is_empty() {
-        return Err("半径内に市町村が見つからない".into());
+        return Err(jma("半径内に市町村が見つからない".into()));
     }
-    let area = get_json(agent, AREA_URL, None)?;
+    let area = get_json(agent, AREA_URL, None).map_err(jma)?;
     // 自宅の市町村(帯に出す)。決められなくてもアラートは続ける
-    let home_muni = match home_muni_code(agent, ha) {
-        Ok(muni) => crate::weather::class20_for(&area, &muni).and_then(|(code, name)| {
+    let (home_muni, home_err) = match home_muni_code(agent, ha) {
+        Ok(muni) => match crate::weather::class20_for(&area, &muni).and_then(|(code, name)| {
             let office = offices_for(&area, std::iter::once(&code)).pop()?;
             Some((code, name, office))
-        }),
-        Err(e) => {
-            eprintln!("disaster: 自宅の市町村を決められない: {e}");
-            None
-        }
+        }) {
+            Some(m) => (Some(m), None),
+            None => (None, Some(jma("自宅の市区町村が area.json にない".into()))),
+        },
+        Err(e) => (None, Some(e)),
     };
+    if let Some(e) = &home_err {
+        eprintln!("disaster: 自宅の市町村を決められない: {e}");
+    }
     let mut offices = offices_for(&area, munis.keys());
     if offices.is_empty() {
-        return Err("市町村を受け持つ気象台が area.json にない".into());
+        return Err(jma("市町村を受け持つ気象台が area.json にない".into()));
     }
     if let Some((_, _, o)) = &home_muni
         && !offices.contains(o)
     {
         offices.push(o.clone());
     }
-    Ok(Watch {
-        home,
-        munis,
-        offices,
-        home_muni,
-    })
+    Ok((
+        Watch {
+            home,
+            munis,
+            offices,
+            home_muni,
+        },
+        home_err,
+    ))
+}
+
+/// 決め直しで自宅の市町村だけが決まらなかったら、自宅が同じ位置のうちは前の値を使い続ける
+/// (受け持つ気象台も読む)。前の値を使ったら true。
+fn keep_home_muni(w: &mut Watch, old: Option<&Watch>) -> bool {
+    if w.home_muni.is_some() {
+        return false;
+    }
+    let Some(prev) = old
+        .filter(|o| o.home == w.home)
+        .and_then(|o| o.home_muni.clone())
+    else {
+        return false;
+    };
+    if !w.offices.contains(&prev.2) {
+        w.offices.push(prev.2.clone());
+    }
+    w.home_muni = Some(prev);
+    true
+}
+
+/// 見張る範囲を次に決め直すまでの時間。自宅の市町村が決まっていなければ、範囲を作れていても早めに問い合わせ直す
+/// (国土地理院の逆ジオコーダーだけが止まっていたときに、帯が 24 時間「決められない」のままにならないように)。
+fn refresh_after(w: &Watch) -> Duration {
+    if w.home_muni.is_some() {
+        AREA_REFRESH
+    } else {
+        AREA_RETRY
+    }
 }
 
 /// 自宅の市町村の警報・注意報を写す。`ok` は今回すべての気象台を読めたか。
+/// `home_err` は自宅の市町村を決められなかった理由(帯に、届かなかった相手を出す)。
 fn publish_home(
     out: &HomeShared,
     w: &Watch,
+    home_err: Option<&AreaError>,
     docs: &HashMap<String, (Value, Option<String>)>,
     ok: bool,
 ) {
     let Ok(mut g) = out.lock() else { return };
     let Some((code, name, office)) = &w.home_muni else {
-        g.status.fail("自宅の市町村を決められない".into());
+        match home_err {
+            Some(e) => g.status.fail_at(
+                e.source,
+                format!("自宅の市町村を決められない: {}", e.message),
+            ),
+            None => g.status.fail("自宅の市町村を決められない".into()),
+        };
         return;
     };
     g.area = name.clone();
@@ -546,6 +596,8 @@ fn run(tx: Sender<AlertView>, ha: HomeAssistant, poll: Duration, km: f64, home: 
         .build()
         .into();
     let mut watch: Option<Watch> = None;
+    // 自宅の市町村を決められなかった理由(決まれば None)
+    let mut home_err: Option<AreaError> = None;
     let mut next_watch = Instant::now();
     // 気象台ごとの最新のファイルと ETag
     let mut docs: HashMap<String, (Value, Option<String>)> = HashMap::new();
@@ -556,7 +608,17 @@ fn run(tx: Sender<AlertView>, ha: HomeAssistant, poll: Duration, km: f64, home: 
     loop {
         if Instant::now() >= next_watch {
             match find_watch(&agent, &ha, km) {
-                Ok(w) => {
+                Ok((mut w, err)) => {
+                    home_err = if keep_home_muni(&mut w, watch.as_ref()) {
+                        None
+                    } else {
+                        err
+                    };
+                    if w.home_muni.is_some()
+                        && watch.as_ref().is_some_and(|o| o.home_muni.is_none())
+                    {
+                        eprintln!("disaster: 自宅の市町村が決まった");
+                    }
                     if watch.as_ref() != Some(&w) {
                         eprintln!(
                             "disaster: 自宅から{km}km以内の {} 市町村を見張る(気象台 {:?})",
@@ -565,8 +627,8 @@ fn run(tx: Sender<AlertView>, ha: HomeAssistant, poll: Duration, km: f64, home: 
                         );
                         docs.retain(|o, _| w.offices.contains(o));
                     }
+                    next_watch = Instant::now() + refresh_after(&w);
                     watch = Some(w);
-                    next_watch = Instant::now() + AREA_REFRESH;
                 }
                 Err(e) => {
                     eprintln!("disaster: 見張る範囲を決められない(再試行する): {e}");
@@ -574,7 +636,8 @@ fn run(tx: Sender<AlertView>, ha: HomeAssistant, poll: Duration, km: f64, home: 
                     if watch.is_none()
                         && let Ok(mut g) = home.lock()
                     {
-                        g.status.fail(format!("見張る範囲を決められない: {e}"));
+                        g.status
+                            .fail_at(e.source, format!("見張る範囲を決められない: {}", e.message));
                     }
                 }
             }
@@ -602,7 +665,7 @@ fn run(tx: Sender<AlertView>, ha: HomeAssistant, poll: Duration, km: f64, home: 
             eprintln!("disaster: 警報の取得が回復");
         }
         warned = !ok;
-        publish_home(&home, w, &docs, ok);
+        publish_home(&home, w, home_err.as_ref(), &docs, ok);
         // すべての気象台を一度は読めてから判定する(欠けたまま比べると解除と見分けられない)
         if w.offices.iter().all(|o| docs.contains_key(o)) {
             let mut hits = BTreeMap::new();
@@ -738,7 +801,7 @@ mod tests {
         let home: HomeShared = Arc::default();
         let docs: HashMap<String, (Value, Option<String>)> =
             [("130000".to_string(), (d, None))].into();
-        publish_home(&home, &watch(), &docs, true);
+        publish_home(&home, &watch(), None, &docs, true);
         let g = home.lock().unwrap().clone();
         assert_eq!(
             (g.area.as_str(), g.kinds.map(|k| k.len())),
@@ -746,7 +809,7 @@ mod tests {
         );
         assert!(!g.status.failing);
         // 読めなくなったら、最後の内容を残して失敗にする
-        publish_home(&home, &watch(), &HashMap::new(), false);
+        publish_home(&home, &watch(), None, &HashMap::new(), false);
         let g = home.lock().unwrap().clone();
         assert!(g.status.failing && g.kinds.is_some());
         let no_home = Watch {
@@ -754,8 +817,56 @@ mod tests {
             ..watch()
         };
         let fresh: HomeShared = Arc::default();
-        publish_home(&fresh, &no_home, &docs, true);
+        publish_home(&fresh, &no_home, None, &docs, true);
         assert!(fresh.lock().unwrap().status.failing);
+        // 逆ジオコーダーに届かなかったなら、帯には国土地理院と出す
+        let gsi = AreaError::gsi("timeout: global".into());
+        publish_home(&fresh, &no_home, Some(&gsi), &docs, true);
+        let s = fresh.lock().unwrap().status.clone();
+        assert_eq!(s.source, Some("国土地理院"));
+        assert!(s.error.unwrap().contains("timeout: global"));
+    }
+
+    /// 逆ジオコーダーだけが失敗して自宅の市町村が決まらなかったら、範囲を作れていても 10 分後に問い合わせ直す。
+    #[test]
+    fn retries_soon_while_the_home_municipality_is_unknown() {
+        assert_eq!(refresh_after(&watch()), AREA_REFRESH);
+        let no_home = Watch {
+            home_muni: None,
+            ..watch()
+        };
+        assert_eq!(refresh_after(&no_home), AREA_RETRY);
+        assert!(AREA_RETRY <= Duration::from_secs(600));
+    }
+
+    #[test]
+    fn keeps_the_previous_home_municipality_only_at_the_same_place() {
+        let lost = || Watch {
+            home_muni: None,
+            offices: vec![],
+            ..watch()
+        };
+        // 前の値があれば使い続け、受け持つ気象台も読む
+        let mut w = lost();
+        assert!(keep_home_muni(&mut w, Some(&watch())));
+        assert_eq!(w.home_muni, watch().home_muni);
+        assert_eq!(w.offices, ["130000"]);
+        // 前も決まっていなければ何もしない(失敗の理由を残す)
+        let mut w = lost();
+        assert!(!keep_home_muni(&mut w, Some(&lost())));
+        assert!(w.home_muni.is_none());
+        assert!(!keep_home_muni(&mut w, None));
+        // 自宅の位置が変わったら使わない
+        let moved = Watch {
+            home: (36.0, 140.0),
+            ..lost()
+        };
+        let mut w = moved.clone();
+        assert!(!keep_home_muni(&mut w, Some(&watch())));
+        // 今回決まったなら今回の値
+        let mut w = watch();
+        assert!(!keep_home_muni(&mut w, Some(&lost())));
+        assert!(w.home_muni.is_some());
     }
 
     fn doc(report: &str, items: Value) -> Value {
