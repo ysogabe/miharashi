@@ -1,4 +1,4 @@
-/* 実機のスクリーンショットと、機能・段階の一覧(Miharashi の LP と操作パネルの LP で共用) */
+/* 実機のスクリーンショット、仮データの見本と、機能・段階の一覧 */
 .shot{margin:0}
 .shot img{display:block;width:100%;height:auto;border:1px solid var(--line);border-radius:8px;background:#05080c}
 .shot figcaption{display:flex;justify-content:space-between;gap:16px;margin-top:10px;font-size:11px;line-height:1.7;color:var(--muted)}
@@ -6,6 +6,7 @@
 .shot-main{margin-bottom:22px}
 .shot-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:22px}
 .shot-note{margin:18px 0 0;font-size:11px;color:#8ea4b0}
+.screen-samples{margin-top:22px}
 .hero-shot{margin-top:6px}
 
 .feature-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}

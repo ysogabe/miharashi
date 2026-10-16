@@ -70,7 +70,7 @@ A は Miharashi 側の変更がゼロという強い利点があるので捨て�
 
 | 候補 | 判断 |
 |---|---|
-| 設計、LP、Miharashi 側の API | **miharashi リポジトリ**(この文書、`site/panel/`、`crates/miharashi-app`)。製品の一部であり、Pages の公開経路もある |
+| 設計、Miharashi 側の API | **miharashi リポジトリ**(この文書、`crates/miharashi-app`)。操作パネル専用の LP は Miharashi 側では配信しない。製品 LP には操作パネルの機能紹介とアプリのソースへのリンクを残す |
 | Android アプリ | **新リポジトリ `miharashi-panel`** にゼロから書く(決定)。ほかのアプリから派生しない。miharashi リポジトリには入れない(JDK / Android SDK / 署名鍵を Rust のワークスペースに持ち込まない)。API の契約は、この文書の §5.2 と `/status` の JSON 例(フィクスチャ)で共有する |
 
 ## 5. 設計
