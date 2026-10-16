@@ -1,6 +1,6 @@
 # Miharashi 操作パネル(Echo Show 5 / Android)の設計
 
-状態: **設計(未実装)**。2026-10-13 作成、同日に改訂(v0.2: 単体アプリの前提に改めた)。
+状態: **P3 まで実装済み**(miharashi-panel v0.2.0)。2026-10-13 作成、2026-10-16 に現状の表記を整理。段階ごとの実装・確認内容は §6、未検証項目は §7。
 対象: Android 化した Echo Show 5(960×480)で動く、**Miharashi 専用の単体アプリ**。ほかの操作盤との同居や、既存アプリからの派生は設計に入れない。
 画面側の契約: [DESIGN-screen-interface.md](../DESIGN-screen-interface.md)(Issue #9、PR #10)。パネルからの操作は、この契約の `KeyPress` として実行ループに入る。
 
@@ -89,15 +89,15 @@ flowchart LR
 
 - パネルは**キーボードと同じ `KeyPress` を送るだけ**で、画面の切替やメニューの論理はキオスク側にある(手元の画面一覧も、キオスクの `/status` の `screens` をそのまま出し、選んだ画面への遷移は `KeyPress` の列ではなく `POST /api/v1/screen` で指示する。§5.2)。
 - 実行ループは `Keys::poll()` と同じ場所でチャネルから `KeyPress` を取り出す。DRM / VT / seat の流れは変わらない(#9 の受け入れ条件)。
-- キオスクは**コマンドを実行しない**。API でできるのは、キー操作、画面の指定、状態の読み出しだけ。
+- キオスクは**コマンドを実行しない**。API でできるのは、キー操作、画面の指定、モニターと巡回の切り替え、状態の読み出しだけ。
 
-### 5.2 API(案)
+### 5.2 API
 
-> キオスク側は #5 の S2(2026-10-15)で全部入りました(`up` / `down` / `menu` と `/api/v1/screen`)。パネルのアプリ側の対応は P3。
+> キオスク側は #5 の S2(2026-10-15)で全部入りました(`up` / `down` / `menu` と `/api/v1/screen`)。パネルのアプリ側も P3(miharashi-panel v0.2.0)で対応済み。巡回の停止・再開 API は #57 で追加。
 
 | メソッド | パス | 内容 |
 |---|---|---|
-| GET | `/api/v1/status` | `{schema_version, host, screen: {id, title, index, count}, screens: [{id, title}], photo: {position, total} \| null, feed: "online" \| "retrying", rotation: {state: "on" \| "paused" \| "off", resume_in_s, control} \| null, menu: {index, id} \| null, keys: {prev, next, select, up, down, menu}, display: {on, mode: "auto" \| "force_on" \| "force_off" \| null, control}, uptime_s, generated_at}` |
+| GET | `/api/v1/status` | `{schema_version, host, screen: {id, title, index, count, page}, screens: [{id, title}], photo: {position, total} \| null, feed: "online" \| "retrying", rotation: {state: "on" \| "paused" \| "off", resume_in_s, control} \| null, menu: {index, id} \| null, keys: {prev, next, select, up, down, menu}, display: {on, mode: "auto" \| "force_on" \| "force_off" \| null, control}, uptime_s, generated_at}` |
 | POST | `/api/v1/input` | `{"key": "prev" \| "next" \| "select" \| "up" \| "down" \| "menu"}` → `204`。`quit` は受け付けない |
 | POST | `/api/v1/screen` | `{"id": "photo"}` → `204`。登録されていない id は `404` |
 | POST | `/api/v1/display` | `{"mode": "force_off" \| "force_on" \| "auto"}` → `204`。キオスクのモニターの消灯・点灯。キオスクが HA の手動オーバーライド(`screen_power.mode_entity` の input_select)を書き換え、すぐ問い合わせ直して反映する。HA と表示が食い違わないよう、キオスクの中だけでは切り替えない。mode エンティティが未設定なら `409`、HA に届かなければ `502` |
@@ -105,6 +105,7 @@ flowchart LR
 | GET | `/api/v1/events` | SSE。画面・モニター・巡回・メニュー・キーの意味が変わるたびに `status` と同じ JSON を 1 行。接続中は 15 秒ごとに `: keepalive` |
 | GET | `/api/v1/healthz` | 認証なし。`{"ok": true}` だけ |
 
+- `screen.page`: 状況画面の `OVERVIEW` / `DETAILS`。ページのない画面では `null`。
 - `rotation`: 自動巡回(DESIGN-screens.md §7.2)の状態。`[rotation]` が無効なら `null`。操作で止まっている間は `paused`、戻ると `on`(#45)。`resume_in_s` は戻るまでの残り秒数(切り上げ、0 未満にしない。`on` なら `null`)。残り秒数は `/status` を組み立てるときに戻る時刻から計算するので、SSE は止まる・戻る・もう一度の操作で止める時間が延びる、のときだけ送り、毎秒は送らない。項目を足しただけなので `schema_version` は 1 のまま。
   - `off` は `POST /api/v1/rotation` で止めたままにしている間(`resume_in_s` は `null`)。時間がたっても戻らず、キーや `POST /api/v1/screen` で操作しても `paused` にならない(`off` のまま)。`on` を送るまで止まったまま。止めた状態は保存しないので、キオスクを再起動すると設定どおり `on` に戻る。`off` になる・`off` から戻るときにも SSE を送る(#57)。
   - `control`: キオスクが `/api/v1/rotation` を受け付けるか。これが無い古いキオスクでは、パネルは止める・再開するボタンを灰色にする(`display.control` と同じ判定の型)。古いパネルは知らない `state`(`off`)を「巡回なし」として扱い、巡回の行を出さなくなるだけで壊れない。`off` と `control` も項目と値を足しただけなので `schema_version` は 1 のまま。ボタンの置き場所は miharashi-panel 側で決める。
@@ -178,7 +179,7 @@ flowchart LR
 | 段階 | 内容 | 確認方法 |
 |---|---|---|
 | P0(済) | 設計と LP | — |
-| P1(済、#26) | miharashi に `[panel]` と API(既定 OFF)。`KeyPress` の注入、`/status`、SSE、トークン、レート制限。#5 より先に、今の `KeyPress`(Prev / Switch / Next)へ直接つなぐ最小版を入れた。キーは `prev` / `next` / `select` だけで、`up` / `down` / `menu` は `400`(#5 で `KeyPress` が増えたら受け付ける)。`/api/v1/screen` は P3 | **Echo なしで検証できる**: `curl -H "Authorization: Bearer ..." -d '{"key":"next"}'` で画面が切り替わり、`/status` が変わる。24 時間試験のログに `panel=` が出る |
+| P1(済、#26) | miharashi に `[panel]` と API(既定 OFF)。`KeyPress` の注入、`/status`、SSE、トークン、レート制限。#5 より先に、今の `KeyPress`(Prev / Switch / Next)へ直接つなぐ最小版を入れた。当時のキーは `prev` / `next` / `select` だけだった。`up` / `down` / `menu` と `/api/v1/screen` は後続の S2・P3 で追加済み(現在の仕様は §5.2) | **Echo なしで検証できる**: `curl -H "Authorization: Bearer ..." -d '{"key":"next"}'` で画面が切り替わり、`/status` が変わる。24 時間試験のログに `panel=` が出る |
 | P2(済、miharashi-panel v0.1.0) | 単体アプリ `miharashi-panel` の最小版。4 / 5 / 6、現在画面の表示、自動起動、全画面。あとから足したもの: モニターの消灯・点灯・自動(`/api/v1/display`、#32、miharashi-panel#1)、触らなければ操作盤を消灯(miharashi-panel#2)。画面一覧のレールは、タップで遷移できないうちは不要としてやめ、その場所にモニターのボタンを置いた | 実機で 4 / 6 の往復。Wi-Fi 切断 → 復帰で `OFFLINE` → `API` 点灯。端末を再起動すると自動で前面に出る |
 | P3(済、miharashi-panel v0.2.0、2026-10-15) | 8 / 2 / 0(miharashi-panel#4)。ボタンは数字をやめてアイコンと「今押すと何が起きるか」のラベルに(miharashi-panel#5、ラベルはキオスクの `keys`、#51・#53)。キオスクのメニューの一覧を出し、行をタップでその画面へ直接移る(`/api/v1/screen`、miharashi-panel#6、#49)。自動巡回の状態と戻るまでの残り(miharashi-panel#3、#45)。写真 n/N は P2 から出ている。夜間の減光は作らず、触らなければ操作盤を消灯(miharashi-panel#2)で代える(§7) | 実機(Echo Show 5)で、メニューを開く → ▼ で選択が動く → 行のタップで閉じて移る、ラベルが画面ごとに変わる、巡回の停止と残りの数え下げ |
 | P4(#55) | LLM 管理(local-model-lab#19、旧 gpu-eval#19)とエージェントの状態を手元に表示 | LLM 管理の状態をキオスクが中継するか、パネルが直接読むかを決める(#55 の案はキオスクが中継) |

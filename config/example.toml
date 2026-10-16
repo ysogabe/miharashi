@@ -1,4 +1,4 @@
-# Miharashi 設定例。コメントアウトした行は既定値。
+# Miharashi 設定例。コメントアウトした行は既定値(例示・推奨と記したものを除く)。
 # 置き場所の検索順: --config → ~/.config/miharashi/config.toml → /etc/miharashi/config.toml
 
 [runtime]
@@ -108,9 +108,11 @@
 # bearer は GET /api/orchestration/shell にだけ使う。環境表示用に認証なしの GET /.well-known/t3/environment も行う。
 # 更新系 API は呼び出さない。
 # enabled = false
+# 例示用の接続先。既定値は http://192.168.0.132:3773。自分の T3 に合わせる
 # url = "http://192.0.2.10:3773"
 # T3 の bearer は 30 日で切れる。miharashi-t3-token.timer が週 1 回、読み取りだけのトークンを作り直して
 # このファイルを置き換える(docs/DESIGN-t3-token.md)。そのため実行ユーザーが書ける場所に置く。
+# 推奨: 自動更新で書き換えられる場所。既定値は /etc/miharashi/t3-agent.token
 # token_file = "/var/lib/miharashi/t3-agent.token"
 # poll_secs = 5
 # timeout_secs = 3
@@ -149,7 +151,8 @@
 # トークンは 16 文字以上を 1 行で書いたファイル。ha-token と同じく root:<実行ユーザー> 0640(か 0600)。誰でも読める権限なら起動しない。
 # 例: head -c 24 /dev/urandom | base64 | sudo install -o root -g hermes -m 640 /dev/stdin /etc/miharashi/panel.token
 # 待ち受けられない(起動直後でまだ IP が無いなど)ときは 30 秒ごとに再試行する。
-# 使えるキーは prev / next / select(4 / 6 / 5)。up / down / menu は PoC-003(#5)の後。
+# 使えるキーは prev / next / select / up / down / menu(4 / 6 / 5 / 8 / 2 / 0)。
+# POST /api/v1/screen で画面を直接選び、POST /api/v1/rotation で巡回の停止・再開ができる。
 # enabled = false
 # listen = "192.168.0.132:8790"
 # token_file = "/etc/miharashi/panel.token"

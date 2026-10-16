@@ -3,7 +3,7 @@
 2026-10-13 作成。この文書の「画面」はキオスクに出る 1 枚の表示(状況画面、写真画面など)を指し、
 Echo Show の「操作パネル」([panel/DESIGN.md](panel/DESIGN.md))とは区別する。
 
-画面の登録と操作の仕組みは [DESIGN-screen-interface.md](DESIGN-screen-interface.md)(Issue #9、#5 で実装予定の
+画面の登録と操作の仕組みは [DESIGN-screen-interface.md](DESIGN-screen-interface.md)(Issue #9、#5 で実装した
 `ScreenManager` / `Screen` / `Provider` / `World`)をそのまま土台にし、この文書では**どの画面を持ち、
 データをどこから取り、無人のときにどう切り替えるか**を決める。
 
@@ -17,7 +17,7 @@ Echo Show の「操作パネル」([panel/DESIGN.md](panel/DESIGN.md))とは区�
 |---|---|---|
 | Hermes 連携 | やめる。Agent 画面(Issue #6、PoC-004)は作らない | 2026-10-13 ユーザー決定(GEOFRAME 側の exporter も撤去済み) |
 | 室内環境と天気 | **独立した画面**にする | 2026-10-13 ユーザー指示。写真の合間に挟む案は採らない |
-| 航空機 | **独立した画面**に作り直す。今の「写真 10 枚ごとに挟む」(#27)は廃止する | 同上。12 時間試験(10/14)の後に着手 |
+| 航空機 | **独立した画面**にした(S3、2026-10-15)。以前の「写真 10 枚ごとに挟む」(#27)は廃止済み | 2026-10-13 の決定を実装済み |
 | アラート(地震・災害) | 画面ではなく、すべての画面の上に重ねる層のまま | #23・#24 で実装済み |
 | 旅・季節のカード | 写真画面の中の演出のまま | #25 |
 
@@ -82,11 +82,15 @@ flowchart LR
         QK[quake: 気象庁の地震情報]
         HA[screen_power: HA の在宅・画面モード]
     end
-    SYS & ENV & WX & WARN & AIR --> W[World: 画面が読む共有データ]
+    SYS --> W[World: system・photo_feed・agents]
+    AG[T3 worker / AgentProvider] --> W
+    ENV & WX & WARN --> ROOM[RoomScreen: RoomFeeds]
+    AIR --> AC[AircraftScreen: Shared]
     WARN -- 特別警報・土砂災害危険警報 --> AL[アラート層]
     QK --> AL
     FEED --> PH[photo 画面が所有]
     W --> SM[ScreenManager]
+    ROOM & AC --> SM
     PH --> SM
     AL --> SM
     ROT[自動巡回] --> SM
@@ -97,28 +101,28 @@ flowchart LR
 
 - **runtime** は今のまま(`trait App` だけを知る)。画面の電源(`screen_power`)も runtime に残す。
 - **ScreenManager** が `App` を実装する。画面の登録・巡回・メニュー、自動巡回、アラート層の重ね描き、
-  操作パネルへの状態(`panel_view`)を受け持つ。今の `KioskApp` の中身を画面ごとに分けて移す。
-- **Screen** は 4 つ(§2)。写真フィードのように画面だけが使う資源は画面が持つ。
+  操作パネルへの状態(`panel_view`)を受け持つ。旧 `KioskApp` から分割済み。
+- **Screen** は最大 5 つ(§2)。写真フィードのように画面だけが使う資源は画面が持つ。
 - **Provider**(取得)は自前のスレッドで取り、`World` の自分の領域に最新値を写すだけ(ブロックしない)。
   非表示の画面のデータも取り続ける(切り替えた瞬間に出せるように)。
 - **アラート層**は画面ではない。地震・災害のアラートは表示中の画面に関係なく最前面に重ね、
   画面が消えていても点ける(今の `wants_screen`)。
 
-### 3.1 World(共有データ)
+### 3.1 共有データの実装(2026-10-16 ソース照合)
 
-| 領域 | 書く Provider | 読む画面 | 更新間隔 |
-|---|---|---|---|
-| `clock` | ScreenManager | 全画面 | 毎 tick |
-| `system` | system(今の `data.rs`) | status | 1 秒 |
-| `photo_feed` | photo 画面 | status(HEALTH) | 変化時 |
-| `env` | env | room | 値 60 秒、24h 履歴 10 分 |
-| `weather` | weather | room | 30 分(気象庁の発表は 1 日 3 回) |
-| `warnings` | warnings | room(帯)、アラート層 | 60 秒(ETag で 304) |
-| `aircraft` | aircraft | aircraft | 5 秒 |
+当初案では全取得結果を World に集める予定だったが、現在は画面固有の共有ハンドルも使う。
 
-- `warnings` は今の `disaster.rs` を分けて作る: 取得と解析(自宅 50km の市町村の全種類の発表)を Provider にし、
-  「新しく出た特別警報・土砂災害危険警報」の判定とアラート送信はその上に残す。room 画面は自宅の市町村の分だけを読む。
-- `aircraft` は今の `aircraft.rs`(#27)の `Shared` をそのまま `World` の領域にする。
+| データ | 保持場所 | 更新元・間隔(既定) |
+|---|---|---|
+| システムと時計 | `World.system` | `DataSource` と ScreenManager、1 秒 |
+| 写真フィードの状態・位置 | `World.photo_feed` | PhotoScreen の共有状態を `FeedStateProvider` が毎周期コピー |
+| T3 Agent | `World.agents` | `AgentProvider` が worker の最新値を毎周期コピー。HTTP 取得は 5 秒 |
+| 室内環境 | `RoomFeeds.env` | env worker、値 60 秒・履歴 10 分 |
+| 天気 | `RoomFeeds.weather` | weather worker、30 分 |
+| 自宅の市町村の警報 | `RoomFeeds.warnings` | disaster worker、60 秒 |
+| 航空機 | `AircraftScreen` の `Shared` | aircraft worker、5 秒 |
+
+`World` に独立した `clock`・`env`・`weather`・`warnings`・`aircraft` フィールドはない。警報の取得とアラート判定は `disaster.rs` にあり、room 画面への共有値とアラート通知を同じ worker から出す。
 
 ## 4. 画面の切り替え
 
@@ -175,7 +179,7 @@ pause_after_input_secs = 300
   背景の地図は画面サイズごとに 1 回だけ描いて保持し、機体や文字だけを毎秒重ねる。
 - 12 時間試験の結果(10/14)を見て、巡回の秒数と描き直す間隔を決め直す。
 
-## 6. 設定(案)
+## 6. 設定例
 
 ```toml
 [room]
@@ -186,8 +190,7 @@ tiles = [
   { label = "CO₂",  entity = "sensor.m5coreink_air_monito_0e7e_carbon_dioxide", warn = 1000, alert = 1500 },
   { label = "VOC",  entity = "sensor.m5coreink_air_monito_0e7e_volatile_organic_compounds" },
   { label = "気圧", entity = "sensor.m5coreink_air_monito_0e7e_pressure", trend_hours = 3 },
-  { label = "玄関", entity = "sensor.atoms3_door_sensor_01_atom_s3_door_sensor_01_temperature_dht12",
-    second = "sensor.atoms3_door_sensor_01_atom_s3_door_sensor_01_humidity_dht12" },
+  { label = "玄関", entity = "sensor.door_temperature", second = "sensor.door_humidity" },
 ]
 history_hours = 24
 # 天気予報の地域は自宅の位置から決める(気象庁 area.json の class10。東京地方など)。空なら自動
@@ -257,7 +260,7 @@ S1・S2 は 12 時間試験(10/14)の結果を見てから始める(操作の変
 - 写真画面は表示中だけ次の写真へ進むので、巡回で戻ると続きの写真から出る。
 - 焼き付き対策の演出は、対象の画面を続けて `refresh_minutes` 出したときだけ入るので、巡回の手順がそれより短いと入らない
   (画面が切り替わること自体が焼き付き対策になる)。巡回を止めたまま(`off`)にすると、同じ画面を出し続けるので演出が入る(#57)。
-- 操作パネルの `/api/v1/status` と SSE に `rotation: {"state": "on" | "paused", "resume_in_s": 240 | null}`(無効なら `null`)を出す(#45)。
+- 操作パネルの `/api/v1/status` と SSE に `rotation: {"state": "on" | "paused" | "off", "resume_in_s": 240 | null, "control": true}`(無効なら `null`)を出す(#45)。
   止めたままの `"off"` と `control` は下のとおり(#57)。
   `resume_in_s` は戻るまでの残り秒数(切り上げ)。`PanelView` には戻る時刻だけを持たせ、秒数は `/status` を組み立てるときに計算する(毎秒 SSE を送らない)。
   実行ループは毎秒の tick(再描画の要求)のたびにパネルへ状態を渡す(モニターを消していても。SSE は変わったときだけ)ので、

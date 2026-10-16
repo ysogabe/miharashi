@@ -1,6 +1,6 @@
 # T3 Agent 画面の概要設計
 
-2026-10-15 作成・改訂。状態: **承認済み概要設計。実装・ローカル検証済み。実サーバーの認証済みshell APIも接続確認済み（15分セッション、GETのみ）**。
+2026-10-15 作成、2026-10-16 に現行ソースとの表記を照合。状態: **承認済み概要設計。実装・ローカル検証済み。実サーバーの認証済みshell APIも接続確認済み（15分セッション、GETのみ）**。
 実装と検証の記録は [T3 Agent カードボード — 実装・検証記録](poc/T3-AGENTS.md) を参照。
 基準: miharashi `4267f7c`、起動中の T3 Code **0.0.45 / orchestration protocol 1**。
 
@@ -335,7 +335,7 @@ branch / worktree は初期画面に出さない。中央ポップアップも�
 進捗の全 step 数が 0、範囲が矛盾、時刻が未来の場合はバーや経過時間を `--` にし、異常な数値を描画しない。
 受信文字列は制御文字を除き、表示枠に合わせて省略する。会話本文・添付・承認 payload は取得しない。
 
-## 8. 接続・認証・設定案
+## 8. 接続・認証・設定
 
 一覧 API は認証が必要。v0.0.45 の `t3 auth session issue` はscope指定に対応せず、発行tokenは `orchestration:operate` など更新系を含む広い権限を持つ。そこで、ペアリング用トークンを `POST /oauth/token` で `orchestration:read` だけのトークンに交換し、週 1 回作り直す([トークンの更新](DESIGN-t3-token.md))。Bearer tokenは `GET /api/orchestration/shell` にだけ使い、表示用の環境情報は認証なしの `GET /.well-known/t3/environment` で取得する。更新系APIは呼び出さない。
 
@@ -367,23 +367,24 @@ recent_hours = 24
 WS に移す場合は初期 snapshot と `thread/project-upserted`、`thread/project-removed` を適用し、
 切断・sequence の不整合時に全体を同期し直す。変更のない時間を疎通失敗と誤認しない生存確認も必要になる。
 
-## 10. 実装の配置と進め方
+## 10. 実装の配置
 
-既存の実装では `World` は `system` と `photo_feed` だけであり、Agent 領域はまだない。
-以前の設計書の `Option<AgentSnapshot>` や registry 自動 PNG 出力を、実装済みとは扱わない。
+`World.agents: AgentSnapshot` と `Composite::Agents` を実装済み。`AgentProvider` が共有値を写し、`kiosk()` が設定に応じて画面と Provider を登録する。`Option<AgentSnapshot>` や registry 自動 PNG 出力は採用していない。PNG は `main.rs` から `agent_demo::write_fixtures` を呼んで生成する。
+
+以下は実装済みの配置と、当初の段階分けの記録。最新の確認結果は [実装・検証記録](poc/T3-AGENTS.md) を参照。
 
 | 追加・変更先 | 内容 |
 |---|---|
-| `crates/miharashi-app/src/agents.rs` (新規) | T3 DTO / adapter、取得スレッド、意味のある差分、上限付き変更記録、`AgentProvider` |
+| `crates/miharashi-app/src/agents.rs` | T3 DTO / adapter、取得スレッド、意味のある差分、上限付き変更記録、`AgentProvider` |
 | `crates/miharashi-app/src/screen.rs` | `World.agents`、カード合成用の `Composite` variant の追加。`Provider` 契約は維持 |
-| `crates/miharashi-app/src/app/screens/agents.rs` (新規) | 帰る場所、活動度、演出の状態機械・待ち行列、自動巡回。画面内操作なし |
-| `crates/miharashi-render/src/agents.rs` (新規) | カード面・変更内容と CPU 合成。ネットワークを持たせない |
+| `crates/miharashi-app/src/app/screens/agents.rs` | 帰る場所、活動度、演出の状態機械・待ち行列、自動巡回。画面内操作なし |
+| `crates/miharashi-render/src/agents.rs` | カード面・変更内容と CPU 合成。ネットワークを持たせない |
 | `crates/miharashi-gpu/src/compose.rs` / app の `runtime.rs` | キャッシュしたカード面を位置・拡縮・不透明度で合成する経路と `Composite` の接続 |
 | `config.rs` / `config/example.toml` | `[agents]` と値の検証 |
 | `app.rs` / `main.rs` | module 宣言、取得開始、有効時の画面 / Provider 登録、PNG 用の仮データと出力追加 |
 | ドキュメント | 接続手順、操作、実機確認結果。既存の Hermes 連携中止と今回の T3 連携を区別 |
 
-カードの動きには新しい GPU 合成経路を設け、runtime にその接続を足す。既存の `Canvas / Photo / Radar` の
+カードの動きには GPU 合成経路を設け、runtime に接続済み。既存の `Canvas / Photo / Radar` の
 合成とアラートの前面表示を維持する。操作パネルの `screens` は登録画面から作られるので、新しい id の登録で
 選択肢になる。個別カード操作をパネル API に足す必要はない。
 
