@@ -74,20 +74,31 @@ pub fn line_chart_ex(
     c.stroke_rect(x, y, w, h, 1.0, rgba(60, 80, 105, 255));
     t.draw(c, title, x + 16.0, y + 10.0, 24.0, [180, 200, 220, 255]);
 
+    // 凡例がタイトルまで届くときは、収まるまで文字と間隔を縮める(最小 60%)
+    let legend_w: f32 = series.iter().map(|s| t.measure(s.name, 22.0) + 50.0).sum();
+    let room = w - 16.0 - (16.0 + t.measure(title, 24.0) + 16.0);
+    let k = (room / legend_w).clamp(0.6, 1.0);
     let mut lx = x + w - 16.0;
     for s in series.iter().rev() {
-        let tw = t.measure(s.name, 22.0);
+        let tw = t.measure(s.name, 22.0 * k);
         lx -= tw;
-        t.draw(c, s.name, lx, y + 12.0, 22.0, s.color);
-        lx -= 22.0;
+        t.draw(
+            c,
+            s.name,
+            lx,
+            y + 12.0 + 11.0 * (1.0 - k),
+            22.0 * k,
+            s.color,
+        );
+        lx -= 22.0 * k;
         c.fill_rect(
             lx,
             y + 21.0,
-            14.0,
+            14.0 * k,
             6.0,
             rgba(s.color[0], s.color[1], s.color[2], 255),
         );
-        lx -= 28.0;
+        lx -= 28.0 * k;
     }
 
     let (px, py, pw, ph) = (x + 84.0, y + 56.0, w - 108.0, h - 80.0);

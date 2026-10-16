@@ -49,7 +49,10 @@ pub struct Sample {
     pub peaks_today: Vec<(String, String, String)>,
 }
 
-/// GPU 1 台分の使用率と温度。
+/// GPU 1 台分の (使用率, 温度, (使用中, 全体) [MiB])。
+type GpuValues = (Option<f32>, Option<f32>, Option<(u32, u32)>);
+
+/// GPU 1 台分の使用率・温度・メモリ。
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct GpuReading {
     /// "GPU0", "GPU1", ...(状態ログのキー。番号は変えない)
@@ -58,6 +61,22 @@ pub struct GpuReading {
     pub name: String,
     pub usage: Option<f32>,
     pub temp: Option<f32>,
+    /// 使用中のメモリ [MiB]
+    pub mem_used_mib: Option<u32>,
+    /// 使えるメモリの全体 [MiB]。NVIDIA はドライバーの予約分を除き、amdgpu は VRAM + GTT
+    pub mem_total_mib: Option<u32>,
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// NVIDIA の (使用中, 使える全体) [MiB]。全体からはドライバーの予約分(アプリは使えない)を除く。
+/// 値は 2 MiB 単位で、確保・解放はすぐに反映される。
+fn nvml_mem(d: &nvml_wrapper::Device) -> Option<(u32, u32)> {
+    let m = d.memory_info().ok()?;
+    Some((
+        (m.used / MIB) as u32,
+        (m.total.saturating_sub(m.reserved) / MIB) as u32,
+    ))
 }
 
 /// 画面用に GPU の名前を短くする("NVIDIA GeForce RTX 5060 Ti" → "RTX 5060 Ti")。
@@ -89,6 +108,22 @@ impl SysfsGpu {
         let rd = std::fs::read_dir(self.device.join("hwmon")).ok()?;
         rd.flatten()
             .find_map(|e| read_milli_c(&e.path().join("temp1_input")))
+    }
+
+    /// (使用中, 全体) [MiB]。VRAM と GTT の合計。内蔵 GPU の VRAM は BIOS が切り出した
+    /// 数十 MiB だけで、溢れた分はシステム RAM から借りる GTT に置かれるので、VRAM だけでは
+    /// どれだけ使えるかが分からない。
+    fn mem(&self) -> Option<(u32, u32)> {
+        let rd = |f: &str| -> Option<u64> {
+            std::fs::read_to_string(self.device.join(f))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        let used = rd("mem_info_vram_used")? + rd("mem_info_gtt_used")?;
+        let total = rd("mem_info_vram_total")? + rd("mem_info_gtt_total")?;
+        Some(((used / MIB) as u32, (total / MIB) as u32))
     }
 }
 
@@ -143,7 +178,6 @@ impl Default for SamplerOptions {
 /// NVML から間引いて読む GPU の指標(NVML の中では重いもの)。
 #[derive(Default)]
 struct GpuSlow {
-    vram: Option<(u32, u32)>,
     /// (現在, 最大) [MHz]
     clock: Option<(u32, u32)>,
     pstate: Option<String>,
@@ -152,10 +186,9 @@ struct GpuSlow {
     fan: Option<u32>,
 }
 
-/// メモリ、クロック、P ステート、プロセス、ファンを読む。最大クロックは変わらないので呼び出し側で 1 回だけ読む。
+/// クロック、P ステート、プロセス、ファンを読む。最大クロックは変わらないので呼び出し側で 1 回だけ読む。
 fn read_gpu_slow(d: &nvml_wrapper::Device, max_clock: Option<u32>) -> GpuSlow {
     use nvml_wrapper::enum_wrappers::device::Clock;
-    const MIB: u64 = 1024 * 1024;
     let mut procs: Vec<(String, u32, u32)> = Vec::new();
     let all = d
         .running_compute_processes()
@@ -176,10 +209,6 @@ fn read_gpu_slow(d: &nvml_wrapper::Device, max_clock: Option<u32>) -> GpuSlow {
     procs.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.cmp(&b.1)));
     procs.truncate(5);
     GpuSlow {
-        vram: d
-            .memory_info()
-            .ok()
-            .map(|m| ((m.used / MIB) as u32, (m.total / MIB) as u32)),
         clock: d.clock_info(Clock::Graphics).ok().zip(max_clock),
         pstate: d.performance_state().ok().and_then(|p| {
             // c_variant は NVML_PSTATE_0..15 の値。Unknown は 32
@@ -191,7 +220,7 @@ fn read_gpu_slow(d: &nvml_wrapper::Device, max_clock: Option<u32>) -> GpuSlow {
     }
 }
 
-/// NVML のメモリ・クロック・P ステート・プロセス・ファン、amdgpu、ファンの回転を読む間隔
+/// NVML のクロック・P ステート・プロセス・ファン、amdgpu の使用率と温度、ファンの回転を読む間隔
 const SLOW_EVERY: Duration = Duration::from_secs(5);
 /// SSD の温度を読む間隔
 const SSD_EVERY: Duration = Duration::from_secs(30);
@@ -441,8 +470,8 @@ impl Sampler {
                 let (mem_used_gb, mem_total_gb) = mem.unzip();
                 let psi_mem = psi[1];
 
-                // 監視 GPU の温度・使用率・電力は毎回。同じ GPU を GPU 一覧のために読み直さない
-                let (gpu_temp, gpu_percent, gpu_power_w, nv) = part!("nvml", {
+                // 監視 GPU の温度・使用率・電力・メモリは毎回。同じ GPU を GPU 一覧のために読み直さない
+                let (gpu_temp, gpu_percent, gpu_power_w, vram, nv) = part!("nvml", {
                     use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
                     let temp = gpu
                         .as_ref()
@@ -456,22 +485,28 @@ impl Sampler {
                         .as_ref()
                         .and_then(|d| d.power_usage().ok())
                         .map(|mw| mw as f32 / 1000.0);
-                    let nv: Vec<(Option<f32>, Option<f32>)> = nvml_all
+                    let vram = gpu.as_ref().and_then(nvml_mem);
+                    let nv: Vec<GpuValues> = nvml_all
                         .iter()
                         .map(|d| {
                             if gpu_index.is_some() && d.index().ok() == gpu_index {
-                                (util, temp)
+                                (util, temp, vram)
                             } else {
                                 (
                                     d.utilization_rates().ok().map(|u| u.gpu as f32),
                                     d.temperature(TemperatureSensor::Gpu).ok().map(|t| t as f32),
+                                    nvml_mem(d),
                                 )
                             }
                         })
                         .collect();
-                    (temp, util, power, nv)
+                    (temp, util, power, vram, nv)
                 });
-                // メモリ・クロック・P ステート・プロセス・ファンは SLOW_EVERY ごと(NVML の中で重い)
+                let amd_mem: Vec<Option<(u32, u32)>> = part!(
+                    "amdgpu メモリ",
+                    sysfs_gpus.iter().map(|g| g.mem()).collect()
+                );
+                // クロック・P ステート・プロセス・ファンは SLOW_EVERY ごと(NVML の中で重い)
                 if slow_due {
                     part!("nvml(間引き)", {
                         slow = gpu
@@ -533,8 +568,8 @@ impl Sampler {
                     swap_used_gb: swap.map(|s| s.0),
                     swap_total_gb: swap.map(|s| s.1),
                     load_avg,
-                    vram_used_mib: slow.vram.map(|v| v.0),
-                    vram_total_mib: slow.vram.map(|v| v.1),
+                    vram_used_mib: vram.map(|v| v.0),
+                    vram_total_mib: vram.map(|v| v.1),
                     gpu_clock_mhz: slow.clock.map(|c| c.0),
                     gpu_clock_max_mhz: slow.clock.map(|c| c.1),
                     gpu_pstate: slow.pstate.clone(),
@@ -553,13 +588,15 @@ impl Sampler {
                     gpu_percent,
                     gpus: nv
                         .into_iter()
-                        .chain(amd.iter().copied())
+                        .chain(amd.iter().zip(&amd_mem).map(|(&(u, t), &m)| (u, t, m)))
                         .enumerate()
-                        .map(|(i, (usage, temp))| GpuReading {
+                        .map(|(i, (usage, temp, mem))| GpuReading {
                             label: format!("GPU{i}"),
                             name: display_names.get(i).cloned().unwrap_or_default(),
                             usage,
                             temp,
+                            mem_used_mib: mem.map(|m| m.0),
+                            mem_total_mib: mem.map(|m| m.1),
                         })
                         .collect(),
                     mem_used_gb,
@@ -831,6 +868,9 @@ pub fn profile(
                 .map(|g| (g.usage(), g.temp()))
                 .collect::<Vec<_>>()
         });
+        time!("sysfs: amdgpu メモリ(VRAM + GTT)", n, {
+            sysfs_gpus.iter().map(|g| g.mem()).collect::<Vec<_>>()
+        });
         time!("rapl: ヘルパーのファイル", n, rapl.poll(tick));
         time!("exec: systemctl(30 秒に 1 回)", n, failed.poll(tick));
         if let Some(d) = gpu.as_ref() {
@@ -932,6 +972,15 @@ mod tests {
             if let Some(b) = busy {
                 std::fs::write(d.join("gpu_busy_percent"), b).unwrap();
                 std::fs::write(d.join("hwmon/hwmon3/temp1_input"), "38000\n").unwrap();
+                // 本番の内蔵 GPU と同じ値: VRAM 55 / 64 MiB、GTT 208 / 15655 MiB
+                for (f, mib) in [
+                    ("mem_info_vram_used", 55),
+                    ("mem_info_vram_total", 64),
+                    ("mem_info_gtt_used", 208),
+                    ("mem_info_gtt_total", 15655),
+                ] {
+                    std::fs::write(d.join(f), format!("{}\n", mib * MIB)).unwrap();
+                }
             }
             d
         };
@@ -952,6 +1001,7 @@ mod tests {
         assert_eq!(pcis, ["0000:03:00.0", "0000:10:00.0"]);
         assert_eq!(g[1].usage(), Some(7.0));
         assert_eq!(g[1].temp(), Some(38.0));
+        assert_eq!(g[1].mem(), Some((263, 15719)), "VRAM と GTT の合計");
         assert!(find_sysfs_gpus(&root.join("none")).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }

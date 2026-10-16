@@ -246,6 +246,12 @@ fn halves(w: f32) -> [(f32, f32); 2] {
     [(PAD, cw), (PAD + cw + GAP, cw)]
 }
 
+/// 横に 3 つ並べるグラフの (x, 幅)。
+fn thirds(w: f32) -> [(f32, f32); 3] {
+    let cw = (w - PAD * 2.0 - GAP * 2.0) / 3.0;
+    [0.0, 1.0, 2.0].map(|i| (PAD + (cw + GAP) * i, cw))
+}
+
 fn series<'a>(name: &'a str, data: &'a [f32], color: [u8; 4]) -> Series<'a> {
     Series { name, data, color }
 }
@@ -361,6 +367,41 @@ fn usage_series(s: &Snapshot) -> Vec<Series<'_>> {
     v
 }
 
+/// GPU ごとのメモリ使用率のグラフ。全体の大きさが GPU ごとに違うので % で並べ、凡例に今の値を添える。
+fn vram_chart(
+    c: &mut Canvas,
+    t: &mut TextEngine,
+    (x, cw): (f32, f32),
+    y: f32,
+    h: f32,
+    s: &Snapshot,
+) {
+    let names: Vec<String> = s
+        .gpus
+        .iter()
+        .map(|g| format!("{} {}", g.display_name(), pct(g.mem_pct())))
+        .collect();
+    let series: Vec<Series> = s
+        .gpus
+        .iter()
+        .zip(&names)
+        .enumerate()
+        .map(|(i, (g, n))| series(n, &g.mem_history, gpu_color(i)))
+        .collect();
+    chart::line_chart_ex(
+        c,
+        t,
+        x,
+        y,
+        cw,
+        h,
+        "VRAM %",
+        &series,
+        Scale::Fixed(100.0),
+        "%",
+    );
+}
+
 fn overview(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot) {
     let (w, h) = (c.width() as f32, c.height() as f32);
 
@@ -433,12 +474,12 @@ fn overview(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot) {
         .collect();
     rows_tile(c, t, tile_rect(w, 4), "FAN", &fans);
 
-    // 下段: 使用率と電力の時系列
+    // 下段: 使用率、GPU のメモリ、電力の時系列
     let sum_h = 64.0;
     let sum_y = h - FOOT - sum_h;
     let cy = tile_rect(w, 0).1 + TILE_H + GAP;
     let ch = sum_y - 16.0 - cy;
-    let [l, r] = halves(w);
+    let [l, m, r] = thirds(w);
     chart::line_chart_ex(
         c,
         t,
@@ -451,6 +492,7 @@ fn overview(c: &mut Canvas, t: &mut TextEngine, s: &Snapshot) {
         Scale::Fixed(100.0),
         "%",
     );
+    vram_chart(c, t, m, cy, ch, s);
     chart::line_chart_ex(
         c,
         t,

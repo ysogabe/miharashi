@@ -30,6 +30,9 @@ pub fn dummy_snapshot(phase: f32) -> Snapshot {
             usage: Some(gpu),
             temp: Some(55.0 + gpu * 0.15),
             history: gpu_history.clone(),
+            mem_used_mib: Some(9830),
+            mem_total_mib: Some(15941),
+            mem_history: dummy_history(phase + 60.0, HISTORY, 55.0),
         },
         GpuLoad {
             label: "GPU1".into(),
@@ -37,6 +40,9 @@ pub fn dummy_snapshot(phase: f32) -> Snapshot {
             usage: igpu_history.last().copied(),
             temp: Some(42.0),
             history: igpu_history,
+            mem_used_mib: Some(263),
+            mem_total_mib: Some(15719),
+            mem_history: vec![1.7; HISTORY],
         },
     ];
     let mut s = Snapshot {
@@ -68,8 +74,8 @@ pub fn dummy_snapshot(phase: f32) -> Snapshot {
         swap_used_gb: Some(3.1),
         swap_total_gb: Some(8.0),
         load_avg: Some([1.52, 1.31, 1.18]),
-        vram_used_mib: Some(6144),
-        vram_total_mib: Some(16384),
+        vram_used_mib: Some(9830),
+        vram_total_mib: Some(15941),
         gpu_clock_mhz: Some(2100),
         gpu_clock_max_mhz: Some(2850),
         gpu_pstate: Some("P2".into()),
@@ -234,9 +240,12 @@ impl DataSource for LiveData {
 fn update_gpus(gpus: &mut Vec<GpuLoad>, readings: Vec<miharashi_linux::metrics::GpuReading>) {
     let mut prev = std::mem::take(gpus);
     for r in readings {
-        let history = match prev.iter().position(|g| g.label == r.label) {
-            Some(i) => std::mem::take(&mut prev[i].history),
-            None => vec![0.0; HISTORY],
+        let (history, mem_history) = match prev.iter().position(|g| g.label == r.label) {
+            Some(i) => (
+                std::mem::take(&mut prev[i].history),
+                std::mem::take(&mut prev[i].mem_history),
+            ),
+            None => (vec![0.0; HISTORY], vec![0.0; HISTORY]),
         };
         let mut g = GpuLoad {
             label: r.label,
@@ -244,9 +253,15 @@ fn update_gpus(gpus: &mut Vec<GpuLoad>, readings: Vec<miharashi_linux::metrics::
             usage: r.usage,
             temp: r.temp,
             history,
+            mem_used_mib: r.mem_used_mib,
+            mem_total_mib: r.mem_total_mib,
+            mem_history,
         };
         if let Some(v) = r.usage {
             push_history(&mut g.history, v);
+        }
+        if let Some(v) = g.mem_pct() {
+            push_history(&mut g.mem_history, v);
         }
         gpus.push(g);
     }
@@ -289,6 +304,10 @@ mod tests {
             &s.psi_mem_history,
         ] {
             assert_eq!(h.len(), HISTORY);
+        }
+        for g in &s.gpus {
+            assert_eq!(g.mem_history.len(), HISTORY);
+            assert!(g.mem_pct().is_some());
         }
         assert_eq!(s.disk_io.len(), 2);
         assert!((2..=3).contains(&s.gpu_processes.len()));
