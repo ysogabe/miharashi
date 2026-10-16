@@ -1,13 +1,35 @@
 # 画面管理インターフェースの最小設計(Issue #9)
 
-状態: **S1〜S3 を実装**(2026-10-15、[#5](https://github.com/ysogabe/miharashi/issues/5))。実装で変えた点は §10〜§12。2026-10-13 作成。対象: [#9](https://github.com/ysogabe/miharashi/issues/9)。
-基準にしたコード: ブランチ `trial/poc-002-kiosk-runtime`([PR #8](https://github.com/ysogabe/miharashi/pull/8))の `crates/miharashi-app`(`runtime.rs` / `app.rs` / `data.rs` / `photos.rs`)。`main` の `miharashi-poc` ではない。
+状態: **画面管理・5 画面・自動巡回を実装済み**。現行契約を 2026-10-16 にソース照合。2026-10-13 作成。対象: [#9](https://github.com/ysogabe/miharashi/issues/9)、[#5](https://github.com/ysogabe/miharashi/issues/5)。
 
-[DESIGN.md](DESIGN.md) §3 のワークスペース案(`core` / `screens` / `data` crate)と §4 の trait 例は実装前の案で、実際の crate は `render` / `linux` / `app` の 3 つである。この文書は、その現実のコードを起点に、画面を追加するための最小の契約を決める。§4 の trait 例はこの文書で置き換える。
+**現在の実装は §0 とソースを参照してください。§1〜§9 は PoC-002 時点の問題と当初案、§10 以降は段階ごとの変更記録です。** 当初案の trait・未実装リストは現行 API ではありません。ワークスペース全体は [技術設計](DESIGN.md) にまとめています。
 
-本格的な実装(全画面の trait 化、レジストリー、3 画面での検証)は [#5](https://github.com/ysogabe/miharashi/issues/5)(PoC-003)で行う。ここで決めるのは **境界と名前** であり、PoC-002 のコードに今すぐ入れる変更は §8 の 2 点だけに限る。
+表記: **決定** = 当初の設計で確定、**推奨** = 当時の実装案、**#5 へ** = PoC-003 で実装、**未検証** = 実機で確かめていない。
 
-表記: **決定** = この文書で確定、**推奨** = 実装時に覆してよい、**#5 へ** = PoC-003 で実装、**未検証** = 実機で確かめていない。
+## 0. 現在の契約(2026-10-16)
+
+定義は [`src/screen.rs`](../crates/miharashi-app/src/screen.rs)、管理は [`app/manager.rs`](../crates/miharashi-app/src/app/manager.rs)、登録は [`app::kiosk()`](../crates/miharashi-app/src/app.rs)。現在の 5 画面と操作は [画面の全体構成](DESIGN-screens.md) §2 を参照。
+
+| 項目 | 現在の定義・動作 |
+|---|---|
+| 識別 | `id() -> ScreenId`、`title() -> &'static str` |
+| `KeyPress` | app の `Prev / Next / Select / Up / Down / Menu`。Quit は含まない。Linux 側の `input::Action::Quit` を runtime が処理する |
+| `ScreenAction` / `Outcome` | `Select / Up / Down`、結果は `Consumed / Ignored`。`Consumed { redraw }` ではない |
+| ライフサイクル | `on_enter(Instant)` / `on_leave(Instant)`、`set_presentation(visible, covered, display_on, Instant)` |
+| 更新・操作 | `tick(&World, Instant) -> bool`、`handle_action(ScreenAction, Instant) -> Outcome`。操作には World を渡さない |
+| `RenderContext` | `canvas`・`text`・`world`・`covered`・`force_overlay`。`now` フィールドはない |
+| 描画 | `render(&mut RenderContext)`、`render_composite(&mut RenderContext) -> Composite`。後者の既定は CPU 完成画面 |
+| 補助メソッド | `key_labels`・`invalidate`・`animating`・`is_empty`・`page`・`stats` |
+| `Provider` | `update(&mut self, &mut World)`。時刻の引数はない。毎周期、取得済みの最新値を写す |
+| `World` | `system: Snapshot`(時計を含む)・`photo_feed: FeedState`・`agents: AgentSnapshot`。room / aircraft は画面が共有ハンドルを直接持つ |
+| 登録 | `kiosk()` の `Vec<Box<dyn Screen>>`。`registry.rs` や `ScreenRegistry` はない。順序は status → photo → room → aircraft → agents。無効な画面は登録しない |
+| `App` | `on_key`・`tick`・`render`・`render_composite`・`animating`・`wants_screen`・`set_display_on`・`set_display_forced_off`・`stats`・`show_screen`・`set_rotation`・`panel_view` |
+| PNG | `variants()` / `set_variant()` は未採用。`main.rs` の `png` と `agent_demo` が見本データを描く。画面追加時は必要な fixture も明示的に追加する |
+| 終了キー | `runtime.quit_key` 設定は未実装。Esc/q は終了し、常駐サービスは正常終了でも再起動する |
+
+Provider と画面の tick は非表示でも呼ぶ。`set_presentation` で表示・重ね絵・出力電源を通知し、非表示中の演出を復帰時にまとめて再生しない。アラートとメニューは ScreenManager が重ねる。自動巡回とパネル API の状態も ScreenManager が持つ。
+
+物理テンキーの 4・5・6・8・2 は確認記録がある。0 と NumLock OFF の実機確認、終了キー無効化は済んだとは扱わない。古い各段階の「これから確認する」は当時の記録である。
 
 ## 1. 現状と問題
 

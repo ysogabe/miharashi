@@ -26,7 +26,7 @@ Miharashi(ミハラシ)は、Linux マシンのそばに置くキオスク・ダ
 
 ![Echo Show 5 の操作パネル(実機の表示)](site/images/panel.png)
 
-机の上の Echo Show 5 から、画面の切り替えと、モニターの消灯・点灯・自動を操作できます。
+机の上の Echo Show 5 から、画面の切り替え、画面内の操作、メニューからの直接選択と、モニターの消灯・点灯・自動を操作できます。掲載画像は v0.1.0 の表示です。現在の v0.2.0 では、アイコンと操作ラベル、メニュー、巡回状態の表示に対応しています。
 
 - 紹介ページ: https://ysogabe.github.io/miharashi/panel/
 - アプリのソース: [ysogabe/miharashi-panel](https://github.com/ysogabe/miharashi-panel)
