@@ -23,6 +23,17 @@ struct Step {
     skip_if_empty: bool,
 }
 
+/// 自動巡回が回っているか。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RotationMode {
+    /// 回っている
+    On,
+    /// 操作で止めている。`until` を過ぎたら次の手順から戻る
+    Paused { until: Instant },
+    /// 操作パネルから止めたまま。時間では戻らず、操作しても `Paused` にしない
+    Off,
+}
+
 /// 自動巡回の状態。
 struct Rotation {
     steps: Vec<Step>,
@@ -32,8 +43,8 @@ struct Rotation {
     index: usize,
     /// 今の手順の残り時間。アラートとメニューの間は減らさない
     remaining: Duration,
-    /// 操作で止めている間の終わり
-    paused_until: Option<Instant>,
+    /// 回っている・操作で止めている・止めたまま
+    mode: RotationMode,
     /// 前回の tick の時刻(残り時間を減らす)
     last: Instant,
 }
@@ -171,27 +182,47 @@ impl ScreenManager {
             pause,
             index: 0,
             remaining,
-            paused_until: None,
+            mode: RotationMode::On,
             last: now,
         });
         self
     }
 
-    /// 自動巡回の状態("on" / "paused")。無効なら None。
+    /// 自動巡回の状態("on" / "paused" / "off")。無効なら None。
     pub fn rotation_state(&self) -> Option<&'static str> {
-        self.rotation.as_ref().map(|r| {
-            if r.paused_until.is_some() {
-                "paused"
-            } else {
-                "on"
-            }
+        self.rotation.as_ref().map(|r| match r.mode {
+            RotationMode::On => "on",
+            RotationMode::Paused { .. } => "paused",
+            RotationMode::Off => "off",
         })
     }
 
-    /// 操作があったので巡回を止める。
+    /// 操作パネルから巡回を再開する(`on`)・止めたままにする(`!on`)。戻り値: 状態が変わったか(パネルへ送り直す)。
+    /// 再開したら次の tick ですぐ次の手順へ移る(一時停止が明けたときと同じ)。巡回が無効・同じ状態なら何もしない。
+    /// 画面は選んでいないので、キーの数に入れず、一時停止にもしない。
+    pub fn set_rotation(&mut self, on: bool) -> bool {
+        let Some(r) = self.rotation.as_mut() else {
+            return false;
+        };
+        match (on, r.mode) {
+            (true, RotationMode::On) | (false, RotationMode::Off) => return false,
+            (true, _) => {
+                r.mode = RotationMode::On;
+                r.remaining = Duration::ZERO;
+            }
+            (false, _) => r.mode = RotationMode::Off,
+        }
+        true
+    }
+
+    /// 操作があったので巡回を止める。止めたまま(`Off`)なら、そのままにする。
     fn pause_rotation(&mut self, now: Instant) {
-        if let Some(r) = self.rotation.as_mut() {
-            r.paused_until = Some(now + r.pause);
+        if let Some(r) = self.rotation.as_mut()
+            && r.mode != RotationMode::Off
+        {
+            r.mode = RotationMode::Paused {
+                until: now + r.pause,
+            };
         }
     }
 
@@ -206,13 +237,16 @@ impl ScreenManager {
         };
         let dt = now.saturating_duration_since(r.last);
         r.last = now;
-        if let Some(until) = r.paused_until {
-            if now < until {
-                return false;
+        match r.mode {
+            RotationMode::On => {}
+            // 止めたままの間は時間を進めない
+            RotationMode::Off => return false,
+            RotationMode::Paused { until } if now < until => return false,
+            RotationMode::Paused { .. } => {
+                // 止める前の手順の続き(次の手順)から
+                r.mode = RotationMode::On;
+                r.remaining = Duration::ZERO;
             }
-            // 止める前の手順の続き(次の手順)から
-            r.paused_until = None;
-            r.remaining = Duration::ZERO;
         }
         // アラートとメニューの間は時間を進めない
         if frozen {
@@ -679,6 +713,10 @@ impl App for ScreenManager {
         ScreenManager::show_screen(self, id)
     }
 
+    fn set_rotation(&mut self, on: bool) -> bool {
+        ScreenManager::set_rotation(self, on)
+    }
+
     fn wants_screen(&self) -> bool {
         self.alert_active()
     }
@@ -751,9 +789,10 @@ impl App for ScreenManager {
             feed_online: self.world.photo_feed.online,
             menu: self.menu,
             keys: self.panel_keys(),
-            rotation: self.rotation.as_ref().map(|r| match r.paused_until {
-                Some(until) => PanelRotation::Paused { until },
-                None => PanelRotation::On,
+            rotation: self.rotation.as_ref().map(|r| match r.mode {
+                RotationMode::On => PanelRotation::On,
+                RotationMode::Paused { until } => PanelRotation::Paused { until },
+                RotationMode::Off => PanelRotation::Off,
             }),
         })
     }
