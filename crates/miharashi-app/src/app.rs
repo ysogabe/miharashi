@@ -409,7 +409,7 @@ mod tests {
         );
     }
 
-    /// 操作パネルに見せる巡回の状態("on" / "paused")。
+    /// 操作パネルに見せる巡回の状態("on" / "paused" / "off")。
     fn panel_rotation(app: &ScreenManager) -> Option<&'static str> {
         app.panel_view().unwrap().rotation.map(|r| match r {
             crate::screen::PanelRotation::On => "on",
@@ -481,6 +481,113 @@ mod tests {
         assert_eq!(run_for(&mut app, &mut t, 2), "status", "閉じた");
         assert!(!app.alert_active());
         assert_eq!(run_for(&mut app, &mut t, 4), "blank", "残りの 5 秒で次へ");
+    }
+
+    /// 操作パネルから止めたままにすると、時間がたっても画面は変わらない。
+    /// 状態が変わったときだけ true(パネルへ送り直す)。キーの数に入れない。
+    #[test]
+    fn rotation_off_keeps_the_screen() {
+        let (mut app, _) = rotating(&[step("status", 10, false), step("blank", 10, false)], 60);
+        let mut t = Instant::now();
+        assert_eq!(run_for(&mut app, &mut t, 5), "status");
+        assert!(app.set_rotation(false), "on から off");
+        assert!(!app.set_rotation(false), "off のままなら何もしない");
+        assert_eq!(run_for(&mut app, &mut t, 600), "status");
+        assert_eq!(app.rotation_state(), Some("off"));
+        assert_eq!(panel_rotation(&app), Some("off"));
+        assert_eq!(app.stats().last(), Some(&("rotation", "off".to_string())));
+        assert_eq!(app.keys, 0);
+    }
+
+    /// 止めたままの間にキー・操作パネルで画面を選んでも off のまま(paused にしない)。pause 秒たっても動かない。
+    #[test]
+    fn input_while_off_keeps_it_off() {
+        let steps = [
+            step("status", 10, false),
+            step("blank", 10, false),
+            step("maybe", 10, false),
+        ];
+        let (mut app, _) = rotating(&steps, 60);
+        assert!(app.set_rotation(false));
+        app.on_key(KeyPress::Next);
+        assert_eq!(
+            (app.screen_id(), app.rotation_state()),
+            ("blank", Some("off"))
+        );
+        app.show_screen("maybe");
+        assert_eq!(
+            app.rotation_state(),
+            Some("off"),
+            "操作パネルでも off のまま"
+        );
+        // キーは実時刻で数えるので、時計を合わせ直す
+        let mut t = Instant::now();
+        assert_eq!(run_for(&mut app, &mut t, 120), "maybe");
+        assert_eq!(panel_rotation(&app), Some("off"));
+    }
+
+    /// off から on にすると、次の tick ですぐ次の手順の画面へ移る。
+    #[test]
+    fn turning_rotation_on_moves_to_the_next_step_at_once() {
+        let (mut app, _) = rotating(&[step("status", 10, false), step("blank", 10, false)], 60);
+        let mut t = Instant::now();
+        assert!(app.set_rotation(false));
+        assert_eq!(run_for(&mut app, &mut t, 30), "status");
+        assert!(app.set_rotation(true), "off から on");
+        assert!(!app.set_rotation(true), "on のままなら何もしない");
+        assert_eq!(panel_rotation(&app), Some("on"));
+        assert_eq!(run_for(&mut app, &mut t, 1), "blank");
+        assert_eq!(
+            run_for(&mut app, &mut t, 10),
+            "status",
+            "そのあとは手順どおり"
+        );
+        assert_eq!(app.keys, 0);
+    }
+
+    /// 操作で止めている間に on にすると、すぐ次の手順へ移る。off にすると止めたままになる。
+    #[test]
+    fn turning_rotation_on_while_paused_resumes_at_once() {
+        let steps = [
+            step("status", 10, false),
+            step("blank", 10, false),
+            step("maybe", 10, false),
+        ];
+        let (mut app, _) = rotating(&steps, 60);
+        let mut t = Instant::now();
+        assert_eq!(run_for(&mut app, &mut t, 10), "blank");
+        app.show_screen("status");
+        assert_eq!(app.rotation_state(), Some("paused"));
+        let mut t = Instant::now();
+        assert!(app.set_rotation(true), "paused から on");
+        assert_eq!(app.rotation_state(), Some("on"));
+        assert_eq!(
+            run_for(&mut app, &mut t, 1),
+            "maybe",
+            "blank の次の手順から"
+        );
+
+        app.on_key(KeyPress::Prev);
+        assert_eq!(app.rotation_state(), Some("paused"));
+        let mut t = Instant::now();
+        assert!(app.set_rotation(false), "paused から off");
+        assert_eq!(
+            run_for(&mut app, &mut t, 120),
+            "blank",
+            "pause 秒たっても戻らない"
+        );
+        assert_eq!(app.rotation_state(), Some("off"));
+    }
+
+    /// 巡回が無効なら、操作パネルから止める・再開するは何もしない。
+    #[test]
+    fn set_rotation_does_nothing_without_rotation() {
+        let mut app = three_screens();
+        assert!(!app.set_rotation(false));
+        assert!(!app.set_rotation(true));
+        assert_eq!(app.rotation_state(), None);
+        assert_eq!(panel_rotation(&app), None);
+        assert_eq!(app.keys, 0);
     }
 
     /// 巡回が無効なら状態ログに rotation を出さない。
