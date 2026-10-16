@@ -758,8 +758,8 @@ mod tests {
         assert_eq!(c.room.tiles[1].second, "sensor.h");
         assert_eq!(c.room.tiles[2].trend_hours, Some(3));
         for bad in [
-            "[room]\nforecast_area = \"千葉\"\n",
-            "[room]\nforecast_area = \"12001\"\n",
+            "[room]\nforecast_area = \"東京\"\n",
+            "[room]\nforecast_area = \"13001\"\n",
             "[room]\npoll_secs = 5\n",
             "[room]\nhistory_hours = 0\n",
             "[room]\nforecast_minutes = 1\n",

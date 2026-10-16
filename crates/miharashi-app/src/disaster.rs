@@ -412,7 +412,7 @@ pub fn demo_view() -> DisasterView {
             area(4, (35.6947, 139.7628), (35.7312, 139.8097)),
             area(4, (35.5897, 139.7713), (35.708, 139.8477)),
         ],
-        home: (35.856, 139.767),
+        home: miharashi_render::sample::HOME,
         radius_km: 50.0,
         time: "10/13 21:30 発表".into(),
     }
@@ -644,7 +644,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const HOME: (f64, f64) = (35.856, 139.767);
+    const HOME: (f64, f64) = miharashi_render::sample::HOME;
 
     #[test]
     fn alert_codes_are_special_warnings_and_landslide_level4() {
@@ -670,8 +670,8 @@ mod tests {
     fn relm() -> Value {
         json!({
             "1310100": {"name": "千代田区", "ne": [35.7054, 139.7825], "sw": [35.6686, 139.7312]},
-            "1220600": {"name": "木更津市", "ne": [35.4527, 140.0484], "sw": [35.3196, 139.8649]},
-            "0820100": {"name": "水戸市", "ne": [36.4602, 140.5652], "sw": [36.2965, 140.3546]},
+            "1220600": {"name": "木更津市", "ne": [35.4443, 140.1297], "sw": [35.3135, 139.8875]},
+            "0820100": {"name": "水戸市", "ne": [36.4643, 140.5868], "sw": [36.3009, 140.3217]},
             "bad": {"name": "欠け", "ne": [1]},
         })
     }
@@ -691,22 +691,22 @@ mod tests {
         let area = json!({
             "class20s": {"1310100": {"parent": "130011"}, "9999999": {"parent": "x"}},
             "class15s": {"130011": {"parent": "130010"}},
-            "class10s": {"130010": {"parent": "120000"}},
+            "class10s": {"130010": {"parent": "130000"}},
         });
         let codes = [
             "1310100".to_string(),
             "9999999".to_string(),
             "0".to_string(),
         ];
-        assert_eq!(offices_for(&area, codes.iter()), ["120000"]);
+        assert_eq!(offices_for(&area, codes.iter()), ["130000"]);
     }
 
     fn watch() -> Watch {
         Watch {
             home: HOME,
             munis: munis_within(&relm(), HOME, 50.0),
-            offices: vec!["120000".into()],
-            home_muni: Some(("1310100".into(), "千代田区".into(), "120000".into())),
+            offices: vec!["130000".into()],
+            home_muni: Some(("1310100".into(), "千代田区".into(), "130000".into())),
         }
     }
 
@@ -737,7 +737,7 @@ mod tests {
 
         let home: HomeShared = Arc::default();
         let docs: HashMap<String, (Value, Option<String>)> =
-            [("120000".to_string(), (d, None))].into();
+            [("130000".to_string(), (d, None))].into();
         publish_home(&home, &watch(), &docs, true);
         let g = home.lock().unwrap().clone();
         assert_eq!(
