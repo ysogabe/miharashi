@@ -307,7 +307,7 @@ fn receiver(agent: &ureq::Agent, url: &str) -> Option<(f64, f64)> {
 
 /// 試しの表示用(`png`)。
 pub fn demo_view() -> AircraftView {
-    let r = (35.852687, 139.948132);
+    let r = miharashi_render::sample::RECEIVER;
     let plane = |cs: &str, lat: f64, lon: f64, alt: Option<i32>, track: f64| {
         let mut p = Plane {
             callsign: cs.into(),
@@ -326,11 +326,11 @@ pub fn demo_view() -> AircraftView {
         p
     };
     let mut planes = vec![
-        plane("JAL516", 35.95, 140.05, Some(32000), 35.0),
-        plane("ANA21", 35.70, 139.80, Some(8500), 250.0),
-        plane("APJ123", 35.55, 140.25, Some(4500), 120.0),
-        plane("SKY601", 36.15, 139.70, Some(28000), 300.0),
-        plane("", 35.80, 139.90, None, 0.0),
+        plane("JAL516", 35.78, 139.87, Some(32000), 35.0),
+        plane("ANA21", 35.53, 139.62, Some(8500), 250.0),
+        plane("APJ123", 35.38, 140.07, Some(4500), 120.0),
+        plane("SKY601", 35.98, 139.52, Some(28000), 300.0),
+        plane("", 35.55, 139.78, None, 0.0),
     ];
     planes[0].model = "Boeing 787 9".into();
     planes[0].reg = "JA873J".into();
@@ -448,15 +448,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const RX: (f64, f64) = (35.852687, 139.948132);
+    const RX: (f64, f64) = miharashi_render::sample::RECEIVER;
 
     #[test]
     fn parses_fresh_planes_within_radius_nearest_first() {
         let doc = json!({"now": 1.0, "aircraft": [
-            {"hex": "86e7c4", "flight": "JAL516  ", "lat": 36.0, "lon": 140.0, "seen_pos": 1.2,
+            {"hex": "86e7c4", "flight": "JAL516  ", "lat": 35.83, "lon": 139.82, "seen_pos": 1.2,
              "alt_baro": 32000, "gs": 450.5, "track": 35.0, "baro_rate": 1600, "t": "B789", "r": "JA873J"},
-            {"hex": "861afe", "lat": 35.86, "lon": 139.95, "seen_pos": 0.5, "alt_baro": "ground"},
-            {"hex": "old", "lat": 35.86, "lon": 139.95, "seen_pos": 120.0},
+            {"hex": "861afe", "lat": 35.69, "lon": 139.77, "seen_pos": 0.5, "alt_baro": "ground"},
+            {"hex": "old", "lat": 35.69, "lon": 139.77, "seen_pos": 120.0},
             {"hex": "far", "lat": 34.0, "lon": 135.0, "seen_pos": 1.0},
             {"hex": "nopos", "seen_pos": 1.0},
             "壊れた行",

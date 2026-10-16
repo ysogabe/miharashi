@@ -22,13 +22,13 @@ const FORECAST_RETRY: Duration = Duration::from_secs(300);
 /// 予報の地域。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForecastArea {
-    /// class10 のコード("120010")
+    /// class10 のコード("130010")
     pub class10: String,
-    /// 府県予報区(気象台)のコード("120000")
+    /// 府県予報区(気象台)のコード("130000")
     pub office: String,
-    /// "千葉県北西部"
+    /// "東京都東京地方"
     pub name: String,
-    /// 気温を読むアメダスの地点(forecast_area.json。"45212" など)
+    /// 気温を読むアメダスの地点(forecast_area.json。"44132" など)
     pub amedas: Vec<String>,
 }
 
@@ -219,7 +219,7 @@ pub fn parse_forecast(doc: &Value, area: &ForecastArea) -> Option<Forecast> {
     })
 }
 
-/// 市区町村コード(5 桁)→ class20 の (コード, 名前)。area.json に "12220" + "00" があればそれ、
+/// 市区町村コード(5 桁)→ class20 の (コード, 名前)。area.json に "13101" + "00" があればそれ、
 /// 無ければ同じ 5 桁で始まる最初のもの(区に分かれた市など)。
 pub fn class20_for(area: &Value, muni: &str) -> Option<(String, String)> {
     let all = area.get("class20s")?.as_object()?;
@@ -502,12 +502,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn chiba() -> ForecastArea {
+    fn tokyo() -> ForecastArea {
         ForecastArea {
-            class10: "120010".into(),
-            office: "120000".into(),
-            name: "千葉県北西部".into(),
-            amedas: vec!["45212".into()],
+            class10: "130010".into(),
+            office: "130000".into(),
+            name: "東京都東京地方".into(),
+            amedas: vec!["44132".into()],
         }
     }
 
@@ -515,7 +515,7 @@ mod tests {
         json!({"name": name, "code": code})
     }
 
-    /// 11 時発表の形(気象庁の 120000.json を縮めたもの)。
+    /// 11 時発表の形(気象庁の 130000.json を縮めたもの)。
     fn doc(report: &str, temp_times: Value, temps: Value) -> Value {
         json!([
             {
@@ -524,24 +524,24 @@ mod tests {
                     {
                         "timeDefines": ["2026-10-15T11:00:00+09:00", "2026-10-16T00:00:00+09:00", "2026-10-17T00:00:00+09:00"],
                         "areas": [
-                            {"area": area("北西部", "120010"), "weatherCodes": ["201", "201", "101"],
+                            {"area": area("東京地方", "130010"), "weatherCodes": ["201", "201", "101"],
                              "weathers": ["くもり\u{3000}時々\u{3000}晴れ", "くもり\u{3000}昼前\u{3000}から\u{3000}夕方\u{3000}晴れ"]},
-                            {"area": area("北東部", "120020"), "weatherCodes": ["300", "300", "300"], "weathers": ["雨", "雨", "雨"]},
+                            {"area": area("伊豆諸島北部", "130020"), "weatherCodes": ["300", "300", "300"], "weathers": ["雨", "雨", "雨"]},
                         ]
                     },
                     {
                         "timeDefines": ["2026-10-15T12:00:00+09:00", "2026-10-15T18:00:00+09:00", "2026-10-16T00:00:00+09:00",
                                         "2026-10-16T06:00:00+09:00", "2026-10-16T12:00:00+09:00", "2026-10-16T18:00:00+09:00"],
                         "areas": [
-                            {"area": area("北西部", "120010"), "pops": ["10", "20", "30", "40", "0", ""]},
-                            {"area": area("北東部", "120020"), "pops": ["90", "90", "90", "90", "90", "90"]},
+                            {"area": area("東京地方", "130010"), "pops": ["10", "20", "30", "40", "0", ""]},
+                            {"area": area("伊豆諸島北部", "130020"), "pops": ["90", "90", "90", "90", "90", "90"]},
                         ]
                     },
                     {
                         "timeDefines": temp_times,
                         "areas": [
-                            {"area": area("千葉", "45212"), "temps": temps},
-                            {"area": area("銚子", "45148"), "temps": ["1", "1", "1", "1"]},
+                            {"area": area("東京", "44132"), "temps": temps},
+                            {"area": area("大島", "44172"), "temps": ["1", "1", "1", "1"]},
                         ]
                     }
                 ]
@@ -551,11 +551,11 @@ mod tests {
                 "timeSeries": [
                     {
                         "timeDefines": ["2026-10-16T00:00:00+09:00", "2026-10-17T00:00:00+09:00", "2026-10-18T00:00:00+09:00"],
-                        "areas": [{"area": area("千葉県", "120000"), "weatherCodes": ["201", "101", "999"], "pops": ["", "10", "20"]}]
+                        "areas": [{"area": area("東京都", "130000"), "weatherCodes": ["201", "101", "999"], "pops": ["", "10", "20"]}]
                     },
                     {
                         "timeDefines": ["2026-10-16T00:00:00+09:00", "2026-10-17T00:00:00+09:00", "2026-10-18T00:00:00+09:00"],
-                        "areas": [{"area": area("銚子", "45148"), "tempsMin": ["", "18", "18"], "tempsMax": ["", "23", "24.4"]}]
+                        "areas": [{"area": area("大島", "44172"), "tempsMin": ["", "18", "18"], "tempsMax": ["", "23", "24.4"]}]
                     }
                 ]
             }
@@ -578,8 +578,8 @@ mod tests {
             ]),
             json!(["23", "23", "18", "25"]),
         );
-        let f = parse_forecast(&doc, &chiba()).unwrap();
-        assert_eq!(f.area, "千葉県北西部");
+        let f = parse_forecast(&doc, &tokyo()).unwrap();
+        assert_eq!(f.area, "東京都東京地方");
         assert_eq!(f.days.len(), 3);
         let today = &f.days[0];
         assert_eq!(today.date, d(15));
@@ -631,7 +631,7 @@ mod tests {
             ]),
             json!(["15", "24", "16", "21"]),
         );
-        let f = parse_forecast(&doc, &chiba()).unwrap();
+        let f = parse_forecast(&doc, &tokyo()).unwrap();
         assert_eq!((f.days[0].min, f.days[0].max), (Some(15), Some(24)));
         assert_eq!((f.days[1].min, f.days[1].max), (Some(16), Some(21)));
     }
@@ -645,9 +645,9 @@ mod tests {
             json!(["30"]),
         );
         let other = ForecastArea {
-            class10: "120020".into(),
+            class10: "130020".into(),
             amedas: vec![],
-            ..chiba()
+            ..tokyo()
         };
         let f = parse_forecast(&doc, &other).unwrap();
         assert_eq!(f.days[0].weather, "雨");
@@ -655,22 +655,22 @@ mod tests {
         assert_eq!(
             f.days[0].max,
             Some(1),
-            "2 番目の地域なので 2 番目の地点(銚子)"
+            "2 番目の地域なので 2 番目の地点(大島)"
         );
         let unknown = ForecastArea {
             class10: "999999".into(),
             amedas: vec![],
-            ..chiba()
+            ..tokyo()
         };
         assert_eq!(
             parse_forecast(&doc, &unknown).unwrap().days[0].max,
             Some(30)
         );
-        assert!(parse_forecast(&json!([]), &chiba()).is_none());
-        assert!(parse_forecast(&json!([{"timeSeries": "壊れた形"}]), &chiba()).is_none());
+        assert!(parse_forecast(&json!([]), &tokyo()).is_none());
+        assert!(parse_forecast(&json!([{"timeSeries": "壊れた形"}]), &tokyo()).is_none());
         let only_short = json!([doc[0].clone()]);
         assert!(
-            parse_forecast(&only_short, &chiba())
+            parse_forecast(&only_short, &tokyo())
                 .unwrap()
                 .week
                 .is_empty()
@@ -698,18 +698,18 @@ mod tests {
     #[test]
     fn home_municipality_and_forecast_area() {
         let a = json!({
-            "offices": {"120000": {"name": "千葉県"}},
-            "class10s": {"120010": {"name": "北西部", "parent": "120000"}},
-            "class15s": {"120013": {"name": "東葛飾", "parent": "120010"}},
+            "offices": {"130000": {"name": "東京都"}},
+            "class10s": {"130010": {"name": "東京地方", "parent": "130000"}},
+            "class15s": {"130011": {"name": "２３区西部", "parent": "130010"}},
             "class20s": {
-                "1222000": {"name": "流山市", "parent": "120013"},
+                "1310300": {"name": "港区", "parent": "130011"},
                 "1310101": {"name": "千代田区北部", "parent": "x"},
                 "1310102": {"name": "千代田区南部", "parent": "x"},
             },
         });
         assert_eq!(
-            class20_for(&a, "12220"),
-            Some(("1222000".into(), "流山市".into()))
+            class20_for(&a, "13103"),
+            Some(("1310300".into(), "港区".into()))
         );
         assert_eq!(
             class20_for(&a, "13101").unwrap().0,
@@ -717,12 +717,12 @@ mod tests {
             "分かれた市区は最初のもの"
         );
         assert_eq!(class20_for(&a, "99999"), None);
-        assert_eq!(class10_of(&a, "1222000").as_deref(), Some("120010"));
-        let fa = json!({"120000": [
-            {"class10": "120010", "amedas": ["45212"], "class20": "1210000"},
-            {"class10": "120020", "amedas": ["45148"], "class20": "1220200"},
+        assert_eq!(class10_of(&a, "1310300").as_deref(), Some("130010"));
+        let fa = json!({"130000": [
+            {"class10": "130010", "amedas": ["44132"], "class20": "1310100"},
+            {"class10": "130020", "amedas": ["44172"], "class20": "1336100"},
         ]});
-        assert_eq!(forecast_area(&a, &fa, "120010"), Some(chiba()));
+        assert_eq!(forecast_area(&a, &fa, "130010"), Some(tokyo()));
         assert_eq!(forecast_area(&a, &fa, "999999"), None);
     }
 

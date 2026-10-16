@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn weather_view_drops_past_days_and_fills_tomorrow() {
         let f = Forecast {
-            area: "千葉県北西部".into(),
+            area: "東京都東京地方".into(),
             report: "2026-10-14T17:00:00+09:00".into(),
             days: vec![
                 Day {

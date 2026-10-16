@@ -299,7 +299,7 @@ pub struct Room {
     pub tiles: Vec<RoomTile>,
     /// 折れ線に出す過去の時間
     pub history_hours: u64,
-    /// 天気予報の地域(気象庁 area.json の class10 のコード。"120010" など)。空なら自宅の位置から決める
+    /// 天気予報の地域(気象庁 area.json の class10 のコード。"130010" など)。空なら自宅の位置から決める
     pub forecast_area: String,
     /// センサーの値を読む間隔(秒)
     pub poll_secs: u64,
@@ -515,7 +515,7 @@ impl Config {
             && !(r.forecast_area.len() == 6 && r.forecast_area.bytes().all(|b| b.is_ascii_digit()))
         {
             return Err(
-                "room.forecast_area は気象庁の class10 のコード(6 桁。\"120010\" など)か空".into(),
+                "room.forecast_area は気象庁の class10 のコード(6 桁。\"130010\" など)か空".into(),
             );
         }
         if let Some(t) = r
@@ -750,7 +750,7 @@ mod tests {
         assert!(c.room.enabled && c.room.tiles.is_empty());
         assert_eq!((c.room.history_hours, c.room.poll_secs), (24, 60));
         let c = Config::parse(
-            "[room]\nforecast_area = \"120010\"\ntiles = [\n  { label = \"CO₂\", entity = \"sensor.co2\", warn = 1000, alert = 1500 },\n  { label = \"玄関\", entity = \"sensor.t\", second = \"sensor.h\" },\n  { label = \"気圧\", entity = \"sensor.p\", trend_hours = 3 },\n]\n[ui]\nstart_screen = \"room\"\nrefresh_screens = [\"room\"]\n",
+            "[room]\nforecast_area = \"130010\"\ntiles = [\n  { label = \"CO₂\", entity = \"sensor.co2\", warn = 1000, alert = 1500 },\n  { label = \"玄関\", entity = \"sensor.t\", second = \"sensor.h\" },\n  { label = \"気圧\", entity = \"sensor.p\", trend_hours = 3 },\n]\n[ui]\nstart_screen = \"room\"\nrefresh_screens = [\"room\"]\n",
         )
         .unwrap();
         assert_eq!(c.room.tiles.len(), 3);
@@ -758,8 +758,8 @@ mod tests {
         assert_eq!(c.room.tiles[1].second, "sensor.h");
         assert_eq!(c.room.tiles[2].trend_hours, Some(3));
         for bad in [
-            "[room]\nforecast_area = \"千葉\"\n",
-            "[room]\nforecast_area = \"12001\"\n",
+            "[room]\nforecast_area = \"東京\"\n",
+            "[room]\nforecast_area = \"13001\"\n",
             "[room]\npoll_secs = 5\n",
             "[room]\nhistory_hours = 0\n",
             "[room]\nforecast_minutes = 1\n",

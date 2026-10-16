@@ -366,7 +366,7 @@ pub fn demo_view() -> DisasterView {
             DisasterKind {
                 name: "大雨特別警報(テスト表示)".into(),
                 level: 5,
-                areas: ["流山市", "柏市", "野田市", "松戸市"]
+                areas: ["千代田区", "中央区", "港区", "新宿区"]
                     .map(String::from)
                     .to_vec(),
             },
@@ -374,47 +374,45 @@ pub fn demo_view() -> DisasterView {
                 name: "土砂災害危険警報(テスト表示)".into(),
                 level: 4,
                 areas: [
-                    "我孫子市",
-                    "龍ケ崎市",
-                    "川越市",
-                    "取手市",
-                    "守谷市",
-                    "つくばみらい市",
-                    "常総市",
-                    "坂東市",
-                    "春日部市",
-                    "越谷市",
-                    "吉川市",
-                    "三郷市",
-                    "八潮市",
-                    "草加市",
-                    "鎌ケ谷市",
-                    "白井市",
-                    "印西市",
-                    "船橋市",
-                    "市川市",
+                    "文京区",
+                    "台東区",
+                    "墨田区",
+                    "江東区",
+                    "品川区",
+                    "目黒区",
+                    "大田区",
+                    "世田谷区",
+                    "渋谷区",
+                    "中野区",
+                    "杉並区",
+                    "豊島区",
+                    "北区",
+                    "荒川区",
+                    "板橋区",
+                    "練馬区",
                     "足立区",
                     "葛飾区",
                     "江戸川区",
-                    "千葉市",
-                    "八千代市",
-                    "佐倉市",
-                    "成田市",
+                    "川口市",
+                    "戸田市",
+                    "和光市",
+                    "浦安市",
+                    "市川市",
                 ]
                 .map(String::from)
                 .to_vec(),
             },
         ],
         areas: vec![
-            area(5, (35.8276, 139.8748), (35.9195, 139.9575)),
-            area(5, (35.7835, 139.9136), (35.9358, 140.1114)),
-            area(5, (35.9129, 139.7762), (36.1041, 139.9519)),
-            area(5, (35.7467, 139.8795), (35.8495, 140.0014)),
-            area(4, (35.8408, 139.9887), (35.9006, 140.1465)),
-            area(4, (35.8724, 140.0888), (36.0079, 140.261)),
-            area(4, (35.8376, 139.3774), (35.9619, 139.5584)),
+            area(5, (35.6686, 139.7312), (35.7054, 139.7825)),
+            area(5, (35.646, 139.7586), (35.6966, 139.7927)),
+            area(5, (35.6231, 139.7086), (35.6815, 139.7824)),
+            area(5, (35.6734, 139.6735), (35.7294, 139.7459)),
+            area(4, (35.6997, 139.7175), (35.7359, 139.7724)),
+            area(4, (35.6947, 139.7628), (35.7312, 139.8097)),
+            area(4, (35.5897, 139.7713), (35.708, 139.8477)),
         ],
-        home: (35.856, 139.903),
+        home: miharashi_render::sample::HOME,
         radius_km: 50.0,
         time: "10/13 21:30 発表".into(),
     }
@@ -646,7 +644,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const NAGAREYAMA: (f64, f64) = (35.856, 139.903);
+    const HOME: (f64, f64) = miharashi_render::sample::HOME;
 
     #[test]
     fn alert_codes_are_special_warnings_and_landslide_level4() {
@@ -671,44 +669,44 @@ mod tests {
 
     fn relm() -> Value {
         json!({
-            "1222000": {"name": "流山市", "ne": [35.9195, 139.9575], "sw": [35.8276, 139.8748]},
-            "1220600": {"name": "木更津市", "ne": [35.4527, 140.0484], "sw": [35.3196, 139.8649]},
-            "0820100": {"name": "水戸市", "ne": [36.4602, 140.5652], "sw": [36.2965, 140.3546]},
+            "1310100": {"name": "千代田区", "ne": [35.7054, 139.7825], "sw": [35.6686, 139.7312]},
+            "1220600": {"name": "木更津市", "ne": [35.4443, 140.1297], "sw": [35.3135, 139.8875]},
+            "0820100": {"name": "水戸市", "ne": [36.4643, 140.5868], "sw": [36.3009, 140.3217]},
             "bad": {"name": "欠け", "ne": [1]},
         })
     }
 
     #[test]
     fn radius_selects_by_nearest_bbox_point() {
-        let m = munis_within(&relm(), NAGAREYAMA, 50.0);
-        assert!(m.contains_key("1222000"), "自宅の市");
+        let m = munis_within(&relm(), HOME, 50.0);
+        assert!(m.contains_key("1310100"), "自宅の市");
         assert!(m.contains_key("1220600"), "木更津市は 50km 以内");
         assert!(!m.contains_key("0820100"), "水戸市は外");
         assert!(!m.contains_key("bad"));
-        assert!(munis_within(&json!([]), NAGAREYAMA, 50.0).is_empty());
+        assert!(munis_within(&json!([]), HOME, 50.0).is_empty());
     }
 
     #[test]
     fn offices_follow_area_parents() {
         let area = json!({
-            "class20s": {"1222000": {"parent": "120013"}, "9999999": {"parent": "x"}},
-            "class15s": {"120013": {"parent": "120010"}},
-            "class10s": {"120010": {"parent": "120000"}},
+            "class20s": {"1310100": {"parent": "130011"}, "9999999": {"parent": "x"}},
+            "class15s": {"130011": {"parent": "130010"}},
+            "class10s": {"130010": {"parent": "130000"}},
         });
         let codes = [
-            "1222000".to_string(),
+            "1310100".to_string(),
             "9999999".to_string(),
             "0".to_string(),
         ];
-        assert_eq!(offices_for(&area, codes.iter()), ["120000"]);
+        assert_eq!(offices_for(&area, codes.iter()), ["130000"]);
     }
 
     fn watch() -> Watch {
         Watch {
-            home: NAGAREYAMA,
-            munis: munis_within(&relm(), NAGAREYAMA, 50.0),
-            offices: vec!["120000".into()],
-            home_muni: Some(("1222000".into(), "流山市".into(), "120000".into())),
+            home: HOME,
+            munis: munis_within(&relm(), HOME, 50.0),
+            offices: vec!["130000".into()],
+            home_muni: Some(("1310100".into(), "千代田区".into(), "130000".into())),
         }
     }
 
@@ -717,7 +715,7 @@ mod tests {
     fn home_kinds_and_latest_report() {
         let d = json!([
             {"reportDatetime": "2026-10-13T21:00:00+09:00", "warning": {"class20Items": [
-                {"areaCode": "1222000", "kinds": [
+                {"areaCode": "1310100", "kinds": [
                     {"code": "14", "status": "発表"},
                     {"code": "03", "status": "継続"},
                     {"code": "10", "status": "解除"},
@@ -726,11 +724,11 @@ mod tests {
                 {"areaCode": "1220600", "kinds": [{"code": "33", "status": "発表"}]},
             ]}},
             {"reportDatetime": "2026-10-13T21:30:00+09:00", "warning": {"class20Items": [
-                {"areaCode": "1222000", "kinds": [{"code": "14", "status": "継続"}]},
+                {"areaCode": "1310100", "kinds": [{"code": "14", "status": "継続"}]},
             ]}},
         ]);
         assert_eq!(
-            kinds_for(&d, "1222000"),
+            kinds_for(&d, "1310100"),
             [("大雨警報".to_string(), 3), ("雷注意報".to_string(), 2)]
         );
         assert!(kinds_for(&d, "0000000").is_empty());
@@ -739,12 +737,12 @@ mod tests {
 
         let home: HomeShared = Arc::default();
         let docs: HashMap<String, (Value, Option<String>)> =
-            [("120000".to_string(), (d, None))].into();
+            [("130000".to_string(), (d, None))].into();
         publish_home(&home, &watch(), &docs, true);
         let g = home.lock().unwrap().clone();
         assert_eq!(
             (g.area.as_str(), g.kinds.map(|k| k.len())),
-            ("流山市", Some(2))
+            ("千代田区", Some(2))
         );
         assert!(!g.status.failing);
         // 読めなくなったら、最後の内容を残して失敗にする
@@ -773,7 +771,7 @@ mod tests {
         let d = doc(
             "2026-10-13T21:00:00+09:00",
             json!([
-                {"areaCode": "1222000", "kinds": [
+                {"areaCode": "1310100", "kinds": [
                     {"code": "33", "status": "発表"},
                     {"code": "03", "status": "継続"},
                     {"code": "49", "status": "解除"},
@@ -789,7 +787,7 @@ mod tests {
         active_hits(&d, &watch().munis, &mut hits, &mut unknown);
         let codes: Vec<&str> = hits.keys().map(|h| h.code.as_str()).collect();
         assert_eq!(codes, ["03", "33", "77"]);
-        assert!(hits.keys().all(|h| h.area == "1222000"), "水戸市は見ない");
+        assert!(hits.keys().all(|h| h.area == "1310100"), "水戸市は見ない");
         assert_eq!(unknown.iter().collect::<Vec<_>>(), ["77"]);
         active_hits(&json!({"x": 1}), &watch().munis, &mut hits, &mut unknown);
     }
@@ -802,7 +800,7 @@ mod tests {
         };
         let hits: BTreeMap<Hit, String> = [
             (
-                hit("1222000", "33"),
+                hit("1310100", "33"),
                 "2026-10-13T21:00:00+09:00".to_string(),
             ),
             (
@@ -810,7 +808,7 @@ mod tests {
                 "2026-10-13T20:00:00+09:00".to_string(),
             ),
             (
-                hit("1222000", "03"),
+                hit("1310100", "03"),
                 "2026-10-13T21:00:00+09:00".to_string(),
             ),
         ]
@@ -818,9 +816,9 @@ mod tests {
         .collect();
         // 起動直後は 20:50 より前の発表を出さない(警報 03 はそもそも対象外)
         let fresh = new_alerts(&hits, &HashSet::new(), Some("2026-10-13T20:50:00+09:00"));
-        assert_eq!(fresh, [hit("1222000", "33")]);
+        assert_eq!(fresh, [hit("1310100", "33")]);
         // 起動後は、前回に無かった対象だけ
-        let prev: HashSet<Hit> = [hit("1222000", "33")].into_iter().collect();
+        let prev: HashSet<Hit> = [hit("1310100", "33")].into_iter().collect();
         assert_eq!(new_alerts(&hits, &prev, None), [hit("1220600", "49")]);
         // 49 → 39 への引き上げは新しい対象として出る
         let up: BTreeMap<Hit, String> = [(hit("1220600", "39"), "t".to_string())]
@@ -838,7 +836,7 @@ mod tests {
         };
         let hits: BTreeMap<Hit, String> = [
             (
-                hit("1222000", "49"),
+                hit("1310100", "49"),
                 "2026-10-13T21:00:00+09:00".to_string(),
             ),
             (
@@ -846,11 +844,11 @@ mod tests {
                 "2026-10-13T21:10:00+09:00".to_string(),
             ),
             (
-                hit("1222000", "33"),
+                hit("1310100", "33"),
                 "2026-10-13T21:05:00+09:00".to_string(),
             ),
             (
-                hit("1222000", "03"),
+                hit("1310100", "03"),
                 "2026-10-13T21:20:00+09:00".to_string(),
             ),
         ]

@@ -255,14 +255,14 @@ pub fn demo_view() -> QuakeView {
     QuakeView {
         title: "震源・震度情報(テスト表示)".into(),
         max_intensity: Some(6),
-        place: "千葉県北西部".into(),
+        place: "東京湾".into(),
         time: "10/13 21:30 ごろ".into(),
         magnitude: "M6.1".into(),
         depth: "深さ 70km".into(),
-        epicenter: Some((35.6, 140.1)),
+        epicenter: Some((35.5, 139.9)),
         prefs: vec![
-            ("12".into(), 6),
-            ("13".into(), 5),
+            ("13".into(), 6),
+            ("12".into(), 5),
             ("11".into(), 5),
             ("14".into(), 4),
             ("08".into(), 4),
@@ -385,8 +385,8 @@ mod tests {
     fn entry(ctt: &str, eid: &str, ttl: &str, maxi: &str, ints: &[(&str, &str)]) -> Value {
         json!({
             "ctt": ctt, "eid": eid, "ttl": ttl, "ser": "1",
-            "at": "2026-10-13T20:53:00+09:00", "anm": "千葉県北西部",
-            "cod": "+35.6+140.1-70000/", "mag": "5.0", "maxi": maxi,
+            "at": "2026-10-13T20:53:00+09:00", "anm": "東京湾",
+            "cod": "+35.5+139.9-70000/", "mag": "5.0", "maxi": maxi,
             "int": ints.iter().map(|(c, m)| json!({"code": c, "maxi": m, "city": []})).collect::<Vec<_>>(),
         })
     }
@@ -415,7 +415,7 @@ mod tests {
         assert_eq!(r.view.time, "10/13 20:53 ごろ");
         assert_eq!(r.view.magnitude, "M5.0");
         assert_eq!(r.view.depth, "深さ 70km");
-        assert_eq!(r.view.epicenter, Some((35.6, 140.1)));
+        assert_eq!(r.view.epicenter, Some((35.5, 139.9)));
         assert_eq!(
             r.view.prefs,
             vec![("12".to_string(), 4), ("13".to_string(), 3)]
@@ -502,13 +502,13 @@ mod tests {
     #[test]
     fn region_lookup_from_area_json() {
         let area = json!({
-            "centers": {"010300": {"name": "関東甲信地方", "children": ["080000", "120000", "190000", "200000"]}},
-            "offices": {"120000": {"name": "千葉県", "parent": "010300"}, "011000": {"name": "宗谷地方", "parent": "010100"}},
+            "centers": {"010300": {"name": "関東甲信地方", "children": ["080000", "130000", "190000", "200000"]}},
+            "offices": {"130000": {"name": "東京都", "parent": "010300"}, "011000": {"name": "宗谷地方", "parent": "010100"}},
         });
-        let r = region_from_area(&area, "12").unwrap();
+        let r = region_from_area(&area, "13").unwrap();
         assert_eq!(r.name, "関東甲信地方");
-        assert!(r.prefs.contains("19") && r.prefs.contains("12"));
+        assert!(r.prefs.contains("19") && r.prefs.contains("13"));
         assert!(region_from_area(&area, "01").is_none(), "center が無い");
-        assert!(region_from_area(&json!([]), "12").is_none());
+        assert!(region_from_area(&json!([]), "13").is_none());
     }
 }

@@ -61,7 +61,7 @@ pub struct WeekDay {
 /// 天気予報。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Weather {
-    /// 予報の地域("千葉県北西部")
+    /// 予報の地域("東京都東京地方")
     pub area: String,
     pub days: Vec<ForecastDay>,
     pub week: Vec<WeekDay>,
@@ -93,7 +93,7 @@ pub struct RoomView {
     /// まだ予報を一度も取れていなければ None
     pub weather: Option<Weather>,
     pub weather_feed: Feed,
-    /// 自宅の市町村("流山市")。分からなければ空
+    /// 自宅の市町村("千代田区")。分からなければ空
     pub warn_area: String,
     /// 発表中の警報・注意報(レベルの高い順)。まだ取れていなければ None
     pub warnings: Option<Vec<Warning>>,
@@ -753,7 +753,7 @@ pub fn demo_view() -> RoomView {
             stale: false,
         },
         weather: Some(Weather {
-            area: "千葉県北西部".into(),
+            area: crate::sample::FORECAST_AREA.into(),
             days: vec![
                 day(
                     "今日 14日(火)",
@@ -776,7 +776,7 @@ pub fn demo_view() -> RoomView {
             text: "気象庁 05:00 発表".into(),
             stale: false,
         },
-        warn_area: "流山市".into(),
+        warn_area: crate::sample::MUNI.into(),
         warnings: Some(vec![
             Warning {
                 name: "大雨警報".into(),
