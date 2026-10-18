@@ -174,6 +174,10 @@ impl SceneState {
     }
 }
 
+/// `reset_gl_state` がテクスチャと sampler の束縛を外すユニットの数(GLES 3.x の最低保証の 16)。
+/// Compositor 自身が使うのは 0〜3 だけだが、3D の場面が使うユニットに前の場面の sampler を残さないため広く外す。
+const RESET_TEXTURE_UNITS: u32 = 16;
+
 /// 溜まっている GL エラーを読み出しきり、最初のものを返す(`GL_CONTEXT_LOST` で終わらないよう回数に上限)。
 fn drain_errors(gl: &glow::Context) -> Option<u32> {
     let mut first = None;
@@ -213,12 +217,15 @@ impl Compositor {
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, target);
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, target);
             gl.viewport(0, 0, w as i32, h as i32);
-            // 画面(既定の framebuffer)は BACK、FBO は COLOR_ATTACHMENT0
-            gl.draw_buffers(&[if target.is_some() {
+            gl.scissor(0, 0, w as i32, h as i32);
+            // 画面(既定の framebuffer)は BACK、FBO は COLOR_ATTACHMENT0。FBO ごとの状態なので target に対して設定する
+            let color = if target.is_some() {
                 glow::COLOR_ATTACHMENT0
             } else {
                 glow::BACK
-            }]);
+            };
+            gl.draw_buffers(&[color]);
+            gl.read_buffer(color);
             for cap in [
                 glow::DEPTH_TEST,
                 glow::CULL_FACE,
@@ -227,6 +234,8 @@ impl Compositor {
                 glow::STENCIL_TEST,
                 glow::RASTERIZER_DISCARD,
                 glow::SAMPLE_ALPHA_TO_COVERAGE,
+                glow::SAMPLE_COVERAGE,
+                glow::SAMPLE_MASK,
                 glow::PRIMITIVE_RESTART_FIXED_INDEX,
                 glow::POLYGON_OFFSET_FILL,
             ] {
@@ -237,6 +246,7 @@ impl Compositor {
             gl.color_mask(true, true, true, true);
             // 無効にした機能のパラメーターも既定へ(次の画面に漏らさない)
             gl.depth_func(glow::LESS);
+            gl.depth_range_f32(0.0, 1.0);
             gl.front_face(glow::CCW);
             gl.cull_face(glow::BACK);
             gl.stencil_func(glow::ALWAYS, 0, 0xFF);
@@ -244,9 +254,15 @@ impl Compositor {
             gl.stencil_mask(0xFF);
             gl.clear_depth_f32(1.0);
             gl.clear_stencil(0);
+            // blend_func / blend_equation は RGB とアルファの両方を設定する(separate の値も戻る)
             gl.blend_func(glow::ONE, glow::ZERO);
             gl.blend_equation(glow::FUNC_ADD);
+            gl.blend_color(0.0, 0.0, 0.0, 0.0);
             gl.polygon_offset(0.0, 0.0);
+            gl.line_width(1.0);
+            gl.sample_coverage(1.0, false);
+            gl.hint(glow::GENERATE_MIPMAP_HINT, glow::DONT_CARE);
+            gl.hint(glow::FRAGMENT_SHADER_DERIVATIVE_HINT, glow::DONT_CARE);
             gl.use_program(None);
             // VAO を外してから ELEMENT_ARRAY_BUFFER を外す(VAO の中の束縛を壊さないため)
             gl.bind_vertex_array(None);
@@ -255,22 +271,29 @@ impl Compositor {
                 glow::ELEMENT_ARRAY_BUFFER,
                 glow::PIXEL_UNPACK_BUFFER,
                 glow::PIXEL_PACK_BUFFER,
+                glow::DRAW_INDIRECT_BUFFER,
             ] {
                 gl.bind_buffer(binding, None);
             }
-            for unit in [
-                glow::TEXTURE3,
-                glow::TEXTURE2,
-                glow::TEXTURE1,
-                glow::TEXTURE0,
-            ] {
-                gl.active_texture(unit);
-                gl.bind_texture(glow::TEXTURE_2D, None);
+            // sampler オブジェクトは、束縛が残るとテクスチャ自身のフィルター設定より優先される
+            for unit in (0..RESET_TEXTURE_UNITS).rev() {
+                gl.active_texture(glow::TEXTURE0 + unit);
+                for kind in [
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_CUBE_MAP,
+                    glow::TEXTURE_3D,
+                    glow::TEXTURE_2D_ARRAY,
+                ] {
+                    gl.bind_texture(kind, None);
+                }
+                gl.bind_sampler(unit, None);
             }
             for pname in [
                 glow::UNPACK_ROW_LENGTH,
                 glow::UNPACK_SKIP_PIXELS,
                 glow::UNPACK_SKIP_ROWS,
+                glow::UNPACK_IMAGE_HEIGHT,
+                glow::UNPACK_SKIP_IMAGES,
                 glow::PACK_ROW_LENGTH,
                 glow::PACK_SKIP_PIXELS,
                 glow::PACK_SKIP_ROWS,
@@ -520,6 +543,8 @@ mod tests {
         dirt_fbo: Option<glow::Framebuffer>,
         dirt_tex: Option<glow::Texture>,
         dirt_pbo: Option<glow::Buffer>,
+        dirt_cube: Option<glow::Texture>,
+        dirt_sampler: Option<glow::Sampler>,
     }
 
     const VS: &str = "#version 300 es
@@ -548,6 +573,8 @@ void main() { o = v_col; }
                 dirt_fbo: None,
                 dirt_tex: None,
                 dirt_pbo: None,
+                dirt_cube: None,
+                dirt_sampler: None,
             }
         }
 
@@ -571,11 +598,16 @@ void main() { o = v_col; }
                     ("STENCIL_TEST", glow::STENCIL_TEST),
                     ("RASTERIZER_DISCARD", glow::RASTERIZER_DISCARD),
                     ("SAMPLE_ALPHA_TO_COVERAGE", glow::SAMPLE_ALPHA_TO_COVERAGE),
+                    ("SAMPLE_COVERAGE", glow::SAMPLE_COVERAGE),
+                    ("SAMPLE_MASK", glow::SAMPLE_MASK),
                     ("POLYGON_OFFSET_FILL", glow::POLYGON_OFFSET_FILL),
                 ] {
                     if gl.is_enabled(cap) {
                         bad.push(format!("{name} が有効"));
                     }
+                }
+                if !gl.is_enabled(glow::DITHER) {
+                    bad.push("DITHER が無効".into());
                 }
                 for (name, pname, want) in [
                     ("DEPTH_FUNC", glow::DEPTH_FUNC, glow::LESS),
@@ -590,11 +622,31 @@ void main() { o = v_col; }
                         glow::BLEND_EQUATION_RGB,
                         glow::FUNC_ADD,
                     ),
+                    (
+                        "BLEND_EQUATION_ALPHA",
+                        glow::BLEND_EQUATION_ALPHA,
+                        glow::FUNC_ADD,
+                    ),
                     ("STENCIL_FUNC", glow::STENCIL_FUNC, glow::ALWAYS),
+                    ("STENCIL_BACK_FUNC", glow::STENCIL_BACK_FUNC, glow::ALWAYS),
+                    ("STENCIL_REF", glow::STENCIL_REF, 0),
+                    ("STENCIL_BACK_REF", glow::STENCIL_BACK_REF, 0),
+                    ("STENCIL_VALUE_MASK", glow::STENCIL_VALUE_MASK, 0xFF),
+                    (
+                        "STENCIL_BACK_VALUE_MASK",
+                        glow::STENCIL_BACK_VALUE_MASK,
+                        0xFF,
+                    ),
                     ("STENCIL_FAIL", glow::STENCIL_FAIL, glow::KEEP),
+                    ("STENCIL_BACK_FAIL", glow::STENCIL_BACK_FAIL, glow::KEEP),
                     (
                         "STENCIL_PASS_DEPTH_FAIL",
                         glow::STENCIL_PASS_DEPTH_FAIL,
+                        glow::KEEP,
+                    ),
+                    (
+                        "STENCIL_BACK_PASS_DEPTH_FAIL",
+                        glow::STENCIL_BACK_PASS_DEPTH_FAIL,
                         glow::KEEP,
                     ),
                     (
@@ -602,7 +654,13 @@ void main() { o = v_col; }
                         glow::STENCIL_PASS_DEPTH_PASS,
                         glow::KEEP,
                     ),
+                    (
+                        "STENCIL_BACK_PASS_DEPTH_PASS",
+                        glow::STENCIL_BACK_PASS_DEPTH_PASS,
+                        glow::KEEP,
+                    ),
                     ("STENCIL_WRITEMASK", glow::STENCIL_WRITEMASK, 0xFF),
+                    ("STENCIL_BACK_WRITEMASK", glow::STENCIL_BACK_WRITEMASK, 0xFF),
                     ("DEPTH_WRITEMASK", glow::DEPTH_WRITEMASK, 1),
                     ("CURRENT_PROGRAM", glow::CURRENT_PROGRAM, 0),
                     ("VERTEX_ARRAY_BINDING", glow::VERTEX_ARRAY_BINDING, 0),
@@ -612,12 +670,37 @@ void main() { o = v_col; }
                         glow::PIXEL_UNPACK_BUFFER_BINDING,
                         0,
                     ),
+                    (
+                        "PIXEL_PACK_BUFFER_BINDING",
+                        glow::PIXEL_PACK_BUFFER_BINDING,
+                        0,
+                    ),
+                    (
+                        "DRAW_INDIRECT_BUFFER_BINDING",
+                        glow::DRAW_INDIRECT_BUFFER_BINDING,
+                        0,
+                    ),
                     ("ACTIVE_TEXTURE", glow::ACTIVE_TEXTURE, glow::TEXTURE0),
-                    ("TEXTURE_BINDING_2D(0)", glow::TEXTURE_BINDING_2D, 0),
+                    ("READ_BUFFER", glow::READ_BUFFER, glow::COLOR_ATTACHMENT0),
+                    (
+                        "GENERATE_MIPMAP_HINT",
+                        glow::GENERATE_MIPMAP_HINT,
+                        glow::DONT_CARE,
+                    ),
+                    (
+                        "FRAGMENT_SHADER_DERIVATIVE_HINT",
+                        glow::FRAGMENT_SHADER_DERIVATIVE_HINT,
+                        glow::DONT_CARE,
+                    ),
                     ("UNPACK_ROW_LENGTH", glow::UNPACK_ROW_LENGTH, 0),
                     ("UNPACK_SKIP_PIXELS", glow::UNPACK_SKIP_PIXELS, 0),
                     ("UNPACK_SKIP_ROWS", glow::UNPACK_SKIP_ROWS, 0),
+                    ("UNPACK_IMAGE_HEIGHT", glow::UNPACK_IMAGE_HEIGHT, 0),
+                    ("UNPACK_SKIP_IMAGES", glow::UNPACK_SKIP_IMAGES, 0),
                     ("UNPACK_ALIGNMENT", glow::UNPACK_ALIGNMENT, 4),
+                    ("PACK_ROW_LENGTH", glow::PACK_ROW_LENGTH, 0),
+                    ("PACK_SKIP_PIXELS", glow::PACK_SKIP_PIXELS, 0),
+                    ("PACK_SKIP_ROWS", glow::PACK_SKIP_ROWS, 0),
                     ("PACK_ALIGNMENT", glow::PACK_ALIGNMENT, 4),
                 ] {
                     let got = gl.get_parameter_i32(pname);
@@ -625,9 +708,46 @@ void main() { o = v_col; }
                         bad.push(format!("{name} = 0x{got:x}(期待 0x{want:x})"));
                     }
                 }
-                gl.active_texture(glow::TEXTURE1);
-                if gl.get_parameter_i32(glow::TEXTURE_BINDING_2D) != 0 {
-                    bad.push("TEXTURE1 に bind が残っている".into());
+                for (name, pname, want) in [
+                    ("LINE_WIDTH", glow::LINE_WIDTH, 1.0),
+                    ("POLYGON_OFFSET_FACTOR", glow::POLYGON_OFFSET_FACTOR, 0.0),
+                    ("POLYGON_OFFSET_UNITS", glow::POLYGON_OFFSET_UNITS, 0.0),
+                    ("SAMPLE_COVERAGE_VALUE", glow::SAMPLE_COVERAGE_VALUE, 1.0),
+                ] {
+                    let got = gl.get_parameter_f32(pname);
+                    if got != want {
+                        bad.push(format!("{name} = {got}(期待 {want})"));
+                    }
+                }
+                if gl.get_parameter_bool(glow::SAMPLE_COVERAGE_INVERT) {
+                    bad.push("SAMPLE_COVERAGE_INVERT".into());
+                }
+                let mut range = [0f32; 2];
+                gl.get_parameter_f32_slice(glow::DEPTH_RANGE, &mut range);
+                if range != [0.0, 1.0] {
+                    bad.push(format!("DEPTH_RANGE = {range:?}"));
+                }
+                let mut color = [1f32; 4];
+                gl.get_parameter_f32_slice(glow::BLEND_COLOR, &mut color);
+                if color != [0.0; 4] {
+                    bad.push(format!("BLEND_COLOR = {color:?}"));
+                }
+                // sampler とテクスチャの束縛は、Compositor が使うユニット(0〜3)の外も含めて全部外れている
+                for unit in 0..RESET_TEXTURE_UNITS {
+                    gl.active_texture(glow::TEXTURE0 + unit);
+                    if gl.get_parameter_i32(glow::SAMPLER_BINDING) != 0 {
+                        bad.push(format!("TEXTURE{unit} に sampler が残っている"));
+                    }
+                    for (name, pname) in [
+                        ("2D", glow::TEXTURE_BINDING_2D),
+                        ("CUBE_MAP", glow::TEXTURE_BINDING_CUBE_MAP),
+                        ("3D", glow::TEXTURE_BINDING_3D),
+                        ("2D_ARRAY", glow::TEXTURE_BINDING_2D_ARRAY),
+                    ] {
+                        if gl.get_parameter_i32(pname) != 0 {
+                            bad.push(format!("TEXTURE{unit} に {name} の bind が残っている"));
+                        }
+                    }
                 }
                 gl.active_texture(glow::TEXTURE0);
                 if gl.get_parameter_bool_array::<4>(glow::COLOR_WRITEMASK) != [true; 4] {
@@ -637,6 +757,10 @@ void main() { o = v_col; }
                 gl.get_parameter_i32_slice(glow::VIEWPORT, &mut vp);
                 if vp != [0, 0, t.size.0 as i32, t.size.1 as i32] {
                     bad.push(format!("viewport = {vp:?}"));
+                }
+                gl.get_parameter_i32_slice(glow::SCISSOR_BOX, &mut vp);
+                if vp != [0, 0, t.size.0 as i32, t.size.1 as i32] {
+                    bad.push(format!("scissor = {vp:?}"));
                 }
                 if gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING) != Some(t.fbo)
                     || gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING) != Some(t.fbo)
@@ -661,13 +785,25 @@ void main() { o = v_col; }
             unsafe {
                 // 層の FBO 自身の draw buffer(FBO ごとの状態)。bind を変える前にやる
                 gl.draw_buffers(&[glow::NONE]);
+                gl.read_buffer(glow::NONE);
                 gl.clear_color(1.0, 0.0, 1.0, 1.0);
                 gl.disable(glow::DITHER);
                 gl.enable(glow::BLEND);
                 gl.blend_func(glow::SRC_ALPHA, glow::ZERO);
                 gl.blend_equation(glow::FUNC_REVERSE_SUBTRACT);
+                // RGB とアルファで別々の値(blend_func / blend_equation のあとに設定する)
+                gl.blend_func_separate(
+                    glow::SRC_ALPHA,
+                    glow::ONE,
+                    glow::ZERO,
+                    glow::ONE_MINUS_SRC_ALPHA,
+                );
+                gl.blend_equation_separate(glow::FUNC_SUBTRACT, glow::MAX);
+                gl.blend_color(1.0, 1.0, 1.0, 1.0);
                 gl.enable(glow::DEPTH_TEST);
                 gl.depth_func(glow::ALWAYS);
+                // 前後関係が逆になる
+                gl.depth_range_f32(1.0, 0.0);
                 gl.depth_mask(false);
                 gl.clear_depth_f32(0.0);
                 gl.enable(glow::CULL_FACE);
@@ -680,7 +816,16 @@ void main() { o = v_col; }
                 gl.stencil_func(glow::NEVER, 1, 0);
                 gl.stencil_op(glow::ZERO, glow::ZERO, glow::ZERO);
                 gl.stencil_mask(0);
+                gl.stencil_func_separate(glow::BACK, glow::NEVER, 3, 5);
+                gl.stencil_op_separate(glow::BACK, glow::ZERO, glow::ZERO, glow::ZERO);
+                gl.stencil_mask_separate(glow::BACK, 0);
                 gl.enable(glow::RASTERIZER_DISCARD);
+                gl.enable(glow::SAMPLE_COVERAGE);
+                gl.enable(glow::SAMPLE_MASK);
+                gl.sample_coverage(0.0, true);
+                gl.line_width(3.0);
+                gl.hint(glow::GENERATE_MIPMAP_HINT, glow::NICEST);
+                gl.hint(glow::FRAGMENT_SHADER_DERIVATIVE_HINT, glow::NICEST);
                 gl.enable(glow::SAMPLE_ALPHA_TO_COVERAGE);
                 gl.enable(glow::POLYGON_OFFSET_FILL);
                 gl.polygon_offset(5.0, 5.0);
@@ -699,6 +844,8 @@ void main() { o = v_col; }
                 self.created();
                 self.dirt_pbo = Some(pbo);
                 gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, Some(pbo));
+                gl.bind_buffer(glow::PIXEL_PACK_BUFFER, Some(pbo));
+                gl.bind_buffer(glow::DRAW_INDIRECT_BUFFER, Some(pbo));
                 let tex = gl.create_texture().unwrap();
                 self.created();
                 self.dirt_tex = Some(tex);
@@ -706,11 +853,30 @@ void main() { o = v_col; }
                 gl.bind_texture(glow::TEXTURE_2D, Some(tex));
                 gl.active_texture(glow::TEXTURE0);
                 gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                let cube = gl.create_texture().unwrap();
+                self.created();
+                self.dirt_cube = Some(cube);
+                gl.active_texture(glow::TEXTURE2);
+                gl.bind_texture(glow::TEXTURE_CUBE_MAP, Some(cube));
+                // sampler は bind_texture(None) では外れない。Compositor が使わないユニット(9)にも残す
+                let sampler = gl.create_sampler().unwrap();
+                self.created();
+                self.dirt_sampler = Some(sampler);
+                gl.sampler_parameter_i32(sampler, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+                gl.sampler_parameter_i32(sampler, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+                for unit in [0, 1, 2, 3, 9] {
+                    gl.bind_sampler(unit, Some(sampler));
+                }
                 gl.active_texture(glow::TEXTURE3);
                 gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 7);
                 gl.pixel_store_i32(glow::UNPACK_SKIP_PIXELS, 2);
                 gl.pixel_store_i32(glow::UNPACK_SKIP_ROWS, 1);
+                gl.pixel_store_i32(glow::UNPACK_IMAGE_HEIGHT, 5);
+                gl.pixel_store_i32(glow::UNPACK_SKIP_IMAGES, 1);
                 gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+                gl.pixel_store_i32(glow::PACK_ROW_LENGTH, 9);
+                gl.pixel_store_i32(glow::PACK_SKIP_PIXELS, 2);
+                gl.pixel_store_i32(glow::PACK_SKIP_ROWS, 1);
                 gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
             }
             let _ = t;
@@ -806,6 +972,14 @@ void main() { o = v_col; }
                 }
                 if let Some(t) = self.dirt_tex.take() {
                     gl.delete_texture(t);
+                    self.deleted();
+                }
+                if let Some(t) = self.dirt_cube.take() {
+                    gl.delete_texture(t);
+                    self.deleted();
+                }
+                if let Some(smp) = self.dirt_sampler.take() {
+                    gl.delete_sampler(smp);
                     self.deleted();
                 }
                 if let Some(f) = self.dirt_fbo.take() {
@@ -1016,26 +1190,85 @@ void main() { o = v_col; }
         }
     }
 
-    /// 3D の場面がどれだけ状態を汚しても、同じフレームの層の合成と重ね絵、次の 2D の下地、次の 3D の場面が、
-    /// 汚さなかったときと同じになる。
-    #[test]
-    fn dirty_scene_does_not_leak_into_composite_or_following_frames() {
-        let Some(off) = offscreen() else { return };
-        let (base, top) = (solid(BASE, SCREEN), top_image());
-        let old = solid([200, 40, 10, 255], SCREEN);
-        let new = solid([20, 100, 240, 255], SCREEN);
+    /// 本番の `GlesDisplay::present_frame` と同じ呼び方(framebuffer を bind するだけ)で、2D のフレームを描く。
+    /// 0 = 写真(フェードと重ね絵つき)、1 = Radar、2 = Agent(拡大した 2x2 のカードと scrim)。
+    /// どれも画面全体を不透明な下地から描くので、直前の 3D の絵は残らない。
+    const FRAMES_2D: usize = 3;
+
+    fn draw_2d(
+        gl: &glow::Context,
+        comp: &mut Compositor,
+        target: Option<glow::Framebuffer>,
+        kind: usize,
+    ) {
+        use crate::compose::{AgentGpuCard, Radar};
+        let (old, new, top) = (
+            solid([200, 40, 10, 255], SCREEN),
+            solid([20, 100, 240, 255], SCREEN),
+            top_image(),
+        );
+        let bg = solid([8, 12, 20, 255], SCREEN);
+        let card = [
+            255u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
         let layer = |id, rgba| PhotoLayer {
             id,
             src: PhotoSource::Frame(rgba),
         };
-        let photo = Frame::Photo {
-            photo: layer(2, &new),
-            old: Some((layer(1, &old), 0.5)),
-            overlay: Some(&top),
+        let blips = [[40.0, 12.0, 0.0], [20.0, 20.0, 0.0]];
+        let cards = [AgentGpuCard {
+            id: 7,
+            revision: 1,
+            pixels: &card,
+            size: (2, 2),
+            rect: (8.0, 4.0, 24.0, 16.0),
+            alpha: 0.9,
+        }];
+        let frame = match kind {
+            0 => Frame::Photo {
+                photo: layer(2, &new),
+                old: Some((layer(1, &old), 0.5)),
+                overlay: Some(&top),
+            },
+            1 => Frame::Radar {
+                background: Some(&bg),
+                radar: Radar {
+                    center: (32.0, 16.0),
+                    radius: 14.0,
+                    sweep: 1.0,
+                    trail: 0.9,
+                    scale: 1.0,
+                    blips: &blips,
+                },
+            },
+            _ => Frame::Agents {
+                background: Some(&bg),
+                cards: &cards,
+                scrim_alpha: 0.3,
+                focus_card_id: None,
+            },
         };
+        unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, target) };
+        comp.draw(gl, &frame).unwrap();
+    }
+
+    /// 3D の場面がどれだけ状態を汚しても、同じフレームの層の合成と重ね絵、次の 2D の下地(本番と同じ呼び方)、
+    /// 次の 3D の場面が、汚さなかったときと同じになる。
+    #[test]
+    fn dirty_scene_does_not_leak_into_composite_or_following_frames() {
+        let Some(off) = offscreen() else { return };
+        let (base, top) = (solid(BASE, SCREEN), top_image());
         let c = Counters::default();
-        // [3D(dirty か clean), そのあと 2D か 3D] を描いて最後の絵を返す
-        let run = |dirty: bool, then_2d: bool| {
+        // 3D(dirty か clean)のあとに続けるもの
+        #[derive(Clone, Copy, Debug)]
+        enum Then {
+            /// 3D の場面。`contract` なら draw の頭で §5.4 の約束も確かめる(なしなら絵だけで確かめる)
+            Scene {
+                contract: bool,
+            },
+            Frame2d(usize),
+        }
+        let run = |dirty: bool, then: Then| {
             let c = c.clone();
             off.render_with_compositor(SCREEN, |gl, comp, target| {
                 let mut a = TestScene::new(&c, Fail::None, dirty);
@@ -1047,42 +1280,111 @@ void main() { o = v_col; }
                     )
                     .unwrap();
                 assert_eq!(o, SceneOutcome::Drawn);
-                let mid = if then_2d {
-                    Compositor::reset_gl_state(gl, SCREEN, target);
-                    comp.draw(gl, &photo).unwrap();
-                    None
-                } else {
-                    // 3D → 3D: 次の場面は §5.4 の約束を確かめる(違えば Err で SceneFailed)
-                    let mut b = TestScene::new(&c, Fail::None, false);
-                    let o = comp
-                        .draw_scene(
-                            gl,
-                            target,
-                            &mut frame(&mut b, &base, REGION, SceneTop::Keep),
-                        )
-                        .unwrap();
-                    b.release(gl);
-                    Some(o)
+                let mid = match then {
+                    Then::Frame2d(kind) => {
+                        draw_2d(gl, comp, target, kind);
+                        None
+                    }
+                    Then::Scene { contract } => {
+                        let mut b = TestScene::new(&c, Fail::None, false);
+                        b.check_contract = contract;
+                        let o = comp
+                            .draw_scene(
+                                gl,
+                                target,
+                                &mut frame(&mut b, &base, REGION, SceneTop::Keep),
+                            )
+                            .unwrap();
+                        b.release(gl);
+                        Some(o)
+                    }
                 };
                 a.release(gl);
                 mid
             })
             .unwrap()
         };
-        for then_2d in [false, true] {
-            let (clean_mid, clean) = run(false, then_2d);
-            let (dirty_mid, dirty) = run(true, then_2d);
-            assert_eq!(dirty_mid, clean_mid);
-            if !then_2d {
+        let mut thens = vec![
+            Then::Scene { contract: true },
+            Then::Scene { contract: false },
+        ];
+        thens.extend((0..FRAMES_2D).map(Then::Frame2d));
+        for then in thens {
+            let (clean_mid, clean) = run(false, then);
+            let (dirty_mid, dirty) = run(true, then);
+            assert_eq!(dirty_mid, clean_mid, "{then:?}");
+            if matches!(then, Then::Scene { .. }) {
                 assert_eq!(
                     dirty_mid,
                     Some(SceneOutcome::Drawn),
-                    "前の場面の状態が漏れた"
+                    "前の場面の状態が漏れた: {then:?}"
                 );
                 assert_scene_pixels(&dirty, REGION);
                 assert_top_over(&dirty);
             }
-            assert_eq!(diff_rgb(&clean, &dirty, 0), (0, 0), "then_2d = {then_2d}");
+            assert_eq!(diff_rgb(&clean, &dirty, 0), (0, 0), "{then:?}");
+        }
+        assert_eq!(c.created.get(), c.deleted.get());
+    }
+
+    /// 失敗した 3D(panic・`Err`・GL エラー。状態を汚したまま)のあとでも、次の 2D のフレーム(本番と同じ呼び方)と
+    /// 次の 3D の場面(前後関係を絵で確かめる)が、成功した汚れのない 3D のあとと同じになる。
+    #[test]
+    fn failed_scene_does_not_leak_into_following_frames() {
+        let Some(off) = offscreen() else { return };
+        let (base, top) = (solid(BASE, SCREEN), top_image());
+        let c = Counters::default();
+        let run = |fail: Fail, dirty: bool, kind: Option<usize>| {
+            let c = c.clone();
+            off.render_with_compositor(SCREEN, |gl, comp, target| {
+                let mut a = TestScene::new(&c, fail, dirty);
+                let o = comp
+                    .draw_scene(
+                        gl,
+                        target,
+                        &mut frame(&mut a, &base, REGION, SceneTop::Upload(&top)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    matches!(o, SceneOutcome::SceneFailed(_)),
+                    fail != Fail::None,
+                    "{fail:?}"
+                );
+                let again = match kind {
+                    Some(kind) => {
+                        draw_2d(gl, comp, target, kind);
+                        None
+                    }
+                    None => {
+                        let mut b = TestScene::new(&c, Fail::None, false);
+                        b.check_contract = false;
+                        let o = comp
+                            .draw_scene(
+                                gl,
+                                target,
+                                &mut frame(&mut b, &base, REGION, SceneTop::Keep),
+                            )
+                            .unwrap();
+                        b.release(gl);
+                        Some(o)
+                    }
+                };
+                a.release(gl);
+                again
+            })
+            .unwrap()
+        };
+        let kinds = std::iter::once(None).chain((0..FRAMES_2D).map(Some));
+        for kind in kinds {
+            let (_, clean) = run(Fail::None, false, kind);
+            for fail in [Fail::None, Fail::Panic, Fail::Err, Fail::GlError] {
+                let (again, img) = run(fail, true, kind);
+                assert_eq!(diff_rgb(&clean, &img, 0), (0, 0), "{fail:?} kind={kind:?}");
+                if kind.is_none() {
+                    assert_eq!(again, Some(SceneOutcome::Drawn), "{fail:?}");
+                    assert_scene_pixels(&img, REGION);
+                }
+            }
         }
         assert_eq!(c.created.get(), c.deleted.get());
     }

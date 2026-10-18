@@ -170,8 +170,9 @@ impl GlesDisplay {
     ///   DEPTH_TEST・CULL_FACE・BLEND・SCISSOR_TEST・STENCIL_TEST などの無効化とそのパラメーターの既定化
     ///   (depth_func・front_face・cull_face・stencil・blend_func・ポリゴンオフセットなど)、
     ///   depth_mask と color_mask の全許可、プログラム・VAO・バッファの bind 解除、
-    ///   TEXTURE0〜3 の TEXTURE_2D の bind 解除、PIXEL_STORE(UNPACK / PACK)の既定化。
-    /// - 設定し直さないもの(借りた側が変えたら、そのまま残る): clear 色、uniform の値、scissor の矩形。
+    ///   TEXTURE0〜15 のテクスチャと sampler の bind 解除、PIXEL_STORE(UNPACK / PACK)の既定化、
+    ///   scissor の矩形(画面全体)、深度範囲、ブレンド色、line_width など(詳しくは設計書 §5.1)。
+    /// - 設定し直さないもの(借りた側が変えたら、そのまま残る): clear 色、uniform の値。
     ///   `Compositor` は使う前にそれぞれ自分で設定する。
     pub fn with_gl<R>(&mut self, f: impl FnOnce(&glow::Context, (u32, u32)) -> R) -> R {
         let size = self.out.size();

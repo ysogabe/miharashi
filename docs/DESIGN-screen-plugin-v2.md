@@ -278,14 +278,18 @@ flowchart LR
   - `get_error` を読み切るのは Compositor(`draw` の前にも読み切って、下地の合成のエラーを 3D の失敗にしない。§8、§9.1)。
   - 自分の GL オブジェクトを自分で作り、`release` で消す。
   - 層の FBO に、premultiplied alpha で描く。深度が要るなら、深度テストは自分で有効にする。
-- Compositor が毎回設定する状態(1 フレーム 2 回、数十回の GL 呼び出しで、描画時間への影響は #74 で測る):
-  - framebuffer の bind(READ / DRAW とも)、viewport。
-  - `DEPTH_TEST`・`CULL_FACE`・`BLEND`・`SCISSOR_TEST`・`STENCIL_TEST` の無効化、`depth_mask` と `color_mask` の全許可。
-  - 無効化した機能の**パラメーター**も既定へ: `depth_func(LESS)`、`front_face(CCW)`、`cull_face(BACK)`、stencil の関数(`ALWAYS, 0, 0xFF`)・動作(`KEEP, KEEP, KEEP`)・`stencil_mask(0xFF)`、`clear_depth(1.0)`。VRM は `depth_func(LEQUAL)`(`render.rs:930`)と `cull_face(FRONT)`(`render.rs:973`)を設定して残すので、設定し直さないと次の画面に漏れる。
-  - `RASTERIZER_DISCARD`・`SAMPLE_ALPHA_TO_COVERAGE`・`PRIMITIVE_RESTART_FIXED_INDEX` の無効化。
-  - プログラム・VAO・`ARRAY_BUFFER`・`ELEMENT_ARRAY_BUFFER` の bind 解除。
-  - `TEXTURE0` を選んで `TEXTURE_2D` の bind 解除、`UNPACK_ALIGNMENT` / `PACK_ALIGNMENT` を 4。
-  - **追加**(今の `restore_gl_state` にない): `UNPACK_ROW_LENGTH`・`UNPACK_SKIP_PIXELS`・`UNPACK_SKIP_ROWS` を 0(テクスチャ転送に効く)、`TEXTURE1` の bind 解除、`blend_func`(`ONE, ZERO`)と `blend_equation`(`FUNC_ADD`)を既定、ポリゴンオフセット無効、`DRAW_BUFFER0` を `COLOR_ATTACHMENT0`/`BACK`。
+- Compositor が毎回設定する状態(`Compositor::reset_gl_state`。1 フレーム 3〜4 回。実測は 1 回 約 0.7µs(リリースビルド、内蔵 GPU)で、描画時間への影響は無視できる):
+  - framebuffer の bind(READ / DRAW とも)、viewport、scissor の矩形(描画先の全体)。`DRAW_BUFFER0` と `READ_BUFFER` は、FBO なら `COLOR_ATTACHMENT0`、画面なら `BACK`(FBO ごとの状態なので、描画先に対して設定する)。
+  - `DEPTH_TEST`・`CULL_FACE`・`BLEND`・`SCISSOR_TEST`・`STENCIL_TEST` の無効化、`DITHER` の有効化、`depth_mask` と `color_mask` の全許可。
+  - 無効化した機能の**パラメーター**も既定へ: `depth_func(LESS)`、`depth_range(0, 1)`、`front_face(CCW)`、`cull_face(BACK)`、stencil の関数(`ALWAYS, 0, 0xFF`)・動作(`KEEP, KEEP, KEEP`)・`stencil_mask(0xFF)`(`stencil_func` などは表と裏の両方を設定する)、`clear_depth(1.0)`、`clear_stencil(0)`。VRM は `depth_func(LEQUAL)`(`render.rs:930`)と `cull_face(FRONT)`(`render.rs:973`)を設定して残すので、設定し直さないと次の画面に漏れる。
+  - ブレンド: `blend_func(ONE, ZERO)` と `blend_equation(FUNC_ADD)`(RGB とアルファの両方が戻るので、`blend_func_separate` などで別々にした値も戻る)、`blend_color(0, 0, 0, 0)`。
+  - ポリゴンオフセット無効(`POLYGON_OFFSET_FILL`、`polygon_offset(0, 0)`)、`line_width(1.0)`。
+  - `RASTERIZER_DISCARD`・`SAMPLE_ALPHA_TO_COVERAGE`・`SAMPLE_COVERAGE`・`SAMPLE_MASK`・`PRIMITIVE_RESTART_FIXED_INDEX` の無効化、`sample_coverage(1.0, false)`。
+  - プログラム・VAO の bind 解除。バッファの bind 解除(VAO を外してから): `ARRAY_BUFFER`・`ELEMENT_ARRAY_BUFFER`・`PIXEL_UNPACK_BUFFER`・`PIXEL_PACK_BUFFER`・`DRAW_INDIRECT_BUFFER`。
+  - テクスチャユニット `TEXTURE0`〜`TEXTURE15` それぞれで、`TEXTURE_2D`・`TEXTURE_CUBE_MAP`・`TEXTURE_3D`・`TEXTURE_2D_ARRAY` の bind 解除と、**sampler オブジェクトの bind 解除**(`bind_texture(None)` では sampler は外れず、残るとテクスチャ自身のフィルター設定より優先されて、次の画面の見え方が変わる)。最後にアクティブユニットを `TEXTURE0` にする。Compositor が使うのは 0〜3 だけだが、3D の場面が使うユニットにも前の場面の sampler を残さないため、GLES の最低保証の 16 まで外す。
+  - pixel store: `UNPACK_ROW_LENGTH`・`UNPACK_SKIP_PIXELS`・`UNPACK_SKIP_ROWS`・`UNPACK_IMAGE_HEIGHT`・`UNPACK_SKIP_IMAGES` と `PACK_ROW_LENGTH`・`PACK_SKIP_PIXELS`・`PACK_SKIP_ROWS` を 0、`UNPACK_ALIGNMENT` と `PACK_ALIGNMENT` を 4(テクスチャの転送と読み戻しに効く)。
+  - ヒント: `GENERATE_MIPMAP_HINT` と `FRAGMENT_SHADER_DERIVATIVE_HINT` を `DONT_CARE`。
+  - **設定し直さないもの**(理由): clear 色(`draw_scene` が消去の前に設定する。3D には `(0,0,0,0)` で消した状態で渡す)、uniform の値(プログラムごとの状態)、インデックスつきのバッファ束縛(`UNIFORM_BUFFER` などの `bind_buffer_base`。プログラムが自分で束縛する)、`COPY_READ_BUFFER`・`COPY_WRITE_BUFFER`・`UNIFORM_BUFFER`・`TRANSFORM_FEEDBACK_BUFFER`・`SHADER_STORAGE_BUFFER` などの汎用の束縛(描画結果に効かず、使う前に必ず束縛し直される)、`TEXTURE_2D_MULTISAMPLE` / `TEXTURE_BUFFER` / `TEXTURE_CUBE_MAP_ARRAY` の bind(使う画面がない)、`SAMPLE_SHADING` と `sample_mask_i`(マルチサンプルの描画先がない)、既定の VAO(VAO 0)の属性配列(Compositor は自分の VAO を使う)、レンダーバッファの bind(使う前に必ず束縛する)、開始した query・transform feedback・debug group(画面が `draw` の中で終える。上記)。
 - Compositor が**自分の描画では**使う直前に設定するので、画面が残しても Compositor の絵には影響しないもの(`with_gl` の doc の「戻さないもの」と同じ): `blend_func`(`compose.rs:411`、`469`、`555`、`616`)、`use_program`、`TEXTURE1` を含むテクスチャ・VAO の bind、uniform の値、clear 色。ただし**次の 3D 画面へ漏らさないため**、3D の `draw` を呼ぶ前には、このうち `blend_func`・`TEXTURE1` の bind・プログラム・VAO・バッファ・テクスチャの bind も上の既定へ戻す(「毎回設定する」側が優先。どちらの扱いかで迷ったら、設定し直す)。
 
 ### 5.2 ほかの案と、選ばなかった理由
@@ -319,12 +323,12 @@ flowchart LR
 
 - `GlTarget::fbo` が bind 済み。viewport は `(0, 0, size.0, size.1)`。
 - 色は `(0,0,0,0)`、深度は 1.0、ステンシルは 0 で塗ってある。`depth_mask` と `color_mask` は全許可、`DEPTH_TEST` は無効(画面が必要なら有効にする)。
-- 上の「毎回設定する状態」がすべて既定値(`depth_func` は `LESS`、`cull_face` は `BACK`、`blend_func` は `ONE, ZERO` など。§5.1)。プログラム・VAO・バッファ・テクスチャ(`TEXTURE1` を含む)は bind されていない。
+- 上の「毎回設定する状態」がすべて既定値(`depth_func` は `LESS`、`depth_range` は `0, 1`、`cull_face` は `BACK`、`blend_func` は `ONE, ZERO` など。§5.1)。プログラム・VAO・バッファ・テクスチャ(`TEXTURE1` を含む)・sampler は bind されていない。
 - 前の画面の GL オブジェクトは残っているが、名前は使わない(`GlScene` は自分で作ったものだけを使う)。
 
 ### 5.5 #74 と #71 B でやること
 
-- **#74**: `reset_gl_state` を作り、`draw_scene` の中で 2 回呼ぶ。**わざと状態を汚す試験画面**を作る(`CULL_FACE` 有効、`SCISSOR` を小さく、`color_mask` の一部を false、`UNPACK_ROW_LENGTH` を非ゼロ、`TEXTURE1` に別のテクスチャ、blend を有効のまま、FBO を別のものに)。その直後に写真画面を描いて、PNG が汚していないときと一致することを確かめる。汚す項目に `depth_func(ALWAYS)`・`front_face(CW)`・`cull_face(FRONT)`・stencil の関数と動作・`clear_depth(0.0)`・`RASTERIZER_DISCARD` 有効を足す。
+- **#74**: `reset_gl_state` を作り、`draw_scene` の中で 2 回呼ぶ。**わざと状態を汚す試験画面**を作る(`CULL_FACE` 有効、`SCISSOR` を小さく、`color_mask` の一部を false、`UNPACK_ROW_LENGTH` を非ゼロ、`TEXTURE1` に別のテクスチャ、blend を有効のまま、FBO を別のものに)。その直後に写真画面を描いて、PNG が汚していないときと一致することを確かめる。汚す項目に `depth_func(ALWAYS)`・`front_face(CW)`・`cull_face(FRONT)`・stencil の関数と動作(表と裏)・`clear_depth(0.0)`・`RASTERIZER_DISCARD` 有効・`depth_range(1, 0)`・sampler の bind・blend の separate と色・pixel store・各種バッファの bind を足す。2D のフレームは、本番の `present_frame` と同じ呼び方(framebuffer を bind するだけで、試験の側で `reset_gl_state` を呼ばない)で、成功した 3D と失敗した 3D のそれぞれの直後に写真・Radar・Agent を描く(sampler の漏れは Agent 画面の拡大したカードに出る)。
   - **2D → 3D と 3D → 3D(別の画面どうし)の漏れ**も確かめる: 写真・Agent 画面の直後にキューブを描いた PNG と、キューブだけを描いた PNG が一致すること。キューブを 2 種類(別の状態を汚す 2 つのテスト用画面)で続けて描いても、後ろの絵が前の画面の状態に影響されないこと。補助に、デバッグビルドで `draw` の先頭に `glGet` で §5.4 の約束(`DEPTH_TEST` 無効、`depth_func` が `LESS` など)が成り立っているかを調べる検査を入れる(リリースでは外す)。
 - **#71 B**: `VrmLayer` が行っていた `composite` の部分が Compositor に移ること。VRM が残す状態(blend_func_separate など)が次のフレームに影響しないこと。
 
