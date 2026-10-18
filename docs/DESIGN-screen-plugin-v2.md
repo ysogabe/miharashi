@@ -54,7 +54,7 @@
 
 - **新クレート `miharashi-glscene`**(依存は `glow` だけ)に、画面が実装する `GlScene` と、描画先の説明 `GlTarget` を置く。app・gpu・vrm の 3 つが無条件に依存する。Linux 限定の `miharashi-gpu` や、`miharashi-app` の型は出さない。
 - 画面は `Composite::Gl(GlComposite)` を返す。`GlComposite` は、`scene`(画面が持つ `GlScene` への `&mut`)、`region`(3D を置く画面上の矩形)、`base`(3D の下に出す下地。無ければ黒)を持つ。
-- **描画先は Compositor が用意する層**。画面の `draw` には、深度つきの FBO(色は RGBA8 のテクスチャ、深度は 24bit renderbuffer、大きさは `region`)が bind 済みで渡される。Compositor は呼ぶ前に色を `(0,0,0,0)`、深度を 1.0 で塗る。画面が出す色は **premultiplied alpha**(`layer.rs` の約束と同じ)。Compositor が呼んだあとに、その層を `ONE, ONE_MINUS_SRC_ALPHA` で画面へ重ねる。
+- **描画先は Compositor が用意する層**。画面の `draw` には、深度つきの FBO(色は RGBA8 のテクスチャ、深度・ステンシルは `DEPTH24_STENCIL8` の renderbuffer(`render.rs` の `attach_depth` と同じ)、大きさは `region`)が bind 済みで渡される。Compositor は呼ぶ前に色を `(0,0,0,0)`、深度を 1.0 で塗る。画面が出す色は **premultiplied alpha**(`layer.rs` の約束と同じ)。Compositor が呼んだあとに、その層を `ONE, ONE_MINUS_SRC_ALPHA` で画面へ重ねる。
 - 画面は `draw` の中で、自分の GL オブジェクト(プログラム・VBO・テクスチャなど)を**最初の呼び出しで作り**(遅延)、`release` で消す。`draw` は何度呼ばれても、`release` の後でも作り直せる(冪等)。
 - 時刻・姿勢・表情といった毎フレームの状態は、画面が `tick` などで自分の `GlScene` の具体型に直接入れる。`GlScene` の窓口は GL の呼び出しだけで、時間は渡さない(PNG・動画の固定刻みで、同じ入力から同じ絵になる)。
 
@@ -77,7 +77,7 @@
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Region { pub x: u32, pub y: u32, pub w: u32, pub h: u32 }
 
-/// Compositor が `draw` に渡す描画先。`fbo` は bind 済みで、色(RGBA8)と深度(24bit)つき。
+/// Compositor が `draw` に渡す描画先。`fbo` は bind 済みで、色(RGBA8)と深度・ステンシル(DEPTH24_STENCIL8)つき。
 pub struct GlTarget {
     /// 層の FBO。画面が自前の深度パスなどで bind を変えたら、これに戻す
     pub fbo: glow::Framebuffer,
@@ -105,7 +105,7 @@ pub struct GlComposite<'a> {
     pub base: Option<Box<Composite<'a>>>,
     pub scene: &'a mut dyn GlScene,
     pub region: Region,
-    /// アラート・メニューの重ね絵。画面は None で返し、ScreenManager が埋める(§4)
+    /// アラート・メニューの重ね絵。画面は `Top::Off` で返し、ScreenManager が埋める(§4)
     pub top: Top<'a>,
 }
 pub enum Top<'a> { Off, Keep, Upload(&'a miharashi_render::Pixmap) }  // Keep = 前回の重ね絵のまま
@@ -315,10 +315,10 @@ flowchart LR
 | 画面の種類 | `renderer = gles`(GL が使える) | `renderer = cpu`、GL が使えない、3D が失敗中 |
 |---|---|---|
 | GL 専用(キューブ。`needs_gl() = true`) | `Composite::Gl` | CPU の案内(「この画面は GPU 描画が必要です」)を `render` で描く。自動巡回では**飛ばす**(`is_empty` と同じ扱い)。手動(メニュー・パネル)では選べて、案内が出る |
-| 既存画面に 3D を足す装飾(VRM を載せた写真・Agent 画面。`needs_gl() = false`) | 下地の `Composite` に `Composite::Gl` をかぶせる | **3D だけをやめて、元の画面をそのまま出す**。CPU 経路の写真は今のまま |
+| 既存画面に 3D を足す装飾(VRM を載せた写真・Agent 画面。`needs_gl() = false`) | 下地の `Composite` に `Composite::Gl` をかぶせる | **3D だけをやめて、元の画面をそのまま出す**(ScreenManager が `Composite::Gl` の `base` を取り出す)。CPU 経路の写真は今のまま |
 
 - `Presenter::open` で GLES を開けた(`auto` で CPU に戻った場合を含む)かを、runtime が `App::set_gl_available` で渡す(前例: `runtime.rs:169` の `gpu_max_texture` を `Catalog.gpu_max` へ渡す)。
-- ScreenManager は GL が使えない・失敗中の画面で、`render_composite` を呼ばずに `render` を呼ぶ(CPU の案内か元の画面)。**案内は共通の描画関数**(`miharashi-render` に `notice::gpu_required` を足す)で、GL 専用画面の `render` はそれを呼ぶだけ。これで、`Screen::render` が必須(`screen.rs:105`)でも、画面側の負担が小さい。
+- GL の可否の判断は **ScreenManager だけ**が行う(`Screen` には可否を渡さない)。`needs_gl()` の画面が GL 不可・失敗中なら、`render_composite` を呼ばずに `render` を呼ぶ(CPU の案内)。それ以外の画面は常に `render_composite` を呼び、`Composite::Gl` が返ってきて GL 不可・失敗中なら、`base` を取り出して使う(`None` なら `Composite::Canvas` と空の Canvas)。これで装飾(`WithScene`)は単純なまま、元の画面だけが出る。**案内は共通の描画関数**(`miharashi-render` に `notice::gpu_required` を足す)で、GL 専用画面の `render` はそれを呼ぶだけ。これで、`Screen::render` が必須(`screen.rs:105`)でも、画面側の負担が小さい。
 - **焼き付き対策(`refresh_screens`)**: 3D の画面を指定しても、CPU の案内(`render`)がグリッチの素材になるだけで意味がない。GL の画面は対象にしない(設定の読み込みで警告を出し、無視する)。既定は `["aircraft"]` のまま(`config.rs:392`)。
 - **PNG ヘッドレス**:
   - `png`(既定、CPU): GL 専用画面は案内の 1 枚(`cube.png` など)。GL の装飾は元の画面。Linux 以外でもビルドできる。
@@ -433,7 +433,7 @@ flowchart LR
 
 **決定**: 新しい仕組みは足さず、既存の `animating()` / `tick` の戻り値 / 消灯中は描かない、で表す。
 
-- 3D を毎フレーム動かし続ける間は、画面の `Screen::animating()` を true にする(実行ループは vsync だけで間隔をとる。`runtime.rs:613`)。**静止している 3D は `animating() = false` で、必要なときに `tick` の戻り値(再描画)で要求する**。VRM は、身振り・口パクのあいだだけ true、待機中は false にして描き直しを減らす(VRM は 1 回の描き直しが、画面全体の描き直しになる)。
+- 3D を毎フレーム動かし続ける間は、画面の `Screen::animating()` を true にする(実行ループは vsync だけで間隔をとる。`runtime.rs:613`)。**静止している 3D は `animating() = false` で、必要なときに `tick` の戻り値(再描画)で要求する**。VRM は待機中も呼吸・頭の揺れがある(POC-006)ので、「待機中は静止」とは限らない。待機の動きを何 fps で見せるか(`frame_interval`、または待機の動きの間引き)が、描き直しを減らす実際の手段になる。VRM は 1 回の描き直しが画面全体の描き直しになる。
 - 3D は**保持しない**: 何かの理由(時計の 1 秒更新、アラートの開閉)で画面が再描画されると、毎回 `GlScene::draw` が呼ばれる。時間が止まっている間は同じ絵になるようにする(画面の状態が変わらなければ同じ入力)。
 - **消灯中は描かない**: 既存どおり、`redraw && screen_on` のときだけ描く(`runtime.rs:547`)。`set_presentation(display_on = false)`(`manager.rs:393-398`)で、画面は自分の演出の時計を止められる。復帰時に溜まった動きを再生しない。
 - 非表示の画面は `draw` が呼ばれない。`tick` は呼ばれる(Provider と同じ)ので、データの取り込み(エージェントの状態など)は続くが、3D は描かれない。
@@ -470,7 +470,7 @@ B に入る前の宿題(Issue #71 のコメント): sparse accessor の `byteStr
 
 1. `miharashi-vrm` が `miharashi-glscene` に依存し、`VrmScene: GlScene` を実装する。`VrmLayer` の FBO・合成を Compositor に移し、VRM は層に描くだけにする(`vrm-view` は PoC・計測用として、`VrmLayer` を使う現行の経路のまま残してよい)。
 2. モデルの読み込みを別スレッドにする。GL への転送は最初の `draw` で。モデルの場所は設定(リポジトリの外)で指定し、**ニケちゃんのモデルは同梱しない**(ライセンスの理由)。モデルがなければ 3D なしで動く。
-3. **VRM を装飾として載せる画面**を `miharashi-app` に足す: `WithScene<S: Screen>`(推奨)。内側の画面(写真・Agent)のすべてのメソッドを委譲し、`render_composite` の結果を `Composite::Gl { base: Some(内側の結果), scene, region, top: Off }` に包む。内側の画面と操作・`id`・巡回は変わらない。`needs_gl() = false`。GL が使えない・失敗中は、内側の結果をそのまま返す。
+3. **VRM を装飾として載せる画面**を `miharashi-app` に足す: `WithScene<S: Screen>`(推奨)。内側の画面(写真・Agent)のすべてのメソッドを委譲し、`render_composite` の結果を `Composite::Gl { base: Some(内側の結果), scene, region, top: Off }` に包む。内側の画面と操作・`id`・巡回は変わらない。`needs_gl() = false`。`WithScene` は GL の可否を知らなくてよい(常に `Composite::Gl` で包んで返す)。GL が使えない・失敗中の処理は ScreenManager だけが行う(§6.1)。
 4. 表情・口パク・身振りの入力(`tick` から `VrmScene` の具体型へ)。T3 Agent の状態との連動は B の範囲で決める。
 5. 実機で B の確認: 写真 + VRM と Agent + VRM で巡回、アラートが体の手前に出る、`renderer = cpu` で元の画面、壊れたモデルで落ちない。VRAM+GTT の保持量を測り、タイムアウト解放の要否を決める(§3)。12 時間試験。
 
