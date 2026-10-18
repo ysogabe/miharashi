@@ -1,0 +1,14 @@
+[package]
+name = "miharashi-vrm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glow = "0.18.0"
+# glb の読み込みとテクスチャ(PNG/JPEG)のデコード。KHR 拡張は使わないので既定の feature のみ
+gltf = { version = "1.4.1", default-features = false, features = ["import", "utils"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+serde_json = "1.0.152"
+libc = "0.2.190"
+# vrm-bench(計測用の bin)だけが使う。ライブラリ部は glow にしか依存しない
+miharashi-gpu = { path = "../miharashi-gpu" }

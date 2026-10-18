@@ -30,6 +30,7 @@
 | [PoC-001 Direct Display](poc/POC-001.md) | DRM/KMS への直接描画、日本語・写真・グラフ、2 画面 |
 | [PoC-002 Kiosk Runtime](poc/POC-002.md) | seat / VT、systemd、設定、写真サーバーへの再接続、12 時間試験。運用と復旧の手順 |
 | [PoC-005 GPU Render Baseline](poc/POC-005.md) | 内蔵 GPU(OpenGL ES 3.2)での描画と、CPU 使用率の計測 |
+| [PoC-006 VRM 描画の単体スパイク](poc/POC-006.md) | VRM 1.0 モデルを内蔵 GPU(GLES 3.2)で描くときの速さの計測(合成モデル) |
 | [T3 Agent カードボード — 実装・検証記録](poc/T3-AGENTS.md) | T3 Agent画面の実装状況、CPU/GPU合成検証、未確認事項 |
 
 ## 現在の状況
