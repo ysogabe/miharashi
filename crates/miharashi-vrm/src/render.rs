@@ -1239,7 +1239,9 @@ impl Anchors {
         let visible_top = self.top + (self.top - bottom) * FRAMING_TOP_MARGIN;
         let aspect = w as f32 / h as f32;
         let need_half_w = self.shoulder_half * SHOULDER_FIT + self.arm_reach * REACH_FRAC;
-        let half_h = ((visible_top - bottom) * 0.5).max(need_half_w / aspect);
+        let half_h = ((visible_top - bottom) * 0.5)
+            .max(need_half_w / aspect)
+            .max(1e-3);
         let cy = visible_top - half_h;
         let t = (FRAMING_FOVY_DEG.to_radians() * 0.5).tan();
         let dist = half_h / t + self.depth * 0.5;

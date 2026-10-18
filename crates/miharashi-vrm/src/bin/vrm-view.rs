@@ -160,7 +160,7 @@ impl Sum {
             )
         };
         format!(
-            "{:.1} fps  frame {:.2}ms  cpu {}  | CPU/フレーム ms: pose {:.3} spring {:.3} face {:.3} photo {:.3} vrm_draw {:.3}  | 写真の準備 {build}",
+            "{:.1} fps  frame {:.2}ms  cpu {}  | 発行時間 ms(壁時計): pose {:.3} spring {:.3} face {:.3} photo {:.3} vrm_draw {:.3}  | 写真の準備 {build}",
             self.frames as f64 / secs,
             self.frame.as_secs_f64() * 1e3 / n,
             cpu.map_or("-".into(), |c| format!("{c:.1}%")),
@@ -398,14 +398,13 @@ fn view_loop(
         if let Some(s) = show.as_deref_mut() {
             s.update(now);
         }
-        let has_vrm = vrm.is_some();
         let yaw = if sway { demo::camera_yaw(t) } else { 0.0 };
         let enter = Instant::now();
         // 層へ描いて、写真(または暗い背景)の上の領域に重ねる。GL を借りた中で測る
         let mut draw_vrm = |gl: &glow::Context, sum: &mut Sum, with_bg: bool| {
             let Some(v) = vrm.as_deref_mut() else { return };
-            let t1 = Instant::now();
             let times = v.renderer.update(gl);
+            let t_draw = Instant::now();
             if with_bg {
                 unsafe {
                     gl.clear_color(0.08, 0.09, 0.12, 1.0);
@@ -419,21 +418,17 @@ fn view_loop(
             sum.pose = times.pose_ms;
             sum.spring = times.spring_ms;
             sum.face += times.morph_ms;
-            sum.vrm_draw = t1.elapsed().as_secs_f64() * 1e3 - times.pose_ms - times.morph_ms;
+            sum.vrm_draw = t_draw.elapsed().as_secs_f64() * 1e3;
         };
         // present が page flip の完了まで待つので、フレームの間隔は vsync でとれる
         match show.as_deref() {
             Some(s) => {
                 let frame = s.frame(now);
-                if has_vrm {
-                    display.present_frame_with(&frame, |gl, _| {
-                        sum.photo_draw = enter.elapsed().as_secs_f64() * 1e3;
-                        draw_vrm(gl, &mut sum, false);
-                    })?;
-                } else {
-                    display.present_frame(&frame)?;
+                // --no-vrm も同じ present_frame_with で、flip の前に photo を測る(draw_vrm は VRM がなければ何もしない)
+                display.present_frame_with(&frame, |gl, _| {
                     sum.photo_draw = enter.elapsed().as_secs_f64() * 1e3;
-                }
+                    draw_vrm(gl, &mut sum, false);
+                })?;
             }
             None => {
                 display.present_with(|gl, _| draw_vrm(gl, &mut sum, true))?;

@@ -251,6 +251,8 @@ fn measure(
     }
     if let Some(l) = layer {
         l.destroy(gl);
+        // destroy は FRAMEBUFFER を外すので、あとの detach_depth のために描画先へ戻す
+        unsafe { glow::HasContext::bind_framebuffer(gl, glow::FRAMEBUFFER, target) };
     }
     let wall = wall_start.elapsed().as_secs_f64();
     let cpu = cpu_seconds() - cpu_start;
