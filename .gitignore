@@ -10,3 +10,6 @@
 .env
 .env.*
 !.env.example
+
+# VRM モデルは再配布できないので置かない(docs/poc/POC-006.md)
+*.vrm

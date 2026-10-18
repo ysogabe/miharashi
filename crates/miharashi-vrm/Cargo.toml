@@ -1,0 +1,28 @@
+[package]
+name = "miharashi-vrm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glow = "0.18.0"
+# glb の読み込みとテクスチャ(PNG/JPEG)のデコード。KHR 拡張は使わないので既定の feature のみ
+gltf = { version = "1.4.1", default-features = false, features = ["import", "utils"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+serde_json = "1.0.152"
+# vrm-bench(計測用の bin)だけが使う(feature `bench`)。ライブラリ部は glow 系にしか依存しない
+libc = { version = "0.2.190", optional = true }
+miharashi-gpu = { path = "../miharashi-gpu", optional = true }
+
+[dev-dependencies]
+# GPU の試験(renders_and_morphs_on_gpu)が EGL の surfaceless コンテキストを作るのに使う
+miharashi-gpu = { path = "../miharashi-gpu" }
+
+[features]
+# 既定で有効。ライブラリとして使うだけなら `default-features = false` で miharashi-gpu を外せる
+default = ["bench"]
+bench = ["dep:miharashi-gpu", "dep:libc"]
+
+[[bin]]
+name = "vrm-bench"
+path = "src/bin/vrm-bench.rs"
+required-features = ["bench"]

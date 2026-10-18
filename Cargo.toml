@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/miharashi-render", "crates/miharashi-app", "crates/miharashi-linux", "crates/miharashi-gpu", "crates/miharashi-video"]
+members = ["crates/miharashi-render", "crates/miharashi-app", "crates/miharashi-linux", "crates/miharashi-gpu", "crates/miharashi-video", "crates/miharashi-vrm"]
 # miharashi-video(B2 の動画ベンチマーク)は ffmpeg の開発用パッケージが要るので、既定のビルドには入れない。
 # 使うときは `cargo build --release --features miharashi-app/video`、試験は `cargo test -p miharashi-video`
-default-members = ["crates/miharashi-render", "crates/miharashi-app", "crates/miharashi-linux", "crates/miharashi-gpu"]
+default-members = ["crates/miharashi-render", "crates/miharashi-app", "crates/miharashi-linux", "crates/miharashi-gpu", "crates/miharashi-vrm"]
