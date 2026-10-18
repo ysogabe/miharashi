@@ -708,6 +708,11 @@ impl Renderer {
         }
     }
 
+    /// 身振りに重ねる視線と指さしの目標(`animate` の前に毎フレーム与える)。
+    pub fn set_aim(&mut self, aim: Option<crate::gesture::Aim>) {
+        self.rig.set_aim(aim);
+    }
+
     /// 最後に評価した関節行列(`animate` 後)。
     pub fn joint_matrices(&self) -> &[math::Mat4] {
         &self.rig.joints
@@ -1124,6 +1129,8 @@ pub enum Region {
     Left,
     /// 画面の中央 1/3
     Center,
+    /// 画面の右 1/3
+    Right,
     /// 画面全体
     Full,
 }
@@ -1133,15 +1140,16 @@ impl Region {
         match self {
             Region::Left => "left",
             Region::Center => "center",
+            Region::Right => "right",
             Region::Full => "full",
         }
     }
 
     pub fn parse(s: &str) -> Result<Self, String> {
-        [Region::Left, Region::Center, Region::Full]
+        [Region::Left, Region::Center, Region::Right, Region::Full]
             .into_iter()
             .find(|r| r.name() == s)
-            .ok_or_else(|| format!("--region は left / center / full: {s}"))
+            .ok_or_else(|| format!("--region は left / center / right / full: {s}"))
     }
 
     /// 画面 `(w, h)` の中の領域 `(x, y, 幅, 高さ)`。GL の座標(左下が原点)。高さは画面いっぱい。
@@ -1150,6 +1158,7 @@ impl Region {
         match self {
             Region::Left => (0, 0, third, h),
             Region::Center => ((w - third) / 2, 0, third, h),
+            Region::Right => (w - third, 0, third, h),
             Region::Full => (0, 0, w, h),
         }
     }

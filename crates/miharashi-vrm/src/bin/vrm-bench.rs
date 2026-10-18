@@ -12,7 +12,7 @@ use std::time::Instant;
 const USAGE: &str = "使い方: vrm-bench (--model <path.vrm> | --synthetic) [--pci 0000:10:00.0] [--size 1280x720] \
 [--frames 600 | --seconds 30] [--fps 30] [--feature-level bake|skin|pose|mtoon|spring] [--outline-scale 1] \
 [--expression blink] [--still] [--png out.png] [--segments 48] [--texture 1024] \
-[--frame full|waist|bust] [--region left|center|full] [--gesture] [--lipsync] [--start 0]";
+[--frame full|waist|bust] [--region left|center|right|full] [--gesture] [--lipsync] [--start 0]";
 
 struct Args {
     model: Option<PathBuf>,

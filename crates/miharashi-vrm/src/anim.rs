@@ -73,6 +73,8 @@ pub struct Rig {
     body: BodyRig,
     /// 身振り(`gesture::pose_at`)を重ねるか
     gesture: bool,
+    /// 身振りに重ねる視線と指さしの目標(`--follow-cards`)
+    aim: Option<gesture::Aim>,
     /// 毎フレームの、ノードごとのワールド回転(自然なポーズ + 待機モーション)
     delta: Vec<Quat>,
     /// 腰の上下 [m](ワールド Y)
@@ -97,6 +99,7 @@ impl Rig {
             arms: Vec::new(),
             body: BodyRig::default(),
             gesture: false,
+            aim: None,
             delta: vec![QUAT_IDENTITY; n],
             hip_bob: 0.0,
             override_rot: vec![None; n],
@@ -123,6 +126,11 @@ impl Rig {
     pub fn set_gesture(&mut self, on: bool) -> bool {
         self.gesture = on && !self.arms.is_empty();
         !on || self.gesture
+    }
+
+    /// 視線と指さしの目標(身振りが有効なときだけ効く)。None で通常の身振りに戻る。
+    pub fn set_aim(&mut self, aim: Option<gesture::Aim>) {
+        self.aim = aim;
     }
 
     /// 身振りで動かせる腕と、指の関節の数。
@@ -214,7 +222,7 @@ impl Rig {
         const X: [f32; 3] = [1.0, 0.0, 0.0];
         const Y: [f32; 3] = [0.0, 1.0, 0.0];
         const Z: [f32; 3] = [0.0, 0.0, 1.0];
-        let g = gesture::pose_at(t);
+        let g = gesture::pose_aimed(t, self.aim.as_ref());
         let yaw = g.body_yaw_deg.to_radians();
         let lean = g.body_lean_deg.to_radians();
         let mut applied_yaw = 0.0;
