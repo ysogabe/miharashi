@@ -25,6 +25,17 @@ pub fn translate(x: f32, y: f32, z: f32) -> Mat4 {
     m
 }
 
+/// Y 軸まわりの回転(ラジアン)。
+pub fn rotate_y(a: f32) -> Mat4 {
+    let (s, c) = a.sin_cos();
+    let mut m = IDENTITY;
+    m[0][0] = c;
+    m[0][2] = -s;
+    m[2][0] = s;
+    m[2][2] = c;
+    m
+}
+
 /// OpenGL 流の透視投影(NDC の z は -1..1)。
 pub fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
     let f = 1.0 / (fovy * 0.5).tan();

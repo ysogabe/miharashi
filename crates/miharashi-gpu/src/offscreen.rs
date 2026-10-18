@@ -171,6 +171,89 @@ mod tests {
         assert_eq!(diff_rgb(&img, &got, 0), (0, 0));
     }
 
+    /// 借りた側が FBO や GL の状態を汚したまま返しても、`restore_gl_state` のあとの
+    /// `Compositor` の描画が、きれいな状態の描画と一致すること(`GlesDisplay::with_gl` の約束)。
+    #[test]
+    fn offscreen_draw_after_dirty_borrow_matches_clean_draw() {
+        let node = Path::new("/dev/dri/renderD128");
+        let off = match Offscreen::open(node) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("GLES が使えないので skip: {e}");
+                return;
+            }
+        };
+        let (w, h) = (64u32, 32u32);
+        let mut img = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                img.extend_from_slice(&[(x * 4) as u8, (y * 8) as u8, ((x + y) * 3) as u8, 255]);
+            }
+        }
+        let clean = off.render(&img, (w, h)).unwrap();
+
+        // 別の FBO の bind、各種テスト・マスク・bind を残す
+        let dirty = |gl: &glow::Context| unsafe {
+            let rb = gl.create_renderbuffer().unwrap();
+            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(rb));
+            gl.renderbuffer_storage(glow::RENDERBUFFER, glow::RGBA8, 8, 8);
+            let fbo = gl.create_framebuffer().unwrap();
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_renderbuffer(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::RENDERBUFFER,
+                Some(rb),
+            );
+            gl.viewport(0, 0, 3, 3);
+            for cap in [
+                glow::DEPTH_TEST,
+                glow::CULL_FACE,
+                glow::BLEND,
+                glow::SCISSOR_TEST,
+                glow::STENCIL_TEST,
+            ] {
+                gl.enable(cap);
+            }
+            gl.scissor(0, 0, 1, 1);
+            gl.depth_mask(false);
+            gl.color_mask(false, true, false, true);
+            gl.bind_vertex_array(Some(gl.create_vertex_array().unwrap()));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(gl.create_buffer().unwrap()));
+            gl.active_texture(glow::TEXTURE3);
+            gl.bind_texture(glow::TEXTURE_2D, Some(gl.create_texture().unwrap()));
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+        };
+
+        // 汚したままだと描画先がずれて一致しない(この試験が効いている確認)
+        let (r, unrestored) = off
+            .with_fbo((w, h), |gl| {
+                let mut comp = Compositor::new(gl, (w, h))?;
+                dirty(gl);
+                let r = comp.draw(gl, &Frame::Image(&img));
+                comp.destroy(gl);
+                r
+            })
+            .unwrap();
+        r.unwrap();
+        assert_ne!(diff_rgb(&clean, &unrestored, 0).0, 0);
+
+        let (r, restored) = off
+            .with_fbo((w, h), |gl| {
+                let target = unsafe { gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING) };
+                let mut comp = Compositor::new(gl, (w, h))?;
+                dirty(gl);
+                crate::display::restore_gl_state(gl, (w, h), target);
+                let r = comp.draw(gl, &Frame::Image(&img));
+                comp.destroy(gl);
+                r
+            })
+            .unwrap();
+        r.unwrap();
+        assert_eq!(diff_rgb(&clean, &restored, 0), (0, 0));
+    }
+
     /// フェード(旧 → 新を不透明度 t で混ぜる)と重ね絵(premultiplied の source-over)が、
     /// CPU で計算した値と ±1 以内で一致すること。重ね絵を渡さない回は前回のものを使うこと。
     #[test]
