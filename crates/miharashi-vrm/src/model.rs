@@ -85,7 +85,7 @@ impl Model {
     pub fn from_glb(bytes: &[u8]) -> Result<Self, String> {
         let json = vrm::glb_json(bytes)?;
         let vrm = vrm::parse(&json)?;
-        let patched = zero_fill_empty_accessors(bytes, &json);
+        let patched = zero_fill_empty_accessors(bytes, &json)?;
         let (doc, buffers, images) = gltf::import_slice(patched.as_deref().unwrap_or(bytes))
             .map_err(|e| format!("glb を読めない: {e}"))?;
         let images = images
@@ -158,17 +158,23 @@ impl Model {
             let Some(mesh) = node.mesh() else { continue };
             meshes.insert(mesh.index());
             // スキンがあるメッシュはノードの変換を使わず、関節のワールド変換 × 逆バインド行列
-            let skin = node.skin().map(|s| {
-                let reader = s.reader(|b| Some(&buffers[b.index()]));
-                let ibm: Vec<Mat4> = reader
-                    .read_inverse_bind_matrices()
-                    .map(|i| i.collect())
-                    .unwrap_or_default();
-                s.joints()
-                    .enumerate()
-                    .map(|(k, j)| math::mul(&world[j.index()], ibm.get(k).unwrap_or(&IDENTITY)))
-                    .collect::<Vec<Mat4>>()
-            });
+            let skin = node
+                .skin()
+                .map(|s| -> Result<Vec<Mat4>, String> {
+                    if let Some(a) = s.inverse_bind_matrices() {
+                        check_accessor("inverseBindMatrices", &a, Dimensions::Mat4, &[F32], None)?;
+                    }
+                    let reader = s.reader(|b| Some(&buffers[b.index()]));
+                    let ibm: Vec<Mat4> = reader
+                        .read_inverse_bind_matrices()
+                        .map(|i| i.collect())
+                        .unwrap_or_default();
+                    Ok(s.joints()
+                        .enumerate()
+                        .map(|(k, j)| math::mul(&world[j.index()], ibm.get(k).unwrap_or(&IDENTITY)))
+                        .collect())
+                })
+                .transpose()?;
             for prim in mesh.primitives() {
                 if prim.mode() != gltf::mesh::Mode::Triangles {
                     continue;
@@ -231,14 +237,40 @@ impl Model {
     }
 }
 
+/// 0 詰めの大きさの下限(BIN チャンクが短くても、これだけは許す)。
+const MIN_ZERO_LIMIT: u64 = 1 << 20;
+
 /// bufferView も sparse もない accessor は、glTF の仕様では「すべて 0」の意味(UniVRM が
 /// 変化のない morph target に出す)。gltf クレートの検査はこれを弾くので、0 を詰めた
 /// bufferView を BIN チャンクの末尾に足して、そこを指すように glb を組み直す。
-/// 該当する accessor がなければ `None`(元のバイト列をそのまま読む)。
-fn zero_fill_empty_accessors(bytes: &[u8], json: &serde_json::Value) -> Option<Vec<u8>> {
+/// 対象は morph target が参照する accessor だけで、0 の大きさは BIN チャンクの長さ
+/// (下限 1 MiB)までに限る(小さな glb で大きなメモリを確保させない)。
+/// 該当する accessor がなければ `Ok(None)`(元のバイト列をそのまま読む)。
+fn zero_fill_empty_accessors(
+    bytes: &[u8],
+    json: &serde_json::Value,
+) -> Result<Option<Vec<u8>>, String> {
     use serde_json::Value;
-    let accessors = json.get("accessors")?.as_array()?;
-    let empty = |a: &Value| a.get("bufferView").is_none() && a.get("sparse").is_none();
+    let Some(accessors) = json.get("accessors").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    // morph target の属性が指す accessor の番号
+    let mut targeted = std::collections::BTreeSet::new();
+    let meshes = json.get("meshes").and_then(Value::as_array);
+    for prim in meshes
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("primitives")?.as_array())
+        .flatten()
+    {
+        let targets = prim.get("targets").and_then(Value::as_array);
+        for attrs in targets.into_iter().flatten().filter_map(Value::as_object) {
+            targeted.extend(attrs.values().filter_map(Value::as_u64));
+        }
+    }
+    let empty = |i: usize, a: &Value| {
+        targeted.contains(&(i as u64)) && a.get("bufferView").is_none() && a.get("sparse").is_none()
+    };
     let size_of = |a: &Value| -> Option<u64> {
         let comps = match a.get("type")?.as_str()? {
             "SCALAR" => 1,
@@ -256,43 +288,66 @@ fn zero_fill_empty_accessors(bytes: &[u8], json: &serde_json::Value) -> Option<V
         };
         a.get("count")?.as_u64()?.checked_mul(comps * bytes)
     };
-    let zeros = accessors
+    let sizes: Option<Vec<u64>> = accessors
         .iter()
-        .filter(|a| empty(a))
-        .map(size_of)
-        .collect::<Option<Vec<_>>>()?
-        .into_iter()
-        .max()?;
-    if zeros == 0 || zeros > 1 << 30 {
-        return None;
-    }
+        .enumerate()
+        .filter(|&(i, a)| empty(i, a))
+        .map(|(_, a)| size_of(a))
+        .collect();
+    // 大きさが読めない accessor は、そのまま gltf クレートの検査に任せる
+    let Some(zeros) = sizes.and_then(|v| v.into_iter().max()).filter(|&z| z > 0) else {
+        return Ok(None);
+    };
     let u32_at = |o: usize| -> Option<usize> {
-        let b = bytes.get(o..o + 4)?;
+        let b = bytes.get(o..o.checked_add(4)?)?;
         Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
     };
     // JSON チャンクの次が BIN チャンク
-    let bin_at = 20 + u32_at(12)?;
-    if bytes.get(bin_at + 4..bin_at + 8)? != b"BIN\0" {
-        return None;
+    let bin = (|| {
+        let bin_at = 20usize.checked_add(u32_at(12)?)?;
+        if bytes.get(bin_at.checked_add(4)?..bin_at.checked_add(8)?)? != b"BIN\0" {
+            return None;
+        }
+        let bin_len = u32_at(bin_at)?;
+        bytes.get(bin_at + 8..bin_at.checked_add(8)?.checked_add(bin_len)?)
+    })();
+    let Some(bin) = bin else { return Ok(None) };
+    let limit = (bin.len() as u64).max(MIN_ZERO_LIMIT);
+    if zeros > limit {
+        return Err(format!(
+            "bufferView のない accessor が大きすぎる({zeros} バイト、上限 {limit})"
+        ));
     }
-    let bin_len = u32_at(bin_at)?;
-    let bin = bytes.get(bin_at + 8..bin_at + 8 + bin_len)?;
     let pad = bin.len().next_multiple_of(4) - bin.len();
     let offset = bin.len() + pad;
 
     let mut json = json.clone();
-    let views = json.get_mut("bufferViews")?.as_array_mut()?;
+    let Some(views) = json.get_mut("bufferViews").and_then(Value::as_array_mut) else {
+        return Ok(None);
+    };
     let view = views.len();
     views.push(serde_json::json!({"buffer": 0, "byteOffset": offset, "byteLength": zeros}));
-    for a in json.get_mut("accessors")?.as_array_mut()? {
-        if empty(a) {
-            a["bufferView"] = serde_json::json!(view);
+    if let Some(accessors) = json.get_mut("accessors").and_then(Value::as_array_mut) {
+        for (i, a) in accessors.iter_mut().enumerate() {
+            if empty(i, a)
+                && let Some(o) = a.as_object_mut()
+            {
+                o.insert("bufferView".into(), serde_json::json!(view));
+            }
         }
     }
-    json["buffers"][0]["byteLength"] = serde_json::json!(offset as u64 + zeros);
+    let buffer = json
+        .get_mut("buffers")
+        .and_then(|b| b.get_mut(0))
+        .and_then(Value::as_object_mut)
+        .ok_or("buffers[0] がない")?;
+    buffer.insert(
+        "byteLength".into(),
+        serde_json::json!(offset as u64 + zeros),
+    );
     let mut new_bin = bin.to_vec();
     new_bin.resize(offset + zeros as usize, 0);
-    Some(crate::synth::pack_glb(&json, &new_bin))
+    Ok(Some(crate::synth::pack_glb(&json, &new_bin)))
 }
 
 fn wrap(m: gltf::texture::WrappingMode) -> u32 {
@@ -394,6 +449,8 @@ fn vertex_matrices(
 
 /// accessor が属性の期待する型(要素数・成分の型)かを、読む前に確かめる。
 /// gltf クレートの reader は型が違うと assert で panic するので、ここで Err にする。
+const F32: (DataType, bool) = (DataType::F32, false);
+
 fn check_accessor(
     what: &str,
     a: &gltf::Accessor,
@@ -414,6 +471,15 @@ fn check_accessor(
             if a.normalized() { "、正規化" } else { "" }
         ));
     }
+    // byteStride が要素より小さいと reader が panic する
+    if let Some(s) = a.view().and_then(|v| v.stride())
+        && s < a.size()
+    {
+        return Err(format!(
+            "{what} の byteStride({s})が要素の大きさ({})より小さい",
+            a.size()
+        ));
+    }
     if let Some(c) = count
         && a.count() != c
     {
@@ -428,7 +494,6 @@ fn check_accessor(
 /// プリミティブの属性・インデックス・morph target の accessor を検査し、頂点数を返す。
 fn check_attributes(prim: &gltf::Primitive) -> Result<usize, String> {
     use gltf::Semantic as S;
-    const F32: (DataType, bool) = (DataType::F32, false);
     let pos = prim
         .get(&S::Positions)
         .ok_or("POSITION がないプリミティブ")?;
@@ -633,6 +698,69 @@ mod tests {
                 .iter()
                 .all(|n| *n == [0.0; 3])
         );
+    }
+
+    #[test]
+    fn rejects_huge_empty_accessor_without_allocating() {
+        let (mut d, b) = doc();
+        let t = d["meshes"][0]["primitives"][0]["targets"][0]["NORMAL"]
+            .as_u64()
+            .unwrap() as usize;
+        let a = d["accessors"][t].as_object_mut().unwrap();
+        a.remove("bufferView");
+        a.insert("count".into(), json!(1u64 << 28));
+        let e = load(&d, &b).err().unwrap();
+        assert!(e.contains("大きすぎる"), "{e}");
+    }
+
+    #[test]
+    fn empty_accessor_outside_morph_target_is_left_alone() {
+        // morph target 以外の bufferView なし accessor は 0 詰めせず、gltf の検査で弾く
+        let (mut d, b) = doc();
+        let n = attr(&d, 0, "NORMAL");
+        d["accessors"][n]
+            .as_object_mut()
+            .unwrap()
+            .remove("bufferView");
+        assert!(load(&d, &b).is_err());
+    }
+
+    #[test]
+    fn missing_buffers_is_error_not_panic() {
+        let (mut d, b) = doc();
+        let t = d["meshes"][0]["primitives"][0]["targets"][0]["NORMAL"]
+            .as_u64()
+            .unwrap() as usize;
+        d["accessors"][t]
+            .as_object_mut()
+            .unwrap()
+            .remove("bufferView");
+        d.as_object_mut().unwrap().remove("buffers");
+        assert!(load(&d, &b).is_err());
+        d["buffers"] = json!([]);
+        assert!(load(&d, &b).is_err());
+    }
+
+    #[test]
+    fn rejects_stride_smaller_than_element() {
+        let (mut d, b) = doc();
+        let n = attr(&d, 0, "NORMAL");
+        let view = d["accessors"][n]["bufferView"].as_u64().unwrap() as usize;
+        d["bufferViews"][view]["byteStride"] = json!(4);
+        let e = load(&d, &b).err().unwrap();
+        assert!(
+            e.contains("byteStride") || e.contains("glb を読めない"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_inverse_bind_matrices() {
+        let (mut d, b) = doc();
+        let ibm = d["skins"][0]["inverseBindMatrices"].as_u64().unwrap() as usize;
+        retype(&mut d, ibm, "VEC4", 4);
+        let e = load(&d, &b).err().unwrap();
+        assert!(e.contains("inverseBindMatrices"), "{e}");
     }
 
     #[test]

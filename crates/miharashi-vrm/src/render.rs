@@ -165,7 +165,11 @@ impl Renderer {
                 Err(e) => {
                     created.delete(gl);
                     // 途中で立った GL エラーを呼び出し側に残さない
-                    while gl.get_error() != glow::NO_ERROR {}
+                    for _ in 0..32 {
+                        if gl.get_error() == glow::NO_ERROR {
+                            break;
+                        }
+                    }
                     Err(e)
                 }
             }
