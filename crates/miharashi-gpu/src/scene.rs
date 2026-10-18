@@ -5,7 +5,8 @@
 //!   (`Compositor::reset_gl_state`)。画面は GL の状態を「戻す」責任を持たない。
 //! - `draw` の panic・`Err`・GL エラーは、その場面の失敗として扱う。Compositor が `release` を呼び、
 //!   そのフレームは 3D 抜き(下地と重ね絵だけ)で完成させて `SceneOutcome::SceneFailed` を返す。
-//!   致命的な失敗(下地の描画や表示)だけが `Err` になる。
+//!   致命的な失敗(下地の描画や表示)だけが `Err(SceneError)` になる。場面の失敗のあとに致命的な失敗が起きても、
+//!   場面の失敗は `SceneError::scene_failed` で運ぶ(呼び出し側が、`release` 済みの場面を終了時に二重に解放しないため)。
 use crate::compose::{Compositor, Frame, VERT};
 use crate::photo::{program as link, texture as tex2d};
 use glow::HasContext;
@@ -52,6 +53,52 @@ pub enum SceneOutcome {
     Drawn,
     /// 3D が失敗した(panic を含む)。その場面の `release` は済んでいて、そのフレームは 3D 抜きで完成している
     SceneFailed(String),
+}
+
+/// `draw_scene` / `present_scene` の致命的な失敗(下地の描画・最上段の重ね絵・swap・page flip・DRM など)。
+/// 場面の失敗(`SceneOutcome::SceneFailed`)より後に起きたときも、場面の失敗を `scene_failed` で運ぶ
+/// (`Err` だけ返すと、`release` 済みの場面が呼び出し側に「まだ生きている」と見えて、終了時に二重に解放される)。
+#[derive(Debug, PartialEq, Eq)]
+pub struct SceneError {
+    pub message: String,
+    /// この致命的な失敗の前に場面が失敗していたときの理由(その場面の `release` は済んでいる)。
+    /// 呼び出し側は、`Err` でもこれを必ず場面の失敗として反映すること
+    pub scene_failed: Option<String>,
+}
+
+impl SceneError {
+    /// 場面の失敗(`outcome`)より後に起きた致命的な失敗にする
+    pub fn after(outcome: &SceneOutcome, message: String) -> Self {
+        Self {
+            message,
+            scene_failed: match outcome {
+                SceneOutcome::Drawn => None,
+                SceneOutcome::SceneFailed(m) => Some(m.clone()),
+            },
+        }
+    }
+}
+
+/// 場面に触れる前の致命的な失敗(下地の描画など)
+impl From<String> for SceneError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            scene_failed: None,
+        }
+    }
+}
+
+impl From<SceneError> for String {
+    fn from(e: SceneError) -> Self {
+        e.message
+    }
+}
+
+impl std::fmt::Display for SceneError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 /// 色(RGBA8 のテクスチャ)と深度・ステンシル(DEPTH24_STENCIL8 の renderbuffer)つきの FBO。
@@ -140,6 +187,10 @@ pub(crate) struct SceneState {
     top_ready: bool,
     /// `draw` の前に読み出した GL エラー(下地の合成などで出たもの)をログに出したか
     pre_error_logged: bool,
+    /// 試験用: 次の最上段の重ね絵の転送を、この理由で失敗させる(`draw_top` の `Err` は GL の資源が尽きたときだけで、
+    /// 実機では起こせない)
+    #[cfg(test)]
+    fail_top: Option<String>,
 }
 
 impl SceneState {
@@ -307,13 +358,14 @@ impl Compositor {
 
     /// `target`(画面なら None)に、下地 → `frame.scene` を層へ描いて重ねたもの → 最上段の重ね絵、の順で描く。
     /// 3D の失敗(panic・`Err`・GL エラー・不正な領域・層を作れない)は `SceneFailed` で返し、その場面の
-    /// `release` を呼んでから、3D 抜きで残りを描く。`Err` は下地の描画など致命的なものだけ。
+    /// `release` を呼んでから、3D 抜きで残りを描く。`Err` は下地の描画など致命的なものだけで、
+    /// 場面の失敗のあとに起きたときは、その理由を `SceneError::scene_failed` に残す。
     pub fn draw_scene(
         &mut self,
         gl: &glow::Context,
         target: Option<glow::Framebuffer>,
         frame: &mut SceneFrame<'_>,
-    ) -> Result<SceneOutcome, String> {
+    ) -> Result<SceneOutcome, SceneError> {
         let size = self.size;
         let region = frame.region;
         // 1. 下地
@@ -354,7 +406,9 @@ impl Compositor {
             }
         }
         // 4. 最上段の重ね絵
-        self.draw_top(gl, frame.top)?;
+        if let Err(msg) = self.draw_top(gl, frame.top) {
+            return Err(SceneError::after(&outcome, msg));
+        }
         Ok(outcome)
     }
 
@@ -439,6 +493,10 @@ impl Compositor {
             SceneTop::Off => self.scene.top_ready = false,
             SceneTop::Keep => {}
             SceneTop::Upload(rgba) => {
+                #[cfg(test)]
+                if let Some(msg) = self.scene.fail_top.take() {
+                    return Err(msg);
+                }
                 let tex = match self.scene.top_tex {
                     Some(t) => t,
                     None => {
@@ -1460,6 +1518,50 @@ void main() { o = v_col; }
                 assert_scene_pixels(&img, REGION);
                 assert_top_over(&img);
             }
+        }
+    }
+
+    /// 場面が失敗したあとに、最上段の重ね絵が失敗して `Err` になっても、場面の失敗は `scene_failed` で運ぶ
+    /// (呼び出し側が `release` 済みの場面を解放済みと分かるように)。場面が成功していたなら `scene_failed` は無い。
+    #[test]
+    fn scene_failure_survives_a_later_fatal_error() {
+        let Some(off) = offscreen() else { return };
+        let (base, top) = (solid(BASE, SCREEN), top_image());
+        for (fail, want) in [(Fail::Err, Some("draw が Err")), (Fail::None, None)] {
+            let c = Counters::default();
+            let ((err, ok), _) = off
+                .render_with_compositor(SCREEN, |gl, comp, target| {
+                    let mut s = TestScene::new(&c, fail, false);
+                    comp.scene.fail_top = Some("重ね絵の転送に失敗".into());
+                    let err = comp
+                        .draw_scene(
+                            gl,
+                            target,
+                            &mut frame(&mut s, &base, REGION, SceneTop::Upload(&top)),
+                        )
+                        .expect_err("最上段の失敗は Err");
+                    // 致命的な失敗のあとでも、同じ Compositor で次のフレームを描ける
+                    let mut s2 = TestScene::new(&c, Fail::None, false);
+                    let ok = comp.draw_scene(
+                        gl,
+                        target,
+                        &mut frame(&mut s2, &base, REGION, SceneTop::Upload(&top)),
+                    );
+                    s2.release(gl);
+                    s.release(gl);
+                    (err, ok)
+                })
+                .unwrap();
+            assert_eq!(err.message, "重ね絵の転送に失敗", "{fail:?}");
+            match want {
+                Some(w) => assert!(
+                    err.scene_failed.as_deref().is_some_and(|m| m.contains(w)),
+                    "{fail:?}: {:?}",
+                    err.scene_failed
+                ),
+                None => assert_eq!(err.scene_failed, None, "{fail:?}"),
+            }
+            assert_eq!(ok, Ok(SceneOutcome::Drawn), "{fail:?}");
         }
     }
 

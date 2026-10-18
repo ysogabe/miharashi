@@ -1,7 +1,7 @@
 //! GLES 3.2 で KMS に出す Presenter。GBM surface のダブルバッファを page flip で切り替える。
 //! 合成は `compose::Compositor`(写真のフェードと文字の重ね絵は GPU で行う)。
 use crate::compose::{Compositor, Frame};
-use crate::scene::{SceneFrame, SceneOutcome};
+use crate::scene::{SceneError, SceneFrame, SceneOutcome};
 use crate::{egl, gbm};
 use drm::Device as _;
 use drm::control::{Device as ControlDevice, Event, PageFlipFlags, framebuffer};
@@ -126,13 +126,16 @@ impl GlesDisplay {
     /// page flip の完了まで待つ。一時停止中は何も描かず(`GlScene::draw` も呼ばず)`Drawn` を返す。
     /// 3D の失敗(panic・`Err`・GL エラー)は `Err` にせず `SceneFailed` で返す。そのとき失敗した場面の
     /// `release` はここで済んでいて、そのフレームは下地と重ね絵だけで表示してある。
-    /// `Err` は下地の描画や表示(DRM・EGL・page flip)の失敗だけ。
-    pub fn present_scene(&mut self, f: &mut SceneFrame<'_>) -> Result<SceneOutcome, String> {
+    /// `Err` は下地の描画や表示(DRM・EGL・page flip)の失敗だけ。場面の失敗のあとに `Err` になったとき
+    /// (最上段の重ね絵の失敗、swap・page flip の失敗)も、場面の失敗は `SceneError::scene_failed` に残る
+    /// (呼び出し側は `Err` でも必ず反映すること。反映しないと、`release` 済みの場面を終了時にもう一度 `release` する)。
+    pub fn present_scene(&mut self, f: &mut SceneFrame<'_>) -> Result<SceneOutcome, SceneError> {
         if self.suspended {
             return Ok(SceneOutcome::Drawn);
         }
         let outcome = self.comp.draw_scene(&self.ctx.gl, None, f)?;
-        self.flip()?;
+        self.flip()
+            .map_err(|msg| SceneError::after(&outcome, msg))?;
         Ok(outcome)
     }
 

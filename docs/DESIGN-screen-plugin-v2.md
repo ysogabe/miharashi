@@ -143,13 +143,18 @@ pub struct SceneFrame<'a> {
     pub top: Top2<'a>,                     // Off / Keep / Upload(&[u8])。Pixmap でなく画素列
 }
 impl GlesDisplay {
-    pub fn present_scene(&mut self, f: &mut SceneFrame<'_>) -> Result<SceneOutcome, String>;
+    pub fn present_scene(&mut self, f: &mut SceneFrame<'_>) -> Result<SceneOutcome, SceneError>;
     pub fn release_scenes(&mut self, scenes: &mut [&mut dyn GlScene]);
 }
 /// 3D の失敗は表示全体の失敗にしない(Err は DRM・EGL などの致命的なもの)。
 /// `SceneFailed` のとき、失敗した scene の `release`(catch_unwind つき)は `present_scene` の中で済んでいる
 pub enum SceneOutcome { Drawn, SceneFailed(String) }
+/// 致命的な失敗(下地の描画・最上段の重ね絵・swap・page flip・DRM)。場面の失敗より**後**に起きたときも
+/// 場面の失敗を失わない(`Err` だけ返すと、`release` 済みの場面が終了時にもう一度 `release` される)
+pub struct SceneError { pub message: String, pub scene_failed: Option<String> }
 ```
+
+呼び出し側は、`Ok(SceneFailed)` でも `Err(e)` の `e.scene_failed` が `Some` でも、**必ず** `App::report_scene_failure` を呼んでから終了処理(`end_run`)へ進む。`Compositor::draw_scene`・`Offscreen::render_scene` も同じ `SceneError` を返す。
 
 `Top`(app。`Pixmap`)と `SceneTop`(gpu。`&[u8]`)は持つものが違うだけ(app は gpu の型に依存できない)。実装(#74 T2)では、`runtime.rs` の `FrameParts`(`Frame` が借りるレーダーの点・Agent のカードの置き場)・`frame_of`(`Gl` 以外の `Composite` → `Frame`)・`scene_frame`(`GlComposite` → `SceneFrame`)が変換を受け持つ。
 
@@ -198,7 +203,7 @@ flowchart LR
 - 解放するのは、(a) 終了時、(b) その画面の 3D が失敗したとき(§9)。
   - (a) 終了時: runtime が `App::gl_scenes()`(ScreenManager が各画面の `gl_scene()` を集める)で全部の `GlScene` を取り、`drop(display)`(`runtime.rs:624`)の前に `GlesDisplay::release_scenes` で GL を current にして `release` を呼ぶ。
   - (b) 失敗時: ScreenManager は `glow::Context` を持たないので、後からは `release` できない。**scene を手に持っている `present_scene` の中で、Compositor がその場で `release`(`catch_unwind` つき)を呼ぶ**。`SceneFailed` を返した時点で解放は済んでいる。
-  - **`release` は 1 つの場面に高々 1 回**。(b) で解放済みの場面(3D が失敗した画面)は、`gl_scenes()` が返さないので終了時には呼ばれない。実行ループが描画の致命的なエラー(下地・EGL・page flip)で終わるときも、エラーを持ったまま同じ終了処理(`runtime::end_run`)に進み、`drop(display)` の前に (a) を行ってからエラーを返す(解放はベストエフォート)。`GlScene` 実装も、2 回目の呼び出しに耐える書き方(`Option::take()` など)を勧める。
+  - **`release` は 1 つの場面に高々 1 回**。(b) で解放済みの場面(3D が失敗した画面)は、`gl_scenes()` が返さないので終了時には呼ばれない。実行ループが描画の致命的なエラー(下地・EGL・page flip)で終わるときも、エラーを持ったまま同じ終了処理(`runtime::end_run`)に進み、`drop(display)` の前に (a) を行ってからエラーを返す(解放はベストエフォート)。場面の失敗のあとに致命的なエラーが起きたとき(最上段の重ね絵、swap・page flip の失敗)も、場面の失敗は `SceneError::scene_failed` で届くので、`report_scene_failure` を通して `gl_scenes()` から外れる(二重の `release` にならない)。`GlScene` 実装も、2 回目の呼び出しに耐える書き方(`Option::take()` など)を勧める。
   - 層(FBO)の作り直しは `region` の大きさが変わったときに Compositor が行う。表示サイズは実行中に変わらない(`resume` も同じモードで設定し直すだけ: `display.rs:88-97`)ので、きっかけは `region` の大きさの変化だけ。層は Compositor の持ち物なので、`GlScene` の解放は伴わない(`GlScene` は毎回 `GlTarget::size` を見る)。
   - `present_scene` は、一時停止中(VT が離れている間)は `draw` を呼ばずに戻る(`present_frame` と同じ: `display.rs:113-115`)。
 - 将来「しばらく見えていない画面を解放する」を足せる形にする。ScreenManager が `gl_scenes()` の返す一覧から、離れてからの経過が長いものを選び、runtime が `release_scenes` で解放する。**v1 のタイムアウトは無限(= 解放しない)**。足すかは #74 の VRAM+GTT の実測で決める。
@@ -431,10 +436,10 @@ flowchart LR
   2. **その場で、手に持っている scene に `release`(`catch_unwind` つき)を呼ぶ**。ScreenManager は `glow::Context` を持たず、`Composite::Gl` の借用からも解放できないので、後からは呼べない。作りかけのオブジェクトがあっても `release` が壊れないことが `GlScene` の約束(§9.4)。
   3. 手順 3 の層の合成は**しない**(中途半端な絵を出さない)。下地と最上段の重ね絵だけで、そのフレームを完成させて表示する。
   4. `SceneFailed(msg)` を返す(runtime は `Err` として扱わず、実行ループを続ける)。
-- 失敗した場面は `release` 済みなので、終了時の解放(§3.1 の (a))からは外す(`ScreenManager::gl_scenes()` が失敗した画面を返さない)。実行ループが `Err`(致命的な描画の失敗)で終わるときも、場面の解放を通ってからエラーを返す(`runtime::end_run`)。
+- 失敗した場面は `release` 済みなので、終了時の解放(§3.1 の (a))からは外す(`ScreenManager::gl_scenes()` が失敗した画面を返さない)。実行ループが `Err`(致命的な描画の失敗)で終わるときも、場面の解放を通ってからエラーを返す(`runtime::end_run`)。場面の失敗のあとの致命的な失敗でも、場面の失敗を失わない(`SceneError::scene_failed`。上の API)。実装の `runtime::draw_gles` が `Err` でも報告し、`runtime::draw_frame` は描画の失敗を `?` で関数の外へ出さずに `run_err` へ入れて、ループを `break` させる(表示を `GlesSurface` / `FrameSink` に差し替えて試験する)。
 - runtime は `App::report_scene_failure(msg)` を呼ぶ。ScreenManager が、画面の id つきで 1 回だけ `eprintln!` し(runtime は出さない)、状態ログの `scene_fail=` に回数を出す(失敗が 1 回以上あるときだけ)。
 - ScreenManager は、今出していた画面を「GL 失敗」にする。
-  - その画面は GL が使えないときと同じ扱い(§6): GL 専用画面は案内、装飾は元の画面。巡回では、**GL 専用画面だけ**飛ばす(装飾は元の写真・Agent 画面として巡回に残す)。
+  - その画面は GL が使えないときと同じ扱い(§6): GL 専用画面は案内、装飾は元の画面。巡回では、**GL 専用画面だけ**飛ばす(装飾は元の写真・Agent 画面として巡回に残す)。巡回の手順が全部 GL 専用で GL が使えないときは、案内の画面に切り替えず、今の画面のまま巡回を始めない(手動で選んだときの案内は出る)。
   - **`force_overlay = true` にし、現在の画面の `invalidate()` を呼ぶ**(必須)。失敗したフレームは `Composite::Gl` で返っていて、次のフレームは `Composite::Photo` / `Agents` / `Canvas` になる。重ね絵・背景を描き直させないと、切り替えのフレームからアラート・メニューが消える(§6.1)。失敗したそのフレームの `Top` は `present_scene` が下地の上に出すので見える。
   - **戻し方(v1)**: 再起動まで戻さない。再試行(例: 5 分後に 1 回、3 回で停止)は v1 に入れず、未決事項にする(§13)。
 - 壊れたモデルなど、CPU 側の失敗の隔離は **GL の外**で行う。モデルの読み込みは別スレッドで行い(`std::thread` の panic は `join` の `Err` になる)、結果をチャネルで受ける。画面は読み込み中・失敗中のあいだ、3D を出さずに下地(または案内)だけを出す。GL への転送は最初の `draw`(UI スレッド)で行う。#71 の「壊れたモデルで panic しても画面全体が落ちない」はこの方針で扱う。
@@ -453,7 +458,7 @@ flowchart LR
 
 | 今 | 変更 |
 |---|---|
-| `let (r, p) = display.draw(app.as_mut(), &mut canvas)?;`(`runtime.rs:549`)。`Presenter::draw` の `d.present_frame(&frame)?`(`runtime.rs:268`) | `Presenter::draw` が `SceneOutcome::SceneFailed` を `Ok` として扱い、`App::report_scene_failure` を呼ぶ。`Err` は従来どおり致命的。`Composite::Gl` の入れ子など呼び出し側の誤りは `Err` にせず、`debug_assert!` + `SceneFailed` 扱い(`?` で実行ループを抜けないため)。実装は `scene_frame` が領域を空にして `present_scene` の失敗の経路(その場面の `release` と、3D 抜きでの完成)に載せる。GL が使えない・失敗中のときは、ScreenManager が入れ子の中まで `base` を外す |
+| `let (r, p) = display.draw(app.as_mut(), &mut canvas)?;`(`runtime.rs:549`)。`Presenter::draw` の `d.present_frame(&frame)?`(`runtime.rs:268`) | `Presenter::draw` が `SceneOutcome::SceneFailed` を `Ok` として扱い、`App::report_scene_failure` を呼ぶ。`Err` は従来どおり致命的(ただし `SceneError::scene_failed` があれば、その報告は先に行う)。`Composite::Gl` の入れ子など呼び出し側の誤りは `Err` にせず、`debug_assert!` + `SceneFailed` 扱い(`?` で実行ループを抜けないため)。実装は `scene_frame` が領域を空にして `present_scene` の失敗の経路(その場面の `release` と、3D 抜きでの完成)に載せる。GL が使えない・失敗中のときは、ScreenManager が入れ子の中まで `base` を外す |
 | `catch_unwind` は `crates/` に 1 件もない | `compose.rs` の `draw_scene`(と `present_scene` の失敗時の `release`)に追加 |
 
 ### 9.4 #74 と #71 B でやること

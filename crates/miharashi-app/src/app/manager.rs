@@ -233,7 +233,8 @@ impl ScreenManager {
     }
 
     /// 自動巡回を始める。登録に無い画面の手順は飛ばす(航空機や室内環境の画面が無効なとき)。
-    /// 手順が 1 つも残らなければ巡回しない。最初の手順の画面から始める。
+    /// 手順が 1 つも残らない、または GL が使えず全部が飛ばす画面なら、巡回しない(今の画面のまま)。
+    /// 最初の手順の画面から始める。
     pub fn with_rotation(mut self, steps: &[RotationStep], pause: Duration) -> Self {
         let steps: Vec<Step> = steps
             .iter()
@@ -256,11 +257,12 @@ impl ScreenManager {
             eprintln!("rotation: 回せる画面が無いので巡回しない");
             return self;
         }
-        // 最初の手順は、GL が使えず飛ばす画面(3D だけの画面)なら次から
-        let start = steps
-            .iter()
-            .position(|st| self.rotatable(st.screen))
-            .unwrap_or(0);
+        // 最初の手順は、GL が使えず飛ばす画面(3D だけの画面)なら次から。
+        // 全部が飛ばす画面なら、今の画面のまま巡回しない(先頭の案内の画面に切り替えない)
+        let Some(start) = steps.iter().position(|st| self.rotatable(st.screen)) else {
+            eprintln!("rotation: GL が要る画面しか無いので巡回しない");
+            return self;
+        };
         let now = Instant::now();
         let (screen, remaining) = (steps[start].screen, steps[start].secs);
         self.switch_to(screen, now);

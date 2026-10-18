@@ -1,7 +1,7 @@
 //! 表示せずに GLES 経路を検証する。render node で surfaceless のコンテキストを作り、表示と同じ
 //! `Compositor` で FBO に描いて読み戻す。CPU 経路の画像と画素が一致するかを確かめる(`png --renderer gles`)。
 use crate::compose::{Compositor, Frame};
-use crate::scene::{SceneFrame, SceneOutcome};
+use crate::scene::{SceneError, SceneFrame, SceneOutcome};
 use crate::{egl, gbm};
 use glow::HasContext;
 use std::os::fd::AsFd;
@@ -68,13 +68,16 @@ impl Offscreen {
 
     /// `frame`(下地 → 3D → 最上段の重ね絵)を、表示と同じ `Compositor::draw_scene` で描き、上から下の
     /// RGBA8 で読み戻す。3D の失敗は `SceneFailed` で返る(そのフレームは 3D 抜きで描かれている)。
+    /// `Err` のときも、場面の失敗は `SceneError::scene_failed` に残る(`present_scene` と同じ)。
     pub fn render_scene(
         &self,
         frame: &mut SceneFrame<'_>,
         size: (u32, u32),
-    ) -> Result<(SceneOutcome, Vec<u8>), String> {
-        self.render_with_compositor(size, |gl, comp, target| comp.draw_scene(gl, target, frame))
-            .and_then(|(outcome, img)| Ok((outcome?, img)))
+    ) -> Result<(SceneOutcome, Vec<u8>), SceneError> {
+        // 描画の前(FBO や Compositor を作れない)の失敗は、場面に触れていないので `scene_failed` なし
+        let (outcome, img) = self
+            .render_with_compositor(size, |gl, comp, target| comp.draw_scene(gl, target, frame))?;
+        Ok((outcome?, img))
     }
 
     /// `size` の FBO を描画先に、`Compositor` を作って `f` に渡し、終わったあとの FBO を上から下の RGBA8 で

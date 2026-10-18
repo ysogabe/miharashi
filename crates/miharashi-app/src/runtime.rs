@@ -6,8 +6,8 @@ use crate::panel::{DisplayControl, DisplayStatus, Panel, PanelInput};
 use crate::screen::{App, Composite, GlComposite, GlScene, KeyPress, PhotoData, PhotoRef, Top};
 use crate::screen_power::{Mode as PowerMode, ScreenPower};
 use miharashi_gpu::{
-    AgentGpuCard, Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, Radar, SceneFrame,
-    SceneOutcome, SceneTop, SourceImage,
+    AgentGpuCard, Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, Radar, SceneError,
+    SceneFrame, SceneOutcome, SceneTop, SourceImage,
 };
 use miharashi_linux::drm_select::{self, CardSel, ModeSel};
 use miharashi_linux::input::{Action, Keys};
@@ -315,40 +315,15 @@ impl Presenter {
     /// Canvas には重ね絵だけを、変わったときだけ描く。
     fn draw(&mut self, app: &mut dyn App, canvas: &mut Canvas) -> Result<(f32, f32), String> {
         let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f32() * 1000.0;
-        let t0 = Instant::now();
         match self {
             Self::Cpu(d) => {
+                let t0 = Instant::now();
                 app.render(canvas);
                 let t1 = Instant::now();
                 d.present(|buf, pitch| canvas.write_xrgb8888(buf, pitch))?;
                 Ok((ms(t0, t1), ms(t1, Instant::now())))
             }
-            Self::Gles(d) => {
-                let comp = app.render_composite(canvas);
-                let t1 = Instant::now();
-                let mut parts = FrameParts::default();
-                parts.fill(&comp);
-                // 3D の失敗は `Err` でなく `SceneFailed`(表示は続く)。`comp` が `app` を借りているので、報告は借用が終わってから
-                let failed = match comp {
-                    Composite::Gl(g) => {
-                        let mut frame = scene_frame(g, canvas, &parts);
-                        match d.present_scene(&mut frame)? {
-                            SceneOutcome::Drawn => None,
-                            SceneOutcome::SceneFailed(msg) => Some(msg),
-                        }
-                    }
-                    other => {
-                        let frame = frame_of(&other, canvas, &parts).expect("Gl 以外");
-                        d.present_frame(&frame)?;
-                        None
-                    }
-                };
-                let times = (ms(t0, t1), ms(t1, Instant::now()));
-                if let Some(msg) = failed {
-                    app.report_scene_failure(&msg);
-                }
-                Ok(times)
-            }
+            Self::Gles(d) => draw_gles(d, app, canvas),
         }
     }
 
@@ -357,6 +332,88 @@ impl Presenter {
         match self {
             Self::Cpu(_) => Vec::new(),
             Self::Gles(d) => d.release_scenes(scenes),
+        }
+    }
+}
+
+/// GLES 経路が `draw_gles` に求めること(試験で DRM なしの表示に差し替えるため)。
+pub(crate) trait GlesSurface {
+    fn present_scene(&mut self, f: &mut SceneFrame<'_>) -> Result<SceneOutcome, SceneError>;
+    fn present_frame(&mut self, f: &Frame<'_>) -> Result<(), String>;
+}
+
+impl GlesSurface for GlesDisplay {
+    fn present_scene(&mut self, f: &mut SceneFrame<'_>) -> Result<SceneOutcome, SceneError> {
+        GlesDisplay::present_scene(self, f)
+    }
+
+    fn present_frame(&mut self, f: &Frame<'_>) -> Result<(), String> {
+        GlesDisplay::present_frame(self, f)
+    }
+}
+
+/// GLES 経路の 1 枚。戻り値は (描画, 転送) の時間 [ms]。
+/// 3D の失敗は `Err` でなく `SceneFailed`(表示は続く)。場面の失敗は、そのあとに致命的な失敗(最上段の重ね絵・
+/// swap・page flip)が起きて `Err` になるときも、必ず `app.report_scene_failure` に届ける。届けないと、`release` 済みの
+/// 場面が `app.gl_scenes()` に残って終了時にもう一度 `release` される。
+pub(crate) fn draw_gles(
+    d: &mut impl GlesSurface,
+    app: &mut dyn App,
+    canvas: &mut Canvas,
+) -> Result<(f32, f32), String> {
+    let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f32() * 1000.0;
+    let t0 = Instant::now();
+    let comp = app.render_composite(canvas);
+    let t1 = Instant::now();
+    let mut parts = FrameParts::default();
+    parts.fill(&comp);
+    // `comp` が `app` を借りているので、報告は借用が終わってから
+    let (shown, scene_failed) = match comp {
+        Composite::Gl(g) => {
+            let mut frame = scene_frame(g, canvas, &parts);
+            match d.present_scene(&mut frame) {
+                Ok(SceneOutcome::Drawn) => (Ok(()), None),
+                Ok(SceneOutcome::SceneFailed(msg)) => (Ok(()), Some(msg)),
+                Err(e) => (Err(e.message), e.scene_failed),
+            }
+        }
+        other => {
+            let frame = frame_of(&other, canvas, &parts).expect("Gl 以外");
+            (d.present_frame(&frame), None)
+        }
+    };
+    let times = (ms(t0, t1), ms(t1, Instant::now()));
+    if let Some(msg) = scene_failed {
+        app.report_scene_failure(&msg);
+    }
+    shown.map(|()| times)
+}
+
+/// 実行ループが表示に求めること(試験で DRM なしの表示に差し替えるため)。
+pub(crate) trait FrameSink {
+    fn draw(&mut self, app: &mut dyn App, canvas: &mut Canvas) -> Result<(f32, f32), String>;
+}
+
+impl FrameSink for Presenter {
+    fn draw(&mut self, app: &mut dyn App, canvas: &mut Canvas) -> Result<(f32, f32), String> {
+        Presenter::draw(self, app, canvas)
+    }
+}
+
+/// 実行ループの 1 枚。描画の失敗(下地・EGL・page flip など)は、`?` で関数を抜けずに `run_err` へ入れて
+/// None を返す。呼び出し側(ループ)は `break` して、場面の解放を通る終了処理(`end_run`)へ進む。
+pub(crate) fn draw_frame(
+    display: &mut impl FrameSink,
+    app: &mut dyn App,
+    canvas: &mut Canvas,
+    run_err: &mut Option<String>,
+) -> Option<(f32, f32)> {
+    match display.draw(app, canvas) {
+        Ok(times) => Some(times),
+        Err(e) => {
+            eprintln!("描画に失敗: {e}");
+            *run_err = Some(e);
+            None
         }
     }
 }
@@ -638,13 +695,9 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
         if redraw && screen_on {
             let t0 = Instant::now();
             // 描画の失敗(下地・EGL・page flip など)でも、場面の解放を通る終了処理へ進む(`end_run`)
-            let (r, p) = match display.draw(app.as_mut(), &mut canvas) {
-                Ok(times) => times,
-                Err(e) => {
-                    eprintln!("描画に失敗: {e}");
-                    run_err = Some(e);
-                    break "描画エラー";
-                }
+            let Some((r, p)) = draw_frame(&mut display, app.as_mut(), &mut canvas, &mut run_err)
+            else {
+                break "描画エラー";
             };
             render_ms.push(r);
             present_ms.push(p);

@@ -426,6 +426,48 @@ fn rotation_skips_gl_only_screens_without_gl() {
     assert_eq!(run_for(&mut app, &mut t, 10), "deco", "cube は戻らない");
 }
 
+/// 巡回の手順がすべて GL が要る画面で GL が使えないときは、案内の画面に切り替えず、今の画面のまま巡回しない。
+/// (手動で GL が要る画面を選んだときの案内は、そのまま出る)
+#[test]
+fn rotation_does_not_start_when_every_step_needs_gl() {
+    let probe = Rc::new(Probe::default());
+    let (app, _tx) = manager(
+        vec![
+            Box::new(Plain("a")),
+            check("cube", true, Base::None, &probe),
+            check("cube2", true, Base::None, &probe),
+        ],
+        "a",
+        false,
+    );
+    let mut app = app.with_rotation(
+        &[step("cube", 10), step("cube2", 10)],
+        Duration::from_secs(60),
+    );
+    assert_eq!(app.screen_id(), "a", "今の画面のまま");
+    assert_eq!(app.rotation_state(), None, "巡回を始めない");
+    let mut t = Instant::now();
+    assert_eq!(run_for(&mut app, &mut t, 30), "a");
+
+    // 手動で選んだときの案内は変わらない
+    assert!(app.show_screen("cube"));
+    let mut c = Canvas::new(SIZE.0, SIZE.1);
+    assert!(matches!(app.render_composite(&mut c), Composite::Canvas));
+
+    // GL が使えるなら、先頭から巡回する
+    let (app, _tx) = manager(
+        vec![
+            Box::new(Plain("a")),
+            check("cube", true, Base::None, &probe),
+        ],
+        "a",
+        true,
+    );
+    let app = app.with_rotation(&[step("cube", 10)], Duration::from_secs(60));
+    assert_eq!(app.screen_id(), "cube");
+    assert_eq!(app.rotation_state(), Some("on"));
+}
+
 /// 終了時の解放用に、全画面の `GlScene` を集められる。
 #[test]
 fn gl_scenes_collects_every_scene() {
@@ -494,10 +536,15 @@ fn nested_gl_is_detected() {
 #[cfg(target_os = "linux")]
 mod gpu {
     use super::*;
-    use crate::runtime::{FrameParts, end_run, frame_of, scene_frame};
+    use crate::runtime::{
+        FrameParts, FrameSink, GlesSurface, draw_frame, draw_gles, end_run, frame_of, scene_frame,
+    };
     use crate::scene_check::{BACK_COLOR, CheckScreen, FRONT_COLOR};
+    use crate::screen::App;
     use miharashi_gpu::compose::Compositor;
-    use miharashi_gpu::{Offscreen, SceneOutcome, read_rgba_top_down};
+    use miharashi_gpu::{
+        Frame, Offscreen, SceneError, SceneFrame, SceneOutcome, read_rgba_top_down,
+    };
     use miharashi_render::menu;
     use std::path::Path;
 
@@ -724,41 +771,87 @@ mod gpu {
         assert_eq!(b.releases.get(), 1, "ほかの場面は終了時に 1 回");
     }
 
-    /// 実行ループが描画の致命的なエラーで終わっても、場面を解放してから、元のエラーを返す。
+    /// 表示を差し替えた実行ループ用の表示。本物の Compositor(オフスクリーン)で描き、`GlesDisplay::present_scene` と
+    /// 同じく、描いたあとに `flip_err` があれば(swap・page flip の失敗)場面の失敗を持たせた `Err` にする。
+    struct FakeDisplay<'a> {
+        gl: &'a glow::Context,
+        comp: &'a mut Compositor,
+        target: Option<glow::Framebuffer>,
+        flip_err: Option<&'static str>,
+    }
+
+    impl GlesSurface for FakeDisplay<'_> {
+        fn present_scene(&mut self, f: &mut SceneFrame<'_>) -> Result<SceneOutcome, SceneError> {
+            let outcome = self.comp.draw_scene(self.gl, self.target, f)?;
+            match self.flip_err.take() {
+                Some(e) => Err(SceneError::after(&outcome, e.into())),
+                None => Ok(outcome),
+            }
+        }
+
+        fn present_frame(&mut self, _: &Frame<'_>) -> Result<(), String> {
+            unreachable!("3D の画面しか使わない")
+        }
+    }
+
+    impl FrameSink for FakeDisplay<'_> {
+        fn draw(&mut self, app: &mut dyn App, canvas: &mut Canvas) -> Result<(f32, f32), String> {
+            draw_gles(self, app, canvas)
+        }
+    }
+
+    /// 実行ループの 1 枚が表示の致命的なエラー(swap・page flip)で失敗しても、ループは `draw_frame` から抜け、
+    /// 場面の失敗(`release` 済み)を反映してから終了処理に入る。解放は場面ごとに 1 回で、元のエラーを返す。
+    /// 場面が先に失敗していたなら、終了時に `release` し直さない(二重に呼ばない)。
     #[test]
-    fn scenes_are_released_when_the_loop_ends_with_an_error() {
+    fn display_error_after_a_scene_failure_still_releases_once() {
         let Some(off) = offscreen() else { return };
-        let probe = Rc::new(Probe::default());
-        let (mut app, _tx) = manager(
-            vec![check("check", false, Base::Canvas, &probe)],
-            "check",
-            true,
-        );
-        let result = off
-            .with_target(SIZE, |gl, fbo| {
-                let mut comp = Compositor::new(gl, SIZE).unwrap();
-                let mut c = Canvas::new(SIZE.0, SIZE.1);
-                let comp_frame = app.render_composite(&mut c);
-                let mut parts = FrameParts::default();
-                parts.fill(&comp_frame);
-                let Composite::Gl(g) = comp_frame else {
-                    panic!("Gl")
-                };
-                let mut sf = scene_frame(g, &c, &parts);
-                assert_eq!(
-                    comp.draw_scene(gl, Some(fbo), &mut sf).unwrap(),
-                    SceneOutcome::Drawn
-                );
-                assert_eq!(probe.releases.get(), 0);
-                let result = end_run(Some("page flip に失敗".into()), &mut app, |scenes| {
-                    Compositor::release_scenes(gl, SIZE, Some(fbo), scenes)
-                });
-                comp.destroy(gl);
-                result
-            })
-            .unwrap();
-        assert_eq!(result, Err("page flip に失敗".to_string()));
-        assert_eq!(probe.releases.get(), 1, "描画エラーでも解放する");
+        for scene_fails in [false, true] {
+            let probe = Rc::new(Probe::default());
+            let (mut app, _tx) = manager(
+                vec![check("check", false, Base::Canvas, &probe)],
+                "check",
+                true,
+            );
+            probe.fail_draw.set(scene_fails);
+            let result = off
+                .with_target(SIZE, |gl, fbo| {
+                    let mut comp = Compositor::new(gl, SIZE).unwrap();
+                    let mut display = FakeDisplay {
+                        gl,
+                        comp: &mut comp,
+                        target: Some(fbo),
+                        flip_err: Some("page flip に失敗"),
+                    };
+                    let mut canvas = Canvas::new(SIZE.0, SIZE.1);
+                    let mut run_err = None;
+                    let times = draw_frame(&mut display, &mut app, &mut canvas, &mut run_err);
+                    assert!(times.is_none(), "描画エラーならループを抜ける");
+                    assert_eq!(run_err.as_deref(), Some("page flip に失敗"));
+                    assert_eq!(
+                        probe.releases.get(),
+                        u32::from(scene_fails),
+                        "失敗した場面はその場で release"
+                    );
+                    assert_eq!(
+                        App::gl_scenes(&mut app).len(),
+                        usize::from(!scene_fails),
+                        "release 済みの場面は終了時の解放の対象から外れる"
+                    );
+                    let result = end_run(run_err, &mut app, |scenes| {
+                        Compositor::release_scenes(gl, SIZE, Some(fbo), scenes)
+                    });
+                    comp.destroy(gl);
+                    result
+                })
+                .unwrap();
+            assert_eq!(result, Err("page flip に失敗".to_string()));
+            assert_eq!(
+                probe.releases.get(),
+                1,
+                "scene_fails={scene_fails}: 場面は 1 回だけ release する"
+            );
+        }
     }
 
     /// アラート表示中に 3D が失敗しても、そのフレームも次のフレームからも、アラートが見え続ける。
