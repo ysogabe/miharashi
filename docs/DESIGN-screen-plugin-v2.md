@@ -151,7 +151,7 @@ impl GlesDisplay {
 pub enum SceneOutcome { Drawn, SceneFailed(String) }
 ```
 
-`Top` と `Top2` は、app が `Pixmap`、gpu が `&[u8]` を持つだけの違い(app は gpu の型に依存できない)。名前は実装で整える。
+`Top`(app。`Pixmap`)と `SceneTop`(gpu。`&[u8]`)は持つものが違うだけ(app は gpu の型に依存できない)。実装(#74 T2)では、`runtime.rs` の `FrameParts`(`Frame` が借りるレーダーの点・Agent のカードの置き場)・`frame_of`(`Gl` 以外の `Composite` → `Frame`)・`scene_frame`(`GlComposite` → `SceneFrame`)が変換を受け持つ。
 
 ### 2.4 依存の向き
 
@@ -343,10 +343,10 @@ flowchart LR
 | GL 専用(キューブ。`needs_gl() = true`) | `Composite::Gl` | CPU の案内(「この画面は GPU 描画が必要です」)を `render` で描く。自動巡回では**飛ばす**(`is_empty` と同じ扱い。**飛ばすのは GL 専用画面だけ**)。手動(メニュー・パネル)では選べて、案内が出る |
 | 既存画面に 3D を足す装飾(VRM を載せた写真・Agent 画面。`needs_gl() = false`) | 下地の `Composite` に `Composite::Gl` をかぶせる | **3D だけをやめて、元の画面をそのまま出す**(ScreenManager が `Composite::Gl` の `base` を取り出す)。**巡回には元の写真・Agent 画面として残す**(飛ばさない)。CPU 経路の写真は今のまま |
 
-- GL の可否は、作るときの `make_app(&Output)` で渡す。`Output.gpu_max_texture.is_some()` が「GLES を開けた」(`auto` で CPU に戻ったときは `None`)なので、これを GL の可否として使う(`runtime.rs:289-293`、`353-356`、`main.rs:153`)。`set_gl_available` のような実行中に呼ぶメソッドは作らない(GL の可否は起動後に変わらない。変わるのは「失敗」だけ)。
+- GL の可否は、作るときの `make_app(&Output)` で渡す。`Output.gpu_max_texture.is_some()` が「GLES を開けた」(`auto` で CPU に戻ったときは `None`)なので、これを GL の可否として使う(`runtime.rs:289-293`、`353-356`、`main.rs:153`)。`set_gl_available` のような実行中に呼ぶメソッドは作らない(GL の可否は起動後に変わらない。変わるのは「失敗」だけ)。実装は、作成時のビルダー `ScreenManager::with_gl_available(bool)`(既定は使えない。`kiosk()` が渡す。`with_rotation` より前に呼ぶ: 巡回の最初の手順から GL が要る画面を外すため)。
 - GL の可否の判断は **ScreenManager だけ**が行う(`Screen` には可否を渡さない)。`needs_gl()` の画面が GL 不可・失敗中なら、`render_composite` を呼ばずに `render` を呼ぶ(CPU の案内)。それ以外の画面は常に `render_composite` を呼び、`Composite::Gl` が返ってきて GL 不可・失敗中なら、`base` を取り出して使う(`None` なら `Composite::Canvas` と空の Canvas)。これで装飾(`WithScene`)は単純なまま、元の画面だけが出る。
 - **GL の可否・失敗状態が変わったとき**(起動時の GL なし、`report_scene_failure` による失敗、将来の復帰): ScreenManager は必ず `force_overlay = true` にし、現在の画面の `invalidate()` を呼ぶ。GL ありの `Composite::Gl`(下地は `base` の中)と、GL なしの `Composite::Photo` / `Composite::Agents` / `Composite::Canvas`(`base` を取り出したもの)では、画面が重ね絵・背景を描いたかどうかの前提が変わる。Photo の `overlay_changed` は `overlay_dirty || force_overlay`(`photo.rs:261`)、ScreenManager の `draw_alert` は `overlay_changed` のときだけ(`manager.rs:655-671`)なので、これをしないと写真画面ではその切り替えのフレームにアラート・メニューが描かれず、消える(Agent 画面は覆われると `Composite::Canvas` を返し、アラートを毎フレーム描くので消えない。`invalidate()` は念のため)。
-- **案内は共通の描画関数**(`miharashi-render` に `notice::gpu_required` を足す)で、GL 専用画面の `render` はそれを呼ぶだけ。これで、`Screen::render` が必須(`screen.rs:105`)でも、画面側の負担が小さい。
+- **案内は共通の描画関数**(`miharashi-render` の `notice::gpu_required(canvas, text, title)`。`title` は画面の題名)で、GL 専用画面の `render` はそれを呼ぶだけ。これで、`Screen::render` が必須(`screen.rs:105`)でも、画面側の負担が小さい。
 - **焼き付き対策(`refresh_screens`)**: 3D の画面を指定しても、CPU の案内(`render`)がグリッチの素材になるだけで意味がない。GL の画面は対象にしない。今の `refresh_screens` は、対応外の id を**エラー**にする(許可は status / photo / room / aircraft。`config.rs:491-502`、テスト `config.rs:659`)ので、キューブの id は何もしなくてもエラーになる。これを警告 + 無視に変えるかは未決事項(§13)。既定は `["aircraft"]` のまま(`config.rs:393`)。
 - **PNG ヘッドレス**:
   - `png`(既定、CPU): GL 専用画面は案内の 1 枚(`cube.png` など)。GL の装飾は元の画面。Linux 以外でもビルドできる。
@@ -430,7 +430,7 @@ flowchart LR
   2. **その場で、手に持っている scene に `release`(`catch_unwind` つき)を呼ぶ**。ScreenManager は `glow::Context` を持たず、`Composite::Gl` の借用からも解放できないので、後からは呼べない。作りかけのオブジェクトがあっても `release` が壊れないことが `GlScene` の約束(§9.4)。
   3. 手順 3 の層の合成は**しない**(中途半端な絵を出さない)。下地と最上段の重ね絵だけで、そのフレームを完成させて表示する。
   4. `SceneFailed(msg)` を返す(runtime は `Err` として扱わず、実行ループを続ける)。
-- runtime は `App::report_scene_failure(msg)` を呼び、1 回だけ `eprintln!` する(状態ログの `scene_fail=` に回数も出す)。
+- runtime は `App::report_scene_failure(msg)` を呼ぶ。ScreenManager が、画面の id つきで 1 回だけ `eprintln!` し(runtime は出さない)、状態ログの `scene_fail=` に回数を出す(失敗が 1 回以上あるときだけ)。
 - ScreenManager は、今出していた画面を「GL 失敗」にする。
   - その画面は GL が使えないときと同じ扱い(§6): GL 専用画面は案内、装飾は元の画面。巡回では、**GL 専用画面だけ**飛ばす(装飾は元の写真・Agent 画面として巡回に残す)。
   - **`force_overlay = true` にし、現在の画面の `invalidate()` を呼ぶ**(必須)。失敗したフレームは `Composite::Gl` で返っていて、次のフレームは `Composite::Photo` / `Agents` / `Canvas` になる。重ね絵・背景を描き直させないと、切り替えのフレームからアラート・メニューが消える(§6.1)。失敗したそのフレームの `Top` は `present_scene` が下地の上に出すので見える。
@@ -451,7 +451,7 @@ flowchart LR
 
 | 今 | 変更 |
 |---|---|
-| `let (r, p) = display.draw(app.as_mut(), &mut canvas)?;`(`runtime.rs:549`)。`Presenter::draw` の `d.present_frame(&frame)?`(`runtime.rs:268`) | `Presenter::draw` が `SceneOutcome::SceneFailed` を `Ok` として扱い、`App::report_scene_failure` を呼ぶ。`Err` は従来どおり致命的。`Composite::Gl` の入れ子など呼び出し側の誤りは `Err` にせず、`debug_assert!` + `SceneFailed` 扱い(`?` で実行ループを抜けないため) |
+| `let (r, p) = display.draw(app.as_mut(), &mut canvas)?;`(`runtime.rs:549`)。`Presenter::draw` の `d.present_frame(&frame)?`(`runtime.rs:268`) | `Presenter::draw` が `SceneOutcome::SceneFailed` を `Ok` として扱い、`App::report_scene_failure` を呼ぶ。`Err` は従来どおり致命的。`Composite::Gl` の入れ子など呼び出し側の誤りは `Err` にせず、`debug_assert!` + `SceneFailed` 扱い(`?` で実行ループを抜けないため)。実装は `scene_frame` が領域を空にして `present_scene` の失敗の経路(その場面の `release` と、3D 抜きでの完成)に載せる。GL が使えない・失敗中のときは、ScreenManager が入れ子の中まで `base` を外す |
 | `catch_unwind` は `crates/` に 1 件もない | `compose.rs` の `draw_scene`(と `present_scene` の失敗時の `release`)に追加 |
 
 ### 9.4 #74 と #71 B でやること
