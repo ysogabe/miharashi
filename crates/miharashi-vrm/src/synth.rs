@@ -295,12 +295,21 @@ mod tests {
     }
 
     #[test]
-    fn bakes_node_and_skin_transforms() {
+    fn joint_matrices_pose_the_vertices() {
         let m = small();
-        // root の +0.5 が頭に効いて、頭の中心は y = 1.5
+        // スキンなしのプリミティブは、自分のノードを 1 関節とみなす(頂点はローカルのまま)
         let head = &m.primitives[0];
         let ys: Vec<f32> = head
             .vertices
+            .as_chunks::<FLOATS_PER_VERTEX>()
+            .0
+            .iter()
+            .map(|v| v[1])
+            .collect();
+        assert!((ys.iter().cloned().fold(f32::MAX, f32::min) - 0.83).abs() < 1e-4);
+        // root の +0.5 が頭に効いて、頭の中心は y = 1.5
+        let baked = m.baked_vertices(0);
+        let ys: Vec<f32> = baked
             .as_chunks::<FLOATS_PER_VERTEX>()
             .0
             .iter()
@@ -315,8 +324,42 @@ mod tests {
             "{lo} {hi}"
         );
         // スキンの三角形は関節の +0.5(x)だけ動く(自身のノードの変換は使わない)
-        let tri = &m.primitives[2];
-        assert!((tri.vertices[0] - 0.4).abs() < 1e-5 && (tri.vertices[1] - 1.0).abs() < 1e-5);
+        let tri = m.baked_vertices(2);
+        assert!((tri[0] - 0.4).abs() < 1e-5 && (tri[1] - 1.0).abs() < 1e-5);
+        // 関節ノードを実行時に動かすと、その分だけ頂点が動く(階層の評価 → 関節行列)
+        let mut locals = m.rest_locals();
+        let joint = m.skins[0].joints[0];
+        locals[joint].t[1] += 0.25;
+        let (mut w, mut r) = (Vec::new(), Vec::new());
+        m.eval_world(&locals, &mut w, &mut r);
+        let mut jm = Vec::new();
+        m.joint_matrices(&w, &mut jm);
+        let moved = m.posed_vertices(2, &jm);
+        assert!(
+            (moved[0] - 0.4).abs() < 1e-5 && (moved[1] - 1.25).abs() < 1e-5,
+            "{moved:?}"
+        );
+        // 親ノード(root)を動かすと、子の頭にも効く
+        let mut locals = m.rest_locals();
+        locals[0].t[1] += 1.0;
+        m.eval_world(&locals, &mut w, &mut r);
+        m.joint_matrices(&w, &mut jm);
+        let up = m.posed_vertices(0, &jm);
+        let top = up
+            .as_chunks::<FLOATS_PER_VERTEX>()
+            .0
+            .iter()
+            .map(|v| v[1])
+            .fold(f32::MIN, f32::max);
+        assert!((top - 2.67).abs() < 1e-4, "{top}");
+    }
+
+    #[test]
+    fn bounds_cover_rest_pose() {
+        let m = small();
+        // 頭(1.5 ± 0.17)から胴(0.5 + 0.5 ± 0.4)まで
+        assert!((m.bounds.1[1] - 1.67).abs() < 1e-3, "{:?}", m.bounds);
+        assert!(m.bounds.0[1] < 0.7, "{:?}", m.bounds);
     }
 
     #[test]

@@ -2,12 +2,13 @@
 //! 画面には出さない。モデルは利用条件を確認して各自で用意する(リポジトリには置かない)。
 //! `--synthetic` なら、コードから組み立てた小さなモデルで動く。
 use miharashi_vrm::synth;
-use miharashi_vrm::{Model, Renderer, attach_depth, detach_depth};
+use miharashi_vrm::{Level, Model, Renderer, attach_depth, detach_depth};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const USAGE: &str = "使い方: vrm-bench (--model <path.vrm> | --synthetic) [--pci 0000:10:00.0] [--size 1280x720] \
-[--frames 600 | --seconds 30] [--fps 30] [--expression blink] [--still] [--png out.png] [--segments 48] [--texture 1024]";
+[--frames 600 | --seconds 30] [--fps 30] [--feature-level bake|skin|pose|mtoon|spring] [--outline-scale 1] \
+[--expression blink] [--still] [--png out.png] [--segments 48] [--texture 1024]";
 
 struct Args {
     model: Option<PathBuf>,
@@ -21,6 +22,8 @@ struct Args {
     expression: Option<String>,
     still: bool,
     png: Option<PathBuf>,
+    level: Level,
+    outline_scale: f32,
     synth: synth::Opts,
 }
 
@@ -35,6 +38,8 @@ fn parse_args() -> Result<Args, String> {
         expression: None,
         still: false,
         png: None,
+        level: Level::Spring,
+        outline_scale: 1.0,
         synth: synth::Opts::default(),
     };
     let mut synthetic = false;
@@ -59,6 +64,10 @@ fn parse_args() -> Result<Args, String> {
             "--expression" => a.expression = Some(value()?),
             "--still" => a.still = true,
             "--png" => a.png = Some(value()?.into()),
+            "--feature-level" => a.level = Level::parse(&value()?)?,
+            "--outline-scale" => {
+                a.outline_scale = value()?.parse().map_err(|_| "--outline-scale が数でない")?
+            }
             "--segments" => {
                 a.synth.segments = value()?.parse().map_err(|_| "--segments が数でない")?
             }
@@ -130,13 +139,16 @@ fn measure(
         r.uploaded_bytes >> 20
     );
     // ウォームアップ(シェーダのコンパイル・最初の転送を計測に入れない)
-    for _ in 0..5 {
+    for k in 0..5 {
+        r.animate(k as f32 / 30.0, 1.0 / 30.0);
         r.update(gl);
         r.render(gl, size);
     }
     unsafe { gl.finish() };
     let (cpu_start, wall_start) = (cpu_seconds(), Instant::now());
-    let (mut total, mut morph) = (Vec::new(), Vec::new());
+    let (mut total, mut morph, mut pose, mut spring) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut gpu = Vec::new();
     let mut i = 0u32;
     loop {
         match a.seconds {
@@ -152,13 +164,20 @@ fn measure(
             0.5 - 0.5 * (t * std::f32::consts::PI).cos()
         };
         let f0 = Instant::now();
+        r.animate(t, 1.0 / 30.0);
+        let f_anim = Instant::now();
         r.set_expression(expr, w)?;
-        r.update(gl);
+        let times = r.update(gl);
         let f1 = Instant::now();
         r.render(gl, size);
         unsafe { gl.finish() };
         total.push(f0.elapsed().as_secs_f64() * 1e3);
-        morph.push((f1 - f0).as_secs_f64() * 1e3);
+        // set_expression + update のうち、骨の分(UBO 転送込み)を除いたものが morph
+        morph.push(times.morph_ms + (f1 - f_anim).as_secs_f64() * 1e3 - times.pose_ms);
+        pose.push(times.pose_ms);
+        spring.push(times.spring_ms);
+        // GPU: 描画コマンドの発行から glFinish の完了まで
+        gpu.push(f1.elapsed().as_secs_f64() * 1e3);
         i += 1;
         if let Some(fps) = a.fps {
             // 次のフレームの時刻まで待つ(遅れていれば待たない)
@@ -175,6 +194,9 @@ fn measure(
     }
     let (tm, tp) = mean_p95(&mut total);
     let (mm, mp) = mean_p95(&mut morph);
+    let (pm, pp) = mean_p95(&mut pose);
+    let (sm, sp) = mean_p95(&mut spring);
+    let (gm, gp) = mean_p95(&mut gpu);
     println!(
         "expression: {expr}{}",
         if a.still {
@@ -193,6 +215,10 @@ fn measure(
         "frame_ms: mean={tm:.2} p95={tp:.2}(glFinish まで待つ。実 FPS 換算 {:.0} fps)",
         1e3 / tm
     );
+    println!("feature_level: {}", r.level().name());
+    println!("gpu_ms(描画の発行 + glFinish): mean={gm:.2} p95={gp:.2}");
+    println!("pose_cpu_ms: mean={pm:.3} p95={pp:.3}(ノード階層の評価 + 関節行列 + UBO 転送)");
+    println!("spring_cpu_ms: mean={sm:.3} p95={sp:.3}");
     println!("morph_cpu_ms: mean={mm:.3} p95={mp:.3}(set_expression + 頂点の合成・転送)");
     println!(
         "process_cpu: {:.1}% (cpu {:.2}s / wall {:.2}s、{})",
@@ -278,13 +304,14 @@ fn run(a: &Args) -> Result<(), String> {
         }
         let depth = attach_depth(gl, size)?;
         let t0 = Instant::now();
-        let mut r = match Renderer::new(gl, model) {
+        let mut r = match Renderer::with_level(gl, model, a.level) {
             Ok(r) => r,
             Err(e) => {
                 detach_depth(gl, depth);
                 return Err(e);
             }
         };
+        r.outline_scale = a.outline_scale;
         // 計測の途中でエラーになっても、あとで destroy / detach_depth を通る
         let measured = measure(
             a,
