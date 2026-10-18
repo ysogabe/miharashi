@@ -82,8 +82,8 @@ fn parse_size(s: &str) -> Result<(u32, u32), String> {
     let (w, h) = s.split_once('x').ok_or("--size は 幅x高さ(例 2560x1080)")?;
     let w: u32 = w.parse().map_err(|_| "--size の幅が整数でない")?;
     let h: u32 = h.parse().map_err(|_| "--size の高さが整数でない")?;
-    if w < 64 || h < 64 || w > 8192 || h > 8192 || !w.is_multiple_of(2) || !h.is_multiple_of(2) {
-        return Err("--size は 64〜8192 の偶数(yuv420p のため)".into());
+    if w < 64 || h < 64 || w > 4096 || h > 4096 || !w.is_multiple_of(2) || !h.is_multiple_of(2) {
+        return Err("--size は 64〜4096 の偶数(yuv420p のため)".into());
     }
     Ok((w, h))
 }
@@ -850,8 +850,6 @@ fn record_run(a: &Args, assets: Assets, term: &AtomicBool) -> Result<(), String>
         text,
     } = assets;
     let wall = Instant::now();
-    // ffmpeg を起動した(出力ファイルに触り始めた)か。失敗時に残骸を消してよいかの判断に使う
-    let mut spawned = false;
     let result = off.with_target(size, |gl, fbo| -> Result<(u64, bool), String> {
         let mut vrm = init_vrm(gl, model, a, (rw, rh))?;
         // 仮想時刻の基準。以後の時刻は base + フレーム番号 / fps
@@ -869,7 +867,6 @@ fn record_run(a: &Args, assets: Assets, term: &AtomicBool) -> Result<(), String>
             }
         };
         let r = record::Sink::spawn(&settings).and_then(|sink| {
-            spawned = true;
             record_frames(
                 gl,
                 fbo,
@@ -891,17 +888,8 @@ fn record_run(a: &Args, assets: Assets, term: &AtomicBool) -> Result<(), String>
         unsafe { gl.finish() };
         r
     });
-    let (frames, interrupted) = match result.and_then(|r| r) {
-        Ok(v) => v,
-        Err(e) => {
-            // ffmpeg が書き始めたあとの失敗なら、途中までの壊れかけのファイルを残さない
-            // (起動前の失敗では、既にあったファイルに触っていないので消さない)
-            if spawned && out.exists() {
-                let _ = std::fs::remove_file(out);
-            }
-            return Err(e);
-        }
-    };
+    // 失敗したときの書きかけは Sink が一時ファイルごと消す(出力先には成功したときだけ移す)
+    let (frames, interrupted) = result.and_then(|r| r)?;
     let secs = wall.elapsed().as_secs_f64();
     eprintln!(
         "録画: {frames} フレーム({:.1}秒分)を {secs:.1}秒で書き出した{} -> {}({} バイト)",
