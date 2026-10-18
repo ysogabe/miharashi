@@ -15,6 +15,8 @@ miharashi-gpu = { path = "../miharashi-gpu", optional = true }
 # vrm-view(実モニターに出す bin)だけが使う(feature `view`)
 miharashi-linux = { path = "../miharashi-linux", optional = true }
 signal-hook = { version = "0.4.5", optional = true }
+# vrm-view の写真の置き方(写真画面と同じ photo_layout::plan を使う)
+miharashi-render = { path = "../miharashi-render", optional = true }
 
 [dev-dependencies]
 # GPU の試験(renders_and_morphs_on_gpu)が EGL の surfaceless コンテキストを作るのに使う
@@ -25,7 +27,7 @@ miharashi-gpu = { path = "../miharashi-gpu" }
 default = ["bench", "view"]
 bench = ["dep:miharashi-gpu", "dep:libc"]
 # vrm-view。DRM/KMS に直接出す(カードの選択に miharashi-linux、終了の signal に signal-hook)
-view = ["bench", "dep:miharashi-linux", "dep:signal-hook"]
+view = ["bench", "dep:miharashi-linux", "dep:signal-hook", "dep:miharashi-render"]
 
 [[bin]]
 name = "vrm-bench"

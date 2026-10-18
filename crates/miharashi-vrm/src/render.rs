@@ -1359,6 +1359,40 @@ mod camera_tests {
     }
 
     #[test]
+    fn bust_and_waist_frame_head_and_chest_in_left_region() {
+        // 身長 1.5m、頭のてっぺん 1.5m、胸 1.15m、腰 0.8m、肩幅 0.3m
+        let a = Anchors {
+            top: 1.5,
+            hips_y: 0.8,
+            chest_y: 1.15,
+            center_x: 0.0,
+            center_z: 0.0,
+            depth: 0.3,
+            shoulder_half: 0.15,
+            arm_reach: 0.55,
+        };
+        let size = Region::Left.rect((2560, 1080));
+        assert_eq!(size, (0, 0, 853, 1080));
+        let ndc = |f: Framing, p: [f32; 3]| {
+            let vp = a.camera(f, (size.2, size.3), 0.0).0;
+            let c: Vec<f32> = (0..4)
+                .map(|r| (0..4).map(|k| vp[k][r] * [p[0], p[1], p[2], 1.0][k]).sum())
+                .collect();
+            [c[0] / c[3], c[1] / c[3]]
+        };
+        // 頭のてっぺん(上に余白)、肩、バストの下端が領域に入る。腰より下は入らない
+        let top = ndc(Framing::Bust, [0.0, 1.5, 0.0]);
+        assert!(top[1] < 1.0 && top[1] > 0.6, "{top:?}");
+        for x in [-0.15, 0.15] {
+            assert!(ndc(Framing::Bust, [x, 1.3, 0.0])[0].abs() < 1.0);
+        }
+        assert!(ndc(Framing::Bust, [0.0, 1.15, 0.0])[1] > -1.0);
+        assert!(ndc(Framing::Bust, [0.0, 0.8, 0.0])[1] < -1.0);
+        assert!(ndc(Framing::Waist, [0.0, 0.85, 0.0])[1] > -1.0);
+        assert!(ndc(Framing::Waist, [0.0, 0.5, 0.0])[1] < -1.0);
+    }
+
+    #[test]
     fn standing_model_fits_ultrawide_screen_by_height() {
         // 身長 1.6m、肩幅 0.5m、奥行き 0.3m の全身
         let b = ([-0.25, 0.0, -0.15], [0.25, 1.6, 0.15]);

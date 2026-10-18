@@ -7,6 +7,8 @@ pub mod gesture;
 pub mod layer;
 pub mod math;
 pub mod model;
+#[cfg(feature = "view")]
+pub mod photo_stage;
 pub mod render;
 pub mod spring;
 pub mod synth;

@@ -231,7 +231,7 @@ impl GlesDisplay {
 
 /// `target`(画面なら None)に `frame` を合成し、`Compositor` が前提にする状態へ戻してから `f` に GL を貸し、
 /// 終わったらまた戻す。`present_frame_with` の本体(表示なしで試験できるよう分けてある)。
-pub(crate) fn draw_frame_with<R>(
+pub fn draw_frame_with<R>(
     comp: &mut Compositor,
     gl: &glow::Context,
     size: (u32, u32),

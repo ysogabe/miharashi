@@ -321,7 +321,7 @@ mod tests {
     /// 追加の描画なしのときと同じになること。
     #[test]
     fn offscreen_draw_frame_with_overlays_and_leaves_next_frame_intact() {
-        use crate::display::draw_frame_with;
+        use crate::draw_frame_with;
         let Ok(off) = Offscreen::open(Path::new("/dev/dri/renderD128")) else {
             eprintln!("GLES が使えないので skip");
             return;

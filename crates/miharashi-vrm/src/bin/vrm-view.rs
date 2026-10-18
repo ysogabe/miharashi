@@ -1,4 +1,6 @@
 //! `vrm-view`: VRM 1.0 モデルを実際のモニター(DRM/KMS)に表示する PoC(Issue #71 B の下調べ)。
+//! `--photos` で、写真画面と同じ GPU 経路の写真を背景に描き、その上の領域(`--region`)にバストアップなど
+//! (`--frame`)のキャラクターを重ねて、身振り(`--gesture`)と口パク(`--lipsync`)の負荷を測れる。
 //! キオスク(miharashi.service)とは DRM master を取り合うので、止めてから実行する。libseat は使わず、
 //! カードを直接 open する。終了(`--seconds` の経過、SIGINT/SIGTERM)で元の画面に戻る。
 //! モデルは利用条件を確認して各自で用意する(リポジトリには置かない)。`--synthetic` なら合成モデル。
@@ -6,16 +8,20 @@ use glow::HasContext;
 use miharashi_gpu::GlesDisplay;
 use miharashi_linux::drm_select::{self, CardSel, ModeSel};
 use miharashi_linux::sysinfo::SelfCpu;
+use miharashi_vrm::demo::FaceSet;
+use miharashi_vrm::photo_stage::{self, Slideshow};
 use miharashi_vrm::synth;
-use miharashi_vrm::{Level, Model, Renderer, attach_depth, demo};
+use miharashi_vrm::{Framing, Level, Model, Region, Renderer, VrmLayer, demo};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "使い方: vrm-view (--model <path.vrm> | --synthetic) [--card driver:amdgpu] [--connector auto] \
-[--mode preferred] [--seconds 60] [--expression blink] [--fps 30] [--feature-level spring] [--outline-scale 1]";
+[--mode preferred] [--seconds 60] [--expression blink] [--fps 30] [--feature-level spring] [--outline-scale 1] \
+[--frame full|waist|bust] [--region left|center|full] [--gesture] [--lipsync] \
+[--photos <dir|synthetic>] [--photo-interval 10] [--no-vrm]";
 
 /// fps などを標準エラーに出す間隔
 const STATS_EVERY: Duration = Duration::from_secs(5);
@@ -31,6 +37,15 @@ struct Args {
     fps: Option<f64>,
     level: Level,
     outline_scale: f32,
+    frame: Framing,
+    region: Region,
+    gesture: bool,
+    lipsync: bool,
+    /// 背景に写真を描く。`synthetic` か、JPEG の入ったディレクトリ(なければ合成写真)
+    photos: Option<String>,
+    photo_interval: f64,
+    /// キャラクターを描かず、写真だけを描く(VRM の上乗せを出すための基準)
+    no_vrm: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -44,6 +59,13 @@ fn parse_args() -> Result<Args, String> {
         fps: None,
         level: Level::Spring,
         outline_scale: 1.0,
+        frame: Framing::Full,
+        region: Region::Full,
+        gesture: false,
+        lipsync: false,
+        photos: None,
+        photo_interval: 10.0,
+        no_vrm: false,
     };
     let mut synthetic = false;
     let mut it = std::env::args().skip(1);
@@ -62,10 +84,27 @@ fn parse_args() -> Result<Args, String> {
             "--outline-scale" => {
                 a.outline_scale = value()?.parse().map_err(|_| "--outline-scale が数でない")?
             }
+            "--frame" => a.frame = Framing::parse(&value()?)?,
+            "--region" => a.region = Region::parse(&value()?)?,
+            "--gesture" => a.gesture = true,
+            "--lipsync" => a.lipsync = true,
+            "--photos" => a.photos = Some(value()?),
+            "--photo-interval" => {
+                a.photo_interval = value()?
+                    .parse()
+                    .map_err(|_| "--photo-interval が数でない")?
+            }
+            "--no-vrm" => a.no_vrm = true,
             _ => return Err(format!("不明な引数 {flag}\n{USAGE}")),
         }
     }
-    if a.model.is_none() && !synthetic {
+    if a.no_vrm && a.photos.is_none() {
+        return Err("--no-vrm は --photos と一緒に使う(写真だけを描く)".into());
+    }
+    if a.photo_interval.partial_cmp(&1.0).is_none_or(|o| o.is_lt()) {
+        return Err("--photo-interval は 1 以上の数".into());
+    }
+    if a.model.is_none() && !synthetic && !a.no_vrm {
         return Err(format!("--model か --synthetic が要る\n{USAGE}"));
     }
     if a.seconds.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
@@ -79,95 +118,66 @@ fn parse_args() -> Result<Args, String> {
     Ok(a)
 }
 
-/// 深度付きの描画先。既定の framebuffer には深度が無いので、ここに描いて blit で画面へ写す。
-struct Target {
-    fbo: glow::Framebuffer,
-    color: glow::Renderbuffer,
-    depth: glow::Renderbuffer,
-    size: (u32, u32),
+/// CPU 時間の内訳 [ms]の合計(窓ごと・全体)。
+#[derive(Default, Clone)]
+struct Sum {
+    frames: u32,
+    frame: Duration,
+    pose: f64,
+    spring: f64,
+    /// 表情の合成(`set_expressions` + 頂点の合成・転送)
+    face: f64,
+    /// 写真の合成(`Compositor::draw` の命令の発行まで。1 枚目の完成フレーム作りを含む)
+    photo_draw: f64,
+    /// VRM の描画命令の発行(層への描画と合成)
+    vrm_draw: f64,
+    /// 写真 1 枚ごとの「完成フレームを作る」CPU 時間
+    builds: Vec<f32>,
 }
 
-impl Target {
-    fn new(gl: &glow::Context, size: (u32, u32)) -> Result<Self, String> {
-        unsafe {
-            let fbo = gl.create_framebuffer()?;
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-            let color = match gl.create_renderbuffer() {
-                Ok(c) => c,
-                Err(e) => {
-                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                    gl.delete_framebuffer(fbo);
-                    return Err(e);
-                }
-            };
-            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(color));
-            gl.renderbuffer_storage(
-                glow::RENDERBUFFER,
-                glow::RGBA8,
-                size.0 as i32,
-                size.1 as i32,
-            );
-            gl.framebuffer_renderbuffer(
-                glow::FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::RENDERBUFFER,
-                Some(color),
-            );
-            // 深度は attach_depth(DEPTH24_STENCIL8)。不完全なら attach_depth がエラーを返す
-            match attach_depth(gl, size) {
-                Ok(depth) => {
-                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                    Ok(Self {
-                        fbo,
-                        color,
-                        depth,
-                        size,
-                    })
-                }
-                Err(e) => {
-                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                    gl.delete_renderbuffer(color);
-                    gl.delete_framebuffer(fbo);
-                    Err(e)
-                }
-            }
-        }
+impl Sum {
+    fn add(&mut self, o: &Sum) {
+        self.frames += o.frames;
+        self.frame += o.frame;
+        self.pose += o.pose;
+        self.spring += o.spring;
+        self.face += o.face;
+        self.photo_draw += o.photo_draw;
+        self.vrm_draw += o.vrm_draw;
+        self.builds.extend_from_slice(&o.builds);
     }
 
-    fn bind(&self, gl: &glow::Context) {
-        unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo)) };
+    fn line(&self, secs: f64, cpu: Option<f32>) -> String {
+        let n = self.frames.max(1) as f64;
+        let build = if self.builds.is_empty() {
+            "-".to_string()
+        } else {
+            format!(
+                "{}枚 平均{:.1}/最大{:.1}ms",
+                self.builds.len(),
+                self.builds.iter().sum::<f32>() / self.builds.len() as f32,
+                self.builds.iter().copied().fold(0.0, f32::max)
+            )
+        };
+        format!(
+            "{:.1} fps  frame {:.2}ms  cpu {}  | CPU/フレーム ms: pose {:.3} spring {:.3} face {:.3} photo {:.3} vrm_draw {:.3}  | 写真の準備 {build}",
+            self.frames as f64 / secs,
+            self.frame.as_secs_f64() * 1e3 / n,
+            cpu.map_or("-".into(), |c| format!("{c:.1}%")),
+            self.pose / n,
+            self.spring / n,
+            self.face / n,
+            self.photo_draw / n,
+            self.vrm_draw / n,
+        )
     }
+}
 
-    /// 描いた内容を既定の framebuffer(画面)へ写す。
-    fn blit_to_screen(&self, gl: &glow::Context) {
-        let (w, h) = (self.size.0 as i32, self.size.1 as i32);
-        unsafe {
-            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.fbo));
-            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
-            gl.blit_framebuffer(
-                0,
-                0,
-                w,
-                h,
-                0,
-                0,
-                w,
-                h,
-                glow::COLOR_BUFFER_BIT,
-                glow::NEAREST,
-            );
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        }
-    }
-
-    fn destroy(self, gl: &glow::Context) {
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            gl.delete_renderbuffer(self.depth);
-            gl.delete_renderbuffer(self.color);
-            gl.delete_framebuffer(self.fbo);
-        }
-    }
+/// VRM を描くのに要るもの(`--no-vrm` では持たない)。
+struct Vrm {
+    renderer: Renderer,
+    layer: VrmLayer,
+    faces: FaceSet,
 }
 
 fn run(a: &Args) -> Result<(), String> {
@@ -179,29 +189,56 @@ fn run(a: &Args) -> Result<(), String> {
         signal_hook::flag::register(sig, term.clone()).map_err(|e| format!("signal: {e}"))?;
     }
 
-    // モデルは画面を取る前に読む(読めなければキオスクの画面を触らずに終わる)
-    let t_load = Instant::now();
-    let model = match &a.model {
-        Some(p) => Model::from_path(p)?,
-        None => Model::from_glb(&synth::build_vrm_glb(&synth::Opts::default()))?,
+    // モデルと写真は画面を取る前に読む(読めなければキオスクの画面を触らずに終わる)
+    let model = if a.no_vrm {
+        None
+    } else {
+        let t_load = Instant::now();
+        let model = match &a.model {
+            Some(p) => Model::from_path(p)?,
+            None => Model::from_glb(&synth::build_vrm_glb(&synth::Opts::default()))?,
+        };
+        let st = model.stats();
+        eprintln!(
+            "model: {} (VRM {}) meshes={} vertices={} triangles={} textures={} morph_targets={} ({:.0}ms)",
+            a.model
+                .as_deref()
+                .map_or("synthetic".into(), |p| p.display().to_string()),
+            model.vrm.spec_version,
+            st.meshes,
+            st.vertices,
+            st.triangles,
+            st.images.len(),
+            st.morph_targets,
+            t_load.elapsed().as_secs_f64() * 1e3
+        );
+        if model.vrm.expression(&a.expression).is_none() {
+            return Err(format!("expression {} がない", a.expression));
+        }
+        if a.lipsync && FaceSet::of(&model.vrm).no_vowels() {
+            return Err("口パクに使う表情(aa/ih/ou/ee/oh)がモデルにない".into());
+        }
+        Some(model)
     };
-    let st = model.stats();
-    eprintln!(
-        "model: {} (VRM {}) meshes={} vertices={} triangles={} textures={} morph_targets={} ({:.0}ms)",
-        a.model
-            .as_deref()
-            .map_or("synthetic".into(), |p| p.display().to_string()),
-        model.vrm.spec_version,
-        st.meshes,
-        st.vertices,
-        st.triangles,
-        st.images.len(),
-        st.morph_targets,
-        t_load.elapsed().as_secs_f64() * 1e3
-    );
-    if model.vrm.expression(&a.expression).is_none() {
-        return Err(format!("expression {} がない", a.expression));
-    }
+    let photos = match &a.photos {
+        Some(p) => {
+            let t = Instant::now();
+            let dir = (p != "synthetic").then(|| Path::new(p));
+            let (imgs, jpegs) = photo_stage::load(dir)?;
+            eprintln!(
+                "photos: {}枚({}) {:.0}ms",
+                imgs.len(),
+                if jpegs == 0 {
+                    "合成写真".to_string()
+                } else {
+                    format!("JPEG {jpegs} 枚")
+                },
+                t.elapsed().as_secs_f64() * 1e3
+            );
+            Some(imgs)
+        }
+        None => None,
+    };
 
     // 表示先を決めて、カードを直接 open する
     let cards = drm_select::scan();
@@ -230,9 +267,19 @@ fn run(a: &Args) -> Result<(), String> {
         display.refresh(),
         display.describe()
     );
+    let (rx, ry, rw, rh) = a.region.rect(size);
+    eprintln!(
+        "composition: frame={} region={} ({rw}x{rh} at {rx},{ry}) gesture={} lipsync={} photos={} vrm={}",
+        a.frame.name(),
+        a.region.name(),
+        a.gesture,
+        a.lipsync,
+        a.photos.as_deref().unwrap_or("なし"),
+        if a.no_vrm { "なし" } else { "あり" },
+    );
 
     // GL の初期化(Renderer と描画先)
-    let init = display.with_gl(|gl, size| -> Result<(Renderer, Target), String> {
+    let init = display.with_gl(|gl, _| -> Result<Option<Vrm>, String> {
         unsafe {
             eprintln!(
                 "gl: GL_RENDERER={} GL_VERSION={}",
@@ -240,26 +287,53 @@ fn run(a: &Args) -> Result<(), String> {
                 gl.get_parameter_string(glow::VERSION)
             );
         }
-        let target = Target::new(gl, size)?;
+        let Some(model) = model else { return Ok(None) };
+        let faces = FaceSet::of(&model.vrm);
+        let layer = VrmLayer::new(gl, (rw, rh))?;
         match Renderer::with_level(gl, model, a.level) {
             Ok(mut r) => {
                 r.outline_scale = a.outline_scale;
-                Ok((r, target))
+                // 透明な層に描いて、写真(または暗い背景)に重ねる
+                r.clear_color = [0.0; 4];
+                if a.gesture {
+                    if let Err(e) = r.set_gesture(true) {
+                        r.destroy(gl);
+                        layer.destroy(gl);
+                        return Err(e);
+                    }
+                    let (arms, fingers) = r.rig().gesture_bones();
+                    eprintln!("gesture: 腕 {arms} 本、指の関節 {fingers} 個");
+                }
+                Ok(Some(Vrm {
+                    renderer: r,
+                    layer,
+                    faces,
+                }))
             }
             Err(e) => {
-                target.destroy(gl);
+                layer.destroy(gl);
                 Err(e)
             }
         }
     });
-    let (mut renderer, target) = init?;
+    let mut vrm = init?;
+    let mut show = photos.map(|imgs| {
+        Slideshow::new(
+            imgs,
+            size,
+            Duration::from_secs_f64(a.photo_interval),
+            Instant::now(),
+        )
+    });
 
     // 描画ループ。エラーでも後始末(destroy → GlesDisplay の drop)を通るよう、結果を持ち越す
-    let result = view_loop(a, &mut display, &mut renderer, &target, &term);
+    let result = view_loop(a, &mut display, vrm.as_mut(), show.as_mut(), &term);
 
     display.with_gl(|gl, _| {
-        renderer.destroy(gl);
-        target.destroy(gl);
+        if let Some(v) = vrm {
+            v.renderer.destroy(gl);
+            v.layer.destroy(gl);
+        }
         unsafe { gl.finish() };
     });
     // display の drop で元の CRTC に戻る
@@ -270,22 +344,30 @@ fn run(a: &Args) -> Result<(), String> {
 fn view_loop(
     a: &Args,
     display: &mut GlesDisplay,
-    renderer: &mut Renderer,
-    target: &Target,
+    mut vrm: Option<&mut Vrm>,
+    mut show: Option<&mut Slideshow>,
     term: &AtomicBool,
 ) -> Result<(), String> {
+    let size = display.size();
+    let (rx, ry, rw, rh) = a.region.rect(size);
+    // 全身・全画面・写真なし・身振りなしのときだけ、従来どおりカメラを左右に振る
+    let sway =
+        a.frame == Framing::Full && a.region == Region::Full && !a.gesture && a.photos.is_none();
     let start = Instant::now();
     let run_for = Duration::from_secs_f64(a.seconds);
     let mut cpu = SelfCpu::default();
+    let mut cpu_total = SelfCpu::default();
     cpu.poll(start);
+    cpu_total.poll(start);
     let mut next_stats = start + STATS_EVERY;
-    let (mut frames, mut busy) = (0u32, Duration::ZERO);
+    let (mut win, mut total) = (Sum::default(), Sum::default());
     let mut last = Instant::now();
     let mut total_frames = 0u64;
     let mut prev_t = 0.0f32;
+    let mut face: Vec<(&'static str, f32)> = Vec::new();
     while !term.load(Ordering::Relaxed) && start.elapsed() < run_for {
         if let Some(fps) = a.fps {
-            // 次のフレームの時刻まで待つ(遅れていれば待たない)。そのあと present_with が vsync を待つ
+            // 次のフレームの時刻まで待つ(遅れていれば待たない)。そのあと present が vsync を待つ
             let next = start + Duration::from_secs_f64(total_frames as f64 / fps);
             // SIGTERM に反応できるよう、100ms ずつに分けて待つ
             while !term.load(Ordering::Relaxed) {
@@ -295,43 +377,99 @@ fn view_loop(
                 std::thread::sleep(d.min(Duration::from_millis(100)));
             }
         }
-        let t = start.elapsed().as_secs_f32();
-        let t0 = Instant::now();
-        renderer.animate(t, t - prev_t);
+        let now = Instant::now();
+        let t = (now - start).as_secs_f32();
+        let t0 = now;
+        let mut sum = Sum::default();
+        if let Some(v) = vrm.as_deref_mut() {
+            v.renderer.animate(t, t - prev_t);
+            let f0 = Instant::now();
+            if a.lipsync {
+                // 口の母音・まばたき・笑顔を同時に合成する
+                demo::face(t, &v.faces, &mut face);
+                v.renderer.set_expressions(&face)?;
+            } else {
+                v.renderer
+                    .set_expression(&a.expression, demo::expression_weight(&a.expression, t))?;
+            }
+            sum.face = f0.elapsed().as_secs_f64() * 1e3;
+        }
         prev_t = t;
-        renderer.set_expression(&a.expression, demo::expression_weight(&a.expression, t))?;
-        let yaw = demo::camera_yaw(t);
-        // present_with が page flip の完了まで待つので、フレームの間隔は vsync でとれる
-        display.present_with(|gl, _| {
-            renderer.update(gl);
-            target.bind(gl);
-            renderer.render_yaw(gl, target.size, yaw);
-            target.blit_to_screen(gl);
-        })?;
-        busy += t0.elapsed();
-        frames += 1;
+        if let Some(s) = show.as_deref_mut() {
+            s.update(now);
+        }
+        let has_vrm = vrm.is_some();
+        let yaw = if sway { demo::camera_yaw(t) } else { 0.0 };
+        let enter = Instant::now();
+        // 層へ描いて、写真(または暗い背景)の上の領域に重ねる。GL を借りた中で測る
+        let mut draw_vrm = |gl: &glow::Context, sum: &mut Sum, with_bg: bool| {
+            let Some(v) = vrm.as_deref_mut() else { return };
+            let t1 = Instant::now();
+            let times = v.renderer.update(gl);
+            if with_bg {
+                unsafe {
+                    gl.clear_color(0.08, 0.09, 0.12, 1.0);
+                    gl.clear(glow::COLOR_BUFFER_BIT);
+                }
+            }
+            let cam = v.renderer.framing_camera(a.frame, (rw, rh), yaw);
+            v.layer.bind(gl);
+            v.renderer.render_camera(gl, (rw, rh), &cam.0, cam.1);
+            v.layer.composite(gl, None, (rx as i32, ry as i32));
+            sum.pose = times.pose_ms;
+            sum.spring = times.spring_ms;
+            sum.face += times.morph_ms;
+            sum.vrm_draw = t1.elapsed().as_secs_f64() * 1e3 - times.pose_ms - times.morph_ms;
+        };
+        // present が page flip の完了まで待つので、フレームの間隔は vsync でとれる
+        match show.as_deref() {
+            Some(s) => {
+                let frame = s.frame(now);
+                if has_vrm {
+                    display.present_frame_with(&frame, |gl, _| {
+                        sum.photo_draw = enter.elapsed().as_secs_f64() * 1e3;
+                        draw_vrm(gl, &mut sum, false);
+                    })?;
+                } else {
+                    display.present_frame(&frame)?;
+                    sum.photo_draw = enter.elapsed().as_secs_f64() * 1e3;
+                }
+            }
+            None => {
+                display.present_with(|gl, _| draw_vrm(gl, &mut sum, true))?;
+            }
+        }
+        if let Some(s) = show.as_deref_mut() {
+            s.mark_sent();
+        }
+        sum.builds = display.take_build_ms();
+        sum.frame = t0.elapsed();
+        sum.frames = 1;
+        win.add(&sum);
         total_frames += 1;
         let now = Instant::now();
         if now >= next_stats {
             let dt = now.duration_since(last).as_secs_f64();
-            eprintln!(
-                "{:.1} fps  frame {:.2}ms  cpu {}",
-                frames as f64 / dt,
-                busy.as_secs_f64() * 1e3 / frames as f64,
-                cpu.poll(now).map_or("-".into(), |c| format!("{c:.1}%"))
-            );
-            (frames, busy, last) = (0, Duration::ZERO, now);
+            eprintln!("{}", win.line(dt, cpu.poll(now)));
+            total.add(&win);
+            win = Sum::default();
+            last = now;
             next_stats = now + STATS_EVERY;
         }
     }
+    total.add(&win);
+    let secs = start.elapsed().as_secs_f64();
     eprintln!(
-        "終了: {total_frames} フレーム / {:.1}秒{}",
-        start.elapsed().as_secs_f64(),
+        "終了: {total_frames} フレーム / {secs:.1}秒{}",
         if term.load(Ordering::Relaxed) {
             "(シグナル)"
         } else {
             ""
         }
+    );
+    eprintln!(
+        "全体の平均: {}",
+        total.line(secs, cpu_total.poll(Instant::now()))
     );
     Ok(())
 }
