@@ -89,6 +89,7 @@ pub fn kiosk(
         text_engine(&cfg.ui.font),
         Duration::from_secs(cfg.alerts.show_minutes * 60),
     )
+    .with_gl_available(gpu_max.is_some())
     .with_provider(Box::new(feed));
     if let Some(shared) = agent_shared {
         m = m.with_provider(Box::new(crate::agents::AgentProvider::new(shared)));
@@ -112,6 +113,9 @@ pub fn kiosk(
 }
 
 use screens::agents::AgentScreen;
+
+#[cfg(test)]
+mod scene_tests;
 
 #[cfg(test)]
 mod tests {

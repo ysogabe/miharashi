@@ -3,10 +3,11 @@
 //! 状態ログは共通部分(t / rss / fds / frames / worst_frame)に `App::stats()` の `k=v` を続けて出す。
 use crate::config::Config;
 use crate::panel::{DisplayControl, DisplayStatus, Panel, PanelInput};
-use crate::screen::{App, Composite, KeyPress, PhotoData, PhotoRef};
+use crate::screen::{App, Composite, GlComposite, GlScene, KeyPress, PhotoData, PhotoRef, Top};
 use crate::screen_power::{Mode as PowerMode, ScreenPower};
 use miharashi_gpu::{
-    AgentGpuCard, Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, Radar, SourceImage,
+    AgentGpuCard, Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, Radar, SceneFrame,
+    SceneOutcome, SceneTop, SourceImage,
 };
 use miharashi_linux::drm_select::{self, CardSel, ModeSel};
 use miharashi_linux::input::{Action, Keys};
@@ -117,6 +118,113 @@ pub fn radar_layer<'a>(
     }
 }
 
+/// `Composite` を GPU の合成器の `Frame` にするとき、`Frame` が借りるもの(レーダーの点・Agent のカード)の置き場。
+/// `fill` で詰めてから `frame_of` / `scene_frame` に渡す。
+#[derive(Default)]
+pub struct FrameParts<'a> {
+    blips: Vec<[f32; 3]>,
+    cards: Vec<AgentGpuCard<'a>>,
+}
+
+impl<'a> FrameParts<'a> {
+    /// `comp`(`Gl` なら下地)の分を詰める。
+    pub fn fill(&mut self, comp: &Composite<'a>) {
+        match comp {
+            Composite::Radar { geom, .. } => self.blips = radar_blips(geom),
+            Composite::Agents { cards, .. } => {
+                self.cards.extend(cards.iter().map(|c| AgentGpuCard {
+                    id: c.id,
+                    revision: c.revision,
+                    pixels: c.surface.data(),
+                    size: (c.surface.width(), c.surface.height()),
+                    rect: (c.pose.x, c.pose.y, c.pose.width, c.pose.height),
+                    alpha: c.pose.alpha,
+                }));
+            }
+            Composite::Gl(g) => {
+                if let Some(base) = &g.base {
+                    self.fill(base);
+                }
+            }
+            Composite::Canvas | Composite::Photo { .. } => {}
+        }
+    }
+}
+
+/// `Gl` 以外の `Composite` を GPU の合成器の `Frame` にする(`Gl` は None)。`canvas` は、完成画面か、
+/// 写真の重ね絵・レーダーやカードの背景を描いたもの。
+pub fn frame_of<'a>(
+    comp: &Composite<'a>,
+    canvas: &'a Canvas,
+    parts: &'a FrameParts<'a>,
+) -> Option<Frame<'a>> {
+    let h = canvas.height();
+    Some(match comp {
+        Composite::Canvas => Frame::Image(canvas.pixmap.data()),
+        Composite::Photo {
+            photo,
+            old,
+            overlay_changed,
+        } => Frame::Photo {
+            photo: photo_layer(*photo, h),
+            old: old.map(|(p, t)| (photo_layer(p, h), t)),
+            overlay: overlay_changed.then(|| canvas.pixmap.data()),
+        },
+        Composite::Radar {
+            background_changed,
+            geom,
+            sweep,
+        } => Frame::Radar {
+            background: background_changed.then(|| canvas.pixmap.data()),
+            radar: radar_layer(geom, *sweep, aircraft::TRAIL, h, &parts.blips),
+        },
+        Composite::Agents {
+            background_changed,
+            scrim_alpha,
+            focus_card_id,
+            ..
+        } => Frame::Agents {
+            background: background_changed.then(|| canvas.pixmap.data()),
+            cards: &parts.cards,
+            scrim_alpha: *scrim_alpha,
+            focus_card_id: *focus_card_id,
+        },
+        Composite::Gl(_) => return None,
+    })
+}
+
+/// `Composite::Gl` を GPU の `present_scene` の入力にする。下地は `frame_of` で `Frame` にする。
+/// `Gl` の入れ子は呼び出し側の誤り: `debug_assert!` で検出し、リリースでは領域を空にして
+/// `present_scene` の失敗(その場面の `release` と、3D 抜きでの完成)として扱う(`Err` で実行ループを抜けない)。
+pub fn scene_frame<'a>(
+    g: GlComposite<'a>,
+    canvas: &'a Canvas,
+    parts: &'a FrameParts<'a>,
+) -> SceneFrame<'a> {
+    let GlComposite {
+        base,
+        scene,
+        mut region,
+        top,
+    } = g;
+    let base = base.as_deref();
+    if base.is_some_and(|b| matches!(b, Composite::Gl(_))) {
+        debug_assert!(false, "Composite::Gl の base に Gl は入れられない");
+        region.w = 0;
+        region.h = 0;
+    }
+    SceneFrame {
+        base: base.and_then(|b| frame_of(b, canvas, parts)),
+        scene,
+        region,
+        top: match top {
+            Top::Off => SceneTop::Off,
+            Top::Keep => SceneTop::Keep,
+            Top::Upload(p) => SceneTop::Upload(p.data()),
+        },
+    }
+}
+
 /// 表示経路。CPU は Canvas を dumb buffer へ変換コピーし、GLES は表示カードの GPU で
 /// テクスチャとして描いて page flip する(PoC-005 PR2。見た目は同じ)。
 // 1 つしか作らないので、variant の大きさの差(glow のコンテキストが約 6KB)は気にしない
@@ -216,58 +324,39 @@ impl Presenter {
                 Ok((ms(t0, t1), ms(t1, Instant::now())))
             }
             Self::Gles(d) => {
-                let h = canvas.height();
                 let comp = app.render_composite(canvas);
                 let t1 = Instant::now();
-                let blips = match &comp {
-                    Composite::Radar { geom, .. } => radar_blips(geom),
-                    _ => Vec::new(),
-                };
-                let mut agent_gpu_cards = Vec::new();
-                let frame = match comp {
-                    Composite::Canvas => Frame::Image(canvas.pixmap.data()),
-                    Composite::Photo {
-                        photo,
-                        old,
-                        overlay_changed,
-                    } => Frame::Photo {
-                        photo: photo_layer(photo, h),
-                        old: old.map(|(p, t)| (photo_layer(p, h), t)),
-                        overlay: overlay_changed.then(|| canvas.pixmap.data()),
-                    },
-                    Composite::Radar {
-                        background_changed,
-                        geom,
-                        sweep,
-                    } => Frame::Radar {
-                        background: background_changed.then(|| canvas.pixmap.data()),
-                        radar: radar_layer(&geom, sweep, aircraft::TRAIL, h, &blips),
-                    },
-                    Composite::Agents {
-                        background_changed,
-                        cards,
-                        scrim_alpha,
-                        focus_card_id,
-                    } => {
-                        agent_gpu_cards.extend(cards.iter().map(|c| AgentGpuCard {
-                            id: c.id,
-                            revision: c.revision,
-                            pixels: c.surface.data(),
-                            size: (c.surface.width(), c.surface.height()),
-                            rect: (c.pose.x, c.pose.y, c.pose.width, c.pose.height),
-                            alpha: c.pose.alpha,
-                        }));
-                        Frame::Agents {
-                            background: background_changed.then(|| canvas.pixmap.data()),
-                            cards: &agent_gpu_cards,
-                            scrim_alpha,
-                            focus_card_id,
+                let mut parts = FrameParts::default();
+                parts.fill(&comp);
+                // 3D の失敗は `Err` でなく `SceneFailed`(表示は続く)。`comp` が `app` を借りているので、報告は借用が終わってから
+                let failed = match comp {
+                    Composite::Gl(g) => {
+                        let mut frame = scene_frame(g, canvas, &parts);
+                        match d.present_scene(&mut frame)? {
+                            SceneOutcome::Drawn => None,
+                            SceneOutcome::SceneFailed(msg) => Some(msg),
                         }
                     }
+                    other => {
+                        let frame = frame_of(&other, canvas, &parts).expect("Gl 以外");
+                        d.present_frame(&frame)?;
+                        None
+                    }
                 };
-                d.present_frame(&frame)?;
-                Ok((ms(t0, t1), ms(t1, Instant::now())))
+                let times = (ms(t0, t1), ms(t1, Instant::now()));
+                if let Some(msg) = failed {
+                    app.report_scene_failure(&msg);
+                }
+                Ok(times)
             }
+        }
+    }
+
+    /// 持っている `GlScene` を、GL が使えるうちに解放する(終了時。`drop` の前に呼ぶ)。CPU 経路は何もしない。
+    fn release_scenes(&mut self, scenes: &mut [&mut dyn GlScene]) -> Vec<String> {
+        match self {
+            Self::Cpu(_) => Vec::new(),
+            Self::Gles(d) => d.release_scenes(scenes),
         }
     }
 }
@@ -619,6 +708,10 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     // 消したまま終わると、元のコンソールも見えなくなる
     if !screen_on && session.is_enabled() {
         let _ = display.set_power(true);
+    }
+    // 3D の GL オブジェクトは、表示を閉じる前に(GL が使えるうちに)消す
+    for panic in display.release_scenes(&mut app.gl_scenes()) {
+        eprintln!("3D: release が panic した: {panic}");
     }
     // 表示(元の CRTC を復元)→ 入力 → デバイスの順に解放する。VT は VtGuard が TEXT に戻す。
     drop(display);

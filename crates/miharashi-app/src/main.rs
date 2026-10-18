@@ -18,6 +18,7 @@ mod photos;
 mod quake;
 #[cfg(target_os = "linux")]
 mod runtime;
+mod scene_check;
 mod screen;
 mod screen_power;
 mod weather;
@@ -373,8 +374,17 @@ fn png(cli: Cli) -> Result<(), String> {
         save(&c, Layers::Image, name)?;
     }
     agent_png_fixtures(&out, size, &mut text)?;
+    // 3D だけの画面(試験用の場面)。GL が使えない(renderer = cpu や GPU なし)ときは案内の 1 枚になる
+    let mut notice = scene_manager(&cfg, true, scene_check::Base::None, false);
+    notice.render(&mut c);
+    c.save_png(&out.join("scene-notice.png"))?;
+    // GLES 経路では、3D の画面を ScreenManager → `Composite::Gl` → `present_scene` の同じ経路で描く
+    #[cfg(target_os = "linux")]
+    if let Some(check) = gles.as_mut() {
+        scene_gles_fixtures(check, &cfg, size, &out)?;
+    }
     println!(
-        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,room,room-offline,room-empty,refresh-glitch,refresh-return,agents-overview,agents-busy,agents-new-*,agents-changed-*,agents-stale,agents-empty}}.png ({}x{})",
+        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,room,room-offline,room-empty,refresh-glitch,refresh-return,scene-notice,agents-overview,agents-busy,agents-new-*,agents-changed-*,agents-stale,agents-empty}}.png ({}x{})",
         out.display(),
         size.0,
         size.1
@@ -413,6 +423,67 @@ fn agent_png_fixtures(
     agent_demo::write_fixtures(out, size, text, 30)
 }
 
+/// 試験用の 3D 画面(`scene_check::CheckScreen`)だけを登録した ScreenManager。`png` の fixture 用。
+/// `gl` は GL が使えるものとして扱うか。`gl_only` は 3D だけの画面(GL が使えないときは案内)にするか。
+fn scene_manager(
+    cfg: &Config,
+    gl_only: bool,
+    base: scene_check::Base,
+    gl: bool,
+) -> app::manager::ScreenManager {
+    let screen = scene_check::CheckScreen::new("check", gl_only, base, Default::default());
+    app::manager::ScreenManager::new(
+        vec![Box::new(screen)],
+        "check",
+        Box::new(data::DummyData::new()),
+        data::dummy_snapshot(0.0),
+        app::text_engine(&cfg.ui.font),
+        std::time::Duration::from_secs(60),
+    )
+    .with_gl_available(gl)
+}
+
+/// `png --renderer gles|auto`: 3D の画面を GLES で描いた `scene-gles.png`(3D だけ)、`scene-base-gles.png`
+/// (下地つき)、`scene-alert-gles.png`(下地つきでアラートを 3D の上に重ねたもの)を保存する。
+/// 3D は CPU の画像と画素比較できない(CPU 版がない)ので、差は出さない。
+#[cfg(target_os = "linux")]
+fn scene_gles_fixtures(
+    check: &mut GlesCheck,
+    cfg: &Config,
+    size: (u32, u32),
+    out: &std::path::Path,
+) -> Result<(), String> {
+    use crate::screen::Composite;
+    use scene_check::Base;
+    for (name, gl_only, base, alert) in [
+        ("scene", true, Base::None, false),
+        ("scene-base", false, Base::Canvas, false),
+        ("scene-alert", false, Base::Canvas, true),
+    ] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut mgr = scene_manager(cfg, gl_only, base, true).with_alerts(Some(rx));
+        if alert {
+            tx.send(miharashi_render::alert::AlertView::Quake(quake::demo_view()))
+                .map_err(|e| e.to_string())?;
+            mgr.tick(std::time::Instant::now());
+        }
+        let mut c = Canvas::new(size.0, size.1);
+        let comp = mgr.render_composite(&mut c);
+        let mut parts = runtime::FrameParts::default();
+        parts.fill(&comp);
+        let Composite::Gl(g) = comp else {
+            return Err("試験用の 3D 画面が Composite::Gl を返さない".into());
+        };
+        let frame = runtime::scene_frame(g, &c, &parts);
+        check(
+            &c,
+            Layers::Scene(frame),
+            &out.join(format!("{name}-gles.png")),
+        )?;
+    }
+    Ok(())
+}
+
 /// `png --renderer gles|auto` の検証。GLES 経路(表示と同じ合成器)で表示カードの render node に
 /// 描いて読み戻し、`*-gles.png` に保存して CPU の画像との差を出す。`layers` が Some なら
 /// (写真のフレーム, 重ね絵)を GPU で合成し、None なら CPU の完成画面をそのまま描く。
@@ -427,6 +498,9 @@ enum Layers<'a> {
     /// (背景, レーダー, 残光の長さ)。回る線は CPU と同じ `STILL_SWEEP` の角度で描く。
     /// 線と点は CPU と描き方が違う(GPU は光のにじみを計算する)ので、差は大きく出る
     Radar(&'a Canvas, &'a air::RadarGeom, f32),
+    /// 3D の画面(下地 → 3D → アラート)。CPU の画像がないので、画素比較はしない
+    #[cfg(target_os = "linux")]
+    Scene(miharashi_gpu::SceneFrame<'a>),
 }
 
 #[cfg(target_os = "linux")]
@@ -446,8 +520,23 @@ fn gles_checker(cfg: &Config, asked: bool) -> Result<Option<GlesCheck>, String> 
     println!("gles: {} ({})", node.display(), off.describe());
     Ok(Some(Box::new(
         move |c: &Canvas, layers, path: &std::path::Path| {
-            use miharashi_gpu::Frame;
+            use miharashi_gpu::{Frame, SceneOutcome};
             let (w, h) = (c.width(), c.height());
+            let layers = match layers {
+                Layers::Scene(mut frame) => {
+                    let (outcome, got) = off.render_scene(&mut frame, (w, h))?;
+                    if let SceneOutcome::SceneFailed(msg) = outcome {
+                        return Err(format!("{}: 3D の描画に失敗: {msg}", path.display()));
+                    }
+                    image::RgbaImage::from_raw(w, h, got)
+                        .ok_or("読み戻した画像の大きさが違う")?
+                        .save(path)
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    println!("gles: {} 3D を描いた", path.display());
+                    return Ok(());
+                }
+                other => other,
+            };
             let blips = match &layers {
                 Layers::Radar(_, g, _) => runtime::radar_blips(g),
                 _ => Vec::new(),
@@ -463,6 +552,7 @@ fn gles_checker(cfg: &Config, asked: bool) -> Result<Option<GlesCheck>, String> 
                     background: Some(bg.pixmap.data()),
                     radar: runtime::radar_layer(g, air::STILL_SWEEP, trail, h, &blips),
                 },
+                Layers::Scene(_) => unreachable!("上で扱った"),
             };
             let got = off.render_frames(&[frame], (w, h))?;
             let (over, max) = miharashi_gpu::diff_rgb(c.pixmap.data(), &got, 0);

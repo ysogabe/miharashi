@@ -1121,7 +1121,9 @@ name = "miharashi-app"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "glow",
  "image",
+ "miharashi-glscene",
  "miharashi-gpu",
  "miharashi-linux",
  "miharashi-render",
