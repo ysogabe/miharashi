@@ -10,6 +10,6 @@ pub mod photo;
 pub mod video;
 
 pub use compose::{AgentGpuCard, Frame, PhotoLayer, PhotoSource, RADAR_BLIPS, Radar};
-pub use display::{GlesDisplay, draw_frame_with};
-pub use offscreen::{Offscreen, diff_rgb, render_node_for_pci};
+pub use display::{GlesDisplay, draw_frame_with, draw_with};
+pub use offscreen::{Offscreen, diff_rgb, read_rgba_top_down, render_node_for_pci};
 pub use photo::{Placement, SourceImage};

@@ -6,14 +6,19 @@
 //! キオスク(miharashi.service)とは DRM master を取り合うので、止めてから実行する。libseat は使わず、
 //! カードを直接 open する。終了(`--seconds` の経過、SIGINT/SIGTERM)で元の画面に戻る。
 //! モデルは利用条件を確認して各自で用意する(リポジトリには置かない)。`--synthetic` なら合成モデル。
+//! `--record <out.mp4>` を付けると、実モニター(DRM/KMS)を使わず、render node のオフスクリーンに同じ場面を
+//! 固定刻み(1/`--fps` 秒)で描いて `ffmpeg` で動画にする(紹介動画やレビュー用。キオスクを止めなくてよい)。
+//! この録画モードの値は計測に使わない。
 use glow::HasContext;
-use miharashi_gpu::GlesDisplay;
+use miharashi_gpu::compose::Compositor;
+use miharashi_gpu::{GlesDisplay, Offscreen};
 use miharashi_linux::drm_select::{self, CardSel, ModeSel};
 use miharashi_linux::sysinfo::SelfCpu;
 use miharashi_render::TextEngine;
 use miharashi_vrm::agent_stage::{AgentStage, AimTracker, StageStats};
 use miharashi_vrm::demo::FaceSet;
 use miharashi_vrm::photo_stage::{self, Slideshow};
+use miharashi_vrm::record::{self, Codec};
 use miharashi_vrm::synth;
 use miharashi_vrm::{Framing, Level, Model, Region, Renderer, VrmLayer, demo};
 use std::os::unix::fs::OpenOptionsExt;
@@ -26,7 +31,8 @@ const USAGE: &str = "使い方: vrm-view (--model <path.vrm> | --synthetic) [--c
 [--mode preferred] [--seconds 60] [--expression blink] [--fps 30] [--feature-level spring] [--outline-scale 1] \
 [--frame full|waist|bust] [--region left|center|right|full] [--gesture] [--lipsync] \
 [--photos <dir|synthetic>] [--photo-interval 10] \
-[--agents [--cards 8] [--card-interval 6] [--follow-cards]] [--no-vrm]";
+[--agents [--cards 8] [--card-interval 6] [--follow-cards]] [--no-vrm] \
+[--record <out.mp4> [--size 2560x1080] [--pci 0000:10:00.0] [--record-codec libx264|h264_vaapi] [--record-overwrite]]";
 
 /// fps などを標準エラーに出す間隔
 const STATS_EVERY: Duration = Duration::from_secs(5);
@@ -59,6 +65,27 @@ struct Args {
     card_interval: f64,
     /// フォーカスが移ったカードの方へ視線と指さしを向ける
     follow_cards: bool,
+    /// 実モニターを使わず、この動画ファイルに書き出す(オフライン描画。`--fps` の既定は 30)
+    record: Option<PathBuf>,
+    /// 録画の画面の大きさ
+    size: (u32, u32),
+    /// 録画で描く GPU の PCI アドレス(render node)
+    pci: String,
+    record_codec: Codec,
+    record_overwrite: bool,
+    /// `--size` `--pci` `--record-codec` `--record-overwrite` のどれかが指定された(`--record` なしでは誤り)
+    record_opts: bool,
+}
+
+/// "2560x1080" を (幅, 高さ) にする。
+fn parse_size(s: &str) -> Result<(u32, u32), String> {
+    let (w, h) = s.split_once('x').ok_or("--size は 幅x高さ(例 2560x1080)")?;
+    let w: u32 = w.parse().map_err(|_| "--size の幅が整数でない")?;
+    let h: u32 = h.parse().map_err(|_| "--size の高さが整数でない")?;
+    if w < 64 || h < 64 || w > 4096 || h > 4096 || !w.is_multiple_of(2) || !h.is_multiple_of(2) {
+        return Err("--size は 64〜4096 の偶数(yuv420p のため)".into());
+    }
+    Ok((w, h))
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -83,6 +110,12 @@ fn parse_args() -> Result<Args, String> {
         cards: 8,
         card_interval: 6.0,
         follow_cards: false,
+        record: None,
+        size: (2560, 1080),
+        pci: "0000:10:00.0".into(),
+        record_codec: Codec::X264,
+        record_overwrite: false,
+        record_opts: false,
     };
     let mut synthetic = false;
     let mut it = std::env::args().skip(1);
@@ -118,6 +151,23 @@ fn parse_args() -> Result<Args, String> {
                 a.card_interval = value()?.parse().map_err(|_| "--card-interval が数でない")?
             }
             "--follow-cards" => a.follow_cards = true,
+            "--record" => a.record = Some(value()?.into()),
+            "--size" => {
+                a.size = parse_size(&value()?)?;
+                a.record_opts = true;
+            }
+            "--pci" => {
+                a.pci = value()?;
+                a.record_opts = true;
+            }
+            "--record-codec" => {
+                a.record_codec = Codec::parse(&value()?)?;
+                a.record_opts = true;
+            }
+            "--record-overwrite" => {
+                a.record_overwrite = true;
+                a.record_opts = true;
+            }
             _ => return Err(format!("不明な引数 {flag}\n{USAGE}")),
         }
     }
@@ -154,6 +204,14 @@ fn parse_args() -> Result<Args, String> {
         .is_some_and(|f| f.partial_cmp(&1.0).is_none_or(|o| o.is_lt()))
     {
         return Err("--fps は 1 以上の数".into());
+    }
+    if a.record.is_none() && a.record_opts {
+        return Err(
+            "--size / --pci / --record-codec / --record-overwrite は --record と一緒に使う".into(),
+        );
+    }
+    if a.record.is_some() && a.fps.is_some_and(|f| f > 240.0) {
+        return Err("--fps は 240 以下(録画)".into());
     }
     Ok(a)
 }
@@ -263,16 +321,14 @@ fn head_fraction(frame: Framing) -> f32 {
     }
 }
 
-fn run(a: &Args) -> Result<(), String> {
-    let term = Arc::new(AtomicBool::new(false));
-    // 1 回目はフラグで正常終了(画面を元に戻す)、2 回目は即終了。条件付きの登録を先にすること
-    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
-        signal_hook::flag::register_conditional_shutdown(sig, 128 + sig, term.clone())
-            .map_err(|e| format!("signal: {e}"))?;
-        signal_hook::flag::register(sig, term.clone()).map_err(|e| format!("signal: {e}"))?;
-    }
+/// 画面(または録画)を始める前に読むもの。
+struct Assets {
+    model: Option<Model>,
+    photos: Option<Vec<image::RgbImage>>,
+    text: Option<Box<TextEngine>>,
+}
 
-    // モデルと写真は画面を取る前に読む(読めなければキオスクの画面を触らずに終わる)
+fn load_assets(a: &Args) -> Result<Assets, String> {
     let model = if a.no_vrm {
         None
     } else {
@@ -325,6 +381,129 @@ fn run(a: &Args) -> Result<(), String> {
     let text = a
         .agents
         .then(|| Box::new(TextEngine::new("Noto Sans CJK JP")));
+    Ok(Assets {
+        model,
+        photos,
+        text,
+    })
+}
+
+/// VRM を描く Renderer と、領域の大きさの層を作る(`--no-vrm` なら None)。失敗したら作った分は消す。
+fn init_vrm(
+    gl: &glow::Context,
+    model: Option<Model>,
+    a: &Args,
+    region_size: (u32, u32),
+) -> Result<Option<Vrm>, String> {
+    unsafe {
+        eprintln!(
+            "gl: GL_RENDERER={} GL_VERSION={}",
+            gl.get_parameter_string(glow::RENDERER),
+            gl.get_parameter_string(glow::VERSION)
+        );
+    }
+    let Some(model) = model else { return Ok(None) };
+    let faces = FaceSet::of(&model.vrm);
+    let layer = VrmLayer::new(gl, region_size)?;
+    match Renderer::with_level(gl, model, a.level) {
+        Ok(mut r) => {
+            r.outline_scale = a.outline_scale;
+            // 透明な層に描いて、写真(または暗い背景)に重ねる
+            r.clear_color = [0.0; 4];
+            if a.gesture {
+                if let Err(e) = r.set_gesture(true) {
+                    r.destroy(gl);
+                    layer.destroy(gl);
+                    return Err(e);
+                }
+                let (arms, fingers) = r.rig().gesture_bones();
+                eprintln!("gesture: 腕 {arms} 本、指の関節 {fingers} 個");
+            }
+            Ok(Some(Vrm {
+                renderer: r,
+                layer,
+                faces,
+            }))
+        }
+        Err(e) => {
+            layer.destroy(gl);
+            Err(e)
+        }
+    }
+}
+
+fn make_backdrop(
+    a: &Args,
+    photos: Option<Vec<image::RgbImage>>,
+    text: Option<Box<TextEngine>>,
+    size: (u32, u32),
+    now0: Instant,
+) -> Backdrop {
+    match (photos, text) {
+        (Some(imgs), _) => Backdrop::Photo(Box::new(Slideshow::new(
+            imgs,
+            size,
+            Duration::from_secs_f64(a.photo_interval),
+            now0,
+        ))),
+        (None, Some(text)) => {
+            let stage = AgentStage::new(
+                size,
+                a.cards,
+                Duration::from_secs_f64(a.card_interval),
+                now0,
+            );
+            Backdrop::Agents(Box::new(stage), text)
+        }
+        (None, None) => Backdrop::None,
+    }
+}
+
+/// Agent 画面なら、配置を一度決めて、キャラクターの領域(`rx, ry, rw, rh`)との重なりを知らせる。
+fn report_agents(a: &Args, backdrop: &mut Backdrop, now0: Instant, rect: (u32, u32, u32, u32)) {
+    let (rx, ry, rw, rh) = rect;
+    if let Backdrop::Agents(stage, text) = backdrop {
+        stage.update(now0, text);
+        let region = (rx as f32, ry as f32, rw as f32, rh as f32);
+        let (any, half, all) = stage.overlap(region);
+        let f = stage.focus_rect();
+        let ov = ((region.0 + region.2).min(f.0 + f.2) - region.0.max(f.0)).max(0.0);
+        eprintln!(
+            "agents: カード {all} 枚 / プロジェクト {} 個。領域 {} と重なるカード {any} 枚(半分以上隠れる {half} 枚)、\
+拡大カード {:.0},{:.0} {:.0}x{:.0}(領域と重なる幅 {ov:.0}px)",
+            stage.project_count(),
+            a.region.name(),
+            f.0,
+            f.1,
+            f.2,
+            f.3,
+        );
+    }
+}
+
+fn run(a: &Args) -> Result<(), String> {
+    let term = Arc::new(AtomicBool::new(false));
+    // 1 回目はフラグで正常終了(画面を元に戻す)、2 回目は即終了。条件付きの登録を先にすること
+    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        signal_hook::flag::register_conditional_shutdown(sig, 128 + sig, term.clone())
+            .map_err(|e| format!("signal: {e}"))?;
+        signal_hook::flag::register(sig, term.clone()).map_err(|e| format!("signal: {e}"))?;
+    }
+
+    // 録画の出力先は、重いモデルの読み込みの前に確かめる(既存ファイルなどはすぐ分かるように)
+    if let Some(out) = &a.record {
+        record::check_output(out, a.record_overwrite)?;
+    }
+    // モデルと写真は画面を取る前に読む(読めなければキオスクの画面を触らずに終わる)
+    let assets = load_assets(a)?;
+    if a.record.is_some() {
+        return record_run(a, assets, &term);
+    }
+    let Assets {
+        model,
+        photos,
+        text,
+    } = assets;
 
     // 表示先を決めて、カードを直接 open する
     let cards = drm_select::scan();
@@ -371,81 +550,11 @@ fn run(a: &Args) -> Result<(), String> {
     );
 
     // GL の初期化(Renderer と描画先)
-    let init = display.with_gl(|gl, _| -> Result<Option<Vrm>, String> {
-        unsafe {
-            eprintln!(
-                "gl: GL_RENDERER={} GL_VERSION={}",
-                gl.get_parameter_string(glow::RENDERER),
-                gl.get_parameter_string(glow::VERSION)
-            );
-        }
-        let Some(model) = model else { return Ok(None) };
-        let faces = FaceSet::of(&model.vrm);
-        let layer = VrmLayer::new(gl, (rw, rh))?;
-        match Renderer::with_level(gl, model, a.level) {
-            Ok(mut r) => {
-                r.outline_scale = a.outline_scale;
-                // 透明な層に描いて、写真(または暗い背景)に重ねる
-                r.clear_color = [0.0; 4];
-                if a.gesture {
-                    if let Err(e) = r.set_gesture(true) {
-                        r.destroy(gl);
-                        layer.destroy(gl);
-                        return Err(e);
-                    }
-                    let (arms, fingers) = r.rig().gesture_bones();
-                    eprintln!("gesture: 腕 {arms} 本、指の関節 {fingers} 個");
-                }
-                Ok(Some(Vrm {
-                    renderer: r,
-                    layer,
-                    faces,
-                }))
-            }
-            Err(e) => {
-                layer.destroy(gl);
-                Err(e)
-            }
-        }
-    });
+    let init = display.with_gl(|gl, _| init_vrm(gl, model, a, (rw, rh)));
     let mut vrm = init?;
     let now0 = Instant::now();
-    let mut backdrop = match (photos, text) {
-        (Some(imgs), _) => Backdrop::Photo(Box::new(Slideshow::new(
-            imgs,
-            size,
-            Duration::from_secs_f64(a.photo_interval),
-            now0,
-        ))),
-        (None, Some(text)) => {
-            let stage = AgentStage::new(
-                size,
-                a.cards,
-                Duration::from_secs_f64(a.card_interval),
-                now0,
-            );
-            Backdrop::Agents(Box::new(stage), text)
-        }
-        (None, None) => Backdrop::None,
-    };
-    if let Backdrop::Agents(stage, text) = &mut backdrop {
-        // 配置を一度決めて、キャラクターの領域との重なりを知らせる
-        stage.update(now0, text);
-        let region = (rx as f32, ry as f32, rw as f32, rh as f32);
-        let (any, half, all) = stage.overlap(region);
-        let f = stage.focus_rect();
-        let ov = ((region.0 + region.2).min(f.0 + f.2) - region.0.max(f.0)).max(0.0);
-        eprintln!(
-            "agents: カード {all} 枚 / プロジェクト {} 個。領域 {} と重なるカード {any} 枚(半分以上隠れる {half} 枚)、\
-拡大カード {:.0},{:.0} {:.0}x{:.0}(領域と重なる幅 {ov:.0}px)",
-            stage.project_count(),
-            a.region.name(),
-            f.0,
-            f.1,
-            f.2,
-            f.3,
-        );
-    }
+    let mut backdrop = make_backdrop(a, photos, text, size, now0);
+    report_agents(a, &mut backdrop, now0, (rx, ry, rw, rh));
 
     // 描画ループ。エラーでも後始末(destroy → GlesDisplay の drop)を通るよう、結果を持ち越す
     let result = view_loop(a, &mut display, vrm.as_mut(), &mut backdrop, &term);
@@ -462,6 +571,98 @@ fn run(a: &Args) -> Result<(), String> {
     result
 }
 
+/// 構図から決まる、領域と視線・指さしの起点。
+struct Geom {
+    /// キャラクターの領域(画素。左下原点の `Region::rect`)
+    rect: (u32, u32, u32, u32),
+    /// 視線と指さしの起点(頭の画面上の位置)
+    head: (f32, f32),
+    /// 画面の面までの仮想の距離
+    depth: f32,
+    /// 全身・全画面・背景なし・身振りなしのときだけ、従来どおりカメラを左右に振る
+    sway: bool,
+}
+
+fn geom(a: &Args, size: (u32, u32), backdrop: &Backdrop) -> Geom {
+    let rect = a.region.rect(size);
+    let (rx, ry, rw, rh) = rect;
+    Geom {
+        rect,
+        head: (
+            rx as f32 + rw as f32 / 2.0,
+            ry as f32 + rh as f32 * head_fraction(a.frame),
+        ),
+        depth: size.1 as f32 * 0.5,
+        sway: a.frame == Framing::Full
+            && a.region == Region::Full
+            && !a.gesture
+            && matches!(backdrop, Backdrop::None),
+    }
+}
+
+/// 時刻 `t` [秒](`now` はその時刻の `Instant`)に、視線と指さし・身振り・SpringBone を進める。
+fn pose_vrm(
+    a: &Args,
+    v: &mut Vrm,
+    backdrop: &Backdrop,
+    tracker: &mut AimTracker,
+    g: &Geom,
+    now: Instant,
+    (t, dt): (f32, f32),
+) {
+    if let (true, Backdrop::Agents(stage, _)) = (a.follow_cards, backdrop) {
+        // フォーカス中のカードの方へ視線と指さしを向ける(重みは滑らかに出し入れ)
+        let aim = tracker.step(now, stage.aim_target(), g.head, g.depth);
+        v.renderer.set_aim(aim);
+    }
+    v.renderer.animate(t, dt);
+}
+
+/// 時刻 `t` の表情(口の母音・まばたき・笑顔)を設定する。
+fn face_vrm(
+    a: &Args,
+    v: &mut Vrm,
+    t: f32,
+    face: &mut Vec<(&'static str, f32)>,
+) -> Result<(), String> {
+    if a.lipsync {
+        // 口の母音・まばたき・笑顔を同時に合成する
+        demo::face(t, &v.faces, face);
+        v.renderer.set_expressions(face)
+    } else {
+        v.renderer
+            .set_expression(&a.expression, demo::expression_weight(&a.expression, t))
+    }
+}
+
+/// 層へ描いて、背景(または暗い単色)の上の領域に重ねる(`target` は画面なら None)。
+/// 戻りは (更新の内訳, 描画命令の発行 [ms])。
+fn draw_vrm(
+    gl: &glow::Context,
+    v: &mut Vrm,
+    a: &Args,
+    g: &Geom,
+    target: Option<glow::Framebuffer>,
+    yaw: f32,
+    with_bg: bool,
+) -> (miharashi_vrm::UpdateTimes, f64) {
+    let (rx, ry, rw, rh) = g.rect;
+    let times = v.renderer.update(gl);
+    let t_draw = Instant::now();
+    if with_bg {
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, target);
+            gl.clear_color(0.08, 0.09, 0.12, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+    }
+    let cam = v.renderer.framing_camera(a.frame, (rw, rh), yaw);
+    v.layer.bind(gl);
+    v.renderer.render_camera(gl, (rw, rh), &cam.0, cam.1);
+    v.layer.composite(gl, target, (rx as i32, ry as i32));
+    (times, t_draw.elapsed().as_secs_f64() * 1e3)
+}
+
 fn view_loop(
     a: &Args,
     display: &mut GlesDisplay,
@@ -470,18 +671,7 @@ fn view_loop(
     term: &AtomicBool,
 ) -> Result<(), String> {
     let size = display.size();
-    let (rx, ry, rw, rh) = a.region.rect(size);
-    // 全身・全画面・背景なし・身振りなしのときだけ、従来どおりカメラを左右に振る
-    let sway = a.frame == Framing::Full
-        && a.region == Region::Full
-        && !a.gesture
-        && matches!(backdrop, Backdrop::None);
-    // 視線と指さしの起点(頭の画面上の位置)と、画面の面までの仮想の距離
-    let head = (
-        rx as f32 + rw as f32 / 2.0,
-        ry as f32 + rh as f32 * head_fraction(a.frame),
-    );
-    let depth = size.1 as f32 * 0.5;
+    let g = geom(a, size, backdrop);
     let mut tracker = AimTracker::default();
     let start = Instant::now();
     let run_for = Duration::from_secs_f64(a.seconds);
@@ -527,45 +717,22 @@ fn view_loop(
             Backdrop::None => {}
         }
         if let Some(v) = vrm.as_deref_mut() {
-            if let (true, Backdrop::Agents(stage, _)) = (a.follow_cards, &*backdrop) {
-                // フォーカス中のカードの方へ視線と指さしを向ける(重みは滑らかに出し入れ)
-                let aim = tracker.step(now, stage.aim_target(), head, depth);
-                v.renderer.set_aim(aim);
-            }
-            v.renderer.animate(t, t - prev_t);
+            pose_vrm(a, v, backdrop, &mut tracker, &g, now, (t, t - prev_t));
             let f0 = Instant::now();
-            if a.lipsync {
-                // 口の母音・まばたき・笑顔を同時に合成する
-                demo::face(t, &v.faces, &mut face);
-                v.renderer.set_expressions(&face)?;
-            } else {
-                v.renderer
-                    .set_expression(&a.expression, demo::expression_weight(&a.expression, t))?;
-            }
+            face_vrm(a, v, t, &mut face)?;
             sum.face = f0.elapsed().as_secs_f64() * 1e3;
         }
         prev_t = t;
-        let yaw = if sway { demo::camera_yaw(t) } else { 0.0 };
+        let yaw = if g.sway { demo::camera_yaw(t) } else { 0.0 };
         let enter = Instant::now();
         // 層へ描いて、背景(または暗い単色)の上の領域に重ねる。GL を借りた中で測る
-        let mut draw_vrm = |gl: &glow::Context, sum: &mut Sum, with_bg: bool| {
+        let mut draw = |gl: &glow::Context, sum: &mut Sum, with_bg: bool| {
             let Some(v) = vrm.as_deref_mut() else { return };
-            let times = v.renderer.update(gl);
-            let t_draw = Instant::now();
-            if with_bg {
-                unsafe {
-                    gl.clear_color(0.08, 0.09, 0.12, 1.0);
-                    gl.clear(glow::COLOR_BUFFER_BIT);
-                }
-            }
-            let cam = v.renderer.framing_camera(a.frame, (rw, rh), yaw);
-            v.layer.bind(gl);
-            v.renderer.render_camera(gl, (rw, rh), &cam.0, cam.1);
-            v.layer.composite(gl, None, (rx as i32, ry as i32));
+            let (times, vrm_ms) = draw_vrm(gl, v, a, &g, None, yaw, with_bg);
             sum.pose = times.pose_ms;
             sum.spring = times.spring_ms;
             sum.face += times.morph_ms;
-            sum.vrm_draw = t_draw.elapsed().as_secs_f64() * 1e3;
+            sum.vrm_draw = vrm_ms;
         };
         // present が page flip の完了まで待つので、フレームの間隔は vsync でとれる
         let agent_cards = match &*backdrop {
@@ -582,11 +749,11 @@ fn view_loop(
                 // --no-vrm も同じ present_frame_with で、flip の前に compose を測る(draw_vrm は VRM がなければ何もしない)
                 display.present_frame_with(&frame, |gl, _| {
                     sum.compose = enter.elapsed().as_secs_f64() * 1e3;
-                    draw_vrm(gl, &mut sum, false);
+                    draw(gl, &mut sum, false);
                 })?;
             }
             None => {
-                display.present_with(|gl, _| draw_vrm(gl, &mut sum, true))?;
+                display.present_with(|gl, _| draw(gl, &mut sum, true))?;
             }
         }
         drop(agent_cards);
@@ -628,6 +795,207 @@ fn view_loop(
         total.line(secs, cpu_total.poll(Instant::now()), agents)
     );
     Ok(())
+}
+
+/// 録画の進み具合を出す間隔
+const PROGRESS_EVERY: Duration = Duration::from_secs(5);
+
+/// `--record`: 実モニターを使わず、render node のオフスクリーンに固定刻みで描いて ffmpeg に流す。
+/// 各フレームの時刻 = フレーム番号 / fps(実時間とは無関係)。写真のフェード・カードの動き・身振り・口パク・
+/// SpringBone は、すべてこの仮想時刻で進む。画面の合成は実モニターと同じ `draw_frame_with` を通す。
+fn record_run(a: &Args, assets: Assets, term: &AtomicBool) -> Result<(), String> {
+    let out = a.record.as_ref().ok_or("--record がない")?;
+    let fps = a.fps.unwrap_or(30.0);
+    let size = a.size;
+    let total = ((a.seconds * fps).round() as u64).max(1);
+    let node = miharashi_gpu::render_node_for_pci(&a.pci);
+    let off = Offscreen::open(&node)?;
+    let (rx, ry, rw, rh) = a.region.rect(size);
+    eprintln!(
+        "record: {} -> {}x{} @{fps}fps {total} フレーム({:.1}秒) codec={:?}{}  gles: {}",
+        node.display(),
+        size.0,
+        size.1,
+        total as f64 / fps,
+        a.record_codec,
+        if a.record_overwrite { " 上書き" } else { "" },
+        off.describe()
+    );
+    eprintln!(
+        "composition: frame={} region={} ({rw}x{rh} at {rx},{ry}) gesture={} lipsync={} photos={} agents={} follow={} vrm={}",
+        a.frame.name(),
+        a.region.name(),
+        a.gesture,
+        a.lipsync,
+        a.photos.as_deref().unwrap_or("なし"),
+        if a.agents {
+            a.cards.to_string()
+        } else {
+            "なし".into()
+        },
+        a.follow_cards,
+        if a.no_vrm { "なし" } else { "あり" },
+    );
+    let settings = record::Settings {
+        out: out.clone(),
+        size,
+        fps,
+        codec: a.record_codec,
+        overwrite: a.record_overwrite,
+        vaapi_device: node,
+    };
+    let Assets {
+        model,
+        photos,
+        text,
+    } = assets;
+    let wall = Instant::now();
+    let result = off.with_target(size, |gl, fbo| -> Result<(u64, bool), String> {
+        let mut vrm = init_vrm(gl, model, a, (rw, rh))?;
+        // 仮想時刻の基準。以後の時刻は base + フレーム番号 / fps
+        let base = Instant::now();
+        let mut backdrop = make_backdrop(a, photos, text, size, base);
+        report_agents(a, &mut backdrop, base, (rx, ry, rw, rh));
+        let mut comp = match Compositor::new(gl, size) {
+            Ok(c) => c,
+            Err(e) => {
+                if let Some(v) = vrm {
+                    v.renderer.destroy(gl);
+                    v.layer.destroy(gl);
+                }
+                return Err(e);
+            }
+        };
+        let r = record::Sink::spawn(&settings).and_then(|sink| {
+            record_frames(
+                gl,
+                fbo,
+                a,
+                sink,
+                total,
+                base,
+                &mut comp,
+                vrm.as_mut(),
+                &mut backdrop,
+                term,
+            )
+        });
+        comp.destroy(gl);
+        if let Some(v) = vrm {
+            v.renderer.destroy(gl);
+            v.layer.destroy(gl);
+        }
+        unsafe { gl.finish() };
+        r
+    });
+    // 失敗したときの書きかけは Sink が一時ファイルごと消す(出力先には成功したときだけ移す)
+    let (frames, interrupted) = result.and_then(|r| r)?;
+    let secs = wall.elapsed().as_secs_f64();
+    eprintln!(
+        "録画: {frames} フレーム({:.1}秒分)を {secs:.1}秒で書き出した{} -> {}({} バイト)",
+        frames as f64 / fps,
+        if interrupted {
+            "(シグナルで中断。ここまでを保存)"
+        } else {
+            ""
+        },
+        out.display(),
+        out.metadata().map_or(0, |m| m.len()),
+    );
+    eprintln!("注意: 録画モードの値(書き出し時間など)は計測に使わない");
+    Ok(())
+}
+
+/// 録画のフレームのループ。戻りは (書いたフレーム数, シグナルで中断したか)。
+#[allow(clippy::too_many_arguments)]
+fn record_frames(
+    gl: &glow::Context,
+    fbo: glow::Framebuffer,
+    a: &Args,
+    mut sink: record::Sink,
+    total: u64,
+    base: Instant,
+    comp: &mut Compositor,
+    mut vrm: Option<&mut Vrm>,
+    backdrop: &mut Backdrop,
+    term: &AtomicBool,
+) -> Result<(u64, bool), String> {
+    let (size, fps) = (a.size, a.fps.unwrap_or(30.0));
+    let g = geom(a, size, backdrop);
+    let target = Some(fbo);
+    let mut tracker = AimTracker::default();
+    let mut face: Vec<(&'static str, f32)> = Vec::new();
+    let mut rgba = vec![0u8; size.0 as usize * size.1 as usize * 4];
+    let mut scratch = Vec::new();
+    let start = Instant::now();
+    let mut next_progress = start + PROGRESS_EVERY;
+    let mut prev_t = 0.0f32;
+    let mut done = 0u64;
+    let mut interrupted = false;
+    while done < total {
+        if term.load(Ordering::Relaxed) {
+            interrupted = true;
+            break;
+        }
+        let secs = done as f64 / fps;
+        let now = base + Duration::from_secs_f64(secs);
+        let t = secs as f32;
+        match &mut *backdrop {
+            Backdrop::Photo(s) => {
+                s.update(now);
+            }
+            Backdrop::Agents(stage, text) => {
+                stage.update(now, text);
+                stage.take_stats();
+            }
+            Backdrop::None => {}
+        }
+        if let Some(v) = vrm.as_deref_mut() {
+            pose_vrm(a, v, backdrop, &mut tracker, &g, now, (t, t - prev_t));
+            face_vrm(a, v, t, &mut face)?;
+        }
+        prev_t = t;
+        let yaw = if g.sway { demo::camera_yaw(t) } else { 0.0 };
+        let agent_cards = match &*backdrop {
+            Backdrop::Agents(stage, _) => stage.gpu_cards(),
+            _ => Vec::new(),
+        };
+        let frame = match &*backdrop {
+            Backdrop::Photo(s) => Some(s.frame(now)),
+            Backdrop::Agents(stage, _) => Some(stage.frame(&agent_cards)),
+            Backdrop::None => None,
+        };
+        let mut draw = |gl: &glow::Context, _: (u32, u32)| {
+            if let Some(v) = vrm.as_deref_mut() {
+                draw_vrm(gl, v, a, &g, target, yaw, frame.is_none());
+            }
+        };
+        match &frame {
+            Some(f) => miharashi_gpu::draw_frame_with(comp, gl, size, target, f, &mut draw)?,
+            None => miharashi_gpu::draw_with(gl, size, target, &mut draw),
+        }
+        drop(agent_cards);
+        match &mut *backdrop {
+            Backdrop::Photo(s) => s.mark_sent(),
+            Backdrop::Agents(stage, _) => stage.mark_sent(),
+            Backdrop::None => {}
+        }
+        miharashi_gpu::read_rgba_top_down(gl, fbo, size, &mut rgba, &mut scratch);
+        sink.write_frame(&rgba)?;
+        done += 1;
+        let wall = Instant::now();
+        if wall >= next_progress {
+            let el = wall.duration_since(start).as_secs_f64();
+            let left = el / done as f64 * (total - done) as f64;
+            eprintln!(
+                "録画 {done}/{total} フレーム({:.0}%) 経過 {el:.0}秒 残り約 {left:.0}秒(録画モードの値は計測に使わない)",
+                done as f64 * 100.0 / total as f64,
+            );
+            next_progress = wall + PROGRESS_EVERY;
+        }
+    }
+    sink.finish()?;
+    Ok((done, interrupted))
 }
 
 fn main() {

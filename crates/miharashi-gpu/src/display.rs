@@ -254,6 +254,20 @@ pub fn draw_frame_with<R>(
     Ok(r)
 }
 
+/// 背景の合成なしで、`target`(画面なら None)を bind して `with_gl` と同じ約束で GL を `f` に貸す
+/// (`present_with` の本体。表示なしで使えるよう分けてある)。
+pub fn draw_with<R>(
+    gl: &glow::Context,
+    size: (u32, u32),
+    target: Option<glow::Framebuffer>,
+    f: impl FnOnce(&glow::Context, (u32, u32)) -> R,
+) -> R {
+    restore_gl_state(gl, size, target);
+    let r = f(gl, size);
+    restore_gl_state(gl, size, target);
+    r
+}
+
 /// `Compositor` が前提にする GL の状態へ戻す(`with_gl` の doc 参照)。`target` は描画先の
 /// framebuffer で、画面なら None。
 pub(crate) fn restore_gl_state(

@@ -13,3 +13,6 @@
 
 # VRM モデルは再配布できないので置かない(docs/poc/POC-006.md)
 *.vrm
+
+# vrm-view --record の出力(デモ動画。リポジトリには置かない)
+*.mp4

@@ -13,6 +13,8 @@ pub mod math;
 pub mod model;
 #[cfg(feature = "view")]
 pub mod photo_stage;
+#[cfg(feature = "view")]
+pub mod record;
 pub mod render;
 pub mod spring;
 pub mod synth;
