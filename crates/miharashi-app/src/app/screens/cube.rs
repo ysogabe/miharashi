@@ -100,6 +100,14 @@ const IDENTITY: Mat4 = [
     1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
 ];
 
+/// 回転の周期 [秒]。yaw(周期 2.5π)と pitch(周期 4π)の公倍数なので、割った余りでも絵は変わらない。
+const ROTATION_PERIOD: f64 = 20.0 * std::f64::consts::PI;
+
+/// 経過時間を回転の周期で割った余りにして f32 にする(長時間でも f32 の精度が落ちない)。
+fn wrap_secs(secs: f64) -> f32 {
+    (secs % ROTATION_PERIOD) as f32
+}
+
 /// `secs`(表示中かつ点灯中に経った時間)のときの変換行列。同じ `secs` と `aspect` なら同じ行列(決定的)。
 fn mvp(secs: f32, aspect: f32) -> Mat4 {
     let yaw = secs * 0.8;
@@ -344,7 +352,7 @@ impl CubeScreen {
         if third {
             let rw = (w / 3).max(1);
             Region {
-                x: (w - rw) / 2,
+                x: w.saturating_sub(rw) / 2,
                 y: 0,
                 w: rw,
                 h,
@@ -423,7 +431,7 @@ impl Screen for CubeScreen {
             );
             Box::new(Composite::Canvas)
         });
-        self.scene.set_secs(self.active.as_secs_f32());
+        self.scene.set_secs(wrap_secs(self.active.as_secs_f64()));
         Composite::Gl(GlComposite {
             base,
             scene: &mut self.scene,

@@ -481,6 +481,14 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     let mut display = Presenter::open(&drm_dev.fd, &cfg.display.renderer, &connector.name, mode)?;
     let (w, h) = display.size();
     eprintln!("mode: {w}x{h}@{}Hz", display.refresh());
+    // vrefresh が 0 のモードでも fps の上限と遅れの判定が効くよう、60Hz とみなす
+    let refresh_hz = match display.refresh() {
+        0 => {
+            eprintln!("mode: リフレッシュレートが 0Hz なので 60Hz とみなす");
+            60
+        }
+        hz => hz,
+    };
 
     let vt = VtGuard::enter();
     eprintln!(
@@ -721,10 +729,10 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                 if let Some(last) = anim_last {
                     let gap = now.duration_since(last).as_secs_f32() * 1000.0;
                     anim_frames += 1;
-                    // 間隔の上限があるときは、その間隔に 8.3ms(60Hz の半フレーム)の余裕を足した値を超えたら遅れ
-                    let limit = app
-                        .frame_interval()
-                        .map_or(25.0, |d| d.as_secs_f32() * 1000.0 + 8.3);
+                    // 間隔の上限があるときは、その間隔に半フレーム(表示のリフレッシュレートから求める)の余裕を足した値を超えたら遅れ
+                    let limit = app.frame_interval().map_or(25.0, |d| {
+                        d.as_secs_f32() * 1000.0 + 500.0 / refresh_hz as f32
+                    });
                     if gap > limit {
                         anim_slow += 1;
                         if anim_slow <= 10 {
@@ -778,7 +786,7 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
         // 背景を描き直すフレームで 1 枚飛んで引っかかって見える)
         // 間隔の上限がある画面(キューブ)は、描いた直後に残りを待つ
         match app.frame_interval().filter(|_| drew && screen_on) {
-            Some(d) => std::thread::sleep(frame_wait(d, display.refresh())),
+            Some(d) => std::thread::sleep(frame_wait(d, refresh_hz)),
             None if !(screen_on && app.animating()) => {
                 std::thread::sleep(Duration::from_millis(20));
             }

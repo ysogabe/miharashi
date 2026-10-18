@@ -390,6 +390,10 @@ fn png(cli: Cli) -> Result<(), String> {
         size.0,
         size.1
     );
+    #[cfg(target_os = "linux")]
+    if gles.is_some() {
+        println!("wrote {}/{{cube-gles,cube-third-gles}}.png", out.display());
+    }
     Ok(())
 }
 

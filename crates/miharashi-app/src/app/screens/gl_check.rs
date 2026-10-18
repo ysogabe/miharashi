@@ -61,21 +61,30 @@ impl DirtyScene {
         }
     }
 
-    /// 汚れに使うオブジェクトを作る(作りかけで失敗しても、作ったものは持ったまま)。
+    /// 汚れに使うオブジェクトを作る。足りないものだけ作るので、途中で失敗して作り直してもオブジェクトは漏れない
+    /// (作りかけで失敗しても、作ったものは持ったまま。`release` が消す)。
     fn build(&mut self, gl: &glow::Context) -> Result<(), String> {
         if self.built {
             return Ok(());
         }
-        self.program = Some(build_program(gl, &self.count, VS, FS)?);
-        self.vao = Some(self.count.create_vertex_array(gl)?);
-        for _ in 0..2 {
+        if self.program.is_none() {
+            self.program = Some(build_program(gl, &self.count, VS, FS)?);
+        }
+        if self.vao.is_none() {
+            self.vao = Some(self.count.create_vertex_array(gl)?);
+        }
+        while self.buffers.len() < 2 {
             self.buffers.push(self.count.create_buffer(gl)?);
         }
-        for _ in 0..3 {
+        while self.textures.len() < 3 {
             self.textures.push(self.count.create_texture(gl)?);
         }
-        self.samplers.push(self.count.create_sampler(gl)?);
-        self.fbos.push(self.count.create_framebuffer(gl)?);
+        while self.samplers.is_empty() {
+            self.samplers.push(self.count.create_sampler(gl)?);
+        }
+        while self.fbos.is_empty() {
+            self.fbos.push(self.count.create_framebuffer(gl)?);
+        }
         self.built = true;
         Ok(())
     }

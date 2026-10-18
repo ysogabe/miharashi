@@ -188,17 +188,20 @@ mod gpu {
     use crate::app::screens::agents::AgentScreen;
     use crate::app::screens::aircraft::AircraftScreen;
     use crate::app::screens::cube::{FACE_COLORS, THIRD_BAND, THIRD_BASE};
-    use crate::app::screens::gl_check::{Dirt, DirtyScreen};
+    use crate::app::screens::gl_check::{Dirt, DirtyScene, DirtyScreen};
     use crate::app::screens::photo::PhotoScreen;
     use crate::config::Config;
     use crate::photos::Source;
     use crate::runtime::{FrameParts, frame_of, scene_frame};
+    use crate::screen::GlScene;
     use crate::screen::{Composite, Provider, RenderContext};
     use glow::HasContext;
+    use miharashi_glscene::{GlTarget, ObjectCount};
     use miharashi_gpu::compose::Compositor;
     use miharashi_gpu::{Offscreen, SceneOutcome, diff_rgb, read_rgba_top_down};
     use miharashi_render::Canvas;
     use std::path::Path;
+    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
     fn offscreen() -> Option<Offscreen> {
@@ -618,6 +621,72 @@ mod gpu {
                 after.destroy(gl);
             })
             .unwrap();
+            drop(composite);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// 陰性対照: `reset_gl_state` を通さずに(汚れたまま)2D を描くと、汚さなかったときと絵が違う。
+    /// 上のテストの「一致する」が、リセットが効いているから一致するのであって、汚れが絵に影響しないからではないことを示す。
+    #[test]
+    fn two_d_after_dirty_scene_without_reset_differs_from_clean_draws() {
+        let Some(off) = offscreen() else { return };
+        for (id, want) in [
+            ("photo", "photo"),
+            ("aircraft", "radar"),
+            ("agents", "agents"),
+        ] {
+            let (mut app, dir) = all_screens();
+            warm(&mut app);
+            app.show_screen(id);
+            let mut c = Canvas::new(SIZE.0, SIZE.1);
+            let composite = app.render_composite(&mut c);
+            assert_eq!(kind(&composite), want, "実際の画面の描き方");
+            let mut parts = FrameParts::default();
+            parts.fill(&composite);
+            let frame = frame_of(&composite, &c, &parts).unwrap();
+            let size = (SIZE.0 * SIZE.1 * 4) as usize;
+            for dirt in [Dirt::A, Dirt::B] {
+                off.with_target(SIZE, |gl, fbo| {
+                    let read = || {
+                        let mut img = vec![0; size];
+                        read_rgba_top_down(gl, fbo, SIZE, &mut img, &mut Vec::new());
+                        img
+                    };
+                    // 前の繰り返しの汚れが fbo に残らないよう、基準はリセットしてから描く
+                    Compositor::reset_gl_state(gl, SIZE, Some(fbo));
+                    let mut clean = Compositor::new(gl, SIZE).unwrap();
+                    clean.draw(gl, &frame).unwrap();
+                    let want_img = read();
+                    clean.destroy(gl);
+                    // 汚れた状態を直接作る(Compositor の `draw_scene` = リセットを通さない)
+                    let count = Rc::new(ObjectCount::default());
+                    let mut scene = DirtyScene::new(dirt, count);
+                    let mut comp = Compositor::new(gl, SIZE).unwrap();
+                    unsafe {
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                        gl.viewport(0, 0, SIZE.0 as i32, SIZE.1 as i32);
+                    }
+                    scene.draw(gl, &GlTarget { fbo, size: SIZE }).unwrap();
+                    unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo)) };
+                    comp.draw(gl, &frame).unwrap();
+                    // 汚れが残した読み出し元(read_buffer = NONE など)では読めないので、読む側だけ戻す。
+                    // 描画側の状態は触らない(2D の描画は済んでいる)
+                    unsafe {
+                        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fbo));
+                        gl.read_buffer(glow::COLOR_ATTACHMENT0);
+                    }
+                    let got = read();
+                    assert_ne!(
+                        diff_rgb(&got, &want_img, 0),
+                        (0, 0),
+                        "{dirt:?} を汚したまま {id} を描くと、{id} だけと絵が違う"
+                    );
+                    comp.destroy(gl);
+                    scene.release(gl);
+                })
+                .unwrap();
+            }
             drop(composite);
             let _ = std::fs::remove_dir_all(dir);
         }
