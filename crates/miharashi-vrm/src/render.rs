@@ -346,6 +346,9 @@ pub struct Renderer {
     scratch: Vec<f32>,
     /// 輪郭線の太さの倍率(確認用。1 で VRM の指定どおり)
     pub outline_scale: f32,
+    /// 描く前に塗る色(RGBA)。透明な FBO に描いて重ねるときは `[0.0; 4]`
+    pub clear_color: [f32; 4],
+    anchors: Anchors,
     pose_ms: f64,
     spring_ms: f64,
     /// GPU に転送したバイト数(頂点・インデックス・テクスチャ)
@@ -398,6 +401,15 @@ unsafe fn compile(gl: &glow::Context, vs: &str, fs: &str) -> Result<glow::Progra
         }
         Ok(program)
     }
+}
+
+/// `layer` など、このクレートの別の場所からシェーダを作る。
+pub(crate) fn compile_program(
+    gl: &glow::Context,
+    vs: &str,
+    fs: &str,
+) -> Result<glow::Program, String> {
+    unsafe { compile(gl, vs, fs) }
 }
 
 /// 3 つのプログラムを作り、関節行列の UBO(binding 0)につなぐ。
@@ -621,6 +633,7 @@ impl Renderer {
                 return Err(format!("GL エラー 0x{e:x}(モデルの転送)"));
             }
             let rig = Rig::new(&model, level >= Level::Pose);
+            let anchors = Anchors::new(&model, &rig.world);
             let spring =
                 (level >= Level::Spring).then(|| crate::spring::SpringSim::new(&model, &rig));
             Ok(Self {
@@ -643,6 +656,8 @@ impl Renderer {
                 dirty: false,
                 scratch: Vec::new(),
                 outline_scale: 1.0,
+                clear_color: [0.08, 0.09, 0.12, 1.0],
+                anchors,
                 pose_ms: 0.0,
                 spring_ms: 0.0,
                 uploaded_bytes: uploaded,
@@ -679,6 +694,18 @@ impl Renderer {
         }
         self.spring_ms = spring_time.as_secs_f64() * 1e3;
         self.pose_ms = (t0.elapsed() - spring_time).as_secs_f64() * 1e3;
+    }
+
+    /// 身振り(`gesture`)を重ねるか。`Pose` 未満の段階や、humanoid の腕の骨がないモデルではエラー。
+    pub fn set_gesture(&mut self, on: bool) -> Result<(), String> {
+        if on && self.level < Level::Pose {
+            return Err("身振りには --feature-level pose 以上が要る".into());
+        }
+        if self.rig.set_gesture(on) {
+            Ok(())
+        } else {
+            Err("humanoid の上腕・前腕・手の骨がないモデルでは身振りを付けられない".into())
+        }
     }
 
     /// 最後に評価した関節行列(`animate` 後)。
@@ -808,7 +835,14 @@ impl Renderer {
             }
             if m.alpha_mode == AlphaMode::Blend {
                 gl.enable(glow::BLEND);
-                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                // 色は SRC_ALPHA で重ね、アルファは ONE / ONE_MINUS_SRC_ALPHA で貯める。透明な FBO に描くと、
+                // 色が premultiplied、アルファが本来の値(a + dst_a * (1 - a))になる(不透明な下地なら従来と同じ)
+                gl.blend_func_separate(
+                    glow::SRC_ALPHA,
+                    glow::ONE_MINUS_SRC_ALPHA,
+                    glow::ONE,
+                    glow::ONE_MINUS_SRC_ALPHA,
+                );
                 gl.depth_mask(false);
             } else {
                 gl.disable(glow::BLEND);
@@ -852,12 +886,38 @@ impl Renderer {
     }
 
     /// `render` に加えて、カメラをモデルの中心のまわりで Y 軸方向に `yaw`(ラジアン)だけ回す。
-    pub fn render_yaw(&self, gl: &glow::Context, (w, h): (u32, u32), yaw: f32) {
-        let (vp, eye) = camera(self.model.bounds, (w, h), yaw);
+    pub fn render_yaw(&self, gl: &glow::Context, size: (u32, u32), yaw: f32) {
+        let (vp, eye) = camera(self.model.bounds, size, yaw);
+        self.render_camera(gl, size, &vp, eye);
+    }
+
+    /// 構図 `framing` のカメラ(`size` は描く先の大きさ)。`Full` は `camera` と同じ。
+    pub fn framing_camera(
+        &self,
+        framing: Framing,
+        size: (u32, u32),
+        yaw: f32,
+    ) -> (math::Mat4, [f32; 3]) {
+        match framing {
+            Framing::Full => camera(self.model.bounds, size, yaw),
+            _ => self.anchors.camera(framing, size, yaw),
+        }
+    }
+
+    /// 指定のカメラ(`framing_camera` の戻り値など)で、今 bind されている FBO の `(w, h)` に描く。
+    pub fn render_camera(
+        &self,
+        gl: &glow::Context,
+        (w, h): (u32, u32),
+        vp: &math::Mat4,
+        eye: [f32; 3],
+    ) {
+        let vp = *vp;
         let aspect = w as f32 / h as f32;
         unsafe {
             gl.viewport(0, 0, w as i32, h as i32);
-            gl.clear_color(0.08, 0.09, 0.12, 1.0);
+            let c = self.clear_color;
+            gl.clear_color(c[0], c[1], c[2], c[3]);
             gl.clear_depth_f32(1.0);
             gl.depth_mask(true);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
@@ -1032,6 +1092,183 @@ unsafe fn upload_texture(
     }
 }
 
+/// 構図。`Full` は全身、`Waist` は腰から上、`Bust` は胸から上が描く先に収まる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Framing {
+    Full,
+    Waist,
+    Bust,
+}
+
+impl Framing {
+    pub fn name(self) -> &'static str {
+        match self {
+            Framing::Full => "full",
+            Framing::Waist => "waist",
+            Framing::Bust => "bust",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        [Framing::Full, Framing::Waist, Framing::Bust]
+            .into_iter()
+            .find(|f| f.name() == s)
+            .ok_or_else(|| format!("--frame は full / waist / bust: {s}"))
+    }
+}
+
+/// キャラクターを描く画面上の領域。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Region {
+    /// 画面の左 1/3
+    Left,
+    /// 画面の中央 1/3
+    Center,
+    /// 画面全体
+    Full,
+}
+
+impl Region {
+    pub fn name(self) -> &'static str {
+        match self {
+            Region::Left => "left",
+            Region::Center => "center",
+            Region::Full => "full",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        [Region::Left, Region::Center, Region::Full]
+            .into_iter()
+            .find(|r| r.name() == s)
+            .ok_or_else(|| format!("--region は left / center / full: {s}"))
+    }
+
+    /// 画面 `(w, h)` の中の領域 `(x, y, 幅, 高さ)`。GL の座標(左下が原点)。高さは画面いっぱい。
+    pub fn rect(self, (w, h): (u32, u32)) -> (u32, u32, u32, u32) {
+        let third = (w / 3).max(1);
+        match self {
+            Region::Left => (0, 0, third, h),
+            Region::Center => ((w - third) / 2, 0, third, h),
+            Region::Full => (0, 0, w, h),
+        }
+    }
+}
+
+/// 構図を決めるための、初期姿勢の体の位置(humanoid の骨から。なければ外接箱の割合で代用)。
+#[derive(Clone, Copy, Debug)]
+struct Anchors {
+    /// 頭のてっぺん(外接箱の上端)
+    top: f32,
+    hips_y: f32,
+    chest_y: f32,
+    /// 体の中心(x, z)
+    center_x: f32,
+    center_z: f32,
+    /// 奥行き(外接箱)
+    depth: f32,
+    /// 肩幅の半分
+    shoulder_half: f32,
+    /// 腕の長さ(上腕の付け根から手まで)
+    arm_reach: f32,
+}
+
+/// 構図の余白など(目で見て決めた値)
+const FRAMING_FOVY_DEG: f32 = 30.0;
+/// 頭のてっぺんの上に空ける余白(収めたい高さに対する割合)
+const FRAMING_TOP_MARGIN: f32 = 0.07;
+/// バストアップの下端を胸の骨から下げる量(胸から頭のてっぺんまでの高さに対する割合)
+const BUST_BELOW_CHEST: f32 = 0.10;
+/// 腰から上の下端を腰の骨から下げる量(腰から頭のてっぺんまでの高さに対する割合)
+const WAIST_BELOW_HIPS: f32 = 0.0;
+/// 領域の半幅に最低限入れたい量 = 肩幅の半分 × この値 + 腕の長さ × `REACH_FRAC`
+const SHOULDER_FIT: f32 = 0.9;
+const REACH_FRAC: f32 = 0.0;
+
+impl Anchors {
+    fn new(model: &Model, world: &[math::Mat4]) -> Self {
+        let (min, max) = model.bounds;
+        let hb = &model.vrm.human_bones;
+        let pos = |names: &[&str]| -> Option<[f32; 3]> {
+            names.iter().find_map(|n| hb.get(*n)).and_then(|&i| {
+                let m = world.get(i)?;
+                Some([m[3][0], m[3][1], m[3][2]])
+            })
+        };
+        let height = max[1] - min[1];
+        let hips = pos(&["hips"]);
+        let chest = pos(&["upperChest", "chest"]);
+        let hips_y = hips.map_or(min[1] + height * 0.52, |p| p[1]);
+        let chest_y = chest.map_or(min[1] + height * 0.72, |p| p[1]);
+        let side = |s: &str| {
+            Some((
+                pos(&[&format!("{s}UpperArm")])?,
+                pos(&[&format!("{s}Hand")])?,
+            ))
+        };
+        let (shoulder_half, arm_reach) = match (side("left"), side("right")) {
+            (Some((lu, lh)), Some((ru, _))) => (
+                (lu[0] - ru[0]).abs() * 0.5,
+                math::vec_len(math::vec_sub(lh, lu)),
+            ),
+            (Some((u, h)), None) | (None, Some((u, h))) => {
+                (height * 0.12, math::vec_len(math::vec_sub(h, u)))
+            }
+            _ => (height * 0.12, height * 0.38),
+        };
+        Self {
+            top: max[1],
+            hips_y,
+            chest_y,
+            center_x: hips.map_or((min[0] + max[0]) * 0.5, |p| p[0]),
+            center_z: (min[2] + max[2]) * 0.5,
+            depth: max[2] - min[2],
+            shoulder_half,
+            arm_reach,
+        }
+    }
+
+    /// 腰から上 / 胸から上が `size` の領域に収まるカメラ。幅が足りないときは、上端を保ったまま下へ広げる。
+    fn camera(&self, framing: Framing, (w, h): (u32, u32), yaw: f32) -> (math::Mat4, [f32; 3]) {
+        let (base, below) = match framing {
+            Framing::Bust => (self.chest_y, BUST_BELOW_CHEST),
+            _ => (self.hips_y, WAIST_BELOW_HIPS),
+        };
+        let span = (self.top - base).max(1e-3);
+        let bottom = base - span * below;
+        let visible_top = self.top + (self.top - bottom) * FRAMING_TOP_MARGIN;
+        let aspect = w as f32 / h as f32;
+        let need_half_w = self.shoulder_half * SHOULDER_FIT + self.arm_reach * REACH_FRAC;
+        let half_h = ((visible_top - bottom) * 0.5).max(need_half_w / aspect);
+        let cy = visible_top - half_h;
+        let t = (FRAMING_FOVY_DEG.to_radians() * 0.5).tan();
+        let dist = half_h / t + self.depth * 0.5;
+        look_camera(
+            [self.center_x, cy, self.center_z],
+            dist,
+            aspect,
+            yaw,
+            FRAMING_FOVY_DEG.to_radians(),
+        )
+    }
+}
+
+/// `c` を見るカメラ(+Z 側から -Z を向く)。`yaw` は `c` のまわりの Y 軸回転。
+fn look_camera(c: [f32; 3], dist: f32, aspect: f32, yaw: f32, fovy: f32) -> (math::Mat4, [f32; 3]) {
+    let proj = math::perspective(fovy, aspect, dist * 0.1, dist * 10.0);
+    let view = math::mul(
+        &math::translate(0.0, 0.0, -dist),
+        &math::mul(&math::rotate_y(yaw), &math::translate(-c[0], -c[1], -c[2])),
+    );
+    let back = math::rotate_y(-yaw);
+    let eye = [
+        c[0] + back[2][0] * dist,
+        c[1] + back[2][1] * dist,
+        c[2] + back[2][2] * dist,
+    ];
+    (math::mul(&proj, &view), eye)
+}
+
 /// 外接箱 `(min, max)` が収まるカメラの view-projection。縦横どちらにも収まる距離に置く
 /// (横長の画面では高さで決まる)。`yaw` はモデルの中心のまわりの回転(0 で +Z 側から正面)。
 pub fn view_proj(bounds: ([f32; 3], [f32; 3]), size: (u32, u32), yaw: f32) -> math::Mat4 {
@@ -1057,19 +1294,7 @@ pub fn camera(
     // 回すと横方向の見かけの幅が奥行きぶん増えるので、幅は水平の対角で見積もる
     let half_w = (size[0] * size[0] + size[2] * size[2]).sqrt() * 0.5;
     let dist = ((size[1] * 0.5 / t).max(half_w / (t * aspect)) * 1.15) + size[2] * 0.5;
-    let proj = math::perspective(fovy, aspect, dist * 0.1, dist * 10.0);
-    let view = math::mul(
-        &math::translate(0.0, 0.0, -dist),
-        &math::mul(&math::rotate_y(yaw), &math::translate(-c[0], -c[1], -c[2])),
-    );
-    // 視点 = view の逆変換で原点を戻した点(c から、回転を戻した +Z 方向に dist)
-    let back = math::rotate_y(-yaw);
-    let eye = [
-        c[0] + back[2][0] * dist,
-        c[1] + back[2][1] * dist,
-        c[2] + back[2][2] * dist,
-    ];
-    (math::mul(&proj, &view), eye)
+    look_camera(c, dist, aspect, yaw, fovy)
 }
 
 /// 今 bind されている FBO に深度 renderbuffer を付ける(`Offscreen::with_fbo` の FBO には深度がない)。

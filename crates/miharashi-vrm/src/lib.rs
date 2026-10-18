@@ -3,6 +3,8 @@
 //! 画面には組み込まない。計測は `vrm-bench`(feature `bench`、既定で有効。`miharashi-gpu` はこの bin と試験だけが使う)。
 pub mod anim;
 pub mod demo;
+pub mod gesture;
+pub mod layer;
 pub mod math;
 pub mod model;
 pub mod render;
@@ -10,5 +12,8 @@ pub mod spring;
 pub mod synth;
 pub mod vrm;
 
+pub use layer::VrmLayer;
 pub use model::{AlphaMode, Model, Stats};
-pub use render::{Level, Renderer, UpdateTimes, attach_depth, detach_depth, view_proj};
+pub use render::{
+    Framing, Level, Region, Renderer, UpdateTimes, attach_depth, detach_depth, view_proj,
+};

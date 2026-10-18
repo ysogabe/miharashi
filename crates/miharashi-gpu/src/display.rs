@@ -115,6 +115,23 @@ impl GlesDisplay {
         self.flip()
     }
 
+    /// `frame` を `present_frame` と同じく GPU で合成したあと、`with_gl` と同じ約束で GL を `f` に貸し
+    /// (写真の上へ追加で描くため)、そのあと swap → page flip の完了待ちまで行う。一時停止中は何もせず None。
+    /// `present_frame` / `present_with` の挙動は変えない。VRM を写真画面に重ねる PoC(`vrm-view`)が使う。
+    pub fn present_frame_with<R>(
+        &mut self,
+        frame: &Frame<'_>,
+        f: impl FnOnce(&glow::Context, (u32, u32)) -> R,
+    ) -> Result<Option<R>, String> {
+        if self.suspended {
+            return Ok(None);
+        }
+        let size = self.out.size();
+        let r = draw_frame_with(&mut self.comp, &self.ctx.gl, size, None, frame, f)?;
+        self.flip()?;
+        Ok(Some(r))
+    }
+
     /// 既定の framebuffer(ウィンドウ surface)を bind した状態で GL を `f` に貸す(表示はしない)。
     /// 深度バッファは無いので、深度が要る描画は `f` の中で FBO を作って blit すること。
     /// `f` には GL と表示サイズを渡す。VRM 表示の PoC(`vrm-view`)が、初期化と後始末に使う。
@@ -210,6 +227,26 @@ impl GlesDisplay {
             }
         }
     }
+}
+
+/// `target`(画面なら None)に `frame` を合成し、`Compositor` が前提にする状態へ戻してから `f` に GL を貸し、
+/// 終わったらまた戻す。`present_frame_with` の本体(表示なしで試験できるよう分けてある)。
+pub(crate) fn draw_frame_with<R>(
+    comp: &mut Compositor,
+    gl: &glow::Context,
+    size: (u32, u32),
+    target: Option<glow::Framebuffer>,
+    frame: &Frame<'_>,
+    f: impl FnOnce(&glow::Context, (u32, u32)) -> R,
+) -> Result<R, String> {
+    use glow::HasContext;
+    unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, target) };
+    comp.draw(gl, frame)?;
+    // 合成のあとはプログラムや TEXTURE1 が残っているので、貸す前に約束の状態へ戻す
+    restore_gl_state(gl, size, target);
+    let r = f(gl, size);
+    restore_gl_state(gl, size, target);
+    Ok(r)
 }
 
 /// `Compositor` が前提にする GL の状態へ戻す(`with_gl` の doc 参照)。`target` は描画先の
