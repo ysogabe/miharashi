@@ -1,6 +1,7 @@
 //! 表示せずに GLES 経路を検証する。render node で surfaceless のコンテキストを作り、表示と同じ
 //! `Compositor` で FBO に描いて読み戻す。CPU 経路の画像と画素が一致するかを確かめる(`png --renderer gles`)。
 use crate::compose::{Compositor, Frame};
+use crate::scene::{SceneFrame, SceneOutcome};
 use crate::{egl, gbm};
 use glow::HasContext;
 use std::os::fd::AsFd;
@@ -63,6 +64,35 @@ impl Offscreen {
             r
         })?;
         r.map(|()| img)
+    }
+
+    /// `frame`(下地 → 3D → 最上段の重ね絵)を、表示と同じ `Compositor::draw_scene` で描き、上から下の
+    /// RGBA8 で読み戻す。3D の失敗は `SceneFailed` で返る(そのフレームは 3D 抜きで描かれている)。
+    pub fn render_scene(
+        &self,
+        frame: &mut SceneFrame<'_>,
+        size: (u32, u32),
+    ) -> Result<(SceneOutcome, Vec<u8>), String> {
+        self.render_with_compositor(size, |gl, comp, target| comp.draw_scene(gl, target, frame))
+            .and_then(|(outcome, img)| Ok((outcome?, img)))
+    }
+
+    /// `size` の FBO を描画先に、`Compositor` を作って `f` に渡し、終わったあとの FBO を上から下の RGBA8 で
+    /// 読み戻す。複数のフレームを続けて描く(場面を挟む、状態を汚す)試験や、`png` が使う。
+    /// `f` には GL と `Compositor` と描画先の FBO(`draw_scene` の `target`)を渡す。
+    pub fn render_with_compositor<R>(
+        &self,
+        size: (u32, u32),
+        f: impl FnOnce(&glow::Context, &mut Compositor, Option<glow::Framebuffer>) -> R,
+    ) -> Result<(R, Vec<u8>), String> {
+        let (r, img) = self.with_fbo(size, |gl| {
+            let target = unsafe { gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING) };
+            let mut comp = Compositor::new(gl, size)?;
+            let r = f(gl, &mut comp, target);
+            comp.destroy(gl);
+            Ok::<_, String>(r)
+        })?;
+        Ok((r?, img))
     }
 
     /// `size` の FBO(色は RGBA8 の renderbuffer)を作って `f` に GL とその FBO を渡す。読み戻しはしない。
@@ -275,7 +305,7 @@ mod tests {
         assert_eq!(diff_rgb(&img, &got, 0), (0, 0));
     }
 
-    /// 借りた側が FBO や GL の状態を汚したまま返しても、`restore_gl_state` のあとの
+    /// 借りた側が FBO や GL の状態を汚したまま返しても、`reset_gl_state` のあとの
     /// `Compositor` の描画が、きれいな状態の描画と一致すること(`GlesDisplay::with_gl` の約束)。
     #[test]
     fn offscreen_draw_after_dirty_borrow_matches_clean_draw() {
@@ -348,7 +378,7 @@ mod tests {
                 let target = unsafe { gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING) };
                 let mut comp = Compositor::new(gl, (w, h))?;
                 dirty(gl);
-                crate::display::restore_gl_state(gl, (w, h), target);
+                Compositor::reset_gl_state(gl, (w, h), target);
                 let r = comp.draw(gl, &Frame::Image(&img));
                 comp.destroy(gl);
                 r

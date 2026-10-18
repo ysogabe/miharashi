@@ -1,9 +1,11 @@
 //! GLES 3.2 で KMS に出す Presenter。GBM surface のダブルバッファを page flip で切り替える。
 //! 合成は `compose::Compositor`(写真のフェードと文字の重ね絵は GPU で行う)。
 use crate::compose::{Compositor, Frame};
+use crate::scene::{SceneFrame, SceneOutcome};
 use crate::{egl, gbm};
 use drm::Device as _;
 use drm::control::{Device as ControlDevice, Event, PageFlipFlags, framebuffer};
+use miharashi_glscene::GlScene;
 use miharashi_linux::drm_select::ModeSel;
 use miharashi_linux::kms::{Card, Output};
 use std::collections::HashMap;
@@ -120,6 +122,26 @@ impl GlesDisplay {
         self.flip()
     }
 
+    /// 3D の画面を GPU で合成して表示する(下地 → 3D の層 → 最上段の重ね絵。`Compositor::draw_scene`)。
+    /// page flip の完了まで待つ。一時停止中は何も描かず(`GlScene::draw` も呼ばず)`Drawn` を返す。
+    /// 3D の失敗(panic・`Err`・GL エラー)は `Err` にせず `SceneFailed` で返す。そのとき失敗した場面の
+    /// `release` はここで済んでいて、そのフレームは下地と重ね絵だけで表示してある。
+    /// `Err` は下地の描画や表示(DRM・EGL・page flip)の失敗だけ。
+    pub fn present_scene(&mut self, f: &mut SceneFrame<'_>) -> Result<SceneOutcome, String> {
+        if self.suspended {
+            return Ok(SceneOutcome::Drawn);
+        }
+        let outcome = self.comp.draw_scene(&self.ctx.gl, None, f)?;
+        self.flip()?;
+        Ok(outcome)
+    }
+
+    /// `scenes` の `release` を GL が current な状態で呼ぶ(終了時。`drop` の前に呼ぶこと)。
+    /// `release` が panic しても止めず、そのメッセージを返す。
+    pub fn release_scenes(&mut self, scenes: &mut [&mut dyn GlScene]) -> Vec<String> {
+        Compositor::release_scenes(&self.ctx.gl, self.out.size(), None, scenes)
+    }
+
     /// `frame` を `present_frame` と同じく GPU で合成したあと、`with_gl` と同じ約束で GL を `f` に貸し
     /// (写真の上へ追加で描くため)、そのあと swap → page flip の完了待ちまで行う。一時停止中は何もせず None。
     /// `present_frame` / `present_with` の挙動は変えない。VRM を写真画面に重ねる PoC(`vrm-view`)が使う。
@@ -143,19 +165,19 @@ impl GlesDisplay {
     ///
     /// 貸す側と借りる側の約束(Issue #74 の土台):
     /// - 借りた側は、自分で作った GL のオブジェクト(FBO・テクスチャ・プログラムなど)を自分で消す。
-    ///   `f` が返ったあと、キオスクの `Compositor` が前提にする状態へ貸す側が戻す:
+    ///   `f` を呼ぶ前と返ったあとに、`Compositor::reset_gl_state` が `Compositor` の前提にする状態へ設定し直す:
     ///   framebuffer の bind(READ / DRAW とも既定)、viewport(画面全体)、
-    ///   DEPTH_TEST・CULL_FACE・BLEND・SCISSOR_TEST・STENCIL_TEST の無効化、depth_mask と color_mask の全許可、
-    ///   プログラム・VAO・ARRAY_BUFFER・ELEMENT_ARRAY_BUFFER の bind 解除、
-    ///   TEXTURE0 を選んで TEXTURE_2D の bind 解除、UNPACK / PACK_ALIGNMENT を 4。
-    /// - 戻さないもの(借りた側が変えたら、そのまま残る): blend_func、clear 色、
-    ///   TEXTURE0 以外のユニットの bind、stencil / depth の関数、ポリゴンオフセット、uniform の値。
+    ///   DEPTH_TEST・CULL_FACE・BLEND・SCISSOR_TEST・STENCIL_TEST などの無効化とそのパラメーターの既定化
+    ///   (depth_func・front_face・cull_face・stencil・blend_func・ポリゴンオフセットなど)、
+    ///   depth_mask と color_mask の全許可、プログラム・VAO・バッファの bind 解除、
+    ///   TEXTURE0〜3 の TEXTURE_2D の bind 解除、PIXEL_STORE(UNPACK / PACK)の既定化。
+    /// - 設定し直さないもの(借りた側が変えたら、そのまま残る): clear 色、uniform の値、scissor の矩形。
     ///   `Compositor` は使う前にそれぞれ自分で設定する。
     pub fn with_gl<R>(&mut self, f: impl FnOnce(&glow::Context, (u32, u32)) -> R) -> R {
         let size = self.out.size();
-        restore_gl_state(&self.ctx.gl, size, None);
+        Compositor::reset_gl_state(&self.ctx.gl, size, None);
         let r = f(&self.ctx.gl, size);
-        restore_gl_state(&self.ctx.gl, size, None);
+        Compositor::reset_gl_state(&self.ctx.gl, size, None);
         r
     }
 
@@ -248,9 +270,9 @@ pub fn draw_frame_with<R>(
     unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, target) };
     comp.draw(gl, frame)?;
     // 合成のあとはプログラムや TEXTURE1 が残っているので、貸す前に約束の状態へ戻す
-    restore_gl_state(gl, size, target);
+    Compositor::reset_gl_state(gl, size, target);
     let r = f(gl, size);
-    restore_gl_state(gl, size, target);
+    Compositor::reset_gl_state(gl, size, target);
     Ok(r)
 }
 
@@ -262,45 +284,10 @@ pub fn draw_with<R>(
     target: Option<glow::Framebuffer>,
     f: impl FnOnce(&glow::Context, (u32, u32)) -> R,
 ) -> R {
-    restore_gl_state(gl, size, target);
+    Compositor::reset_gl_state(gl, size, target);
     let r = f(gl, size);
-    restore_gl_state(gl, size, target);
+    Compositor::reset_gl_state(gl, size, target);
     r
-}
-
-/// `Compositor` が前提にする GL の状態へ戻す(`with_gl` の doc 参照)。`target` は描画先の
-/// framebuffer で、画面なら None。
-pub(crate) fn restore_gl_state(
-    gl: &glow::Context,
-    (w, h): (u32, u32),
-    target: Option<glow::Framebuffer>,
-) {
-    use glow::HasContext;
-    unsafe {
-        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, target);
-        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, target);
-        gl.viewport(0, 0, w as i32, h as i32);
-        for cap in [
-            glow::DEPTH_TEST,
-            glow::CULL_FACE,
-            glow::BLEND,
-            glow::SCISSOR_TEST,
-            glow::STENCIL_TEST,
-        ] {
-            gl.disable(cap);
-        }
-        gl.depth_mask(true);
-        gl.color_mask(true, true, true, true);
-        gl.use_program(None);
-        // VAO を外してから ELEMENT_ARRAY_BUFFER を外す(VAO の中の束縛を壊さないため)
-        gl.bind_vertex_array(None);
-        gl.bind_buffer(glow::ARRAY_BUFFER, None);
-        gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, None);
-        gl.active_texture(glow::TEXTURE0);
-        gl.bind_texture(glow::TEXTURE_2D, None);
-        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
-        gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
-    }
 }
 
 /// `bo` の framebuffer を返す(初めてのバッファなら作る)。
