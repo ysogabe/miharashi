@@ -198,6 +198,7 @@ flowchart LR
 - 解放するのは、(a) 終了時、(b) その画面の 3D が失敗したとき(§9)。
   - (a) 終了時: runtime が `App::gl_scenes()`(ScreenManager が各画面の `gl_scene()` を集める)で全部の `GlScene` を取り、`drop(display)`(`runtime.rs:624`)の前に `GlesDisplay::release_scenes` で GL を current にして `release` を呼ぶ。
   - (b) 失敗時: ScreenManager は `glow::Context` を持たないので、後からは `release` できない。**scene を手に持っている `present_scene` の中で、Compositor がその場で `release`(`catch_unwind` つき)を呼ぶ**。`SceneFailed` を返した時点で解放は済んでいる。
+  - **`release` は 1 つの場面に高々 1 回**。(b) で解放済みの場面(3D が失敗した画面)は、`gl_scenes()` が返さないので終了時には呼ばれない。実行ループが描画の致命的なエラー(下地・EGL・page flip)で終わるときも、エラーを持ったまま同じ終了処理(`runtime::end_run`)に進み、`drop(display)` の前に (a) を行ってからエラーを返す(解放はベストエフォート)。`GlScene` 実装も、2 回目の呼び出しに耐える書き方(`Option::take()` など)を勧める。
   - 層(FBO)の作り直しは `region` の大きさが変わったときに Compositor が行う。表示サイズは実行中に変わらない(`resume` も同じモードで設定し直すだけ: `display.rs:88-97`)ので、きっかけは `region` の大きさの変化だけ。層は Compositor の持ち物なので、`GlScene` の解放は伴わない(`GlScene` は毎回 `GlTarget::size` を見る)。
   - `present_scene` は、一時停止中(VT が離れている間)は `draw` を呼ばずに戻る(`present_frame` と同じ: `display.rs:113-115`)。
 - 将来「しばらく見えていない画面を解放する」を足せる形にする。ScreenManager が `gl_scenes()` の返す一覧から、離れてからの経過が長いものを選び、runtime が `release_scenes` で解放する。**v1 のタイムアウトは無限(= 解放しない)**。足すかは #74 の VRAM+GTT の実測で決める。
@@ -430,6 +431,7 @@ flowchart LR
   2. **その場で、手に持っている scene に `release`(`catch_unwind` つき)を呼ぶ**。ScreenManager は `glow::Context` を持たず、`Composite::Gl` の借用からも解放できないので、後からは呼べない。作りかけのオブジェクトがあっても `release` が壊れないことが `GlScene` の約束(§9.4)。
   3. 手順 3 の層の合成は**しない**(中途半端な絵を出さない)。下地と最上段の重ね絵だけで、そのフレームを完成させて表示する。
   4. `SceneFailed(msg)` を返す(runtime は `Err` として扱わず、実行ループを続ける)。
+- 失敗した場面は `release` 済みなので、終了時の解放(§3.1 の (a))からは外す(`ScreenManager::gl_scenes()` が失敗した画面を返さない)。実行ループが `Err`(致命的な描画の失敗)で終わるときも、場面の解放を通ってからエラーを返す(`runtime::end_run`)。
 - runtime は `App::report_scene_failure(msg)` を呼ぶ。ScreenManager が、画面の id つきで 1 回だけ `eprintln!` し(runtime は出さない)、状態ログの `scene_fail=` に回数を出す(失敗が 1 回以上あるときだけ)。
 - ScreenManager は、今出していた画面を「GL 失敗」にする。
   - その画面は GL が使えないときと同じ扱い(§6): GL 専用画面は案内、装飾は元の画面。巡回では、**GL 専用画面だけ**飛ばす(装飾は元の写真・Agent 画面として巡回に残す)。

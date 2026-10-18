@@ -442,6 +442,25 @@ fn gl_scenes_collects_every_scene() {
     assert_eq!(App::gl_scenes(&mut app).len(), 2);
 }
 
+/// 3D が失敗した画面の場面は、その場で `release` 済みなので、終了時の解放の対象から外す。
+#[test]
+fn gl_scenes_skips_the_failed_screen() {
+    let probe = Rc::new(Probe::default());
+    let (mut app, _tx) = manager(
+        vec![
+            check("a", true, Base::None, &probe),
+            Box::new(Plain("plain")),
+            check("b", false, Base::Canvas, &probe),
+        ],
+        "a",
+        true,
+    );
+    let mut c = Canvas::new(SIZE.0, SIZE.1);
+    assert!(matches!(app.render_composite(&mut c), Composite::Gl(_)));
+    app.report_scene_failure("試験");
+    assert_eq!(App::gl_scenes(&mut app).len(), 1, "a を外し、b だけ");
+}
+
 /// `Composite::Gl` の下地に `Gl` は入れられない(呼び出し側の誤り)。デバッグビルドでは検出する。
 #[cfg(all(target_os = "linux", debug_assertions))]
 #[test]
@@ -475,7 +494,7 @@ fn nested_gl_is_detected() {
 #[cfg(target_os = "linux")]
 mod gpu {
     use super::*;
-    use crate::runtime::{FrameParts, frame_of, scene_frame};
+    use crate::runtime::{FrameParts, end_run, frame_of, scene_frame};
     use crate::scene_check::{BACK_COLOR, CheckScreen, FRONT_COLOR};
     use miharashi_gpu::compose::Compositor;
     use miharashi_gpu::{Offscreen, SceneOutcome, read_rgba_top_down};
@@ -656,6 +675,90 @@ mod gpu {
         assert_eq!(at(&images[2], 0.5, 0.5), FRONT_COLOR);
         assert_eq!(images[3], images[0], "Off の次は Upload し直す");
         assert_eq!(images[4], images[0]);
+    }
+
+    /// 描画の失敗 → 画面の切り替え → 終了、まで通しても、失敗した場面の `release` は 1 回だけ
+    /// (失敗したその場で呼ばれ、終了時には呼ばれない)。ほかの場面は終了時に 1 回ずつ。
+    #[test]
+    fn failed_scene_is_released_exactly_once_through_exit() {
+        let Some(off) = offscreen() else { return };
+        let (a, b) = (Rc::new(Probe::default()), Rc::new(Probe::default()));
+        let (mut app, _tx) = manager(
+            vec![
+                check("a", false, Base::Canvas, &a),
+                check("b", false, Base::Canvas, &b),
+            ],
+            "a",
+            true,
+        );
+        a.fail_draw.set(true);
+        off.with_target(SIZE, |gl, fbo| {
+            let mut comp = Compositor::new(gl, SIZE).unwrap();
+            let mut c = Canvas::new(SIZE.0, SIZE.1);
+            let comp_frame = app.render_composite(&mut c);
+            let mut parts = FrameParts::default();
+            parts.fill(&comp_frame);
+            let Composite::Gl(g) = comp_frame else {
+                panic!("Gl")
+            };
+            let mut sf = scene_frame(g, &c, &parts);
+            let outcome = comp.draw_scene(gl, Some(fbo), &mut sf).unwrap();
+            let SceneOutcome::SceneFailed(msg) = outcome else {
+                panic!("3D が失敗する: {outcome:?}")
+            };
+            app.report_scene_failure(&msg);
+            assert_eq!(
+                (a.draws.get(), a.releases.get()),
+                (1, 1),
+                "その場で release"
+            );
+            app.on_key(KeyPress::Next); // 失敗した画面から切り替える
+            end_run(None, &mut app, |scenes| {
+                Compositor::release_scenes(gl, SIZE, Some(fbo), scenes)
+            })
+            .unwrap();
+            comp.destroy(gl);
+        })
+        .unwrap();
+        assert_eq!(a.releases.get(), 1, "失敗した場面は終了時に呼ばない");
+        assert_eq!(b.releases.get(), 1, "ほかの場面は終了時に 1 回");
+    }
+
+    /// 実行ループが描画の致命的なエラーで終わっても、場面を解放してから、元のエラーを返す。
+    #[test]
+    fn scenes_are_released_when_the_loop_ends_with_an_error() {
+        let Some(off) = offscreen() else { return };
+        let probe = Rc::new(Probe::default());
+        let (mut app, _tx) = manager(
+            vec![check("check", false, Base::Canvas, &probe)],
+            "check",
+            true,
+        );
+        let result = off
+            .with_target(SIZE, |gl, fbo| {
+                let mut comp = Compositor::new(gl, SIZE).unwrap();
+                let mut c = Canvas::new(SIZE.0, SIZE.1);
+                let comp_frame = app.render_composite(&mut c);
+                let mut parts = FrameParts::default();
+                parts.fill(&comp_frame);
+                let Composite::Gl(g) = comp_frame else {
+                    panic!("Gl")
+                };
+                let mut sf = scene_frame(g, &c, &parts);
+                assert_eq!(
+                    comp.draw_scene(gl, Some(fbo), &mut sf).unwrap(),
+                    SceneOutcome::Drawn
+                );
+                assert_eq!(probe.releases.get(), 0);
+                let result = end_run(Some("page flip に失敗".into()), &mut app, |scenes| {
+                    Compositor::release_scenes(gl, SIZE, Some(fbo), scenes)
+                });
+                comp.destroy(gl);
+                result
+            })
+            .unwrap();
+        assert_eq!(result, Err("page flip に失敗".to_string()));
+        assert_eq!(probe.releases.get(), 1, "描画エラーでも解放する");
     }
 
     /// アラート表示中に 3D が失敗しても、そのフレームも次のフレームからも、アラートが見え続ける。

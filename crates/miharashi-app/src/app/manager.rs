@@ -199,11 +199,14 @@ impl ScreenManager {
         self.display_on && self.gl_ok(self.current) && self.screens[self.current].scene_animating()
     }
 
-    /// 持っているすべての `GlScene`(終了時の解放用)。
+    /// 持っているすべての `GlScene`(終了時の解放用)。3D が失敗した画面の場面は、失敗したその場で
+    /// `release` 済み(`present_scene`)なので含めない(`release` を 1 つの場面に高々 1 回にする)。
     pub fn gl_scenes(&mut self) -> Vec<&mut dyn GlScene> {
         self.screens
             .iter_mut()
-            .filter_map(|s| s.gl_scene())
+            .zip(&self.scene_failed)
+            .filter(|(_, failed)| !**failed)
+            .filter_map(|(s, _)| s.gl_scene())
             .collect()
     }
 

@@ -473,6 +473,8 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     let mut panel_err: Option<String> = None;
     let mut panel_retry = Instant::now();
 
+    // ループが描画の失敗で終わったときのエラー(終了処理のあとに返す)
+    let mut run_err = None;
     let reason = loop {
         if term.load(Ordering::Relaxed) {
             break "シグナルを受信";
@@ -635,7 +637,15 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
 
         if redraw && screen_on {
             let t0 = Instant::now();
-            let (r, p) = display.draw(app.as_mut(), &mut canvas)?;
+            // 描画の失敗(下地・EGL・page flip など)でも、場面の解放を通る終了処理へ進む(`end_run`)
+            let (r, p) = match display.draw(app.as_mut(), &mut canvas) {
+                Ok(times) => times,
+                Err(e) => {
+                    eprintln!("描画に失敗: {e}");
+                    run_err = Some(e);
+                    break "描画エラー";
+                }
+            };
             render_ms.push(r);
             present_ms.push(p);
             photo_ms.extend(display.take_photo_build_ms());
@@ -710,15 +720,29 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
         let _ = display.set_power(true);
     }
     // 3D の GL オブジェクトは、表示を閉じる前に(GL が使えるうちに)消す
-    for panic in display.release_scenes(&mut app.gl_scenes()) {
-        eprintln!("3D: release が panic した: {panic}");
-    }
+    let result = end_run(run_err, app.as_mut(), |scenes| {
+        display.release_scenes(scenes)
+    });
     // 表示(元の CRTC を復元)→ 入力 → デバイスの順に解放する。VT は VtGuard が TEXT に戻す。
     drop(display);
     keys.close(&mut session);
     session.close_device(drm_dev);
     drop(vt);
-    Ok(())
+    result
+}
+
+/// 実行ループを抜けたあとの、場面の解放。`release_scenes` は GL が使えるうちに(表示を閉じる前に)呼ぶ。
+/// 描画の失敗で抜けたとき(`run_err`)も呼ぶ。解放はベストエフォートで、panic はログに出すだけ。元のエラーを返す。
+/// 3D が失敗した画面の場面は `app.gl_scenes()` に入らない(失敗したその場で `release` 済み)。
+pub(crate) fn end_run(
+    run_err: Option<String>,
+    app: &mut dyn App,
+    release_scenes: impl FnOnce(&mut [&mut dyn GlScene]) -> Vec<String>,
+) -> Result<(), String> {
+    for panic in release_scenes(&mut app.gl_scenes()) {
+        eprintln!("3D: release が panic した: {panic}");
+    }
+    run_err.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]

@@ -35,5 +35,9 @@ pub trait GlScene {
     fn draw(&mut self, gl: &glow::Context, target: &GlTarget) -> Result<(), String>;
     /// 自分が作った GL オブジェクトをすべて消す。呼んだあとの `draw` で作り直せること。
     /// `draw` の途中(作りかけ)で失敗したあとにも呼ばれるので、作っていないものは消さない。
+    ///
+    /// Compositor / ScreenManager は、1 つの場面に対して `release` を高々 1 回だけ呼ぶ(`draw` が失敗して
+    /// その場で呼んだ場面は、終了時には呼ばない)。ただし場面の側も 2 回目の呼び出しに耐える書き方にしておくこと
+    /// (作ったものを `Option::take()` で持ち、消したら `None` に戻すなど)。
     fn release(&mut self, gl: &glow::Context);
 }
