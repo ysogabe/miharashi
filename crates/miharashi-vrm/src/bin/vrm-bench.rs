@@ -1,14 +1,18 @@
 //! `vrm-bench`: VRM 1.0 モデルを内蔵 GPU に surfaceless で描き、フレーム時間などを測る(Issue #71 A)。
 //! 画面には出さない。モデルは利用条件を確認して各自で用意する(リポジトリには置かない)。
 //! `--synthetic` なら、コードから組み立てた小さなモデルで動く。
+use miharashi_vrm::demo::{self, FaceSet};
 use miharashi_vrm::synth;
-use miharashi_vrm::{Level, Model, Renderer, attach_depth, detach_depth};
+use miharashi_vrm::{
+    Framing, Level, Model, Region, Renderer, VrmLayer, attach_depth, detach_depth,
+};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const USAGE: &str = "使い方: vrm-bench (--model <path.vrm> | --synthetic) [--pci 0000:10:00.0] [--size 1280x720] \
 [--frames 600 | --seconds 30] [--fps 30] [--feature-level bake|skin|pose|mtoon|spring] [--outline-scale 1] \
-[--expression blink] [--still] [--png out.png] [--segments 48] [--texture 1024]";
+[--expression blink] [--still] [--png out.png] [--segments 48] [--texture 1024] \
+[--frame full|waist|bust] [--region left|center|full] [--gesture] [--lipsync] [--start 0]";
 
 struct Args {
     model: Option<PathBuf>,
@@ -25,6 +29,13 @@ struct Args {
     level: Level,
     outline_scale: f32,
     synth: synth::Opts,
+    /// 構図と、描く領域(`--size` の画面の中)。full / full 以外は透明な FBO に描いて重ねる
+    frame: Framing,
+    region: Region,
+    gesture: bool,
+    lipsync: bool,
+    /// 計測の最初の時刻 [秒](途中の身振りや口の形の PNG を見るため)
+    start: f32,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -41,6 +52,11 @@ fn parse_args() -> Result<Args, String> {
         level: Level::Spring,
         outline_scale: 1.0,
         synth: synth::Opts::default(),
+        frame: Framing::Full,
+        region: Region::Full,
+        gesture: false,
+        lipsync: false,
+        start: 0.0,
     };
     let mut synthetic = false;
     let mut it = std::env::args().skip(1);
@@ -64,6 +80,11 @@ fn parse_args() -> Result<Args, String> {
             "--expression" => a.expression = Some(value()?),
             "--still" => a.still = true,
             "--png" => a.png = Some(value()?.into()),
+            "--frame" => a.frame = Framing::parse(&value()?)?,
+            "--region" => a.region = Region::parse(&value()?)?,
+            "--gesture" => a.gesture = true,
+            "--lipsync" => a.lipsync = true,
+            "--start" => a.start = value()?.parse().map_err(|_| "--start が数でない")?,
             "--feature-level" => a.level = Level::parse(&value()?)?,
             "--outline-scale" => {
                 a.outline_scale = value()?.parse().map_err(|_| "--outline-scale が数でない")?
@@ -138,11 +159,46 @@ fn measure(
         (load_cpu + upload).as_secs_f64() * 1e3,
         r.uploaded_bytes >> 20
     );
+    // 描く領域。full / full 以外は、領域と同じ大きさの透明な FBO に描いて画面(この FBO)へ重ねる
+    let (rx, ry, rw, rh) = a.region.rect(size);
+    let use_layer = a.region != Region::Full || a.frame != Framing::Full;
+    let layer = if use_layer {
+        use glow::HasContext;
+        let target = unsafe { gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING) };
+        let l = VrmLayer::new(gl, (rw, rh))?;
+        unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, target) };
+        r.clear_color = [0.0; 4];
+        Some(l)
+    } else {
+        None
+    };
+    let target = unsafe { gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING) };
+    let cam = r.framing_camera(a.frame, (rw, rh), 0.0);
+    let draw = |gl: &glow::Context, r: &Renderer| {
+        use glow::HasContext;
+        match &layer {
+            Some(l) => {
+                // 背景(写真の代わりの単色)を塗り、領域に重ねる
+                unsafe {
+                    gl.viewport(0, 0, size.0 as i32, size.1 as i32);
+                    gl.clear_color(0.22, 0.24, 0.30, 1.0);
+                    gl.clear(glow::COLOR_BUFFER_BIT);
+                }
+                l.bind(gl);
+                r.render_camera(gl, (rw, rh), &cam.0, cam.1);
+                l.composite(gl, target, (rx as i32, ry as i32));
+            }
+            None => r.render(gl, size),
+        }
+    };
+    let faces = FaceSet::of(&r.model().vrm);
+    let mut list: Vec<(&'static str, f32)> = Vec::new();
     // ウォームアップ(シェーダのコンパイル・最初の転送を計測に入れない)
     for k in 0..5 {
-        r.animate(k as f32 / 30.0, 1.0 / 30.0);
+        let t = a.start + k as f32 / 30.0;
+        r.animate(t, 1.0 / 30.0);
         r.update(gl);
-        r.render(gl, size);
+        draw(gl, r);
     }
     unsafe { gl.finish() };
     let (cpu_start, wall_start) = (cpu_seconds(), Instant::now());
@@ -156,20 +212,26 @@ fn measure(
             None if i >= a.frames => break,
             _ => {}
         }
-        let t = i as f32 / 30.0;
-        // 2 秒周期で 0 → 1 → 0
-        let w = if a.still {
-            1.0
-        } else {
-            0.5 - 0.5 * (t * std::f32::consts::PI).cos()
-        };
+        let t = a.start + i as f32 / 30.0;
         let f0 = Instant::now();
         r.animate(t, 1.0 / 30.0);
         let f_anim = Instant::now();
-        r.set_expression(expr, w)?;
+        if a.lipsync {
+            // 口の母音・まばたき・笑顔を同時に合成する
+            demo::face(t, &faces, &mut list);
+            r.set_expressions(&list)?;
+        } else {
+            // 2 秒周期で 0 → 1 → 0
+            let w = if a.still {
+                1.0
+            } else {
+                0.5 - 0.5 * (t * std::f32::consts::PI).cos()
+            };
+            r.set_expression(expr, w)?;
+        }
         let times = r.update(gl);
         let f1 = Instant::now();
-        r.render(gl, size);
+        draw(gl, r);
         unsafe { gl.finish() };
         total.push(f0.elapsed().as_secs_f64() * 1e3);
         // set_expression + update のうち、骨の分(UBO 転送込み)を除いたものが morph
@@ -186,6 +248,11 @@ fn measure(
                 std::thread::sleep(d);
             }
         }
+    }
+    if let Some(l) = layer {
+        l.destroy(gl);
+        // destroy は FRAMEBUFFER を外すので、あとの detach_depth のために描画先へ戻す
+        unsafe { glow::HasContext::bind_framebuffer(gl, glow::FRAMEBUFFER, target) };
     }
     let wall = wall_start.elapsed().as_secs_f64();
     let cpu = cpu_seconds() - cpu_start;
@@ -216,10 +283,30 @@ fn measure(
         1e3 / tm
     );
     println!("feature_level: {}", r.level().name());
+    println!(
+        "composition: frame={} region={} ({rw}x{rh} at {rx},{ry}) gesture={} lipsync={} start={:.1}s{}",
+        a.frame.name(),
+        a.region.name(),
+        a.gesture,
+        a.lipsync,
+        a.start,
+        if use_layer {
+            "(透明な FBO に描いて重ねる)"
+        } else {
+            "(画面全体に直接)"
+        }
+    );
     println!("gpu_ms(描画の発行 + glFinish): mean={gm:.2} p95={gp:.2}");
     println!("pose_cpu_ms: mean={pm:.3} p95={pp:.3}(ノード階層の評価 + 関節行列 + UBO 転送)");
     println!("spring_cpu_ms: mean={sm:.3} p95={sp:.3}");
-    println!("morph_cpu_ms: mean={mm:.3} p95={mp:.3}(set_expression + 頂点の合成・転送)");
+    println!(
+        "morph_cpu_ms: mean={mm:.3} p95={mp:.3}(表情合成: set_expression(s) + 頂点の合成・転送{})",
+        if a.lipsync {
+            "、口パク + まばたき + 笑顔"
+        } else {
+            ""
+        }
+    );
     println!(
         "process_cpu: {:.1}% (cpu {:.2}s / wall {:.2}s、{})",
         cpu / wall * 100.0,
@@ -312,6 +399,36 @@ fn run(a: &Args) -> Result<(), String> {
             }
         };
         r.outline_scale = a.outline_scale;
+        let mut setup = || -> Result<(), String> {
+            if a.gesture {
+                r.set_gesture(true)?;
+                let (arms, fingers) = r.rig().gesture_bones();
+                println!("gesture: 腕 {arms} 本、指の関節 {fingers} 個");
+            }
+            if a.lipsync {
+                let f = FaceSet::of(&r.model().vrm);
+                if f.no_vowels() {
+                    return Err("口パクに使う表情(aa/ih/ou/ee/oh)がモデルにない".into());
+                }
+                println!(
+                    "lipsync: 母音 {:?} blink={} happy={}",
+                    demo::VOWELS
+                        .iter()
+                        .zip(f.vowels)
+                        .filter(|(_, ok)| *ok)
+                        .map(|(n, _)| *n)
+                        .collect::<Vec<_>>(),
+                    f.blink,
+                    f.happy
+                );
+            }
+            Ok(())
+        };
+        if let Err(e) = setup() {
+            r.destroy(gl);
+            detach_depth(gl, depth);
+            return Err(e);
+        }
         // 計測の途中でエラーになっても、あとで destroy / detach_depth を通る
         let measured = measure(
             a,

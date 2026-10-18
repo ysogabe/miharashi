@@ -2,6 +2,7 @@
 //! 自然なポーズ(T ポーズから腕を下ろす)と待機モーション(呼吸・頭の揺れ)は、humanoid の
 //! 骨に「ワールド空間の回転」を掛ける形で与える(骨のローカル軸は並びが決まっていないので、
 //! ローカルで「70 度」とは言えない)。時間 [秒] の関数で、GL には触れない。
+use crate::gesture;
 use crate::math::{self, Mat4, QUAT_IDENTITY, Quat, Trs};
 use crate::model::Model;
 use std::f32::consts::TAU;
@@ -34,12 +35,44 @@ struct Idle {
     phase: f32,
 }
 
+/// 指の 1 関節。曲げる軸は、手のローカル空間で持つ(手の向きが変わっても追従する)。
+struct FingerBone {
+    node: usize,
+    /// 0 = 親指、1 = 人差し指、2 = 中指、3 = 薬指、4 = 小指
+    finger: usize,
+    max_rad: f32,
+    axis_local: [f32; 3],
+}
+
+/// 身振りで動かす片腕。
+struct ArmRig {
+    /// 腕が伸びる側(T ポーズでの向きの x の符号。+1 = +X 側)
+    out: f32,
+    upper: usize,
+    lower: usize,
+    hand: usize,
+    fingers: Vec<FingerBone>,
+}
+
+/// 身振りで動かす体と頭。`(ノード, 配分)`。配分は、体の向き・前傾を各関節に分ける割合。
+#[derive(Default)]
+struct BodyRig {
+    yaw: Vec<(usize, f32)>,
+    lean: Vec<(usize, f32)>,
+    head: Option<usize>,
+    neck: Option<usize>,
+}
+
 pub struct Rig {
     rest: Vec<Trs>,
     /// 自然なポーズ(静的)のワールド回転
     natural: Vec<(usize, Quat)>,
     idle: Vec<Idle>,
     hips: Option<usize>,
+    arms: Vec<ArmRig>,
+    body: BodyRig,
+    /// 身振り(`gesture::pose_at`)を重ねるか
+    gesture: bool,
     /// 毎フレームの、ノードごとのワールド回転(自然なポーズ + 待機モーション)
     delta: Vec<Quat>,
     /// 腰の上下 [m](ワールド Y)
@@ -61,6 +94,9 @@ impl Rig {
             natural: Vec::new(),
             idle: Vec::new(),
             hips: model.vrm.human_bones.get("hips").copied(),
+            arms: Vec::new(),
+            body: BodyRig::default(),
+            gesture: false,
             delta: vec![QUAT_IDENTITY; n],
             hip_bob: 0.0,
             override_rot: vec![None; n],
@@ -72,12 +108,29 @@ impl Rig {
         rig.locals = rig.rest.clone();
         rig.eval(model);
         if pose {
+            // 腕と指の軸は初期姿勢(T ポーズ)の形から決める。自然なポーズを掛ける前に
+            rig.arms = build_arms(model, &rig.world, &rig.world_rot);
+            rig.body = build_body(model);
             rig.natural = rig.natural_pose(model);
             rig.idle = idle_rules(model);
         }
         // animate を呼ぶ前でも描けるよう、初期姿勢の関節行列を持たせる
         model.joint_matrices(&rig.world, &mut rig.joints);
         rig
+    }
+
+    /// 身振りを重ねる。腕の骨がなければ false を返して何もしない。
+    pub fn set_gesture(&mut self, on: bool) -> bool {
+        self.gesture = on && !self.arms.is_empty();
+        !on || self.gesture
+    }
+
+    /// 身振りで動かせる腕と、指の関節の数。
+    pub fn gesture_bones(&self) -> (usize, usize) {
+        (
+            self.arms.len(),
+            self.arms.iter().map(|a| a.fingers.len()).sum(),
+        )
     }
 
     pub fn has_pose(&self) -> bool {
@@ -150,6 +203,81 @@ impl Rig {
         out
     }
 
+    fn rotate_world(&mut self, node: usize, axis: [f32; 3], rad: f32) {
+        self.delta[node] = math::quat_mul(math::quat_axis_angle(axis, rad), self.delta[node]);
+    }
+
+    /// 身振り(`gesture::pose_at`)を `delta` に重ねる。体と頭は世界の軸まわりの回転、腕は
+    /// 「上腕 → 前腕」を目標の向きに合わせる回転、指は手のローカルの軸まわりの曲げ。
+    /// 途中で何度か `eval` して、腕の現在の向きを求め直す。
+    fn apply_gesture(&mut self, model: &Model, t: f32) {
+        const X: [f32; 3] = [1.0, 0.0, 0.0];
+        const Y: [f32; 3] = [0.0, 1.0, 0.0];
+        const Z: [f32; 3] = [0.0, 0.0, 1.0];
+        let g = gesture::pose_at(t);
+        let yaw = g.body_yaw_deg.to_radians();
+        let lean = g.body_lean_deg.to_radians();
+        let mut applied_yaw = 0.0;
+        for i in 0..self.body.yaw.len() {
+            let (n, share) = self.body.yaw[i];
+            self.rotate_world(n, Y, yaw * share);
+            applied_yaw += yaw * share;
+        }
+        for i in 0..self.body.lean.len() {
+            let (n, share) = self.body.lean[i];
+            self.rotate_world(n, X, lean * share);
+        }
+        if let Some(n) = self.body.neck {
+            self.rotate_world(n, Y, g.head_yaw_deg.to_radians() * 0.35);
+        }
+        if let Some(n) = self.body.head {
+            self.rotate_world(n, Y, g.head_yaw_deg.to_radians() * 0.65);
+            self.rotate_world(n, X, g.head_pitch_deg.to_radians());
+            self.rotate_world(n, Z, g.head_roll_deg.to_radians());
+        }
+        self.eval(model);
+
+        let body_q = math::quat_axis_angle(Y, applied_yaw);
+        let target = |pose: &gesture::ArmPose, forearm: bool| {
+            math::quat_rotate(body_q, if forearm { pose.fore } else { pose.upper })
+        };
+        let pos = |w: &[Mat4], i: usize| [w[i][3][0], w[i][3][1], w[i][3][2]];
+        let pose_of = |out: f32| if out > 0.0 { g.plus_x } else { g.minus_x };
+        // 上腕
+        for k in 0..self.arms.len() {
+            let (out, upper, lower) = (self.arms[k].out, self.arms[k].upper, self.arms[k].lower);
+            let cur = math::vec_sub(pos(&self.world, lower), pos(&self.world, upper));
+            let d = math::quat_from_to(cur, target(&pose_of(out), false));
+            self.delta[upper] = math::quat_mul(d, self.delta[upper]);
+        }
+        self.eval(model);
+        // 前腕と手首
+        for k in 0..self.arms.len() {
+            let (out, lower, hand) = (self.arms[k].out, self.arms[k].lower, self.arms[k].hand);
+            let pose = pose_of(out);
+            let want = target(&pose, true);
+            let cur = math::vec_sub(pos(&self.world, hand), pos(&self.world, lower));
+            let d = math::quat_from_to(cur, want);
+            self.delta[lower] = math::quat_mul(d, self.delta[lower]);
+            let axis = math::vec_cross(want, Z);
+            let axis = if math::vec_len(axis) > 1e-4 { axis } else { X };
+            self.delta[hand] = math::quat_axis_angle(axis, pose.wrist_deg.to_radians());
+        }
+        self.eval(model);
+        // 指(手の向きが決まったあとに、手のローカルの軸を世界へ戻して曲げる)
+        for k in 0..self.arms.len() {
+            let pose = pose_of(self.arms[k].out);
+            let hand_rot = self.world_rot[self.arms[k].hand];
+            for i in 0..self.arms[k].fingers.len() {
+                let f = &self.arms[k].fingers[i];
+                let axis = math::quat_rotate(hand_rot, f.axis_local);
+                let q = math::quat_axis_angle(axis, pose.curl[f.finger] * f.max_rad);
+                let node = f.node;
+                self.delta[node] = q;
+            }
+        }
+    }
+
     /// 時刻 `t` のポーズを評価して、関節行列を作る。`spring` は評価の途中で呼ばれ、
     /// `override_rot` を設定して再評価の対象にする(spring を使わなければ `None`)。
     pub fn update(&mut self, model: &Model, t: f32, spring: Option<SpringFn<'_>>) {
@@ -165,12 +293,130 @@ impl Rig {
         if !self.idle.is_empty() {
             self.hip_bob = HIP_BOB_M * (TAU * t / BREATH_PERIOD).sin();
         }
+        if self.gesture {
+            self.apply_gesture(model, t);
+        }
         self.eval(model);
         if let Some(f) = spring {
             f(self, model);
             self.eval(model);
         }
         model.joint_matrices(&self.world, &mut self.joints);
+    }
+}
+
+/// 指の関節ごとの、握り切ったときの曲げ角 [度](親指以外: 付け根・中・先)
+const FINGER_CURL_DEG: [f32; 3] = [75.0, 85.0, 55.0];
+/// 親指(付け根・先)
+const THUMB_CURL_DEG: [f32; 2] = [30.0, 45.0];
+
+fn build_arms(model: &Model, world: &[Mat4], world_rot: &[Quat]) -> Vec<ArmRig> {
+    let hb = &model.vrm.human_bones;
+    let pos = |i: usize| [world[i][3][0], world[i][3][1], world[i][3][2]];
+    let mut arms = Vec::new();
+    for side in ["left", "right"] {
+        let get = |k: &str| hb.get(&format!("{side}{k}")).copied();
+        let (Some(upper), Some(lower), Some(hand)) =
+            (get("UpperArm"), get("LowerArm"), get("Hand"))
+        else {
+            continue;
+        };
+        let dir = math::vec_sub(pos(lower), pos(upper));
+        // T ポーズなら腕は ±X に伸びている。向きが取れないときは VRM 1.0 の左 = +X
+        let out = if dir[0].abs() > 0.2 * math::vec_len(dir) {
+            dir[0].signum()
+        } else if side == "left" {
+            1.0
+        } else {
+            -1.0
+        };
+        let mut fingers = Vec::new();
+        let hand_inv = math::quat_conj(world_rot[hand]);
+        for (fi, name) in ["Thumb", "Index", "Middle", "Ring", "Little"]
+            .into_iter()
+            .enumerate()
+        {
+            // 親指は Metacarpal を動かさず、Proximal(と、あれば Intermediate)・Distal を曲げる
+            let joints: Vec<(usize, f32)> = if fi == 0 {
+                [
+                    ("Proximal", THUMB_CURL_DEG[0]),
+                    ("Distal", THUMB_CURL_DEG[1]),
+                ]
+                .into_iter()
+                .filter_map(|(j, d)| get(&format!("{name}{j}")).map(|n| (n, d)))
+                .collect()
+            } else {
+                ["Proximal", "Intermediate", "Distal"]
+                    .into_iter()
+                    .zip(FINGER_CURL_DEG)
+                    .filter_map(|(j, d)| get(&format!("{name}{j}")).map(|n| (n, d)))
+                    .collect()
+            };
+            for (k, &(node, deg)) in joints.iter().enumerate() {
+                // 指の向き: 次の関節への向き(先端は 1 つ手前からの向き)。手のひらは T ポーズで下向きとみなし、
+                // 曲げる軸は (指の向き × 下) = 指先が下へ向く回転
+                let d = match joints.get(k + 1) {
+                    Some(&(next, _)) => math::vec_sub(pos(next), pos(node)),
+                    None if k > 0 => math::vec_sub(pos(node), pos(joints[k - 1].0)),
+                    None => continue,
+                };
+                let axis = math::vec_cross(math::normalize(d), [0.0, -1.0, 0.0]);
+                if math::vec_len(axis) < 0.1 {
+                    continue;
+                }
+                fingers.push(FingerBone {
+                    node,
+                    finger: fi,
+                    max_rad: deg.to_radians(),
+                    axis_local: math::quat_rotate(hand_inv, math::normalize(axis)),
+                });
+            }
+        }
+        arms.push(ArmRig {
+            out,
+            upper,
+            lower,
+            hand,
+            fingers,
+        });
+    }
+    arms
+}
+
+fn build_body(model: &Model) -> BodyRig {
+    let hb = &model.vrm.human_bones;
+    let get = |k: &str| hb.get(k).copied();
+    let (upper_chest, chest) = (get("upperChest"), get("chest"));
+    let mut yaw = Vec::new();
+    let mut lean = Vec::new();
+    let add = |v: &mut Vec<(usize, f32)>, n: Option<usize>, share: f32| {
+        if let Some(n) = n {
+            v.push((n, share));
+        }
+    };
+    add(&mut yaw, get("hips"), 0.15);
+    add(&mut yaw, get("spine"), 0.25);
+    // 上胸があれば胸と半分ずつ
+    let (c, u) = if upper_chest.is_some() {
+        (0.2, 0.15)
+    } else {
+        (0.35, 0.0)
+    };
+    add(&mut yaw, chest, c);
+    add(&mut yaw, upper_chest, u);
+    add(&mut yaw, get("neck"), 0.1);
+    add(&mut lean, get("spine"), 0.5);
+    add(
+        &mut lean,
+        chest,
+        if upper_chest.is_some() { 0.3 } else { 0.5 },
+    );
+    add(&mut lean, upper_chest, 0.2);
+    BodyRig {
+        yaw,
+        lean,
+        head: get("head"),
+        neck: get("neck"),
     }
 }
 

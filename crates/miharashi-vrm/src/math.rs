@@ -240,6 +240,20 @@ pub fn vec_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     cross(a, b)
 }
 
+/// 単位ベクトル `a` から `b` へ、大円に沿って `s`(0..=1)だけ進んだ向き。ほぼ逆向きのときは
+/// `a` に垂直な任意の軸まわりに回す。
+pub fn vec_slerp(a: [f32; 3], b: [f32; 3], s: f32) -> [f32; 3] {
+    let (a, b) = (normalize(a), normalize(b));
+    let q = quat_from_to(a, b);
+    // quat_from_to の回転を s 倍(角度を s 倍)にして a に掛ける
+    let angle = 2.0 * q[3].clamp(-1.0, 1.0).acos();
+    let axis = [q[0], q[1], q[2]];
+    if vec_len(axis) < 1e-9 {
+        return a;
+    }
+    quat_rotate(quat_axis_angle(axis, angle * s), a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +291,21 @@ mod tests {
         let r = quat_from_to([0.0, 1.0, 0.0], [0.0, -1.0, 0.0]);
         let v = quat_rotate(r, [0.0, 1.0, 0.0]);
         assert!((v[1] + 1.0).abs() < 1e-5, "{v:?}");
+    }
+
+    #[test]
+    fn slerp_keeps_unit_length_and_hits_ends() {
+        let (a, b) = ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let m = vec_slerp(a, b, 0.5);
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((m[0] - h).abs() < 1e-5 && (m[1] - h).abs() < 1e-5, "{m:?}");
+        for s in [0.0, 0.3, 1.0] {
+            assert!((vec_len(vec_slerp(a, b, s)) - 1.0).abs() < 1e-5);
+        }
+        let e = vec_slerp(a, b, 1.0);
+        assert!((e[1] - 1.0).abs() < 1e-5);
+        // 逆向きでも長さ 1 を保つ
+        assert!((vec_len(vec_slerp(a, [-1.0, 0.0, 0.0], 0.5)) - 1.0).abs() < 1e-5);
     }
 
     #[test]

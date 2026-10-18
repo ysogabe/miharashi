@@ -316,6 +316,83 @@ mod tests {
         }
     }
 
+    /// `present_frame_with` の本体(`draw_frame_with`): 写真の上に追加の描画が重なり、貸した側が
+    /// 状態(scissor・ブレンド・プログラムなど)を散らかしても、そのあとの `Compositor` の描画は
+    /// 追加の描画なしのときと同じになること。
+    #[test]
+    fn offscreen_draw_frame_with_overlays_and_leaves_next_frame_intact() {
+        use crate::draw_frame_with;
+        let Ok(off) = Offscreen::open(Path::new("/dev/dri/renderD128")) else {
+            eprintln!("GLES が使えないので skip");
+            return;
+        };
+        let (w, h) = (64u32, 16u32);
+        let n = (w * h) as usize;
+        let old = [200u8, 40, 10, 255].repeat(n);
+        let new = [20u8, 100, 240, 255].repeat(n);
+        let p = |id, rgba| PhotoLayer {
+            id,
+            src: PhotoSource::Frame(rgba),
+        };
+        let f1 = Frame::Photo {
+            photo: p(1, &old),
+            old: None,
+            overlay: None,
+        };
+        let f2 = Frame::Photo {
+            photo: p(2, &new),
+            old: Some((p(1, &old), 0.5)),
+            overlay: None,
+        };
+        // 貸された側が、半透明の赤を左下 16x8 に ブレンドで重ね、scissor・ブレンドを有効のままにする
+        let dirty = |gl: &glow::Context, _: (u32, u32)| unsafe {
+            gl.enable(glow::SCISSOR_TEST);
+            gl.scissor(0, 0, 16, 8);
+            gl.clear_color(0.5, 0.0, 0.0, 0.5);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::SRC_ALPHA, glow::ZERO);
+            gl.active_texture(glow::TEXTURE1);
+        };
+        // 1 枚目の上に追加の描画が載る
+        let ((), img) = off
+            .with_fbo((w, h), |gl| {
+                let fbo = unsafe { gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING) };
+                let mut comp = Compositor::new(gl, (w, h)).unwrap();
+                draw_frame_with(&mut comp, gl, (w, h), fbo, &f1, dirty).unwrap();
+                comp.destroy(gl);
+            })
+            .unwrap();
+        // 画像は上から下。GL の左下 = 画像の最終行の左端
+        let px = |x: usize, y: usize| &img[(y * w as usize + x) * 4..(y * w as usize + x) * 4 + 4];
+        assert_eq!(px(0, h as usize - 1), [128, 0, 0, 128], "追加の描画");
+        assert_eq!(
+            px(40, h as usize - 1)[..3],
+            [200, 40, 10],
+            "領域の外は写真のまま"
+        );
+        assert_eq!(px(0, 0)[..3], [200, 40, 10], "上の行は写真のまま");
+        // 貸したあとの次の描画は、貸さなかったときと同じ
+        let seq = |lend: bool| {
+            off.with_fbo((w, h), |gl| {
+                let fbo = unsafe { gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING) };
+                let mut comp = Compositor::new(gl, (w, h)).unwrap();
+                if lend {
+                    draw_frame_with(&mut comp, gl, (w, h), fbo, &f1, dirty).unwrap();
+                } else {
+                    comp.draw(gl, &f1).unwrap();
+                }
+                // present_frame と同じ前処理(FBO を戻して描く)
+                comp.draw(gl, &f2).unwrap();
+                comp.destroy(gl);
+            })
+            .unwrap()
+            .1
+        };
+        let (a, b) = (seq(true), seq(false));
+        assert_eq!(diff_rgb(&a, &b, 0), (0, 0), "次のフレームが影響を受けない");
+    }
+
     /// 写真から GPU で作った完成フレームが、CPU 経路の `compose_image` とほぼ同じになること。
     /// 左寄せ(ぼかし背景と影あり)と、画面いっぱい(cover)の両方を比べる。
     #[test]
