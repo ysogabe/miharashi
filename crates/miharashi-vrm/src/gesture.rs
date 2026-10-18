@@ -267,6 +267,70 @@ pub fn pose_at(t: f32) -> GesturePose {
     p
 }
 
+/// 視線と指さしの目標(`--follow-cards`)。`pose_at` の身振りに重ねる。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Aim {
+    /// 目標の向き(世界で、キャラクターの正面を +Z とした単位ベクトル。x = +X 側 = 画面の右、y = 上)
+    pub dir: V3,
+    /// 頭と体を目標へ向ける割合(0〜1)
+    pub look: f32,
+    /// 腕を伸ばして指さす割合(0〜1)
+    pub point: f32,
+}
+
+/// 頭の向きの上限 [度]
+const AIM_YAW_MAX: f32 = 35.0;
+
+/// 指さす腕の目標。前腕は `v` の向きに伸ばし、上腕はそれより下に垂らす(`key(Point)` の形に近い)。
+fn point_arm(v: V3) -> ArmPose {
+    // 真横に近い目標でも、腕が体の中へ入らないよう前向きの成分を残す
+    let fore = math::normalize([v[0], v[1], v[2].max(0.35)]);
+    let upper = math::normalize([fore[0] * 0.6, fore[1] - 0.7, fore[2] * 0.9 + 0.2]);
+    arm(upper, fore, 0.0, [0.45, 0.0, 0.9, 0.95, 0.95])
+}
+
+fn apply_aim(p: &mut GesturePose, aim: &Aim) {
+    let look = aim.look.clamp(0.0, 1.0);
+    let point = aim.point.clamp(0.0, 1.0);
+    let v = math::normalize(aim.dir);
+    let yaw = v[0]
+        .atan2(v[2])
+        .to_degrees()
+        .clamp(-AIM_YAW_MAX, AIM_YAW_MAX);
+    // 目標が上なら頭を上げる(正がおじぎ)
+    let pitch = (-v[1])
+        .clamp(-1.0, 1.0)
+        .asin()
+        .to_degrees()
+        .clamp(-15.0, 15.0);
+    // 向きは頭に 3/4、体に 1/4
+    p.head_yaw_deg = lerp(p.head_yaw_deg, yaw * 0.75, look);
+    p.body_yaw_deg = lerp(p.body_yaw_deg, yaw * 0.25, look);
+    p.head_pitch_deg = lerp(p.head_pitch_deg, pitch, look);
+    p.head_roll_deg = lerp(p.head_roll_deg, 0.0, look);
+    if point > 0.0 {
+        // 腕の目標は体を基準にするので、体の向きの分だけ戻す
+        let body = math::quat_axis_angle([0.0, 1.0, 0.0], (-p.body_yaw_deg).to_radians());
+        let local = math::quat_rotate(body, v);
+        let target = point_arm(local);
+        let side = if v[0] >= 0.0 {
+            &mut p.plus_x
+        } else {
+            &mut p.minus_x
+        };
+        *side = blend_arm(side, &target, point);
+    }
+}
+
+/// `pose_at` に、視線と指さしの目標(あれば)を重ねた身振り。
+pub fn pose_aimed(t: f32, aim: Option<&Aim>) -> GesturePose {
+    let mut p = pose_at(t);
+    if let Some(a) = aim {
+        apply_aim(&mut p, a);
+    }
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +424,48 @@ mod tests {
         assert!(point.plus_x.fore[0] > 0.4, "指さしは +X 側へ伸びる");
         assert!(point.plus_x.curl[1] < 0.1 && point.plus_x.curl[2] > 0.8);
         assert!(point.body_yaw_deg > 5.0);
+    }
+
+    #[test]
+    fn aim_turns_head_and_points_the_nearer_arm() {
+        let t = 0.3;
+        let none = pose_aimed(t, None);
+        assert_eq!(none, pose_at(t));
+        // 重みが 0 なら変わらない
+        let zero = Aim {
+            dir: [0.6, 0.0, 0.8],
+            look: 0.0,
+            point: 0.0,
+        };
+        assert!(angle_deg(pose_aimed(t, Some(&zero)).plus_x.fore, none.plus_x.fore) < 1e-3);
+        // 右の目標: 頭が +X 側へ向き、+X 側の腕が目標の向きに伸びる
+        let right = Aim {
+            dir: math::normalize([0.6, 0.1, 0.8]),
+            look: 1.0,
+            point: 1.0,
+        };
+        let p = pose_aimed(t, Some(&right));
+        assert!(p.head_yaw_deg > 10.0 && p.head_yaw_deg <= AIM_YAW_MAX);
+        assert!(p.plus_x.fore[0] > 0.4 && p.plus_x.curl[1] < 0.1);
+        assert!(unit(p.plus_x.upper) && unit(p.plus_x.fore));
+        assert!(
+            angle_deg(p.minus_x.fore, none.minus_x.fore) < 1e-3,
+            "反対の腕はそのまま"
+        );
+        // 左の目標は -X 側の腕
+        let left = Aim {
+            dir: math::normalize([-0.6, -0.1, 0.8]),
+            ..right
+        };
+        let q = pose_aimed(t, Some(&left));
+        assert!(q.head_yaw_deg < -10.0);
+        assert!(q.minus_x.fore[0] < -0.4 && q.minus_x.curl[1] < 0.1);
+        assert!(angle_deg(q.plus_x.fore, none.plus_x.fore) < 1e-3);
+        // 真横に近い目標でも腕は前向きの成分を残す
+        let side = Aim {
+            dir: [1.0, 0.0, 0.0],
+            ..right
+        };
+        assert!(pose_aimed(t, Some(&side)).plus_x.fore[2] > 0.3);
     }
 }

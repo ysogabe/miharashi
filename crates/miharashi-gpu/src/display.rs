@@ -73,6 +73,11 @@ impl GlesDisplay {
         std::mem::take(&mut self.comp.build_ms)
     }
 
+    /// これまでに Agent 画面の背景とカードの面を GPU へ転送した量 [バイト](`Frame::Agents` の分だけ)。
+    pub fn agent_uploaded(&self) -> u64 {
+        self.comp.agent_uploaded
+    }
+
     /// VT が非アクティブになるとき。以後 `present` は何もしない。DRM master は手放す。
     pub fn suspend(&mut self) {
         self.suspended = true;

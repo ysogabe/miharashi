@@ -1,6 +1,8 @@
 //! `vrm-view`: VRM 1.0 モデルを実際のモニター(DRM/KMS)に表示する PoC(Issue #71 B の下調べ)。
 //! `--photos` で、写真画面と同じ GPU 経路の写真を背景に描き、その上の領域(`--region`)にバストアップなど
 //! (`--frame`)のキャラクターを重ねて、身振り(`--gesture`)と口パク(`--lipsync`)の負荷を測れる。
+//! `--agents` なら、写真の代わりに T3 Agent 画面のカード(合成のダミー。`Frame::Agents` の GPU 経路)を背景にして、
+//! 同じようにキャラクターを重ねる。`--follow-cards` で、フォーカスが移ったカードの方へ視線と指さしを向ける。
 //! キオスク(miharashi.service)とは DRM master を取り合うので、止めてから実行する。libseat は使わず、
 //! カードを直接 open する。終了(`--seconds` の経過、SIGINT/SIGTERM)で元の画面に戻る。
 //! モデルは利用条件を確認して各自で用意する(リポジトリには置かない)。`--synthetic` なら合成モデル。
@@ -8,6 +10,8 @@ use glow::HasContext;
 use miharashi_gpu::GlesDisplay;
 use miharashi_linux::drm_select::{self, CardSel, ModeSel};
 use miharashi_linux::sysinfo::SelfCpu;
+use miharashi_render::TextEngine;
+use miharashi_vrm::agent_stage::{AgentStage, AimTracker, StageStats};
 use miharashi_vrm::demo::FaceSet;
 use miharashi_vrm::photo_stage::{self, Slideshow};
 use miharashi_vrm::synth;
@@ -20,8 +24,9 @@ use std::time::{Duration, Instant};
 
 const USAGE: &str = "使い方: vrm-view (--model <path.vrm> | --synthetic) [--card driver:amdgpu] [--connector auto] \
 [--mode preferred] [--seconds 60] [--expression blink] [--fps 30] [--feature-level spring] [--outline-scale 1] \
-[--frame full|waist|bust] [--region left|center|full] [--gesture] [--lipsync] \
-[--photos <dir|synthetic>] [--photo-interval 10] [--no-vrm]";
+[--frame full|waist|bust] [--region left|center|right|full] [--gesture] [--lipsync] \
+[--photos <dir|synthetic>] [--photo-interval 10] \
+[--agents [--cards 8] [--card-interval 6] [--follow-cards]] [--no-vrm]";
 
 /// fps などを標準エラーに出す間隔
 const STATS_EVERY: Duration = Duration::from_secs(5);
@@ -44,8 +49,16 @@ struct Args {
     /// 背景に写真を描く。`synthetic` か、JPEG の入ったディレクトリ(なければ合成写真)
     photos: Option<String>,
     photo_interval: f64,
-    /// キャラクターを描かず、写真だけを描く(VRM の上乗せを出すための基準)
+    /// キャラクターを描かず、背景(写真かカード)だけを描く(VRM の上乗せを出すための基準)
     no_vrm: bool,
+    /// 背景に T3 Agent 画面のカード(合成のダミー)を描く
+    agents: bool,
+    /// ダミーのカードの枚数
+    cards: usize,
+    /// ダミーのカードの状態が変わる間隔 [秒]
+    card_interval: f64,
+    /// フォーカスが移ったカードの方へ視線と指さしを向ける
+    follow_cards: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -66,6 +79,10 @@ fn parse_args() -> Result<Args, String> {
         photos: None,
         photo_interval: 10.0,
         no_vrm: false,
+        agents: false,
+        cards: 8,
+        card_interval: 6.0,
+        follow_cards: false,
     };
     let mut synthetic = false;
     let mut it = std::env::args().skip(1);
@@ -95,11 +112,34 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| "--photo-interval が数でない")?
             }
             "--no-vrm" => a.no_vrm = true,
+            "--agents" => a.agents = true,
+            "--cards" => a.cards = value()?.parse().map_err(|_| "--cards が整数でない")?,
+            "--card-interval" => {
+                a.card_interval = value()?.parse().map_err(|_| "--card-interval が数でない")?
+            }
+            "--follow-cards" => a.follow_cards = true,
             _ => return Err(format!("不明な引数 {flag}\n{USAGE}")),
         }
     }
-    if a.no_vrm && a.photos.is_none() {
-        return Err("--no-vrm は --photos と一緒に使う(写真だけを描く)".into());
+    if a.agents && a.photos.is_some() {
+        return Err("--agents と --photos は一緒に使えない(背景はどちらか一方)".into());
+    }
+    if a.no_vrm && a.photos.is_none() && !a.agents {
+        return Err("--no-vrm は --photos か --agents と一緒に使う(背景だけを描く)".into());
+    }
+    if a.follow_cards && !a.agents {
+        return Err("--follow-cards は --agents と一緒に使う".into());
+    }
+    if a.follow_cards && a.no_vrm {
+        return Err("--follow-cards は VRM を描くとき(--no-vrm なし)だけ".into());
+    }
+    // カードに合わせて腕を動かすには、身振りが要る
+    a.gesture |= a.follow_cards;
+    if !(1..=24).contains(&a.cards) {
+        return Err("--cards は 1〜24".into());
+    }
+    if a.card_interval.partial_cmp(&0.5).is_none_or(|o| o.is_lt()) {
+        return Err("--card-interval は 0.5 以上の数".into());
     }
     if a.photo_interval.partial_cmp(&1.0).is_none_or(|o| o.is_lt()) {
         return Err("--photo-interval は 1 以上の数".into());
@@ -118,7 +158,7 @@ fn parse_args() -> Result<Args, String> {
     Ok(a)
 }
 
-/// CPU 時間の内訳 [ms]の合計(窓ごと・全体)。
+/// 発行時間(壁時計)の内訳 [ms]の合計(窓ごと・全体)。
 #[derive(Default, Clone)]
 struct Sum {
     frames: u32,
@@ -127,12 +167,17 @@ struct Sum {
     spring: f64,
     /// 表情の合成(`set_expressions` + 頂点の合成・転送)
     face: f64,
-    /// 写真の合成(`Compositor::draw` の命令の発行まで。1 枚目の完成フレーム作りを含む)
-    photo_draw: f64,
+    /// 背景の合成(`Compositor::draw` の命令の発行まで。写真は1 枚目の完成フレーム作りを含む)
+    compose: f64,
     /// VRM の描画命令の発行(層への描画と合成)
     vrm_draw: f64,
+    /// Agent 画面の組み立て(配置・pose・カードの面と背景の CPU 描画。転送の準備まで)
+    cards: f64,
     /// 写真 1 枚ごとの「完成フレームを作る」CPU 時間
     builds: Vec<f32>,
+    /// `--agents`: カードの面・背景の描き直しと、GPU へ転送した量
+    stage: StageStats,
+    uploaded: u64,
 }
 
 impl Sum {
@@ -142,12 +187,15 @@ impl Sum {
         self.pose += o.pose;
         self.spring += o.spring;
         self.face += o.face;
-        self.photo_draw += o.photo_draw;
+        self.compose += o.compose;
         self.vrm_draw += o.vrm_draw;
+        self.cards += o.cards;
         self.builds.extend_from_slice(&o.builds);
+        self.stage.add(&o.stage);
+        self.uploaded += o.uploaded;
     }
 
-    fn line(&self, secs: f64, cpu: Option<f32>) -> String {
+    fn line(&self, secs: f64, cpu: Option<f32>, agents: bool) -> String {
         let n = self.frames.max(1) as f64;
         let build = if self.builds.is_empty() {
             "-".to_string()
@@ -159,17 +207,34 @@ impl Sum {
                 self.builds.iter().copied().fold(0.0, f32::max)
             )
         };
-        format!(
-            "{:.1} fps  frame {:.2}ms  cpu {}  | 発行時間 ms(壁時計): pose {:.3} spring {:.3} face {:.3} photo {:.3} vrm_draw {:.3}  | 写真の準備 {build}",
+        let mut line = format!(
+            "{:.1} fps  frame {:.2}ms  cpu {}  | 発行時間 ms(壁時計): pose {:.3} spring {:.3} face {:.3} compose {:.3} vrm_draw {:.3}",
             self.frames as f64 / secs,
             self.frame.as_secs_f64() * 1e3 / n,
             cpu.map_or("-".into(), |c| format!("{c:.1}%")),
             self.pose / n,
             self.spring / n,
             self.face / n,
-            self.photo_draw / n,
+            self.compose / n,
             self.vrm_draw / n,
-        )
+        );
+        if agents {
+            let st = &self.stage;
+            let avg = |ms: f64, k: u32| if k == 0 { 0.0 } else { ms / k as f64 };
+            line += &format!(
+                " cards {:.3}  | カード面 {}回(1回 {:.2}ms) 背景 {}回(1回 {:.2}ms) 組み立て {}フレーム 転送 {:.1}MB",
+                self.cards / n,
+                st.cards_redrawn,
+                avg(st.cards_ms, st.cards_redrawn),
+                st.bg_redrawn,
+                avg(st.bg_ms, st.bg_redrawn),
+                st.scenes,
+                self.uploaded as f64 / 1e6,
+            );
+        } else {
+            line += &format!("  | 写真の準備 {build}");
+        }
+        line
     }
 }
 
@@ -178,6 +243,24 @@ struct Vrm {
     renderer: Renderer,
     layer: VrmLayer,
     faces: FaceSet,
+}
+
+/// 画面の背景(VRM の下に描くもの)。
+enum Backdrop {
+    /// 暗い単色(従来)
+    None,
+    Photo(Box<Slideshow>),
+    /// T3 Agent 画面のカード(合成のダミー)。文字を描く `TextEngine` を持つ
+    Agents(Box<AgentStage>, Box<TextEngine>),
+}
+
+/// 構図ごとの、頭の画面上の位置(領域の上端からの割合)。視線と指さしの向きの起点にする近似。
+fn head_fraction(frame: Framing) -> f32 {
+    match frame {
+        Framing::Bust => 0.22,
+        Framing::Waist => 0.17,
+        Framing::Full => 0.10,
+    }
 }
 
 fn run(a: &Args) -> Result<(), String> {
@@ -239,6 +322,9 @@ fn run(a: &Args) -> Result<(), String> {
         }
         None => None,
     };
+    let text = a
+        .agents
+        .then(|| Box::new(TextEngine::new("Noto Sans CJK JP")));
 
     // 表示先を決めて、カードを直接 open する
     let cards = drm_select::scan();
@@ -269,12 +355,18 @@ fn run(a: &Args) -> Result<(), String> {
     );
     let (rx, ry, rw, rh) = a.region.rect(size);
     eprintln!(
-        "composition: frame={} region={} ({rw}x{rh} at {rx},{ry}) gesture={} lipsync={} photos={} vrm={}",
+        "composition: frame={} region={} ({rw}x{rh} at {rx},{ry}) gesture={} lipsync={} photos={} agents={} follow={} vrm={}",
         a.frame.name(),
         a.region.name(),
         a.gesture,
         a.lipsync,
         a.photos.as_deref().unwrap_or("なし"),
+        if a.agents {
+            a.cards.to_string()
+        } else {
+            "なし".into()
+        },
+        a.follow_cards,
         if a.no_vrm { "なし" } else { "あり" },
     );
 
@@ -317,17 +409,46 @@ fn run(a: &Args) -> Result<(), String> {
         }
     });
     let mut vrm = init?;
-    let mut show = photos.map(|imgs| {
-        Slideshow::new(
+    let now0 = Instant::now();
+    let mut backdrop = match (photos, text) {
+        (Some(imgs), _) => Backdrop::Photo(Box::new(Slideshow::new(
             imgs,
             size,
             Duration::from_secs_f64(a.photo_interval),
-            Instant::now(),
-        )
-    });
+            now0,
+        ))),
+        (None, Some(text)) => {
+            let stage = AgentStage::new(
+                size,
+                a.cards,
+                Duration::from_secs_f64(a.card_interval),
+                now0,
+            );
+            Backdrop::Agents(Box::new(stage), text)
+        }
+        (None, None) => Backdrop::None,
+    };
+    if let Backdrop::Agents(stage, text) = &mut backdrop {
+        // 配置を一度決めて、キャラクターの領域との重なりを知らせる
+        stage.update(now0, text);
+        let region = (rx as f32, ry as f32, rw as f32, rh as f32);
+        let (any, half, all) = stage.overlap(region);
+        let f = stage.focus_rect();
+        let ov = ((region.0 + region.2).min(f.0 + f.2) - region.0.max(f.0)).max(0.0);
+        eprintln!(
+            "agents: カード {all} 枚 / プロジェクト {} 個。領域 {} と重なるカード {any} 枚(半分以上隠れる {half} 枚)、\
+拡大カード {:.0},{:.0} {:.0}x{:.0}(領域と重なる幅 {ov:.0}px)",
+            stage.project_count(),
+            a.region.name(),
+            f.0,
+            f.1,
+            f.2,
+            f.3,
+        );
+    }
 
     // 描画ループ。エラーでも後始末(destroy → GlesDisplay の drop)を通るよう、結果を持ち越す
-    let result = view_loop(a, &mut display, vrm.as_mut(), show.as_mut(), &term);
+    let result = view_loop(a, &mut display, vrm.as_mut(), &mut backdrop, &term);
 
     display.with_gl(|gl, _| {
         if let Some(v) = vrm {
@@ -345,14 +466,23 @@ fn view_loop(
     a: &Args,
     display: &mut GlesDisplay,
     mut vrm: Option<&mut Vrm>,
-    mut show: Option<&mut Slideshow>,
+    backdrop: &mut Backdrop,
     term: &AtomicBool,
 ) -> Result<(), String> {
     let size = display.size();
     let (rx, ry, rw, rh) = a.region.rect(size);
-    // 全身・全画面・写真なし・身振りなしのときだけ、従来どおりカメラを左右に振る
-    let sway =
-        a.frame == Framing::Full && a.region == Region::Full && !a.gesture && a.photos.is_none();
+    // 全身・全画面・背景なし・身振りなしのときだけ、従来どおりカメラを左右に振る
+    let sway = a.frame == Framing::Full
+        && a.region == Region::Full
+        && !a.gesture
+        && matches!(backdrop, Backdrop::None);
+    // 視線と指さしの起点(頭の画面上の位置)と、画面の面までの仮想の距離
+    let head = (
+        rx as f32 + rw as f32 / 2.0,
+        ry as f32 + rh as f32 * head_fraction(a.frame),
+    );
+    let depth = size.1 as f32 * 0.5;
+    let mut tracker = AimTracker::default();
     let start = Instant::now();
     let run_for = Duration::from_secs_f64(a.seconds);
     let mut cpu = SelfCpu::default();
@@ -364,7 +494,9 @@ fn view_loop(
     let mut last = Instant::now();
     let mut total_frames = 0u64;
     let mut prev_t = 0.0f32;
+    let mut prev_uploaded = display.agent_uploaded();
     let mut face: Vec<(&'static str, f32)> = Vec::new();
+    let agents = matches!(backdrop, Backdrop::Agents(..));
     while !term.load(Ordering::Relaxed) && start.elapsed() < run_for {
         if let Some(fps) = a.fps {
             // 次のフレームの時刻まで待つ(遅れていれば待たない)。そのあと present が vsync を待つ
@@ -381,7 +513,25 @@ fn view_loop(
         let t = (now - start).as_secs_f32();
         let t0 = now;
         let mut sum = Sum::default();
+        // 背景を進める(Agent 画面は、変化のあるフレームだけ組み立てる)
+        match &mut *backdrop {
+            Backdrop::Photo(s) => {
+                s.update(now);
+            }
+            Backdrop::Agents(stage, text) => {
+                let c0 = Instant::now();
+                stage.update(now, text);
+                sum.cards = c0.elapsed().as_secs_f64() * 1e3;
+                sum.stage = stage.take_stats();
+            }
+            Backdrop::None => {}
+        }
         if let Some(v) = vrm.as_deref_mut() {
+            if let (true, Backdrop::Agents(stage, _)) = (a.follow_cards, &*backdrop) {
+                // フォーカス中のカードの方へ視線と指さしを向ける(重みは滑らかに出し入れ)
+                let aim = tracker.step(now, stage.aim_target(), head, depth);
+                v.renderer.set_aim(aim);
+            }
             v.renderer.animate(t, t - prev_t);
             let f0 = Instant::now();
             if a.lipsync {
@@ -395,12 +545,9 @@ fn view_loop(
             sum.face = f0.elapsed().as_secs_f64() * 1e3;
         }
         prev_t = t;
-        if let Some(s) = show.as_deref_mut() {
-            s.update(now);
-        }
         let yaw = if sway { demo::camera_yaw(t) } else { 0.0 };
         let enter = Instant::now();
-        // 層へ描いて、写真(または暗い背景)の上の領域に重ねる。GL を借りた中で測る
+        // 層へ描いて、背景(または暗い単色)の上の領域に重ねる。GL を借りた中で測る
         let mut draw_vrm = |gl: &glow::Context, sum: &mut Sum, with_bg: bool| {
             let Some(v) = vrm.as_deref_mut() else { return };
             let times = v.renderer.update(gl);
@@ -421,12 +568,20 @@ fn view_loop(
             sum.vrm_draw = t_draw.elapsed().as_secs_f64() * 1e3;
         };
         // present が page flip の完了まで待つので、フレームの間隔は vsync でとれる
-        match show.as_deref() {
-            Some(s) => {
-                let frame = s.frame(now);
-                // --no-vrm も同じ present_frame_with で、flip の前に photo を測る(draw_vrm は VRM がなければ何もしない)
+        let agent_cards = match &*backdrop {
+            Backdrop::Agents(stage, _) => stage.gpu_cards(),
+            _ => Vec::new(),
+        };
+        let frame = match &*backdrop {
+            Backdrop::Photo(s) => Some(s.frame(now)),
+            Backdrop::Agents(stage, _) => Some(stage.frame(&agent_cards)),
+            Backdrop::None => None,
+        };
+        match frame {
+            Some(frame) => {
+                // --no-vrm も同じ present_frame_with で、flip の前に compose を測る(draw_vrm は VRM がなければ何もしない)
                 display.present_frame_with(&frame, |gl, _| {
-                    sum.photo_draw = enter.elapsed().as_secs_f64() * 1e3;
+                    sum.compose = enter.elapsed().as_secs_f64() * 1e3;
                     draw_vrm(gl, &mut sum, false);
                 })?;
             }
@@ -434,10 +589,16 @@ fn view_loop(
                 display.present_with(|gl, _| draw_vrm(gl, &mut sum, true))?;
             }
         }
-        if let Some(s) = show.as_deref_mut() {
-            s.mark_sent();
+        drop(agent_cards);
+        match &mut *backdrop {
+            Backdrop::Photo(s) => s.mark_sent(),
+            Backdrop::Agents(stage, _) => stage.mark_sent(),
+            Backdrop::None => {}
         }
         sum.builds = display.take_build_ms();
+        let uploaded = display.agent_uploaded();
+        sum.uploaded = uploaded - prev_uploaded;
+        prev_uploaded = uploaded;
         sum.frame = t0.elapsed();
         sum.frames = 1;
         win.add(&sum);
@@ -445,7 +606,7 @@ fn view_loop(
         let now = Instant::now();
         if now >= next_stats {
             let dt = now.duration_since(last).as_secs_f64();
-            eprintln!("{}", win.line(dt, cpu.poll(now)));
+            eprintln!("{}", win.line(dt, cpu.poll(now), agents));
             total.add(&win);
             win = Sum::default();
             last = now;
@@ -464,7 +625,7 @@ fn view_loop(
     );
     eprintln!(
         "全体の平均: {}",
-        total.line(secs, cpu_total.poll(Instant::now()))
+        total.line(secs, cpu_total.poll(Instant::now()), agents)
     );
     Ok(())
 }
