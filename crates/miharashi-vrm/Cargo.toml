@@ -12,6 +12,9 @@ serde_json = "1.0.152"
 # vrm-bench(計測用の bin)だけが使う(feature `bench`)。ライブラリ部は glow 系にしか依存しない
 libc = { version = "0.2.190", optional = true }
 miharashi-gpu = { path = "../miharashi-gpu", optional = true }
+# vrm-view(実モニターに出す bin)だけが使う(feature `view`)
+miharashi-linux = { path = "../miharashi-linux", optional = true }
+signal-hook = { version = "0.4.5", optional = true }
 
 [dev-dependencies]
 # GPU の試験(renders_and_morphs_on_gpu)が EGL の surfaceless コンテキストを作るのに使う
@@ -19,10 +22,17 @@ miharashi-gpu = { path = "../miharashi-gpu" }
 
 [features]
 # 既定で有効。ライブラリとして使うだけなら `default-features = false` で miharashi-gpu を外せる
-default = ["bench"]
+default = ["bench", "view"]
 bench = ["dep:miharashi-gpu", "dep:libc"]
+# vrm-view。DRM/KMS に直接出す(カードの選択に miharashi-linux、終了の signal に signal-hook)
+view = ["bench", "dep:miharashi-linux", "dep:signal-hook"]
 
 [[bin]]
 name = "vrm-bench"
 path = "src/bin/vrm-bench.rs"
 required-features = ["bench"]
+
+[[bin]]
+name = "vrm-view"
+path = "src/bin/vrm-view.rs"
+required-features = ["view"]

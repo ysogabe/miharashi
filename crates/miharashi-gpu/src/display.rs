@@ -109,6 +109,33 @@ impl GlesDisplay {
             return Ok(());
         }
         self.comp.draw(&self.ctx.gl, frame)?;
+        self.flip()
+    }
+
+    /// 既定の framebuffer(ウィンドウ surface)を bind した状態で GL を `f` に貸す(表示はしない)。
+    /// 深度バッファは無いので、深度が要る描画は `f` の中で FBO を作って blit すること。
+    /// `f` には GL と表示サイズを渡す。VRM 表示の PoC(`vrm-view`)が、初期化と後始末に使う。
+    pub fn with_gl<R>(&mut self, f: impl FnOnce(&glow::Context, (u32, u32)) -> R) -> R {
+        use glow::HasContext;
+        unsafe { self.ctx.gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
+        f(&self.ctx.gl, self.out.size())
+    }
+
+    /// `with_gl` で `f` に描かせてから、swap → page flip の完了待ちまで行う。一時停止中は何もせず None。
+    pub fn present_with<R>(
+        &mut self,
+        f: impl FnOnce(&glow::Context, (u32, u32)) -> R,
+    ) -> Result<Option<R>, String> {
+        if self.suspended {
+            return Ok(None);
+        }
+        let r = self.with_gl(f);
+        self.flip()?;
+        Ok(Some(r))
+    }
+
+    /// 描き終えた既定の framebuffer を swap し、front buffer を page flip で出して完了を待つ。
+    fn flip(&mut self) -> Result<(), String> {
         self.ctx.swap_buffers()?;
         let bo = self.surface.lock_front_buffer()?;
         let fb = match fb_for(&self.card, &mut self.fbs, &bo) {

@@ -366,22 +366,13 @@ impl Renderer {
     }
 
     /// 今 bind されている FBO(深度付き)の `(w, h)` に描く。カメラは外接箱から自動で決める。
-    pub fn render(&self, gl: &glow::Context, (w, h): (u32, u32)) {
-        let (min, max) = self.model.bounds;
-        let c = [
-            (min[0] + max[0]) * 0.5,
-            (min[1] + max[1]) * 0.5,
-            (min[2] + max[2]) * 0.5,
-        ];
-        let size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
-        let aspect = w as f32 / h as f32;
-        let fovy = 30f32.to_radians();
-        let t = (fovy * 0.5).tan();
-        // 全身(縦)も横幅も入る距離。+Z 側から -Z を向く(VRM 1.0 は +Z が前)
-        let dist = ((size[1] * 0.5 / t).max(size[0] * 0.5 / (t * aspect)) * 1.15) + size[2] * 0.5;
-        let proj = math::perspective(fovy, aspect, dist * 0.1, dist * 10.0);
-        let view = math::translate(-c[0], -c[1], -(c[2] + dist));
-        let vp = math::mul(&proj, &view);
+    pub fn render(&self, gl: &glow::Context, size: (u32, u32)) {
+        self.render_yaw(gl, size, 0.0);
+    }
+
+    /// `render` に加えて、カメラをモデルの中心のまわりで Y 軸方向に `yaw`(ラジアン)だけ回す。
+    pub fn render_yaw(&self, gl: &glow::Context, (w, h): (u32, u32), yaw: f32) {
+        let vp = view_proj(self.model.bounds, (w, h), yaw);
         unsafe {
             gl.viewport(0, 0, w as i32, h as i32);
             gl.clear_color(0.08, 0.09, 0.12, 1.0);
@@ -503,6 +494,30 @@ unsafe fn upload_texture(
     }
 }
 
+/// 外接箱 `(min, max)` が収まるカメラの view-projection。縦横どちらにも収まる距離に置く
+/// (横長の画面では高さで決まる)。`yaw` はモデルの中心のまわりの回転(0 で +Z 側から正面)。
+pub fn view_proj((min, max): ([f32; 3], [f32; 3]), (w, h): (u32, u32), yaw: f32) -> math::Mat4 {
+    let c = [
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    ];
+    let size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    let aspect = w as f32 / h as f32;
+    let fovy = 30f32.to_radians();
+    let t = (fovy * 0.5).tan();
+    // 全身(縦)も横幅も入る距離。+Z 側から -Z を向く(VRM 1.0 は +Z が前)。
+    // 回すと横方向の見かけの幅が奥行きぶん増えるので、幅は水平の対角で見積もる
+    let half_w = (size[0] * size[0] + size[2] * size[2]).sqrt() * 0.5;
+    let dist = ((size[1] * 0.5 / t).max(half_w / (t * aspect)) * 1.15) + size[2] * 0.5;
+    let proj = math::perspective(fovy, aspect, dist * 0.1, dist * 10.0);
+    let view = math::mul(
+        &math::translate(0.0, 0.0, -dist),
+        &math::mul(&math::rotate_y(yaw), &math::translate(-c[0], -c[1], -c[2])),
+    );
+    math::mul(&proj, &view)
+}
+
 /// 今 bind されている FBO に深度 renderbuffer を付ける(`Offscreen::with_fbo` の FBO には深度がない)。
 /// 返した renderbuffer は描き終わったら `detach_depth` で外して消す。
 pub fn attach_depth(gl: &glow::Context, (w, h): (u32, u32)) -> Result<glow::Renderbuffer, String> {
@@ -539,5 +554,38 @@ pub fn detach_depth(gl: &glow::Context, rb: glow::Renderbuffer) {
             None,
         );
         gl.delete_renderbuffer(rb);
+    }
+}
+
+#[cfg(test)]
+mod camera_tests {
+    use super::*;
+
+    /// 外接箱の 8 隅を投影して、NDC の x/y の範囲(-1..1)に収まるかを返す。
+    fn fits(bounds: ([f32; 3], [f32; 3]), size: (u32, u32), yaw: f32) -> bool {
+        let vp = view_proj(bounds, size, yaw);
+        let (min, max) = bounds;
+        (0..8).all(|i| {
+            let p = [
+                [min[0], max[0]][i & 1],
+                [min[1], max[1]][(i >> 1) & 1],
+                [min[2], max[2]][(i >> 2) & 1],
+            ];
+            let v = [p[0], p[1], p[2], 1.0];
+            let c: Vec<f32> = (0..4)
+                .map(|r| (0..4).map(|k| vp[k][r] * v[k]).sum())
+                .collect();
+            c[3] > 0.0 && (c[0] / c[3]).abs() <= 1.0 && (c[1] / c[3]).abs() <= 1.0
+        })
+    }
+
+    #[test]
+    fn standing_model_fits_ultrawide_screen_by_height() {
+        // 身長 1.6m、肩幅 0.5m、奥行き 0.3m の全身
+        let b = ([-0.25, 0.0, -0.15], [0.25, 1.6, 0.15]);
+        for yaw in [-20f32, 0.0, 20.0] {
+            assert!(fits(b, (2560, 1080), yaw.to_radians()), "yaw {yaw}");
+            assert!(fits(b, (1280, 720), yaw.to_radians()), "yaw {yaw}");
+        }
     }
 }
