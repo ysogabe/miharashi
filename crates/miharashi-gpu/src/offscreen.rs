@@ -65,6 +65,48 @@ impl Offscreen {
         r.map(|()| img)
     }
 
+    /// `size` の FBO(色は RGBA8 の renderbuffer)を作って `f` に GL とその FBO を渡す。読み戻しはしない。
+    /// 1 フレームずつ描いては読む用途(動画の書き出し)で、読み戻しは `f` の中で `read_rgba_top_down` を使う。
+    /// `f` が返ったら FBO を消す(`f` が作った GL のオブジェクトは `f` の中で消すこと)。
+    pub fn with_target<R>(
+        &self,
+        (w, h): (u32, u32),
+        f: impl FnOnce(&glow::Context, glow::Framebuffer) -> R,
+    ) -> Result<R, String> {
+        let gl = &self.ctx.gl;
+        unsafe {
+            let rb = gl.create_renderbuffer()?;
+            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(rb));
+            gl.renderbuffer_storage(glow::RENDERBUFFER, glow::RGBA8, w as i32, h as i32);
+            let fbo = match gl.create_framebuffer() {
+                Ok(f) => f,
+                Err(e) => {
+                    gl.delete_renderbuffer(rb);
+                    return Err(e);
+                }
+            };
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_renderbuffer(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::RENDERBUFFER,
+                Some(rb),
+            );
+            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                gl.delete_framebuffer(fbo);
+                gl.delete_renderbuffer(rb);
+                return Err(format!("FBO が不完全: 0x{status:x}"));
+            }
+            let r = f(gl, fbo);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.delete_framebuffer(fbo);
+            gl.delete_renderbuffer(rb);
+            Ok(r)
+        }
+    }
+
     /// 画面と同じ大きさの FBO を bind して `f` を呼び、終わったあとの FBO を上から下の RGBA8 で
     /// 読み戻す(ベンチマークの場面もこの上で描く)。
     pub fn with_fbo<R>(
@@ -114,6 +156,39 @@ impl Offscreen {
     }
 }
 
+/// `fbo`(`size` の RGBA8)を上から下の RGBA8(stride = 幅 × 4)で `out` に読み戻す。
+/// `glReadPixels` は下の行から返すので、行を逆順に並べ直して書く。`out` の長さは 幅 × 高さ × 4。
+pub fn read_rgba_top_down(
+    gl: &glow::Context,
+    fbo: glow::Framebuffer,
+    (w, h): (u32, u32),
+    out: &mut [u8],
+    scratch: &mut Vec<u8>,
+) {
+    let stride = w as usize * 4;
+    assert_eq!(out.len(), stride * h as usize, "out の大きさが合わない");
+    scratch.resize(out.len(), 0);
+    unsafe {
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(fbo));
+        gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
+        gl.read_pixels(
+            0,
+            0,
+            w as i32,
+            h as i32,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelPackData::Slice(Some(scratch.as_mut_slice())),
+        );
+    }
+    for (dst, src) in out
+        .chunks_exact_mut(stride)
+        .zip(scratch.chunks_exact(stride).rev())
+    {
+        dst.copy_from_slice(src);
+    }
+}
+
 /// 2 枚の RGBA8 画像で RGB の差が `tol` を超える画素の数と、最大の差を返す(アルファは見ない)。
 pub fn diff_rgb(a: &[u8], b: &[u8], tol: u8) -> (usize, u8) {
     let mut over = 0;
@@ -133,6 +208,35 @@ mod tests {
     use super::*;
     use crate::compose::{Frame, PhotoLayer, PhotoSource};
     use crate::photo::{Placement, SourceImage};
+
+    /// `with_target` + `read_rgba_top_down`: GL の下の行(y = 0)が、読み戻した画像の最後の行になる。
+    #[test]
+    fn read_rgba_top_down_flips_rows() {
+        let Ok(off) = Offscreen::open(Path::new("/dev/dri/renderD128")) else {
+            eprintln!("GLES が使えないので skip");
+            return;
+        };
+        let (w, h) = (8u32, 4u32);
+        let mut out = vec![0u8; (w * h * 4) as usize];
+        let mut scratch = Vec::new();
+        off.with_target((w, h), |gl, fbo| unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.clear_color(1.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            // 下の 1 行(y = 0)だけ緑にする
+            gl.enable(glow::SCISSOR_TEST);
+            gl.scissor(0, 0, w as i32, 1);
+            gl.clear_color(0.0, 1.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.disable(glow::SCISSOR_TEST);
+            read_rgba_top_down(gl, fbo, (w, h), &mut out, &mut scratch);
+        })
+        .unwrap();
+        let px = |y: usize| &out[y * w as usize * 4..][..4];
+        assert_eq!(px(0), [255, 0, 0, 255]);
+        assert_eq!(px(2), [255, 0, 0, 255]);
+        assert_eq!(px(3), [0, 255, 0, 255], "下の行が最後の行になる");
+    }
 
     #[test]
     fn diff_counts_pixels_over_tolerance() {
