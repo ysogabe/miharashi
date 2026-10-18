@@ -173,7 +173,7 @@ fn measure(
         unsafe { gl.finish() };
         total.push(f0.elapsed().as_secs_f64() * 1e3);
         // set_expression + update のうち、骨の分(UBO 転送込み)を除いたものが morph
-        morph.push(times.morph_ms + (f1 - f_anim).as_secs_f64() * 1e3 - times.pose_ms);
+        morph.push((f1 - f_anim).as_secs_f64() * 1e3 - times.pose_ms);
         pose.push(times.pose_ms);
         spring.push(times.spring_ms);
         // GPU: 描画コマンドの発行から glFinish の完了まで

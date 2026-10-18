@@ -225,7 +225,7 @@ pub(crate) fn build_vrm_doc(o: &Opts) -> (Value, Vec<u8>) {
             {"name": "Body", "mesh": 1},
             {"name": "Skinned", "mesh": 2, "skin": 0},
             {"name": "Joint", "translation": [0.5, 0.0, 0.0]},
-            {"name": "ArmRoot", "translation": [0.2, 1.2, 0.0], "rotation": [0.0, 0.70710678, 0.0, 0.70710678], "children": [6]},
+            {"name": "ArmRoot", "translation": [0.2, 1.2, 0.0], "rotation": [0.0, std::f32::consts::FRAC_1_SQRT_2, 0.0, std::f32::consts::FRAC_1_SQRT_2], "children": [6]},
             {"name": "UpperArm", "translation": [0.0, 0.0, 0.3], "children": [7]},
             {"name": "LowerArm", "translation": [0.0, 0.0, 0.3], "children": [8]},
             {"name": "Hand", "translation": [0.0, 0.0, 0.3]},
