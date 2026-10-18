@@ -7,13 +7,17 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const USAGE: &str = "使い方: vrm-bench (--model <path.vrm> | --synthetic) [--pci 0000:10:00.0] [--size 1280x720] \
-[--frames 600] [--expression blink] [--still] [--png out.png] [--segments 48] [--texture 1024]";
+[--frames 600 | --seconds 30] [--fps 30] [--expression blink] [--still] [--png out.png] [--segments 48] [--texture 1024]";
 
 struct Args {
     model: Option<PathBuf>,
     pci: String,
     size: (u32, u32),
     frames: u32,
+    /// 指定すると、フレーム数ではなくこの秒数だけ描き続ける
+    seconds: Option<f64>,
+    /// 指定すると、各フレームのあと次の時刻まで sleep してこの間隔を保つ
+    fps: Option<f64>,
     expression: Option<String>,
     still: bool,
     png: Option<PathBuf>,
@@ -26,6 +30,8 @@ fn parse_args() -> Result<Args, String> {
         pci: "0000:10:00.0".into(),
         size: (1280, 720),
         frames: 600,
+        seconds: None,
+        fps: None,
         expression: None,
         still: false,
         png: None,
@@ -48,6 +54,8 @@ fn parse_args() -> Result<Args, String> {
                 );
             }
             "--frames" => a.frames = value()?.parse().map_err(|_| "--frames が数でない")?,
+            "--seconds" => a.seconds = Some(value()?.parse().map_err(|_| "--seconds が数でない")?),
+            "--fps" => a.fps = Some(value()?.parse().map_err(|_| "--fps が数でない")?),
             "--expression" => a.expression = Some(value()?),
             "--still" => a.still = true,
             "--png" => a.png = Some(value()?.into()),
@@ -65,6 +73,13 @@ fn parse_args() -> Result<Args, String> {
     }
     if a.frames == 0 || a.size.0 == 0 || a.size.1 == 0 {
         return Err("--frames と --size は 1 以上".into());
+    }
+    if a.seconds
+        .is_some_and(|s| s.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater))
+        || a.fps
+            .is_some_and(|f| f.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater))
+    {
+        return Err("--seconds と --fps は 0 より大きい数".into());
     }
     Ok(a)
 }
@@ -89,6 +104,115 @@ fn mean_p95(v: &mut [f64]) -> (f64, f64) {
     v.sort_by(f64::total_cmp);
     let mean = v.iter().sum::<f64>() / v.len() as f64;
     (mean, v[((v.len() - 1) as f64 * 0.95).round() as usize])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure(
+    a: &Args,
+    gl: &glow::Context,
+    r: &mut Renderer,
+    expr: &str,
+    t0: Instant,
+    load_cpu: std::time::Duration,
+    (vram0, gtt0): (Option<u64>, Option<u64>),
+    vram: &dyn Fn() -> Option<u64>,
+    gtt: &dyn Fn() -> Option<u64>,
+) -> Result<(), String> {
+    use glow::HasContext;
+    let size = a.size;
+    unsafe { gl.finish() };
+    let upload = t0.elapsed();
+    println!(
+        "load: file+parse={:.0}ms gpu_upload={:.0}ms total={:.0}ms uploaded={}MB",
+        load_cpu.as_secs_f64() * 1e3,
+        upload.as_secs_f64() * 1e3,
+        (load_cpu + upload).as_secs_f64() * 1e3,
+        r.uploaded_bytes >> 20
+    );
+    // ウォームアップ(シェーダのコンパイル・最初の転送を計測に入れない)
+    for _ in 0..5 {
+        r.update(gl);
+        r.render(gl, size);
+    }
+    unsafe { gl.finish() };
+    let (cpu_start, wall_start) = (cpu_seconds(), Instant::now());
+    let (mut total, mut morph) = (Vec::new(), Vec::new());
+    let mut i = 0u32;
+    loop {
+        match a.seconds {
+            Some(s) if wall_start.elapsed().as_secs_f64() >= s => break,
+            None if i >= a.frames => break,
+            _ => {}
+        }
+        let t = i as f32 / 30.0;
+        // 2 秒周期で 0 → 1 → 0
+        let w = if a.still {
+            1.0
+        } else {
+            0.5 - 0.5 * (t * std::f32::consts::PI).cos()
+        };
+        let f0 = Instant::now();
+        r.set_expression(expr, w)?;
+        r.update(gl);
+        let f1 = Instant::now();
+        r.render(gl, size);
+        unsafe { gl.finish() };
+        total.push(f0.elapsed().as_secs_f64() * 1e3);
+        morph.push((f1 - f0).as_secs_f64() * 1e3);
+        i += 1;
+        if let Some(fps) = a.fps {
+            // 次のフレームの時刻まで待つ(遅れていれば待たない)
+            let next = wall_start + std::time::Duration::from_secs_f64(i as f64 / fps);
+            if let Some(d) = next.checked_duration_since(Instant::now()) {
+                std::thread::sleep(d);
+            }
+        }
+    }
+    let wall = wall_start.elapsed().as_secs_f64();
+    let cpu = cpu_seconds() - cpu_start;
+    if total.is_empty() {
+        return Err("計測したフレームがない".into());
+    }
+    let (tm, tp) = mean_p95(&mut total);
+    let (mm, mp) = mean_p95(&mut morph);
+    println!(
+        "expression: {expr}{}",
+        if a.still {
+            " (weight 1 固定)"
+        } else {
+            " (weight を時間で動かす)"
+        }
+    );
+    println!(
+        "frames: {i} size={}x{} fps_limit={}",
+        size.0,
+        size.1,
+        a.fps.map_or("なし(連続描画)".into(), |f| format!("{f}"))
+    );
+    println!(
+        "frame_ms: mean={tm:.2} p95={tp:.2}(glFinish まで待つ。実 FPS 換算 {:.0} fps)",
+        1e3 / tm
+    );
+    println!("morph_cpu_ms: mean={mm:.3} p95={mp:.3}(set_expression + 頂点の合成・転送)");
+    println!(
+        "process_cpu: {:.1}% (cpu {:.2}s / wall {:.2}s、{})",
+        cpu / wall * 100.0,
+        cpu,
+        wall,
+        if a.fps.is_some() {
+            "fps 制限あり、glFinish の待ちを含む"
+        } else {
+            "glFinish の待ちを含む連続描画"
+        }
+    );
+    println!(
+        "gpu_mem(終了前): vram {} -> {} gtt {} -> {}",
+        mib(vram0),
+        mib(vram()),
+        mib(gtt0),
+        mib(gtt())
+    );
+    Ok(())
 }
 
 fn run(a: &Args) -> Result<(), String> {
@@ -154,76 +278,29 @@ fn run(a: &Args) -> Result<(), String> {
         }
         let depth = attach_depth(gl, size)?;
         let t0 = Instant::now();
-        let mut r = Renderer::new(gl, model)?;
-        unsafe { gl.finish() };
-        let upload = t0.elapsed();
-        println!(
-            "load: file+parse={:.0}ms gpu_upload={:.0}ms total={:.0}ms uploaded={}MB",
-            load_cpu.as_secs_f64() * 1e3,
-            upload.as_secs_f64() * 1e3,
-            (load_cpu + upload).as_secs_f64() * 1e3,
-            r.uploaded_bytes >> 20
-        );
-        // ウォームアップ(シェーダのコンパイル・最初の転送を計測に入れない)
-        for _ in 0..5 {
-            r.update(gl);
-            r.render(gl, size);
-        }
-        unsafe { gl.finish() };
-        let (cpu_start, wall_start) = (cpu_seconds(), Instant::now());
-        let (mut total, mut morph) = (Vec::new(), Vec::new());
-        for i in 0..a.frames {
-            let t = i as f32 / 30.0;
-            // 2 秒周期で 0 → 1 → 0
-            let w = if a.still {
-                1.0
-            } else {
-                0.5 - 0.5 * (t * std::f32::consts::PI).cos()
-            };
-            let f0 = Instant::now();
-            r.set_expression(&expr, w)?;
-            r.update(gl);
-            let f1 = Instant::now();
-            r.render(gl, size);
-            unsafe { gl.finish() };
-            total.push(f0.elapsed().as_secs_f64() * 1e3);
-            morph.push((f1 - f0).as_secs_f64() * 1e3);
-        }
-        let wall = wall_start.elapsed().as_secs_f64();
-        let cpu = cpu_seconds() - cpu_start;
-        let (tm, tp) = mean_p95(&mut total);
-        let (mm, mp) = mean_p95(&mut morph);
-        println!(
-            "expression: {expr}{}",
-            if a.still {
-                " (weight 1 固定)"
-            } else {
-                " (weight を時間で動かす)"
+        let mut r = match Renderer::new(gl, model) {
+            Ok(r) => r,
+            Err(e) => {
+                detach_depth(gl, depth);
+                return Err(e);
             }
-        );
-        println!("frames: {} size={}x{}", a.frames, size.0, size.1);
-        println!(
-            "frame_ms: mean={tm:.2} p95={tp:.2}(glFinish まで待つ。実 FPS 換算 {:.0} fps)",
-            1e3 / tm
-        );
-        println!("morph_cpu_ms: mean={mm:.3} p95={mp:.3}(set_expression + 頂点の合成・転送)");
-        println!(
-            "process_cpu: {:.1}% (cpu {:.2}s / wall {:.2}s、glFinish の待ちを含む連続描画)",
-            cpu / wall * 100.0,
-            cpu,
-            wall
-        );
-        println!(
-            "gpu_mem(終了前): vram {} -> {} gtt {} -> {}",
-            mib(vram0),
-            mib(vram()),
-            mib(gtt0),
-            mib(gtt())
+        };
+        // 計測の途中でエラーになっても、あとで destroy / detach_depth を通る
+        let measured = measure(
+            a,
+            gl,
+            &mut r,
+            &expr,
+            t0,
+            load_cpu,
+            (vram0, gtt0),
+            &vram,
+            &gtt,
         );
         r.destroy(gl);
         detach_depth(gl, depth);
         unsafe { gl.finish() };
-        Ok(())
+        measured
     })?;
     r?;
     println!("gpu_mem(解放後): vram {} gtt {}", mib(vram()), mib(gtt()));

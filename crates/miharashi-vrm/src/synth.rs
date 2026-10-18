@@ -156,6 +156,12 @@ fn texture_png(size: u32) -> Vec<u8> {
 /// 頭(node 1)・胴(node 2)・スキン付き三角形(node 3、関節 node 4)を持つ VRM 1.0 の glb。
 /// root(node 0)は y 方向に +0.5 動かしてある。スキンの関節は x 方向に +0.5。
 pub fn build_vrm_glb(o: &Opts) -> Vec<u8> {
+    let (doc, bin) = build_vrm_doc(o);
+    pack_glb(&doc, &bin)
+}
+
+/// `build_vrm_glb` の中身(glTF の JSON と BIN)。壊れた glb を作る試験が JSON を書き換えるのに使う。
+pub(crate) fn build_vrm_doc(o: &Opts) -> (Value, Vec<u8>) {
     let head = ellipsoid(o.segments, [0.0, 1.0, 0.0], [0.15, 0.17, 0.15]);
     let body = ellipsoid(o.segments, [0.0, 0.5, 0.0], [0.2, 0.4, 0.12]);
     // blink: 頭を縦につぶす(morph target の差分)
@@ -231,10 +237,10 @@ pub fn build_vrm_glb(o: &Opts) -> Vec<u8> {
         "bufferViews": b.views,
         "buffers": [{"byteLength": b.data.len()}]
     });
-    pack_glb(&doc, &b.data)
+    (doc, b.data)
 }
 
-fn pack_glb(doc: &Value, bin: &[u8]) -> Vec<u8> {
+pub(crate) fn pack_glb(doc: &Value, bin: &[u8]) -> Vec<u8> {
     let mut json = serde_json::to_vec(doc).expect("JSON にできる");
     while !json.len().is_multiple_of(4) {
         json.push(b' ');
@@ -368,6 +374,10 @@ mod tests {
                 }
                 r.destroy(gl);
                 detach_depth(gl, depth);
+                unsafe {
+                    use glow::HasContext;
+                    assert_eq!(gl.get_error(), glow::NO_ERROR, "解放後に GL エラー");
+                }
                 Ok(())
             })
             .unwrap();

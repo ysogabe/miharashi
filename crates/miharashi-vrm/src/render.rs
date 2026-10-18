@@ -51,9 +51,49 @@ struct GpuPrimitive {
     morphed: bool,
 }
 
+/// シェーダの uniform の場所(一度だけ引いて持つ)。
+struct Uniforms {
+    vp: Option<glow::UniformLocation>,
+    light: Option<glow::UniformLocation>,
+    tex: Option<glow::UniformLocation>,
+    color: Option<glow::UniformLocation>,
+    has_tex: Option<glow::UniformLocation>,
+    cutoff: Option<glow::UniformLocation>,
+    opaque: Option<glow::UniformLocation>,
+}
+
+/// `Renderer::new` の途中で作った GL オブジェクトの控え。失敗したときにまとめて消す。
+#[derive(Default)]
+struct Created {
+    program: Option<glow::Program>,
+    vaos: Vec<glow::VertexArray>,
+    buffers: Vec<glow::Buffer>,
+    textures: Vec<glow::Texture>,
+}
+
+impl Created {
+    unsafe fn delete(self, gl: &glow::Context) {
+        unsafe {
+            for v in self.vaos {
+                gl.delete_vertex_array(v);
+            }
+            for b in self.buffers {
+                gl.delete_buffer(b);
+            }
+            for t in self.textures {
+                gl.delete_texture(t);
+            }
+            if let Some(p) = self.program {
+                gl.delete_program(p);
+            }
+        }
+    }
+}
+
 pub struct Renderer {
     model: Model,
     program: glow::Program,
+    uniforms: Uniforms,
     prims: Vec<GpuPrimitive>,
     textures: Vec<glow::Texture>,
     white: glow::Texture,
@@ -77,14 +117,28 @@ unsafe fn compile(gl: &glow::Context) -> Result<glow::Program, String> {
         let program = gl.create_program()?;
         let mut shaders = Vec::new();
         for (kind, src) in [(glow::VERTEX_SHADER, VS), (glow::FRAGMENT_SHADER, FS)] {
-            let s = gl.create_shader(kind)?;
+            let s = match gl.create_shader(kind) {
+                Ok(s) => s,
+                Err(e) => {
+                    for s in shaders {
+                        gl.delete_shader(s);
+                    }
+                    gl.delete_program(program);
+                    return Err(e);
+                }
+            };
             gl.shader_source(s, src);
             gl.compile_shader(s);
+            shaders.push(s);
             if !gl.get_shader_compile_status(s) {
-                return Err(format!("シェーダ: {}", gl.get_shader_info_log(s)));
+                let log = gl.get_shader_info_log(s);
+                for s in shaders {
+                    gl.delete_shader(s);
+                }
+                gl.delete_program(program);
+                return Err(format!("シェーダ: {log}"));
             }
             gl.attach_shader(program, s);
-            shaders.push(s);
         }
         gl.link_program(program);
         let ok = gl.get_program_link_status(program);
@@ -93,23 +147,57 @@ unsafe fn compile(gl: &glow::Context) -> Result<glow::Program, String> {
             gl.delete_shader(s);
         }
         if !ok {
-            return Err(format!("リンク: {}", gl.get_program_info_log(program)));
+            let log = gl.get_program_info_log(program);
+            gl.delete_program(program);
+            return Err(format!("リンク: {log}"));
         }
         Ok(program)
     }
 }
 
 impl Renderer {
-    /// モデルを GPU に転送する。
+    /// モデルを GPU に転送する。失敗したときは、それまでに作った GL オブジェクトを消して返る。
     pub fn new(gl: &glow::Context, model: Model) -> Result<Self, String> {
+        let mut created = Created::default();
+        unsafe {
+            match Self::build(gl, model, &mut created) {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    created.delete(gl);
+                    // 途中で立った GL エラーを呼び出し側に残さない
+                    while gl.get_error() != glow::NO_ERROR {}
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    unsafe fn build(
+        gl: &glow::Context,
+        model: Model,
+        created: &mut Created,
+    ) -> Result<Self, String> {
         let mut uploaded = 0u64;
         unsafe {
             let program = compile(gl)?;
+            created.program = Some(program);
+            let loc = |n: &str| gl.get_uniform_location(program, n);
+            let uniforms = Uniforms {
+                vp: loc("u_vp"),
+                light: loc("u_light"),
+                tex: loc("u_tex"),
+                color: loc("u_color"),
+                has_tex: loc("u_has_tex"),
+                cutoff: loc("u_cutoff"),
+                opaque: loc("u_opaque"),
+            };
             let mut prims = Vec::new();
             for p in &model.primitives {
                 let vao = gl.create_vertex_array()?;
+                created.vaos.push(vao);
                 gl.bind_vertex_array(Some(vao));
                 let vbo = gl.create_buffer()?;
+                created.buffers.push(vbo);
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                 let usage = if p.targets.is_empty() {
                     glow::STATIC_DRAW
@@ -123,6 +211,7 @@ impl Renderer {
                     gl.vertex_attrib_pointer_f32(loc, comps, glow::FLOAT, false, stride, offset);
                 }
                 let ebo = gl.create_buffer()?;
+                created.buffers.push(ebo);
                 gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
                 gl.buffer_data_u8_slice(
                     glow::ELEMENT_ARRAY_BUFFER,
@@ -145,11 +234,13 @@ impl Renderer {
                 let img = &model.images[t.image];
                 let tex =
                     upload_texture(gl, img.width, img.height, &img.rgba, (t.wrap_s, t.wrap_t))?;
+                created.textures.push(tex);
                 // ミップマップ込みで約 4/3 倍
                 uploaded += img.rgba.len() as u64 * 4 / 3;
                 textures.push(tex);
             }
             let white = upload_texture(gl, 1, 1, &[255; 4], (glow::REPEAT, glow::REPEAT))?;
+            created.textures.push(white);
 
             let mut order: Vec<usize> = (0..model.primitives.len()).collect();
             order.sort_by_key(|&i| {
@@ -168,6 +259,7 @@ impl Renderer {
             Ok(Self {
                 model,
                 program,
+                uniforms,
                 prims,
                 textures,
                 white,
@@ -295,10 +387,10 @@ impl Renderer {
             gl.enable(glow::DEPTH_TEST);
             gl.depth_func(glow::LEQUAL);
             gl.use_program(Some(self.program));
-            let loc = |n: &str| gl.get_uniform_location(self.program, n);
-            gl.uniform_matrix_4_f32_slice(loc("u_vp").as_ref(), false, as_bytes_f32(&vp));
-            gl.uniform_3_f32(loc("u_light").as_ref(), 0.4, 0.6, 0.7);
-            gl.uniform_1_i32(loc("u_tex").as_ref(), 0);
+            let u = &self.uniforms;
+            gl.uniform_matrix_4_f32_slice(u.vp.as_ref(), false, as_bytes_f32(&vp));
+            gl.uniform_3_f32(u.light.as_ref(), 0.4, 0.6, 0.7);
+            gl.uniform_1_i32(u.tex.as_ref(), 0);
             gl.active_texture(glow::TEXTURE0);
             for &i in &self.order {
                 let m = &self.model.materials[self.model.primitives[i].material];
@@ -319,16 +411,16 @@ impl Renderer {
                 }
                 let tex = m.texture.map(|t| self.textures[t]);
                 gl.bind_texture(glow::TEXTURE_2D, Some(tex.unwrap_or(self.white)));
-                gl.uniform_4_f32_slice(loc("u_color").as_ref(), &m.base_color);
-                gl.uniform_1_f32(loc("u_has_tex").as_ref(), tex.is_some() as u32 as f32);
+                gl.uniform_4_f32_slice(u.color.as_ref(), &m.base_color);
+                gl.uniform_1_f32(u.has_tex.as_ref(), tex.is_some() as u32 as f32);
                 let cutoff = if m.alpha_mode == AlphaMode::Mask {
                     m.alpha_cutoff
                 } else {
                     -1.0
                 };
-                gl.uniform_1_f32(loc("u_cutoff").as_ref(), cutoff);
+                gl.uniform_1_f32(u.cutoff.as_ref(), cutoff);
                 gl.uniform_1_f32(
-                    loc("u_opaque").as_ref(),
+                    u.opaque.as_ref(),
                     (m.alpha_mode != AlphaMode::Blend) as u32 as f32,
                 );
                 gl.bind_vertex_array(Some(self.prims[i].vao));

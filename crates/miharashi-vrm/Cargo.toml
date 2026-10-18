@@ -9,6 +9,20 @@ glow = "0.18.0"
 gltf = { version = "1.4.1", default-features = false, features = ["import", "utils"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 serde_json = "1.0.152"
-libc = "0.2.190"
-# vrm-bench(計測用の bin)だけが使う。ライブラリ部は glow にしか依存しない
+# vrm-bench(計測用の bin)だけが使う(feature `bench`)。ライブラリ部は glow 系にしか依存しない
+libc = { version = "0.2.190", optional = true }
+miharashi-gpu = { path = "../miharashi-gpu", optional = true }
+
+[dev-dependencies]
+# GPU の試験(renders_and_morphs_on_gpu)が EGL の surfaceless コンテキストを作るのに使う
 miharashi-gpu = { path = "../miharashi-gpu" }
+
+[features]
+# 既定で有効。ライブラリとして使うだけなら `default-features = false` で miharashi-gpu を外せる
+default = ["bench"]
+bench = ["dep:miharashi-gpu", "dep:libc"]
+
+[[bin]]
+name = "vrm-bench"
+path = "src/bin/vrm-bench.rs"
+required-features = ["bench"]
