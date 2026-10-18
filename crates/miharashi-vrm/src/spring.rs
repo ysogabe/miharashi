@@ -3,7 +3,7 @@
 use crate::anim::Rig;
 use crate::math::{self, Quat};
 use crate::model::Model;
-use crate::vrm::ColliderShape;
+use crate::vrm::{ColliderShape, SPRING_LIMIT};
 
 type V3 = [f32; 3];
 
@@ -118,9 +118,19 @@ impl SpringSim {
                 });
             }
             if joints.len() > start {
+                // グループの展開で同じコライダーが重なっても、1 つにまとめる
+                let mut seen = std::collections::BTreeSet::new();
                 let mut cols = Vec::new();
-                for &g in &sp.collider_groups {
-                    cols.extend(sb.collider_groups[g].iter().copied());
+                for &g in sp
+                    .collider_groups
+                    .iter()
+                    .filter(|&&g| g < sb.collider_groups.len())
+                {
+                    for &c in &sb.collider_groups[g] {
+                        if cols.len() < SPRING_LIMIT && seen.insert(c) {
+                            cols.push(c);
+                        }
+                    }
                 }
                 springs.push((start..joints.len(), cols));
             }

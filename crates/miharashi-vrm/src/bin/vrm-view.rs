@@ -72,9 +72,9 @@ fn parse_args() -> Result<Args, String> {
         return Err("--seconds は 0 より大きい数".into());
     }
     if a.fps
-        .is_some_and(|f| f.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater))
+        .is_some_and(|f| f.partial_cmp(&1.0).is_none_or(|o| o.is_lt()))
     {
-        return Err("--fps は 0 より大きい数".into());
+        return Err("--fps は 1 以上の数".into());
     }
     Ok(a)
 }
@@ -287,8 +287,12 @@ fn view_loop(
         if let Some(fps) = a.fps {
             // 次のフレームの時刻まで待つ(遅れていれば待たない)。そのあと present_with が vsync を待つ
             let next = start + Duration::from_secs_f64(total_frames as f64 / fps);
-            if let Some(d) = next.checked_duration_since(Instant::now()) {
-                std::thread::sleep(d);
+            // SIGTERM に反応できるよう、100ms ずつに分けて待つ
+            while !term.load(Ordering::Relaxed) {
+                let Some(d) = next.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                std::thread::sleep(d.min(Duration::from_millis(100)));
             }
         }
         let t = start.elapsed().as_secs_f32();

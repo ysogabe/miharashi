@@ -456,7 +456,7 @@ impl Renderer {
         unsafe {
             let n_joints = model.joint_nodes.len();
             let max_block = gl.get_parameter_i32(glow::MAX_UNIFORM_BLOCK_SIZE) as usize;
-            if n_joints > MAX_JOINTS || n_joints * 64 > max_block {
+            if level != Level::Bake && (n_joints > MAX_JOINTS || n_joints * 64 > max_block) {
                 return Err(format!(
                     "関節が多すぎる({n_joints} 個、上限 {} 個。UBO は {max_block} バイト)",
                     MAX_JOINTS.min(max_block / 64)
@@ -954,6 +954,7 @@ impl Renderer {
             gl.bind_vertex_array(None);
             gl.depth_mask(true);
             gl.disable(glow::BLEND);
+            gl.cull_face(glow::BACK);
             gl.disable(glow::CULL_FACE);
             gl.disable(glow::DEPTH_TEST);
         }

@@ -205,7 +205,30 @@ fn num(v: Option<&Value>, default: f32) -> f32 {
     v.and_then(Value::as_f64).map_or(default, |x| x as f32)
 }
 
+/// SpringBone のコライダー・コライダーグループ・関節(全 spring の合計)・spring 1 本あたりのコライダーの上限。
+/// 超えた分は読み飛ばす(エラーにはしない)。悪意のある JSON で巨大な確保をさせないため。
+pub const SPRING_LIMIT: usize = 1024;
+
+/// 配列から `bound` 未満の番号だけを、重複なし・出現順で最大 `SPRING_LIMIT` 個取り出す。
+fn unique_indices(v: Option<&Value>, bound: usize) -> Vec<usize> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for i in v.and_then(Value::as_array).into_iter().flatten() {
+        let Some(i) = i.as_u64().map(|i| i as usize).filter(|&i| i < bound) else {
+            continue;
+        };
+        if out.len() >= SPRING_LIMIT {
+            break;
+        }
+        if seen.insert(i) {
+            out.push(i);
+        }
+    }
+    out
+}
+
 /// `VRMC_springBone`。拡張がなければ空。壊れた項目は読み飛ばす。
+/// コライダー・グループ・関節の数は `SPRING_LIMIT` までで、超えた分は切り捨てる。
 pub fn parse_spring(gltf: &Value) -> SpringBone {
     let Some(sb) = gltf
         .get("extensions")
@@ -219,6 +242,7 @@ pub fn parse_spring(gltf: &Value) -> SpringBone {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
+        .take(SPRING_LIMIT)
     {
         let Some(node) = c.get("node").and_then(Value::as_u64) else {
             continue;
@@ -252,26 +276,21 @@ pub fn parse_spring(gltf: &Value) -> SpringBone {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
+        .take(SPRING_LIMIT)
     {
-        out.collider_groups.push(
-            g.get("colliders")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_u64)
-                        .map(|i| i as usize)
-                        .filter(|&i| i < out.colliders.len())
-                        .collect()
-                })
-                .unwrap_or_default(),
-        );
+        out.collider_groups
+            .push(unique_indices(g.get("colliders"), out.colliders.len()));
     }
+    let mut joint_total = 0;
     for sp in sb
         .get("springs")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
     {
+        if joint_total >= SPRING_LIMIT {
+            break;
+        }
         let joints: Vec<SpringJoint> = sp
             .get("joints")
             .and_then(Value::as_array)
@@ -287,10 +306,12 @@ pub fn parse_spring(gltf: &Value) -> SpringBone {
                     drag_force: num(j.get("dragForce"), 0.5),
                 })
             })
+            .take(SPRING_LIMIT - joint_total)
             .collect();
         if joints.is_empty() {
             continue;
         }
+        joint_total += joints.len();
         out.springs.push(Spring {
             name: sp
                 .get("name")
@@ -298,17 +319,7 @@ pub fn parse_spring(gltf: &Value) -> SpringBone {
                 .unwrap_or("")
                 .to_string(),
             joints,
-            collider_groups: sp
-                .get("colliderGroups")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_u64)
-                        .map(|i| i as usize)
-                        .filter(|&i| i < out.collider_groups.len())
-                        .collect()
-                })
-                .unwrap_or_default(),
+            collider_groups: unique_indices(sp.get("colliderGroups"), out.collider_groups.len()),
         });
     }
     out

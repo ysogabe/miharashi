@@ -112,7 +112,7 @@ impl Model {
 
     pub fn from_glb(bytes: &[u8]) -> Result<Self, String> {
         let json = vrm::glb_json(bytes)?;
-        let vrm = vrm::parse(&json)?;
+        let mut vrm = vrm::parse(&json)?;
         let patched = zero_fill_empty_accessors(bytes, &json)?;
         let (doc, buffers, images) = gltf::import_slice(patched.as_deref().unwrap_or(bytes))
             .map_err(|e| format!("glb を読めない: {e}"))?;
@@ -164,6 +164,8 @@ impl Model {
 
         // ノード階層(シーンの根から辿る)
         let n_nodes = doc.nodes().len();
+        // 範囲外のノード番号は、アニメーション側で添字に使う前に捨てる
+        vrm.human_bones.retain(|_, n| *n < n_nodes);
         let mut nodes: Vec<Node> = doc
             .nodes()
             .map(|n| {
@@ -716,11 +718,13 @@ fn read_primitive(
             if j.len() != n || w.len() != n {
                 return Err("JOINTS_0 / WEIGHTS_0 の数が POSITION と合わない".into());
             }
-            // 関節数を超える番号の重みは 0 にする(その関節は使わない)
-            for (jv, wv) in j.iter().zip(w.iter_mut()) {
+            // 関節数を超える番号は、重みを 0 にし番号も 0 にする(シェーダが UBO の範囲外を読まないように)
+            let mut j = j;
+            for (jv, wv) in j.iter_mut().zip(w.iter_mut()) {
                 for k in 0..4 {
                     if jv[k] as usize >= count {
                         wv[k] = 0.0;
+                        jv[k] = 0;
                     }
                 }
             }
@@ -789,6 +793,7 @@ fn smooth_normals(pos: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anim::Rig;
     use crate::synth::{Opts, build_vrm_doc, pack_glb};
     use serde_json::{Value, json};
 
@@ -822,6 +827,43 @@ mod tests {
         let view = doc["accessors"][acc]["bufferView"].as_u64().unwrap() as usize;
         doc["accessors"][acc]["type"] = json!(ty);
         doc["bufferViews"][view]["byteLength"] = json!(count * comps * size);
+    }
+
+    #[test]
+    fn out_of_range_human_bone_nodes_are_dropped() {
+        let (mut d, b) = doc();
+        let hb = &mut d["extensions"]["VRMC_vrm"]["humanoid"]["humanBones"];
+        hb["leftUpperArm"] = json!({"node": 9999});
+        hb["head"] = json!({"node": 9999});
+        let m = load(&d, &b).unwrap();
+        assert!(!m.vrm.human_bones.contains_key("leftUpperArm"));
+        assert!(!m.vrm.human_bones.contains_key("head"));
+        assert!(m.vrm.human_bones.contains_key("leftLowerArm"));
+        let mut rig = Rig::new(&m, true);
+        rig.update(&m, 0.0, None);
+    }
+
+    #[test]
+    fn spring_bone_duplicates_and_counts_stay_small() {
+        use crate::spring::SpringSim;
+        use crate::vrm::SPRING_LIMIT;
+        let (mut d, b) = doc();
+        // コライダー 1 個を指すグループ番号・コライダー番号を大量に重ねる
+        let dup: Vec<u32> = vec![0; 20_000];
+        let groups: Vec<Value> = (0..3000).map(|_| json!({"colliders": dup})).collect();
+        let joints: Vec<Value> = (0..3000).map(|_| json!({"node": 9})).collect();
+        let sb = &mut d["extensions"]["VRMC_springBone"];
+        sb["colliderGroups"] = json!(groups);
+        sb["springs"] = json!([{"colliderGroups": vec![0u32; 20_000], "joints": joints}]);
+        let m = load(&d, &b).unwrap();
+        let sb = &m.vrm.spring;
+        assert!(sb.collider_groups.len() <= SPRING_LIMIT);
+        assert_eq!(sb.collider_groups[0], [0]);
+        assert_eq!(sb.springs[0].collider_groups, [0]);
+        assert_eq!(sb.springs[0].joints.len(), SPRING_LIMIT);
+        let rig = Rig::new(&m, false);
+        let sim = SpringSim::new(&m, &rig);
+        assert_eq!(sim.joint_count(), SPRING_LIMIT);
     }
 
     #[test]
