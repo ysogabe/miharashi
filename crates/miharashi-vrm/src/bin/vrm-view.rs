@@ -138,11 +138,11 @@ fn parse_args() -> Result<Args, String> {
     if !(1..=24).contains(&a.cards) {
         return Err("--cards は 1〜24".into());
     }
-    if a.card_interval.partial_cmp(&0.5).is_none_or(|o| o.is_lt()) {
-        return Err("--card-interval は 0.5 以上の数".into());
+    if !a.card_interval.is_finite() || !(0.5..=3600.0).contains(&a.card_interval) {
+        return Err("--card-interval は 0.5〜3600 の数".into());
     }
-    if a.photo_interval.partial_cmp(&1.0).is_none_or(|o| o.is_lt()) {
-        return Err("--photo-interval は 1 以上の数".into());
+    if !a.photo_interval.is_finite() || !(1.0..=3600.0).contains(&a.photo_interval) {
+        return Err("--photo-interval は 1〜3600 の数".into());
     }
     if a.model.is_none() && !synthetic && !a.no_vrm {
         return Err(format!("--model か --synthetic が要る\n{USAGE}"));
