@@ -1,8 +1,8 @@
 //! VRM(glb)の読み込み。GL には触れない(CPU 側のデータだけを作る)。
-//! 静止ポーズ: ノードの変換とスキニング(バインドポーズ)をここで頂点に焼き込むので、描画側は
-//! 1 つの view-projection 行列だけで描ける。
-use crate::math::{self, IDENTITY, Mat4};
-use crate::vrm::{self, Vrm};
+//! 頂点はメッシュのローカル空間のまま持ち(スキンなしのプリミティブは 1 関節のスキンとして扱う)、
+//! ノード階層(ローカル TRS)から毎フレーム関節行列を作って GPU で変形する。
+use crate::math::{self, IDENTITY, Mat4, QUAT_IDENTITY, Quat, Trs};
+use crate::vrm::{self, Mtoon, Vrm};
 use gltf::accessor::{DataType, Dimensions};
 use std::path::Path;
 
@@ -21,6 +21,8 @@ pub struct Material {
     pub alpha_mode: AlphaMode,
     pub alpha_cutoff: f32,
     pub double_sided: bool,
+    /// `VRMC_materials_mtoon`(なければ Lambert で描く)
+    pub mtoon: Option<Mtoon>,
 }
 
 pub struct Image {
@@ -42,13 +44,32 @@ pub struct Target {
     pub normals: Vec<[f32; 3]>,
 }
 
-/// 頂点は `[px, py, pz, nx, ny, nz, u, v]` の 8 float(インターリーブ)。
+/// 頂点は `[px, py, pz, nx, ny, nz, u, v]` の 8 float(インターリーブ、メッシュのローカル空間)。
 pub const FLOATS_PER_VERTEX: usize = 8;
+
+/// シーンに含まれるノード。`Model::order` は親が子より先の並び。
+pub struct Node {
+    pub parent: Option<usize>,
+    /// ファイルにある初期姿勢(ローカル)
+    pub rest: Trs,
+}
+
+pub struct Skin {
+    /// 関節のノード番号
+    pub joints: Vec<usize>,
+    pub inverse_bind: Vec<Mat4>,
+}
 
 pub struct Primitive {
     /// このプリミティブを持つノードの番号(expression の bind はノード単位)
     pub node: usize,
+    /// ローカル空間の頂点(morph の差分もローカル空間)
     pub vertices: Vec<f32>,
+    /// 頂点ごとの関節番号(スキンの関節の何番目か)と重み。スキンなしは `[0;4]` / `[1,0,0,0]`
+    pub joints: Vec<[u16; 4]>,
+    pub weights: Vec<[f32; 4]>,
+    /// 関節行列の配列(`Model::joint_nodes`)での、このプリミティブの先頭
+    pub joint_base: usize,
     pub indices: Vec<u32>,
     pub targets: Vec<Target>,
     pub material: usize,
@@ -56,12 +77,19 @@ pub struct Primitive {
 
 pub struct Model {
     pub vrm: Vrm,
+    pub nodes: Vec<Node>,
+    /// 親が先の並び(シーンから辿れるノードだけ)
+    pub order: Vec<usize>,
+    pub skins: Vec<Skin>,
+    /// 関節行列の配列 `world[node] * inverse_bind` の元(スキンの関節を並べ、続けてスキンなしの
+    /// プリミティブが持つノード(`inverse_bind` は単位))
+    pub joint_nodes: Vec<(usize, Mat4)>,
     pub primitives: Vec<Primitive>,
     pub materials: Vec<Material>,
     pub textures: Vec<Texture>,
     pub images: Vec<Image>,
     pub mesh_count: usize,
-    /// バインドポーズでの外接箱 `(min, max)`
+    /// 初期姿勢での外接箱 `(min, max)`
     pub bounds: ([f32; 3], [f32; 3]),
 }
 
@@ -84,7 +112,7 @@ impl Model {
 
     pub fn from_glb(bytes: &[u8]) -> Result<Self, String> {
         let json = vrm::glb_json(bytes)?;
-        let vrm = vrm::parse(&json)?;
+        let mut vrm = vrm::parse(&json)?;
         let patched = zero_fill_empty_accessors(bytes, &json)?;
         let (doc, buffers, images) = gltf::import_slice(patched.as_deref().unwrap_or(bytes))
             .map_err(|e| format!("glb を読めない: {e}"))?;
@@ -92,7 +120,7 @@ impl Model {
             .into_iter()
             .map(to_rgba)
             .collect::<Result<Vec<_>, _>>()?;
-        let textures = doc
+        let textures: Vec<Texture> = doc
             .textures()
             .map(|t| Texture {
                 image: t.source().index(),
@@ -100,9 +128,12 @@ impl Model {
                 wrap_t: wrap(t.sampler().wrap_t()),
             })
             .collect();
+        let tex_count = textures.len();
+        let json_materials = json.get("materials").and_then(|m| m.as_array());
         let mut materials: Vec<Material> = doc
             .materials()
-            .map(|m| {
+            .enumerate()
+            .map(|(mi, m)| {
                 let pbr = m.pbr_metallic_roughness();
                 Material {
                     base_color: pbr.base_color_factor(),
@@ -114,6 +145,9 @@ impl Model {
                     },
                     alpha_cutoff: m.alpha_cutoff().unwrap_or(0.5),
                     double_sided: m.double_sided(),
+                    mtoon: json_materials
+                        .and_then(|a| a.get(mi))
+                        .and_then(|j| vrm::parse_mtoon(j, tex_count)),
                 }
             })
             .collect();
@@ -125,17 +159,31 @@ impl Model {
             alpha_mode: AlphaMode::Opaque,
             alpha_cutoff: 0.5,
             double_sided: false,
+            mtoon: None,
         });
 
-        // 各ノードのワールド変換(シーンの根から辿る)
-        let mut world = vec![IDENTITY; doc.nodes().len()];
+        // ノード階層(シーンの根から辿る)
+        let n_nodes = doc.nodes().len();
+        // 範囲外のノード番号は、アニメーション側で添字に使う前に捨てる
+        vrm.human_bones.retain(|_, n| *n < n_nodes);
+        let mut nodes: Vec<Node> = doc
+            .nodes()
+            .map(|n| {
+                let (t, r, sc) = n.transform().decomposed();
+                Node {
+                    parent: None,
+                    rest: Trs { t, r, s: sc },
+                }
+            })
+            .collect();
         let scene = doc
             .default_scene()
             .or_else(|| doc.scenes().next())
             .ok_or("glTF にシーンがない")?;
         let mut order = Vec::new();
-        let mut visited = vec![false; world.len()];
-        let mut stack: Vec<(gltf::Node, Mat4)> = scene.nodes().map(|n| (n, IDENTITY)).collect();
+        let mut visited = vec![false; n_nodes];
+        let mut stack: Vec<(gltf::Node, Option<usize>)> =
+            scene.nodes().map(|n| (n, None)).collect();
         while let Some((n, parent)) = stack.pop() {
             // 子の循環や、複数の親から同じノードに来る形(glTF では不正)は読まない
             if std::mem::replace(&mut visited[n.index()], true) {
@@ -144,74 +192,199 @@ impl Model {
                     n.index()
                 ));
             }
-            let w = math::mul(&parent, &n.transform().matrix());
-            world[n.index()] = w;
+            nodes[n.index()].parent = parent;
             order.push(n.index());
-            stack.extend(n.children().map(|c| (c, w)));
+            stack.extend(n.children().map(|c| (c, Some(n.index()))));
         }
-        order.sort_unstable();
+        // スタックで辿るので、親は必ず子より先に出る
+
+        let mut skins = Vec::new();
+        for s in doc.skins() {
+            if let Some(a) = s.inverse_bind_matrices() {
+                check_accessor("inverseBindMatrices", &a, Dimensions::Mat4, &[F32], None)?;
+            }
+            let reader = s.reader(|b| Some(&buffers[b.index()]));
+            let ibm: Vec<Mat4> = reader
+                .read_inverse_bind_matrices()
+                .map(|i| i.collect())
+                .unwrap_or_default();
+            let joints: Vec<usize> = s.joints().map(|j| j.index()).collect();
+            let inverse_bind = (0..joints.len())
+                .map(|k| ibm.get(k).copied().unwrap_or(IDENTITY))
+                .collect();
+            skins.push(Skin {
+                joints,
+                inverse_bind,
+            });
+        }
+        // 関節行列の配列: スキンごとに並べる
+        let mut joint_nodes: Vec<(usize, Mat4)> = Vec::new();
+        let mut skin_base = Vec::new();
+        for sk in &skins {
+            skin_base.push(joint_nodes.len());
+            joint_nodes.extend(
+                sk.joints
+                    .iter()
+                    .copied()
+                    .zip(sk.inverse_bind.iter().copied()),
+            );
+        }
+        let mut node_slot = std::collections::BTreeMap::new();
 
         let mut primitives = Vec::new();
         let mut meshes = std::collections::BTreeSet::new();
-        for &ni in &order {
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        for &ni in &sorted {
             let node = doc.nodes().nth(ni).ok_or("ノード番号が不正")?;
             let Some(mesh) = node.mesh() else { continue };
             meshes.insert(mesh.index());
-            // スキンがあるメッシュはノードの変換を使わず、関節のワールド変換 × 逆バインド行列
-            let skin = node
-                .skin()
-                .map(|s| -> Result<Vec<Mat4>, String> {
-                    if let Some(a) = s.inverse_bind_matrices() {
-                        check_accessor("inverseBindMatrices", &a, Dimensions::Mat4, &[F32], None)?;
-                    }
-                    let reader = s.reader(|b| Some(&buffers[b.index()]));
-                    let ibm: Vec<Mat4> = reader
-                        .read_inverse_bind_matrices()
-                        .map(|i| i.collect())
-                        .unwrap_or_default();
-                    Ok(s.joints()
-                        .enumerate()
-                        .map(|(k, j)| math::mul(&world[j.index()], ibm.get(k).unwrap_or(&IDENTITY)))
-                        .collect())
-                })
-                .transpose()?;
+            let skin = node.skin().map(|s| s.index());
             for prim in mesh.primitives() {
                 if prim.mode() != gltf::mesh::Mode::Triangles {
                     continue;
                 }
                 let material = prim.material().index().unwrap_or(default_material);
-                primitives.push(read_primitive(
+                let mut p = read_primitive(
                     &prim,
                     &buffers,
                     ni,
                     material,
-                    &world[ni],
-                    skin.as_deref(),
-                )?);
+                    skin.map(|k| skins[k].joints.len()),
+                )?;
+                // JOINTS/WEIGHTS を持つスキンのプリミティブだけが、スキンの関節を使う
+                p.0.joint_base = match (skin, p.1) {
+                    (Some(k), true) => skin_base[k],
+                    _ => *node_slot.entry(ni).or_insert_with(|| {
+                        joint_nodes.push((ni, IDENTITY));
+                        joint_nodes.len() - 1
+                    }),
+                };
+                primitives.push(p.0);
             }
         }
         if primitives.is_empty() {
             return Err("描画できる三角形メッシュがない".into());
         }
+        let mut model = Self {
+            vrm,
+            nodes,
+            order,
+            skins,
+            joint_nodes,
+            primitives,
+            materials,
+            textures,
+            images,
+            mesh_count: meshes.len(),
+            bounds: ([0.0; 3], [0.0; 3]),
+        };
+        // 初期姿勢の外接箱
+        let joints = model.rest_joint_matrices();
         let mut min = [f32::MAX; 3];
         let mut max = [f32::MIN; 3];
-        for p in &primitives {
-            for v in p.vertices.as_chunks::<FLOATS_PER_VERTEX>().0 {
+        for i in 0..model.primitives.len() {
+            for v in model
+                .posed_vertices(i, &joints)
+                .as_chunks::<FLOATS_PER_VERTEX>()
+                .0
+            {
                 for a in 0..3 {
                     min[a] = min[a].min(v[a]);
                     max[a] = max[a].max(v[a]);
                 }
             }
         }
-        Ok(Self {
-            vrm,
-            primitives,
-            materials,
-            textures,
-            images,
-            mesh_count: meshes.len(),
-            bounds: (min, max),
-        })
+        model.bounds = (min, max);
+        Ok(model)
+    }
+
+    /// ローカル変換から、ノードのワールド行列とワールド回転を求める(`order` の順)。
+    /// シーンから辿れないノードは単位のまま。
+    pub fn eval_world(&self, locals: &[Trs], world: &mut Vec<Mat4>, world_rot: &mut Vec<Quat>) {
+        world.resize(self.nodes.len(), IDENTITY);
+        world_rot.resize(self.nodes.len(), QUAT_IDENTITY);
+        for &i in &self.order {
+            let l = locals[i].to_mat4();
+            match self.nodes[i].parent {
+                Some(p) => {
+                    world[i] = math::mul(&world[p], &l);
+                    world_rot[i] = math::quat_mul(world_rot[p], locals[i].r);
+                }
+                None => {
+                    world[i] = l;
+                    world_rot[i] = locals[i].r;
+                }
+            }
+        }
+    }
+
+    pub fn rest_locals(&self) -> Vec<Trs> {
+        self.nodes.iter().map(|n| n.rest).collect()
+    }
+
+    /// 関節行列(`world[node] * inverse_bind`)を `joint_nodes` の順に作る。
+    pub fn joint_matrices(&self, world: &[Mat4], out: &mut Vec<Mat4>) {
+        out.clear();
+        out.extend(
+            self.joint_nodes
+                .iter()
+                .map(|(n, ibm)| math::mul(&world[*n], ibm)),
+        );
+    }
+
+    /// 初期姿勢(ファイルにあるローカル変換)の関節行列。
+    pub fn rest_joint_matrices(&self) -> Vec<Mat4> {
+        let (mut w, mut r) = (Vec::new(), Vec::new());
+        self.eval_world(&self.rest_locals(), &mut w, &mut r);
+        let mut out = Vec::new();
+        self.joint_matrices(&w, &mut out);
+        out
+    }
+
+    /// 関節行列で変形した頂点(`[px,py,pz,nx,ny,nz,u,v]`)。GPU のスキニングと同じ計算を CPU で行う
+    /// (外接箱・試験・bake 用)。重みの合計が 0 の頂点は変換しない。
+    pub fn posed_vertices(&self, prim: usize, joints: &[Mat4]) -> Vec<f32> {
+        let p = &self.primitives[prim];
+        let mut out = p.vertices.clone();
+        for (i, v) in out
+            .as_chunks_mut::<FLOATS_PER_VERTEX>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            let mut m = [[0.0; 4]; 4];
+            let mut sum = 0.0;
+            for k in 0..4 {
+                let w = p.weights[i][k];
+                if w > 0.0
+                    && let Some(j) = joints.get(p.joint_base + p.joints[i][k] as usize)
+                {
+                    math::add_scaled(&mut m, j, w);
+                    sum += w;
+                }
+            }
+            if sum <= 0.0 {
+                continue;
+            }
+            for c in &mut m {
+                for x in c.iter_mut() {
+                    *x /= sum;
+                }
+            }
+            let pos = math::transform_point(&m, [v[0], v[1], v[2]]);
+            let n = math::normalize(math::transform_dir(
+                &math::normal_matrix(&m),
+                [v[3], v[4], v[5]],
+            ));
+            v[..6].copy_from_slice(&[pos[0], pos[1], pos[2], n[0], n[1], n[2]]);
+        }
+        out
+    }
+
+    /// 初期姿勢で頂点に焼き込んだもの(以前の描き方。`bake` の機能段階が使う)。
+    pub fn baked_vertices(&self, prim: usize) -> Vec<f32> {
+        self.posed_vertices(prim, &self.rest_joint_matrices())
     }
 
     pub fn stats(&self) -> Stats {
@@ -407,46 +580,6 @@ fn to_rgba(d: gltf::image::Data) -> Result<Image, String> {
     })
 }
 
-/// 頂点ごとの変換行列(スキンなら関節の重み付き和、なければノードのワールド変換)。
-fn vertex_matrices(
-    n: usize,
-    node_world: &Mat4,
-    skin: Option<&[Mat4]>,
-    joints: Option<Vec<[u16; 4]>>,
-    weights: Option<Vec<[f32; 4]>>,
-) -> Result<Vec<Mat4>, String> {
-    let (Some(skin), Some(joints), Some(weights)) = (skin, joints, weights) else {
-        return Ok(vec![*node_world; n]);
-    };
-    if joints.len() != n || weights.len() != n {
-        return Err("JOINTS_0 / WEIGHTS_0 の数が POSITION と合わない".into());
-    }
-    Ok((0..n)
-        .map(|i| {
-            let mut m = [[0.0; 4]; 4];
-            let mut sum = 0.0;
-            for k in 0..4 {
-                let w = weights[i][k];
-                if w > 0.0
-                    && let Some(j) = skin.get(joints[i][k] as usize)
-                {
-                    math::add_scaled(&mut m, j, w);
-                    sum += w;
-                }
-            }
-            if sum <= 0.0 {
-                return *node_world;
-            }
-            for c in &mut m {
-                for v in c.iter_mut() {
-                    *v /= sum;
-                }
-            }
-            m
-        })
-        .collect())
-}
-
 /// accessor が属性の期待する型(要素数・成分の型)かを、読む前に確かめる。
 /// gltf クレートの reader は型が違うと assert で panic するので、ここで Err にする。
 const F32: (DataType, bool) = (DataType::F32, false);
@@ -545,14 +678,15 @@ fn check_attributes(prim: &gltf::Primitive) -> Result<usize, String> {
     Ok(n)
 }
 
+/// プリミティブを読む。戻り値の `bool` は、スキンの関節を使うか(JOINTS_0 / WEIGHTS_0 がある)。
+/// `skin_joints` はノードのスキンの関節数(関節番号の範囲検査用)。
 fn read_primitive(
     prim: &gltf::Primitive,
     buffers: &[gltf::buffer::Data],
     node: usize,
     material: usize,
-    node_world: &Mat4,
-    skin: Option<&[Mat4]>,
-) -> Result<Primitive, String> {
+    skin_joints: Option<usize>,
+) -> Result<(Primitive, bool), String> {
     let n = check_attributes(prim)?;
     let reader = prim.reader(|b| Some(&buffers[b.index()]));
     let pos: Vec<[f32; 3]> = reader
@@ -577,34 +711,42 @@ fn read_primitive(
     if pos.len() != n || nrm.len() != n || uv.len() != n {
         return Err("頂点属性の数が合わない".into());
     }
-    let mats = vertex_matrices(
-        n,
-        node_world,
-        skin,
-        reader.read_joints(0).map(|j| j.into_u16().collect()),
-        reader.read_weights(0).map(|w| w.into_f32().collect()),
-    )?;
+    let joints_in: Option<Vec<[u16; 4]>> = reader.read_joints(0).map(|j| j.into_u16().collect());
+    let weights_in: Option<Vec<[f32; 4]>> = reader.read_weights(0).map(|w| w.into_f32().collect());
+    let (joints, weights, skinned) = match (skin_joints, joints_in, weights_in) {
+        (Some(count), Some(j), Some(mut w)) => {
+            if j.len() != n || w.len() != n {
+                return Err("JOINTS_0 / WEIGHTS_0 の数が POSITION と合わない".into());
+            }
+            // 関節数を超える番号は、重みを 0 にし番号も 0 にする(シェーダが UBO の範囲外を読まないように)
+            let mut j = j;
+            for (jv, wv) in j.iter_mut().zip(w.iter_mut()) {
+                for k in 0..4 {
+                    if jv[k] as usize >= count {
+                        wv[k] = 0.0;
+                        jv[k] = 0;
+                    }
+                }
+            }
+            (j, w, true)
+        }
+        _ => (vec![[0; 4]; n], vec![[1.0, 0.0, 0.0, 0.0]; n], false),
+    };
     let mut vertices = Vec::with_capacity(n * FLOATS_PER_VERTEX);
-    let normal_mats: Vec<Mat4> = mats.iter().map(math::normal_matrix).collect();
     for i in 0..n {
-        let p = math::transform_point(&mats[i], pos[i]);
-        let nn = math::normalize(math::transform_dir(&normal_mats[i], nrm[i]));
-        vertices.extend_from_slice(&[p[0], p[1], p[2], nn[0], nn[1], nn[2], uv[i][0], uv[i][1]]);
+        let nn = math::normalize(nrm[i]);
+        vertices.extend_from_slice(&[
+            pos[i][0], pos[i][1], pos[i][2], nn[0], nn[1], nn[2], uv[i][0], uv[i][1],
+        ]);
     }
     let mut targets = Vec::new();
     for (tp, tn, _) in reader.read_morph_targets() {
         let positions: Vec<[f32; 3]> = match tp {
-            Some(i) => i
-                .zip(&mats)
-                .map(|(d, m)| math::transform_dir(m, d))
-                .collect(),
+            Some(i) => i.collect(),
             None => vec![[0.0; 3]; n],
         };
         let normals: Vec<[f32; 3]> = match tn {
-            Some(i) => i
-                .zip(&normal_mats)
-                .map(|(d, m)| math::transform_dir(m, d))
-                .collect(),
+            Some(i) => i.collect(),
             None => vec![[0.0; 3]; n],
         };
         if positions.len() != n || normals.len() != n {
@@ -612,13 +754,19 @@ fn read_primitive(
         }
         targets.push(Target { positions, normals });
     }
-    Ok(Primitive {
-        node,
-        vertices,
-        indices,
-        targets,
-        material,
-    })
+    Ok((
+        Primitive {
+            node,
+            vertices,
+            joints,
+            weights,
+            joint_base: 0,
+            indices,
+            targets,
+            material,
+        },
+        skinned,
+    ))
 }
 
 /// 法線がないプリミティブ向けの面積重み付き法線。
@@ -645,6 +793,7 @@ fn smooth_normals(pos: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anim::Rig;
     use crate::synth::{Opts, build_vrm_doc, pack_glb};
     use serde_json::{Value, json};
 
@@ -678,6 +827,43 @@ mod tests {
         let view = doc["accessors"][acc]["bufferView"].as_u64().unwrap() as usize;
         doc["accessors"][acc]["type"] = json!(ty);
         doc["bufferViews"][view]["byteLength"] = json!(count * comps * size);
+    }
+
+    #[test]
+    fn out_of_range_human_bone_nodes_are_dropped() {
+        let (mut d, b) = doc();
+        let hb = &mut d["extensions"]["VRMC_vrm"]["humanoid"]["humanBones"];
+        hb["leftUpperArm"] = json!({"node": 9999});
+        hb["head"] = json!({"node": 9999});
+        let m = load(&d, &b).unwrap();
+        assert!(!m.vrm.human_bones.contains_key("leftUpperArm"));
+        assert!(!m.vrm.human_bones.contains_key("head"));
+        assert!(m.vrm.human_bones.contains_key("leftLowerArm"));
+        let mut rig = Rig::new(&m, true);
+        rig.update(&m, 0.0, None);
+    }
+
+    #[test]
+    fn spring_bone_duplicates_and_counts_stay_small() {
+        use crate::spring::SpringSim;
+        use crate::vrm::SPRING_LIMIT;
+        let (mut d, b) = doc();
+        // コライダー 1 個を指すグループ番号・コライダー番号を大量に重ねる
+        let dup: Vec<u32> = vec![0; 20_000];
+        let groups: Vec<Value> = (0..3000).map(|_| json!({"colliders": dup})).collect();
+        let joints: Vec<Value> = (0..3000).map(|_| json!({"node": 9})).collect();
+        let sb = &mut d["extensions"]["VRMC_springBone"];
+        sb["colliderGroups"] = json!(groups);
+        sb["springs"] = json!([{"colliderGroups": vec![0u32; 20_000], "joints": joints}]);
+        let m = load(&d, &b).unwrap();
+        let sb = &m.vrm.spring;
+        assert!(sb.collider_groups.len() <= SPRING_LIMIT);
+        assert_eq!(sb.collider_groups[0], [0]);
+        assert_eq!(sb.springs[0].collider_groups, [0]);
+        assert_eq!(sb.springs[0].joints.len(), SPRING_LIMIT);
+        let rig = Rig::new(&m, false);
+        let sim = SpringSim::new(&m, &rig);
+        assert_eq!(sim.joint_count(), SPRING_LIMIT);
     }
 
     #[test]

@@ -1,6 +1,8 @@
-//! VRM 1.0 の拡張 `VRMC_vrm` の解釈。バージョンの確認と、expressions のプリセット名 →
-//! morph target bind の対応だけを読む(humanoid・lookAt・springBone などは読まない)。
+//! VRM 1.0 の拡張の解釈。`VRMC_vrm`(バージョン、expressions のプリセット名 → morph target bind、
+//! humanoid の humanBones 名 → ノード)、`VRMC_materials_mtoon`(マテリアルごと)、
+//! `VRMC_springBone`(髪・服の揺れ)を読む。lookAt などは読まない。
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MorphBind {
@@ -21,6 +23,83 @@ pub struct Expression {
 pub struct Vrm {
     pub spec_version: String,
     pub expressions: Vec<Expression>,
+    /// humanoid の humanBones(`leftUpperArm` など → glTF のノード番号)
+    pub human_bones: BTreeMap<String, usize>,
+    pub spring: SpringBone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OutlineMode {
+    None,
+    World,
+    Screen,
+}
+
+/// `VRMC_materials_mtoon` の、描画に使う値。テクスチャは glTF の texture 番号。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mtoon {
+    pub shade_color: [f32; 3],
+    pub shade_texture: Option<usize>,
+    pub shading_toony: f32,
+    pub shading_shift: f32,
+    pub rim_color: [f32; 3],
+    pub rim_fresnel_power: f32,
+    pub rim_lift: f32,
+    pub rim_lighting_mix: f32,
+    /// emissiveFactor × KHR_materials_emissive_strength
+    pub emissive: [f32; 3],
+    pub outline_mode: OutlineMode,
+    /// worldCoordinates はメートル、screenCoordinates は画面の高さに対する割合
+    pub outline_width: f32,
+    pub outline_color: [f32; 3],
+    pub outline_lighting_mix: f32,
+    pub outline_width_texture: Option<usize>,
+    pub render_queue_offset: i32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColliderShape {
+    Sphere {
+        offset: [f32; 3],
+        radius: f32,
+    },
+    Capsule {
+        offset: [f32; 3],
+        radius: f32,
+        tail: [f32; 3],
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Collider {
+    pub node: usize,
+    pub shape: ColliderShape,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpringJoint {
+    pub node: usize,
+    pub hit_radius: f32,
+    pub stiffness: f32,
+    pub gravity_power: f32,
+    pub gravity_dir: [f32; 3],
+    pub drag_force: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spring {
+    pub name: String,
+    pub joints: Vec<SpringJoint>,
+    /// `SpringBone::collider_groups` の番号
+    pub collider_groups: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpringBone {
+    pub colliders: Vec<Collider>,
+    /// コライダーの番号の並び
+    pub collider_groups: Vec<Vec<usize>>,
+    pub springs: Vec<Spring>,
 }
 
 impl Vrm {
@@ -95,9 +174,199 @@ pub fn parse(gltf: &Value) -> Result<Vrm, String> {
             });
         }
     }
+    let mut human_bones = BTreeMap::new();
+    if let Some(m) = vrm
+        .get("humanoid")
+        .and_then(|h| h.get("humanBones"))
+        .and_then(Value::as_object)
+    {
+        for (name, b) in m {
+            if let Some(n) = b.get("node").and_then(Value::as_u64) {
+                human_bones.insert(name.clone(), n as usize);
+            }
+        }
+    }
     Ok(Vrm {
         spec_version,
         expressions,
+        human_bones,
+        spring: parse_spring(gltf),
+    })
+}
+
+fn f3(v: Option<&Value>, default: [f32; 3]) -> [f32; 3] {
+    let Some(a) = v.and_then(Value::as_array).filter(|a| a.len() >= 3) else {
+        return default;
+    };
+    std::array::from_fn(|i| a[i].as_f64().unwrap_or(default[i] as f64) as f32)
+}
+
+fn num(v: Option<&Value>, default: f32) -> f32 {
+    v.and_then(Value::as_f64).map_or(default, |x| x as f32)
+}
+
+/// SpringBone のコライダー・コライダーグループ・関節(全 spring の合計)・spring 1 本あたりのコライダーの上限。
+/// 超えた分は読み飛ばす(エラーにはしない)。悪意のある JSON で巨大な確保をさせないため。
+pub const SPRING_LIMIT: usize = 1024;
+
+/// 配列から `bound` 未満の番号だけを、重複なし・出現順で最大 `SPRING_LIMIT` 個取り出す。
+fn unique_indices(v: Option<&Value>, bound: usize) -> Vec<usize> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for i in v.and_then(Value::as_array).into_iter().flatten() {
+        let Some(i) = i.as_u64().map(|i| i as usize).filter(|&i| i < bound) else {
+            continue;
+        };
+        if out.len() >= SPRING_LIMIT {
+            break;
+        }
+        if seen.insert(i) {
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// `VRMC_springBone`。拡張がなければ空。壊れた項目は読み飛ばす。
+/// コライダー・グループ・関節の数は `SPRING_LIMIT` までで、超えた分は切り捨てる。
+pub fn parse_spring(gltf: &Value) -> SpringBone {
+    let Some(sb) = gltf
+        .get("extensions")
+        .and_then(|e| e.get("VRMC_springBone"))
+    else {
+        return SpringBone::default();
+    };
+    let mut out = SpringBone::default();
+    for c in sb
+        .get("colliders")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(SPRING_LIMIT)
+    {
+        let Some(node) = c.get("node").and_then(Value::as_u64) else {
+            continue;
+        };
+        let shape = c.get("shape");
+        let sh = if let Some(s) = shape.and_then(|s| s.get("sphere")) {
+            ColliderShape::Sphere {
+                offset: f3(s.get("offset"), [0.0; 3]),
+                radius: num(s.get("radius"), 0.0),
+            }
+        } else if let Some(s) = shape.and_then(|s| s.get("capsule")) {
+            ColliderShape::Capsule {
+                offset: f3(s.get("offset"), [0.0; 3]),
+                radius: num(s.get("radius"), 0.0),
+                tail: f3(s.get("tail"), [0.0; 3]),
+            }
+        } else {
+            // 番号がずれないよう、読めない形は半径 0 の球にする
+            ColliderShape::Sphere {
+                offset: [0.0; 3],
+                radius: 0.0,
+            }
+        };
+        out.colliders.push(Collider {
+            node: node as usize,
+            shape: sh,
+        });
+    }
+    for g in sb
+        .get("colliderGroups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(SPRING_LIMIT)
+    {
+        out.collider_groups
+            .push(unique_indices(g.get("colliders"), out.colliders.len()));
+    }
+    let mut joint_total = 0;
+    for sp in sb
+        .get("springs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if joint_total >= SPRING_LIMIT {
+            break;
+        }
+        let joints: Vec<SpringJoint> = sp
+            .get("joints")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|j| {
+                Some(SpringJoint {
+                    node: j.get("node")?.as_u64()? as usize,
+                    hit_radius: num(j.get("hitRadius"), 0.0),
+                    stiffness: num(j.get("stiffness"), 1.0),
+                    gravity_power: num(j.get("gravityPower"), 0.0),
+                    gravity_dir: f3(j.get("gravityDir"), [0.0, -1.0, 0.0]),
+                    drag_force: num(j.get("dragForce"), 0.5),
+                })
+            })
+            .take(SPRING_LIMIT - joint_total)
+            .collect();
+        if joints.is_empty() {
+            continue;
+        }
+        joint_total += joints.len();
+        out.springs.push(Spring {
+            name: sp
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            joints,
+            collider_groups: unique_indices(sp.get("colliderGroups"), out.collider_groups.len()),
+        });
+    }
+    out
+}
+
+/// マテリアル(glTF の JSON の 1 要素)の `VRMC_materials_mtoon`。なければ `None`。
+/// `texture_count` を超えるテクスチャ番号は使わない。
+pub fn parse_mtoon(material: &Value, texture_count: usize) -> Option<Mtoon> {
+    let ext = material.get("extensions")?;
+    let m = ext.get("VRMC_materials_mtoon")?;
+    let tex = |key: &str| {
+        m.get(key)
+            .and_then(|t| t.get("index"))
+            .and_then(Value::as_u64)
+            .map(|i| i as usize)
+            .filter(|&i| i < texture_count)
+    };
+    let strength = num(
+        ext.get("KHR_materials_emissive_strength")
+            .and_then(|e| e.get("emissiveStrength")),
+        1.0,
+    );
+    let emissive = f3(material.get("emissiveFactor"), [0.0; 3]).map(|v| v * strength);
+    let outline_mode = match m.get("outlineWidthMode").and_then(Value::as_str) {
+        Some("worldCoordinates") => OutlineMode::World,
+        Some("screenCoordinates") => OutlineMode::Screen,
+        _ => OutlineMode::None,
+    };
+    Some(Mtoon {
+        shade_color: f3(m.get("shadeColorFactor"), [1.0; 3]),
+        shade_texture: tex("shadeMultiplyTexture"),
+        shading_toony: num(m.get("shadingToonyFactor"), 0.9).clamp(0.0, 1.0),
+        shading_shift: num(m.get("shadingShiftFactor"), 0.0),
+        rim_color: f3(m.get("parametricRimColorFactor"), [0.0; 3]),
+        rim_fresnel_power: num(m.get("parametricRimFresnelPowerFactor"), 5.0).max(0.0),
+        rim_lift: num(m.get("parametricRimLiftFactor"), 0.0),
+        rim_lighting_mix: num(m.get("rimLightingMixFactor"), 1.0).clamp(0.0, 1.0),
+        emissive,
+        outline_mode,
+        outline_width: num(m.get("outlineWidthFactor"), 0.0).max(0.0),
+        outline_color: f3(m.get("outlineColorFactor"), [0.0; 3]),
+        outline_lighting_mix: num(m.get("outlineLightingMixFactor"), 1.0).clamp(0.0, 1.0),
+        outline_width_texture: tex("outlineWidthMultiplyTexture"),
+        render_queue_offset: m
+            .get("renderQueueOffsetNumber")
+            .and_then(Value::as_i64)
+            .unwrap_or(0) as i32,
     })
 }
 
