@@ -7,7 +7,7 @@ use miharashi_render::aircraft::RadarGeom;
 use miharashi_render::photo_layout::PhotoLayout;
 use miharashi_render::screens::Snapshot;
 use miharashi_render::{Canvas, Pixmap, TextEngine};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// 画面の識別子。操作パネルとの約束なので、決めたら変えない(docs/DESIGN-screens.md §2)。
 pub type ScreenId = &'static str;
@@ -130,6 +130,15 @@ pub trait Screen {
     fn scene_animating(&self) -> bool {
         false
     }
+    /// 動き続ける間の描画の間隔の下限。None は表示の完了待ち(vsync)だけで間隔をとる。
+    /// runtime が表示の完了後に残りを待つ(docs/DESIGN-screen-plugin-v2.md §10)。
+    fn frame_interval(&self) -> Option<Duration> {
+        None
+    }
+    /// 場面が今持っている GL オブジェクトの数(作成 − 削除。§3.3)。3D を持たない画面は None。
+    fn gl_live_objects(&self) -> Option<i64> {
+        None
+    }
     /// 出すものが無いか(自動巡回の `skip_if_empty`。航空機の画面で半径内に機体がいないとき)。
     fn is_empty(&self) -> bool {
         false
@@ -177,6 +186,10 @@ pub trait App {
     /// 表示の完了待ち(vsync)だけで間隔をとる。
     fn animating(&self) -> bool {
         false
+    }
+    /// 動き続けている間の描画の間隔の下限(`Screen::frame_interval`)。None なら vsync だけ。
+    fn frame_interval(&self) -> Option<Duration> {
+        None
     }
     /// 持っているすべての `GlScene`(終了時の解放用)。runtime が `drop(display)` の前に集めて `release` を呼ばせる。
     fn gl_scenes(&mut self) -> Vec<&mut dyn GlScene> {

@@ -382,6 +382,7 @@ fn png(cli: Cli) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     if let Some(check) = gles.as_mut() {
         scene_gles_fixtures(check, &cfg, size, &out)?;
+        cube_gles_fixtures(check, size, &out)?;
     }
     println!(
         "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,room,room-offline,room-empty,refresh-glitch,refresh-return,scene-notice,agents-overview,agents-busy,agents-new-*,agents-changed-*,agents-stale,agents-empty}}.png ({}x{})",
@@ -441,6 +442,43 @@ fn scene_manager(
         std::time::Duration::from_secs(60),
     )
     .with_gl_available(gl)
+}
+
+/// `png --renderer gles|auto`: キューブ画面を GLES で描いた `cube-gles.png`(全面)と `cube-third-gles.png`(中央 1/3 幅)。
+/// 回転の時間は 0(表示してから時間が経っていない)なので、いつ作っても同じ絵になる。
+#[cfg(target_os = "linux")]
+fn cube_gles_fixtures(
+    check: &mut GlesCheck,
+    size: (u32, u32),
+    out: &std::path::Path,
+) -> Result<(), String> {
+    use crate::screen::Composite;
+    for (name, third) in [("cube", false), ("cube-third", true)] {
+        let screen = app::screens::cube::CubeScreen::new(third, 30);
+        let mut mgr = app::manager::ScreenManager::new(
+            vec![Box::new(screen)],
+            name,
+            Box::new(data::DummyData::new()),
+            data::dummy_snapshot(0.0),
+            app::text_engine(""),
+            std::time::Duration::from_secs(60),
+        )
+        .with_gl_available(true);
+        let mut c = Canvas::new(size.0, size.1);
+        let comp = mgr.render_composite(&mut c);
+        let mut parts = runtime::FrameParts::default();
+        parts.fill(&comp);
+        let Composite::Gl(g) = comp else {
+            return Err("キューブ画面が Composite::Gl を返さない".into());
+        };
+        let frame = runtime::scene_frame(g, &c, &parts);
+        check(
+            &c,
+            Layers::Scene(frame),
+            &out.join(format!("{name}-gles.png")),
+        )?;
+    }
+    Ok(())
 }
 
 /// `png --renderer gles|auto`: 3D の画面を GLES で描いた `scene-gles.png`(3D だけ)、`scene-base-gles.png`

@@ -21,6 +21,8 @@ pub struct Config {
     pub ui: Ui,
     pub panel: Panel,
     pub agents: ConfigAgents,
+    pub cube: Cube,
+    pub gl_check: GlCheck,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -169,6 +171,45 @@ pub struct ConfigAgents {
     pub timeout_secs: u64,
     pub stale_secs: u64,
     pub recent_hours: u64,
+}
+
+/// キューブ画面(Issue #74。回る立方体を GL で描く 3D の画面)。既定は無効。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Cube {
+    pub enabled: bool,
+    /// full(画面全体、id = cube)/ third(画面中央の 1/3 幅、id = cube-third)/ both(両方)
+    pub layout: String,
+    /// 動いている間の描画の上限 fps(0 = 制限せず vsync だけ)
+    pub fps: u32,
+}
+
+/// GL の状態をわざと汚す試験画面(`dirty-a`・`dirty-b`。実機の確認用)。既定は無効。
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct GlCheck {
+    pub enabled: bool,
+}
+
+impl Default for Cube {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            layout: "both".into(),
+            fps: 30,
+        }
+    }
+}
+
+impl Cube {
+    /// (全面を出すか, 1/3 幅を出すか)。`layout` は検証済みの前提。
+    pub fn layouts(&self) -> (bool, bool) {
+        match self.layout.as_str() {
+            "full" => (true, false),
+            "third" => (false, true),
+            _ => (true, true),
+        }
+    }
 }
 
 impl Default for Runtime {
@@ -483,8 +524,29 @@ impl Config {
             return Err("display.renderer は auto / cpu / gles".into());
         }
         const START_SCREENS: [&str; 5] = ["status", "photo", "room", "aircraft", "agents"];
-        if !START_SCREENS.contains(&self.ui.start_screen.as_str()) {
-            return Err("ui.start_screen は status / photo / room / aircraft / agents".into());
+        // 3D の画面(キューブ、状態を汚す試験画面)。有効にしたものだけ起動時の画面に選べる
+        const GL_SCREENS: [&str; 4] = ["cube", "cube-third", "dirty-a", "dirty-b"];
+        let (full, third) = self.cube.layouts();
+        let gl_enabled = |id: &str| match id {
+            "cube" => self.cube.enabled && full,
+            "cube-third" => self.cube.enabled && third,
+            _ => self.gl_check.enabled,
+        };
+        if !matches!(self.cube.layout.as_str(), "full" | "third" | "both") {
+            return Err("cube.layout は full / third / both".into());
+        }
+        if self.cube.fps > 240 {
+            return Err("cube.fps は 0〜240(0 = 制限なし)".into());
+        }
+        let start = self.ui.start_screen.as_str();
+        if GL_SCREENS.contains(&start) {
+            if !gl_enabled(start) {
+                return Err(format!(
+                    "ui.start_screen = {start} には cube.enabled / gl_check.enabled などで画面を有効にする必要がある"
+                ));
+            }
+        } else if !START_SCREENS.contains(&start) {
+            return Err("ui.start_screen は status / photo / room / aircraft / agents / cube / cube-third / dirty-a / dirty-b".into());
         }
         if self.ui.start_screen == "agents" && !self.agents.enabled {
             return Err("ui.start_screen = agents には agents.enabled = true が必要".into());
@@ -532,13 +594,12 @@ impl Config {
             );
         }
         let rot = &self.rotation;
-        if let Some(st) = rot
-            .steps
-            .iter()
-            .find(|st| !START_SCREENS.contains(&st.screen.as_str()))
-        {
+        if let Some(st) = rot.steps.iter().find(|st| {
+            !START_SCREENS.contains(&st.screen.as_str())
+                && !GL_SCREENS.contains(&st.screen.as_str())
+        }) {
             return Err(format!(
-                "rotation.steps に未知の画面 {:?}(status / photo / room / aircraft / agents)",
+                "rotation.steps に未知の画面 {:?}(status / photo / room / aircraft / agents / cube / cube-third / dirty-a / dirty-b)",
                 st.screen
             ));
         }
@@ -816,6 +877,38 @@ mod tests {
         assert!(on("geoframe-n100:8790").is_err(), "名前ではなく IP");
         // 無効なら listen が空でもよい
         assert!(Config::parse("[panel]\nmax_rate_per_sec = 5\n").is_ok());
+    }
+
+    #[test]
+    fn cube_and_gl_check_are_off_by_default_and_validate() {
+        let c = Config::default();
+        assert!(!c.cube.enabled && !c.gl_check.enabled);
+        assert_eq!((c.cube.layout.as_str(), c.cube.fps), ("both", 30));
+        assert_eq!(c.cube.layouts(), (true, true));
+        assert!(Config::parse("[cube]\nlayout = \"quarter\"\n").is_err());
+        assert!(Config::parse("[cube]\nfps = 241\n").is_err());
+        assert!(Config::parse("[cube]\nfps = 0\n").is_ok());
+        assert!(Config::parse("[cube]\nfpss = 30\n").is_err());
+        // 巡回の手順には書ける(出していない画面は飛ばす)が、起動時の画面は有効にしたものだけ
+        assert!(
+            Config::parse(
+                "[rotation]\nenabled = true\nsteps = [{ screen = \"cube\", secs = 5 }]\n"
+            )
+            .is_ok()
+        );
+        assert!(Config::parse("[ui]\nstart_screen = \"cube\"\n").is_err());
+        assert!(
+            Config::parse(
+                "[cube]\nenabled = true\nlayout = \"third\"\n[ui]\nstart_screen = \"cube\"\n"
+            )
+            .is_err()
+        );
+        assert!(
+            Config::parse("[cube]\nenabled = true\n[ui]\nstart_screen = \"cube-third\"\n").is_ok()
+        );
+        assert!(
+            Config::parse("[gl_check]\nenabled = true\n[ui]\nstart_screen = \"dirty-a\"\n").is_ok()
+        );
     }
 
     #[test]

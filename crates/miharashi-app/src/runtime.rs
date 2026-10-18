@@ -49,6 +49,14 @@ fn format_stats(
     line
 }
 
+/// 描画の間隔の上限(`App::frame_interval`)のとき、表示の完了後に待つ時間。
+/// 表示の完了待ち(vsync)は vsync の境界で終わるので、間隔いっぱいを待つと次のフレームが 1 つあとの vsync に
+/// ずれる(30fps が 20fps になる)。vsync 半分だけ早く起きて、描画を次の vsync の手前に間に合わせる。
+fn frame_wait(interval: Duration, refresh_hz: u32) -> Duration {
+    let half_vsync = Duration::from_secs_f64(0.5 / f64::from(refresh_hz.max(1)));
+    interval.saturating_sub(half_vsync)
+}
+
 /// 区間内のフレーム時間 [ms] を "平均/p95" にする(PoC-005 のベースライン用)。空なら "-"。
 fn summarize_ms(samples: &mut Vec<f32>) -> String {
     if samples.is_empty() {
@@ -692,6 +700,7 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             published_display = ds;
         }
 
+        let mut drew = false;
         if redraw && screen_on {
             let t0 = Instant::now();
             // 描画の失敗(下地・EGL・page flip など)でも、場面の解放を通る終了処理へ進む(`end_run`)
@@ -706,12 +715,17 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             frames += 1;
             worst_ms = worst_ms.max(t0.elapsed().as_millis());
             // 60Hz で 1 枚飛ぶと間隔が 25ms を超える。どこで時間を使ったかを分けて残す(1 分に 10 件まで)
+            drew = true;
             if app.animating() {
                 let now = Instant::now();
                 if let Some(last) = anim_last {
                     let gap = now.duration_since(last).as_secs_f32() * 1000.0;
                     anim_frames += 1;
-                    if gap > 25.0 {
+                    // 間隔の上限があるときは、その間隔に 8.3ms(60Hz の半フレーム)の余裕を足した値を超えたら遅れ
+                    let limit = app
+                        .frame_interval()
+                        .map_or(25.0, |d| d.as_secs_f32() * 1000.0 + 8.3);
+                    if gap > limit {
                         anim_slow += 1;
                         if anim_slow <= 10 {
                             eprintln!(
@@ -762,8 +776,13 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
         }
         // 動かし続ける画面は、表示の完了待ち(vsync)だけで間隔をとる(20ms 待つと 30fps に落ち、
         // 背景を描き直すフレームで 1 枚飛んで引っかかって見える)
-        if !(screen_on && app.animating()) {
-            std::thread::sleep(Duration::from_millis(20));
+        // 間隔の上限がある画面(キューブ)は、描いた直後に残りを待つ
+        match app.frame_interval().filter(|_| drew && screen_on) {
+            Some(d) => std::thread::sleep(frame_wait(d, display.refresh())),
+            None if !(screen_on && app.animating()) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None => {}
         }
     };
 
@@ -823,6 +842,18 @@ mod tests {
             "stats: t=60s rss=81MB fds=26 frames=62 worst_frame=19ms ticks=61 keys=0 screen=Status(Overview) photo=1 feed=online cpu=Some(13.0) gpu=Some(45.0)"
         );
         eprintln!("{line}");
+    }
+
+    /// 間隔の上限の待ちは、間隔から vsync 半分を引いた時間(間隔より短いときは 0)。
+    #[test]
+    fn frame_wait_is_the_interval_minus_half_a_vsync() {
+        let w = frame_wait(Duration::from_secs_f64(1.0 / 30.0), 60);
+        assert!(
+            (w.as_secs_f64() - (1.0 / 30.0 - 1.0 / 120.0)).abs() < 1e-9,
+            "{w:?}"
+        );
+        assert_eq!(frame_wait(Duration::from_millis(2), 60), Duration::ZERO);
+        assert_eq!(frame_wait(Duration::from_millis(33), 0), Duration::ZERO);
     }
 
     #[test]

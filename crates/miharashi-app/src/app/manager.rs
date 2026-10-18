@@ -902,6 +902,14 @@ impl App for ScreenManager {
             || self.scene_animating()
     }
 
+    fn frame_interval(&self) -> Option<Duration> {
+        // 演出(焼き付き対策)は自分の間隔で動く。動いていない画面に間隔は要らない
+        if self.refreshing.is_some() || !self.animating() {
+            return None;
+        }
+        self.screens[self.current].frame_interval()
+    }
+
     fn gl_scenes(&mut self) -> Vec<&mut dyn GlScene> {
         ScreenManager::gl_scenes(self)
     }
@@ -949,6 +957,15 @@ impl App for ScreenManager {
         }
         if self.scene_fails > 0 {
             out.push(("scene_fail", self.scene_fails.to_string()));
+        }
+        // GL の場面が作ったオブジェクトの「作成 − 削除」の合計(§3.3)。場面を持つ画面があるときだけ出す
+        let live: Vec<i64> = self
+            .screens
+            .iter()
+            .filter_map(|s| s.gl_live_objects())
+            .collect();
+        if !live.is_empty() {
+            out.push(("gl_objs", live.iter().sum::<i64>().to_string()));
         }
         out
     }

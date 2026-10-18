@@ -41,3 +41,75 @@ pub trait GlScene {
     /// (作ったものを `Option::take()` で持ち、消したら `None` に戻すなど)。
     fn release(&mut self, gl: &glow::Context);
 }
+
+/// 場面が作った GL オブジェクトの数え方(docs/DESIGN-screen-plugin-v2.md §3.3)。作成と削除を `create_*` / `delete_*` の
+/// 経由で数え、切り替えを重ねても「作成 − 削除」(`live`)が増えないこと、`release` のあとに 0 へ戻ることを確かめる。
+/// `glIs*` を名前の範囲で総当たりして数えない(ドライバーが小さい整数から割り当てる前提に頼らない)。
+#[derive(Debug, Default)]
+pub struct ObjectCount {
+    created: std::cell::Cell<u64>,
+    deleted: std::cell::Cell<u64>,
+}
+
+macro_rules! counted {
+    ($($create:ident, $delete:ident, $ty:ident);* $(;)?) => {
+        impl ObjectCount {
+            $(
+                /// 作って数える。
+                pub fn $create(&self, gl: &glow::Context) -> Result<glow::$ty, String> {
+                    use glow::HasContext;
+                    let object = unsafe { gl.$create() }?;
+                    self.created.set(self.created.get() + 1);
+                    Ok(object)
+                }
+
+                /// 消して数える。
+                pub fn $delete(&self, gl: &glow::Context, object: glow::$ty) {
+                    use glow::HasContext;
+                    unsafe { gl.$delete(object) };
+                    self.deleted.set(self.deleted.get() + 1);
+                }
+            )*
+        }
+    };
+}
+
+counted! {
+    create_buffer, delete_buffer, Buffer;
+    create_texture, delete_texture, Texture;
+    create_vertex_array, delete_vertex_array, VertexArray;
+    create_program, delete_program, Program;
+    create_framebuffer, delete_framebuffer, Framebuffer;
+    create_renderbuffer, delete_renderbuffer, Renderbuffer;
+    create_sampler, delete_sampler, Sampler;
+}
+
+impl ObjectCount {
+    /// シェーダーを作って数える(`kind` は `VERTEX_SHADER` / `FRAGMENT_SHADER`)。
+    pub fn create_shader(&self, gl: &glow::Context, kind: u32) -> Result<glow::Shader, String> {
+        use glow::HasContext;
+        let object = unsafe { gl.create_shader(kind) }?;
+        self.created.set(self.created.get() + 1);
+        Ok(object)
+    }
+
+    /// シェーダーを消して数える。
+    pub fn delete_shader(&self, gl: &glow::Context, object: glow::Shader) {
+        use glow::HasContext;
+        unsafe { gl.delete_shader(object) };
+        self.deleted.set(self.deleted.get() + 1);
+    }
+
+    pub fn created(&self) -> u64 {
+        self.created.get()
+    }
+
+    pub fn deleted(&self) -> u64 {
+        self.deleted.get()
+    }
+
+    /// 作成 − 削除。生きているオブジェクトの数。
+    pub fn live(&self) -> i64 {
+        self.created.get() as i64 - self.deleted.get() as i64
+    }
+}
