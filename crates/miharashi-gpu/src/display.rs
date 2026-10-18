@@ -108,6 +108,9 @@ impl GlesDisplay {
         if self.suspended {
             return Ok(());
         }
+        use glow::HasContext;
+        // 直前に `with_gl` / `present_with` で貸した側が FBO を残していても、キオスクの描画は画面に出す
+        unsafe { self.ctx.gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
         self.comp.draw(&self.ctx.gl, frame)?;
         self.flip()
     }
@@ -115,10 +118,23 @@ impl GlesDisplay {
     /// 既定の framebuffer(ウィンドウ surface)を bind した状態で GL を `f` に貸す(表示はしない)。
     /// 深度バッファは無いので、深度が要る描画は `f` の中で FBO を作って blit すること。
     /// `f` には GL と表示サイズを渡す。VRM 表示の PoC(`vrm-view`)が、初期化と後始末に使う。
+    ///
+    /// 貸す側と借りる側の約束(Issue #74 の土台):
+    /// - 借りた側は、自分で作った GL のオブジェクト(FBO・テクスチャ・プログラムなど)を自分で消す。
+    ///   `f` が返ったあと、キオスクの `Compositor` が前提にする状態へ貸す側が戻す:
+    ///   framebuffer の bind(READ / DRAW とも既定)、viewport(画面全体)、
+    ///   DEPTH_TEST・CULL_FACE・BLEND・SCISSOR_TEST・STENCIL_TEST の無効化、depth_mask と color_mask の全許可、
+    ///   プログラム・VAO・ARRAY_BUFFER・ELEMENT_ARRAY_BUFFER の bind 解除、
+    ///   TEXTURE0 を選んで TEXTURE_2D の bind 解除、UNPACK / PACK_ALIGNMENT を 4。
+    /// - 戻さないもの(借りた側が変えたら、そのまま残る): blend_func、clear 色、
+    ///   TEXTURE0 以外のユニットの bind、stencil / depth の関数、ポリゴンオフセット、uniform の値。
+    ///   `Compositor` は使う前にそれぞれ自分で設定する。
     pub fn with_gl<R>(&mut self, f: impl FnOnce(&glow::Context, (u32, u32)) -> R) -> R {
-        use glow::HasContext;
-        unsafe { self.ctx.gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
-        f(&self.ctx.gl, self.out.size())
+        let size = self.out.size();
+        restore_gl_state(&self.ctx.gl, size, None);
+        let r = f(&self.ctx.gl, size);
+        restore_gl_state(&self.ctx.gl, size, None);
+        r
     }
 
     /// `with_gl` で `f` に描かせてから、swap → page flip の完了待ちまで行う。一時停止中は何もせず None。
@@ -193,6 +209,41 @@ impl GlesDisplay {
                 return Ok(());
             }
         }
+    }
+}
+
+/// `Compositor` が前提にする GL の状態へ戻す(`with_gl` の doc 参照)。`target` は描画先の
+/// framebuffer で、画面なら None。
+pub(crate) fn restore_gl_state(
+    gl: &glow::Context,
+    (w, h): (u32, u32),
+    target: Option<glow::Framebuffer>,
+) {
+    use glow::HasContext;
+    unsafe {
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, target);
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, target);
+        gl.viewport(0, 0, w as i32, h as i32);
+        for cap in [
+            glow::DEPTH_TEST,
+            glow::CULL_FACE,
+            glow::BLEND,
+            glow::SCISSOR_TEST,
+            glow::STENCIL_TEST,
+        ] {
+            gl.disable(cap);
+        }
+        gl.depth_mask(true);
+        gl.color_mask(true, true, true, true);
+        gl.use_program(None);
+        // VAO を外してから ELEMENT_ARRAY_BUFFER を外す(VAO の中の束縛を壊さないため)
+        gl.bind_vertex_array(None);
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, None);
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+        gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
     }
 }
 

@@ -155,7 +155,10 @@ impl Target {
 
 fn run(a: &Args) -> Result<(), String> {
     let term = Arc::new(AtomicBool::new(false));
+    // 1 回目はフラグで正常終了(画面を元に戻す)、2 回目は即終了。条件付きの登録を先にすること
     for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        signal_hook::flag::register_conditional_shutdown(sig, 128 + sig, term.clone())
+            .map_err(|e| format!("signal: {e}"))?;
         signal_hook::flag::register(sig, term.clone()).map_err(|e| format!("signal: {e}"))?;
     }
 
