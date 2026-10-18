@@ -27,7 +27,7 @@
 
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
-| T1 | `miharashi-glscene` クレートと、GPU 側(`Compositor` の層・状態の初期化・`present_scene`・失敗の検出・オフスクリーン)。試験用の場面でテスト | AC1, AC2, AC5(GPU 側) | - | full | 未着手 | | | |
-| T2 | 画面・アプリ側(`Composite::Gl`・`Top`・Screen / App の口・`runtime.rs`・GL の可否と失敗の扱い・CPU 経路の案内と巡回・消灯) | AC3, AC4, AC5, AC6, AC11 | T1 | full | 未着手 | | | |
+| T1 | `miharashi-glscene` クレートと、GPU 側(`Compositor` の層・状態の初期化・`present_scene`・失敗の検出・オフスクリーン)。試験用の場面でテスト | AC1, AC2, AC5(GPU 側) | - | full | 実装中 | 96f8b20 | | |
+| T2 | 画面・アプリ側(`Composite::Gl`・`Top`・Screen / App の口・`runtime.rs`・GL の可否と失敗の扱い・CPU 経路の案内と巡回・消灯) | AC3, AC4, AC5, AC6, AC11 | T1 | full | 実装中 | 96f8b20 | | |
 | T3 | キューブ画面と状態を汚す試験画面、作成/削除の数え方、PNG の一致テスト | AC7, AC8, AC10(数え方) | T2 | quick | 未着手 | | | |
 | T4 | 実機での確認と計測、PoC 記録と設計書の更新 | AC9, AC10, AC11, AC12, AC13 | T3 | quick | 未着手 | | | |
