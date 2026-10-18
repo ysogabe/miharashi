@@ -7,7 +7,7 @@ use miharashi_gpu::GlesDisplay;
 use miharashi_linux::drm_select::{self, CardSel, ModeSel};
 use miharashi_linux::sysinfo::SelfCpu;
 use miharashi_vrm::synth;
-use miharashi_vrm::{Model, Renderer, attach_depth, demo};
+use miharashi_vrm::{Level, Model, Renderer, attach_depth, demo};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "使い方: vrm-view (--model <path.vrm> | --synthetic) [--card driver:amdgpu] [--connector auto] \
-[--mode preferred] [--seconds 60] [--expression blink]";
+[--mode preferred] [--seconds 60] [--expression blink] [--fps 30] [--feature-level spring] [--outline-scale 1]";
 
 /// fps などを標準エラーに出す間隔
 const STATS_EVERY: Duration = Duration::from_secs(5);
@@ -27,6 +27,10 @@ struct Args {
     mode: String,
     seconds: f64,
     expression: String,
+    /// 指定すると、フレームの間隔をこの fps に保つ(既定は vsync のまま)
+    fps: Option<f64>,
+    level: Level,
+    outline_scale: f32,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -37,6 +41,9 @@ fn parse_args() -> Result<Args, String> {
         mode: "preferred".into(),
         seconds: 60.0,
         expression: "blink".into(),
+        fps: None,
+        level: Level::Spring,
+        outline_scale: 1.0,
     };
     let mut synthetic = false;
     let mut it = std::env::args().skip(1);
@@ -50,6 +57,11 @@ fn parse_args() -> Result<Args, String> {
             "--mode" => a.mode = value()?,
             "--seconds" => a.seconds = value()?.parse().map_err(|_| "--seconds が数でない")?,
             "--expression" => a.expression = value()?,
+            "--fps" => a.fps = Some(value()?.parse().map_err(|_| "--fps が数でない")?),
+            "--feature-level" => a.level = Level::parse(&value()?)?,
+            "--outline-scale" => {
+                a.outline_scale = value()?.parse().map_err(|_| "--outline-scale が数でない")?
+            }
             _ => return Err(format!("不明な引数 {flag}\n{USAGE}")),
         }
     }
@@ -58,6 +70,11 @@ fn parse_args() -> Result<Args, String> {
     }
     if a.seconds.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         return Err("--seconds は 0 より大きい数".into());
+    }
+    if a.fps
+        .is_some_and(|f| f.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater))
+    {
+        return Err("--fps は 0 より大きい数".into());
     }
     Ok(a)
 }
@@ -224,8 +241,11 @@ fn run(a: &Args) -> Result<(), String> {
             );
         }
         let target = Target::new(gl, size)?;
-        match Renderer::new(gl, model) {
-            Ok(r) => Ok((r, target)),
+        match Renderer::with_level(gl, model, a.level) {
+            Ok(mut r) => {
+                r.outline_scale = a.outline_scale;
+                Ok((r, target))
+            }
             Err(e) => {
                 target.destroy(gl);
                 Err(e)
@@ -262,9 +282,19 @@ fn view_loop(
     let (mut frames, mut busy) = (0u32, Duration::ZERO);
     let mut last = Instant::now();
     let mut total_frames = 0u64;
+    let mut prev_t = 0.0f32;
     while !term.load(Ordering::Relaxed) && start.elapsed() < run_for {
+        if let Some(fps) = a.fps {
+            // 次のフレームの時刻まで待つ(遅れていれば待たない)。そのあと present_with が vsync を待つ
+            let next = start + Duration::from_secs_f64(total_frames as f64 / fps);
+            if let Some(d) = next.checked_duration_since(Instant::now()) {
+                std::thread::sleep(d);
+            }
+        }
         let t = start.elapsed().as_secs_f32();
         let t0 = Instant::now();
+        renderer.animate(t, t - prev_t);
+        prev_t = t;
         renderer.set_expression(&a.expression, demo::expression_weight(&a.expression, t))?;
         let yaw = demo::camera_yaw(t);
         // present_with が page flip の完了まで待つので、フレームの間隔は vsync でとれる

@@ -195,24 +195,42 @@ pub(crate) fn build_vrm_doc(o: &Opts) -> (Value, Vec<u8>) {
 
     let doc = json!({
         "asset": {"version": "2.0"},
-        "extensionsUsed": ["VRMC_vrm"],
+        "extensionsUsed": ["VRMC_vrm", "VRMC_springBone", "VRMC_materials_mtoon"],
         "extensions": {"VRMC_vrm": {
             "specVersion": "1.0",
             "meta": {"name": "miharashi synthetic", "licenseUrl": "https://vrm.dev/licenses/1.0/", "authors": ["miharashi"]},
-            "humanoid": {"humanBones": {}},
+            "humanoid": {"humanBones": {
+                "head": {"node": 1},
+                "leftUpperArm": {"node": 6},
+                "leftLowerArm": {"node": 7},
+                "leftHand": {"node": 8}
+            }},
             "expressions": {"preset": {
                 "blink": {"morphTargetBinds": [{"node": 1, "index": 0, "weight": 1.0}]},
                 "happy": {}
             }}
-        }},
+        },
+        "VRMC_springBone": {"specVersion": "1.0",
+            "colliders": [{"node": 1, "shape": {"sphere": {"offset": [0.0, 0.0, 0.0], "radius": 0.1}}}],
+            "colliderGroups": [{"name": "head", "colliders": [0]}],
+            "springs": [{"name": "hair", "colliderGroups": [0], "joints": [
+                {"node": 9, "hitRadius": 0.01, "stiffness": 0.5, "gravityPower": 1.0, "gravityDir": [1.0, 0.0, 0.0], "dragForce": 0.4},
+                {"node": 10, "hitRadius": 0.01, "stiffness": 0.5, "gravityPower": 1.0, "dragForce": 0.4}]}]}
+        },
         "scene": 0,
-        "scenes": [{"nodes": [0, 3, 4]}],
+        "scenes": [{"nodes": [0, 3, 4, 5]}],
         "nodes": [
             {"name": "root", "translation": [0.0, 0.5, 0.0], "children": [1, 2]},
-            {"name": "Head", "mesh": 0},
+            {"name": "Head", "mesh": 0, "children": [9]},
             {"name": "Body", "mesh": 1},
             {"name": "Skinned", "mesh": 2, "skin": 0},
-            {"name": "Joint", "translation": [0.5, 0.0, 0.0]}
+            {"name": "Joint", "translation": [0.5, 0.0, 0.0]},
+            {"name": "ArmRoot", "translation": [0.2, 1.2, 0.0], "rotation": [0.0, 0.70710678, 0.0, 0.70710678], "children": [6]},
+            {"name": "UpperArm", "translation": [0.0, 0.0, 0.3], "children": [7]},
+            {"name": "LowerArm", "translation": [0.0, 0.0, 0.3], "children": [8]},
+            {"name": "Hand", "translation": [0.0, 0.0, 0.3]},
+            {"name": "Hair1", "translation": [0.0, 0.9, 0.0], "children": [10]},
+            {"name": "Hair2", "translation": [0.0, 0.1, 0.0]}
         ],
         "skins": [{"joints": [4], "inverseBindMatrices": ibm}],
         "meshes": [
@@ -226,7 +244,13 @@ pub(crate) fn build_vrm_doc(o: &Opts) -> (Value, Vec<u8>) {
         ],
         "materials": [
             {"name": "face", "pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}},
-            {"name": "cloth", "pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.3, 0.35, 1.0]}},
+            {"name": "cloth", "pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.3, 0.35, 1.0]},
+             "emissiveFactor": [0.0, 0.2, 0.0],
+             "extensions": {"VRMC_materials_mtoon": {"specVersion": "1.0",
+                "shadeColorFactor": [0.3, 0.1, 0.1], "shadingToonyFactor": 0.9, "shadingShiftFactor": 0.0,
+                "parametricRimColorFactor": [0.0, 0.0, 1.0], "parametricRimFresnelPowerFactor": 2.0,
+                "outlineWidthMode": "worldCoordinates", "outlineWidthFactor": 0.02,
+                "outlineColorFactor": [1.0, 1.0, 0.0], "outlineLightingMixFactor": 0.0}}},
             {"name": "mask", "alphaMode": "MASK", "alphaCutoff": 0.4, "doubleSided": true,
              "pbrMetallicRoughness": {"baseColorFactor": [0.3, 0.8, 0.4, 1.0]}}
         ],
@@ -267,7 +291,7 @@ pub(crate) fn pack_glb(doc: &Value, bin: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::model::{AlphaMode, FLOATS_PER_VERTEX, Model};
-    use crate::render::{Renderer, attach_depth, detach_depth};
+    use crate::render::{Level, Renderer, attach_depth, detach_depth};
 
     fn small() -> Model {
         Model::from_glb(&build_vrm_glb(&Opts {
@@ -378,6 +402,78 @@ mod tests {
     }
 
     #[test]
+    fn reads_humanoid_spring_and_mtoon() {
+        let m = small();
+        assert_eq!(m.vrm.human_bones["leftUpperArm"], 6);
+        assert_eq!(m.vrm.human_bones["head"], 1);
+        let sb = &m.vrm.spring;
+        assert_eq!((sb.colliders.len(), sb.springs.len()), (1, 1));
+        assert_eq!(sb.springs[0].joints.len(), 2);
+        assert_eq!(sb.springs[0].collider_groups, [0]);
+        assert_eq!(sb.springs[0].joints[0].gravity_power, 1.0);
+        let mt = m.materials[1].mtoon.as_ref().unwrap();
+        assert_eq!(mt.shade_color, [0.3, 0.1, 0.1]);
+        assert_eq!(mt.outline_mode, crate::vrm::OutlineMode::World);
+        assert_eq!(mt.outline_width, 0.02);
+        assert_eq!(mt.rim_color, [0.0, 0.0, 1.0]);
+        assert_eq!(mt.rim_fresnel_power, 2.0);
+        assert_eq!(mt.emissive, [0.0, 0.2, 0.0]);
+        assert!(m.materials[0].mtoon.is_none());
+    }
+
+    fn pos(m: &crate::math::Mat4) -> [f32; 3] {
+        [m[3][0], m[3][1], m[3][2]]
+    }
+
+    #[test]
+    fn natural_pose_lowers_the_arm_in_world_space() {
+        use crate::anim::{ARM_LEAN_DEG, Rig};
+        let m = small();
+        // 初期姿勢: 腕は +X に水平(親の ArmRoot が Y まわりに 90 度回っていて、ローカル軸は Z)
+        let rest = Rig::new(&m, false);
+        let (u0, h0) = (pos(&rest.world[6]), pos(&rest.world[8]));
+        assert!((h0[0] - u0[0] - 0.6).abs() < 1e-4 && (h0[1] - u0[1]).abs() < 1e-4);
+        let mut rig = Rig::new(&m, true);
+        rig.update(&m, 0.0, None);
+        let (u, l, h) = (pos(&rig.world[6]), pos(&rig.world[7]), pos(&rig.world[8]));
+        // 上腕は真下から ARM_LEAN_DEG だけ外側(+X)に開いた向き
+        let d = crate::math::normalize(crate::math::vec_sub(l, u));
+        let a = ARM_LEAN_DEG.to_radians();
+        assert!(
+            (d[0] - a.sin()).abs() < 1e-4 && (d[1] + a.cos()).abs() < 1e-4,
+            "{d:?}"
+        );
+        // 骨の長さは変わらず、手は肩より下で、前腕は前(+Z)に曲がっている
+        assert!((crate::math::vec_len(crate::math::vec_sub(l, u)) - 0.3).abs() < 1e-4);
+        assert!(h[1] < u[1] - 0.4 && h[2] > l[2] + 0.01, "{u:?} {l:?} {h:?}");
+    }
+
+    #[test]
+    fn spring_bone_leans_under_sideways_gravity_and_keeps_length() {
+        use crate::anim::Rig;
+        use crate::spring::SpringSim;
+        let m = small();
+        let mut rig = Rig::new(&m, false);
+        let mut sim = SpringSim::new(&m, &rig);
+        assert_eq!(sim.joint_count(), 2);
+        let tail_rest = pos(&rig.world[10]);
+        for k in 0..90 {
+            let mut f = |r: &mut Rig, md: &crate::model::Model| sim.step(md, r, 1.0 / 30.0);
+            rig.update(&m, k as f32 / 30.0, Some(&mut f));
+        }
+        // 上向きの毛先が、横向き(+X)の重力で傾く。骨の長さ 0.1 は保たれる
+        let (head, tail) = (pos(&rig.world[9]), pos(&rig.world[10]));
+        assert!(tail[0] > tail_rest[0] + 0.005, "{tail_rest:?} {tail:?}");
+        assert!(
+            (crate::math::vec_len(crate::math::vec_sub(tail, head)) - 0.1).abs() < 1e-3,
+            "{head:?} {tail:?}"
+        );
+        assert!(rig.override_rot[9].is_some());
+        // 関節行列の数は変わらない
+        assert_eq!(rig.joints.len(), m.joint_nodes.len());
+    }
+
+    #[test]
     fn rejects_vrm0_glb() {
         let mut doc = serde_json::json!({"asset": {"version": "2.0"}, "extensions": {"VRM": {"specVersion": "0.0"}}});
         doc["scenes"] = serde_json::json!([]);
@@ -433,5 +529,56 @@ mod tests {
             .filter(|p| p[0].abs_diff(20) > 10 || p[1].abs_diff(23) > 10 || p[2].abs_diff(31) > 10)
             .count();
         assert!(nonbg > 1000, "描けた画素が少ない: {nonbg}");
+    }
+
+    /// MToon の段階が、Lambert とは違う絵を描き、輪郭線が太さに応じて変わること。
+    #[test]
+    fn mtoon_level_draws_differently_with_outline() {
+        let node = miharashi_gpu::render_node_for_pci("0000:10:00.0");
+        let off = match miharashi_gpu::Offscreen::open(&node) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("GLES が使えないので skip: {e}");
+                return;
+            }
+        };
+        let size = (256u32, 256u32);
+        let mut shots = Vec::new();
+        for (level, scale) in [(Level::Pose, 1.0), (Level::Mtoon, 0.0), (Level::Mtoon, 1.0)] {
+            let (r, img) = off
+                .with_fbo(size, |gl| -> Result<(), String> {
+                    let depth = attach_depth(gl, size)?;
+                    let mut r = Renderer::with_level(gl, small(), level)?;
+                    r.outline_scale = scale;
+                    r.animate(0.0, 0.0);
+                    r.update(gl);
+                    r.render(gl, size);
+                    unsafe {
+                        use glow::HasContext;
+                        assert_eq!(gl.get_error(), glow::NO_ERROR, "{level:?}");
+                    }
+                    r.destroy(gl);
+                    detach_depth(gl, depth);
+                    Ok(())
+                })
+                .unwrap();
+            r.unwrap();
+            shots.push(img);
+        }
+        let diff =
+            |a: &[u8], b: &[u8]| a.iter().zip(b).filter(|(x, y)| x.abs_diff(**y) > 8).count();
+        assert!(
+            diff(&shots[0], &shots[1]) > 500,
+            "Lambert と MToon が同じ絵"
+        );
+        // 輪郭線の太さ 0 → 1(0.02m)で、黄色い輪郭線が出る
+        assert!(diff(&shots[1], &shots[2]) > 100, "輪郭線が描かれていない");
+        let yellow = shots[2]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] > 200 && p[1] > 200 && p[2] < 80)
+            .count();
+        assert!(yellow > 50, "黄色い画素が少ない: {yellow}");
     }
 }

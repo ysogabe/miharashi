@@ -222,8 +222,8 @@ void main() {
 
 /// 平行光源(モデル空間。正面上から)の向きと強さ、環境光
 const LIGHT_DIR: [f32; 3] = [0.3, 0.6, 0.75];
-const LIGHT_INTENSITY: f32 = 0.95;
-const AMBIENT: f32 = 0.12;
+const LIGHT_INTENSITY: f32 = 0.9;
+const AMBIENT: f32 = 0.1;
 
 struct GpuPrimitive {
     vao: glow::VertexArray,
