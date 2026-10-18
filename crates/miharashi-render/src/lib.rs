@@ -7,6 +7,7 @@ pub mod chart;
 pub mod geo;
 pub mod glitch;
 pub mod menu;
+pub mod notice;
 pub mod photo;
 pub mod photo_layout;
 pub mod photo_screen;

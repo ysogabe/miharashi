@@ -26,6 +26,9 @@ pub struct GlTarget {
 /// `target.fbo` が bind 済みで、色 `(0,0,0,0)`・深度 1.0・ステンシル 0 で塗ってあり、テスト・マスク・
 /// bind は既定値、プログラム・VAO・バッファ・テクスチャは bind されていない。画面が「戻す」責任は持たない。
 /// 開始した query など、Compositor が設定し直せないものだけは `draw` の中で閉じること。
+///
+/// sampler の束縛を `draw` の前に解除するのは、テクスチャユニット 0〜15 まで(GLES 3.x の最低保証の数)。
+/// 16 以降のユニットを使う場面は、前の場面が残した sampler に頼らず、自分で sampler を明示的に設定すること。
 pub trait GlScene {
     /// `target` に今の状態を描く。初回は GL オブジェクトを作る(遅延・冪等)。
     /// 出力は premultiplied alpha。失敗は Err(文字列。コードベースの他と同じ)。
