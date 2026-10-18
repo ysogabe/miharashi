@@ -215,7 +215,7 @@ flowchart LR
 
 - 非表示中に保持するメモリが問題になるか。内蔵 GPU は VRAM+GTT(PR #61 と同じ数え方)。キューブは小さいので影響はない。**VRM はモデルによる**(ニケちゃんは 14 万三角形、テクスチャは複数枚)。B で実測し、大きければタイムアウト解放を足す。**未検証**。
 - 切り替えを重ねても増え続けないこと(#74 の受け入れ条件)は、「作るのは 1 回だけ」で構造的に満たす。確かめ方: キューブ画面と写真画面を数百回切り替え、(1) VRAM+GTT を開始時と終了時で比べる。(2) GL オブジェクトは、`glIs*` を名前の範囲で総当たりして数えない(Mesa が小さい整数から割り当てる前提に頼る)。代わりに、`GlScene` 実装の中で作成・削除の回数を数え(テクスチャ・バッファ・プログラムごと)、切り替え後に「作成 − 削除」が増えていないことを見る。**未検証**。
-- GPU リセット(context lost)は v1 では扱わない。`draw` が Err を返し続けたら §9 の失敗の扱いに入り、`release` と作り直しで復帰する。
+- GPU リセット(context lost)は v1 では扱わない。`draw` が Err を返したら §9 の失敗の扱いに入り、`release` したうえで、v1 は再起動まで 3D を出さない(§9.1)。
 
 ### 3.4 今のコードとの対応
 
@@ -236,8 +236,8 @@ flowchart LR
 ### 4.1 決めたこと
 
 - 描く順番は **下地 → 3D → 重ね絵**。重ね絵は、**ScreenManager が描くアラートとメニュー専用の最上段の層**(透明な背景、premultiplied RGBA8、画面と同じ大きさ)。
-- 画面は `GlComposite.top` を `Off` で返す。ScreenManager が、アラートかメニューが出ているときに専用の Canvas(最初に必要になったときに確保)へ描いて `Upload` / `Keep` に書き換える。出ていないときは `Off`。`Upload` は、アラートが開く・閉じる、メニューのキー操作(`force_overlay`)があったときだけ。
-- **最上段の層は `Off` の次のフレームは必ず `Upload`**(`Keep` は前回が `Upload` か `Keep` のときだけ)。層のテクスチャは `Off` のあいだ古い内容のままか、解放されている。
+- 画面は `GlComposite.top` を `Off` で返す。ScreenManager が、アラートかメニューが出ているときに専用の Canvas(最初に必要になったときに確保)へ描いて `Upload` / `Keep` に書き換える。出ていないときは `Off`。`Upload` は `force_overlay` が立ったとき(アラートが開く・閉じる、メニューのキー操作、画面の切り替え、それに `force_overlay |= redraw`(`manager.rs:556`)により 1 秒ごとの時計の更新でも立つ。今の写真の重ね絵と同じで、アラート・メニューが出ているあいだは毎秒 11MB の転送になる。気になれば #74 で層専用の印に分ける)。
+- **最上段の層は `Off` の次のフレームは必ず `Upload`**(`Keep` は前回が `Upload` か `Keep` のときだけ)。`Gl` 以外を返したフレームも `Off` とみなす。層のテクスチャは `Off` のあいだ古い内容のままか、解放されている。
 - 画面自身の重ね絵(写真の文字)は、これまでどおり**下地の一部**で、3D の下に入る。VRM が写真の文字の手前に出る(`vrm-view` の見た目と同じ)。
 - 3D の画面は、アラート・メニューの間も 3D を描き続ける(`Composite::Canvas` に切り替えない)。
 
@@ -255,7 +255,7 @@ flowchart LR
 | 今 | 変更 |
 |---|---|
 | `ScreenManager::render_composite` が画面の返した `Composite` を見て、`draw_alert` を決め、`layers`(メニュー → アラート)を描く(`manager.rs:655-671`、`manager.rs:679-693`) | `Composite::Gl` のとき、画面の `canvas` ではなく、専用の最上段 Canvas に `layers` を描く。呼び出しと描く内容(`menu::menu`、`alert::overlay`)は変えない |
-| `force_overlay`(`manager.rs:615`)は、重ね絵を描き直す要求 | 最上段の層の `Upload` を出す条件に使う。**GL の可否・失敗状態が変わったときは必ず `force_overlay = true`** にし、現在の画面の `invalidate()` も呼ぶ(§6.1、§9.1)。Photo の `overlay_changed` は `overlay_dirty \|\| force_overlay`(`photo.rs:261`)、`draw_alert` は `overlay_changed` のときだけ(`manager.rs:655-671`)、Agent 画面の `background_changed` も同様なので、これをしないと切り替えの瞬間にアラートが消える |
+| `force_overlay`(`manager.rs:615`)は、重ね絵を描き直す要求 | 最上段の層の `Upload` を出す条件に使う。**GL の可否・失敗状態が変わったときは必ず `force_overlay = true`** にし、現在の画面の `invalidate()` も呼ぶ(§6.1、§9.1)。Photo の `overlay_changed` は `overlay_dirty \|\| force_overlay`(`photo.rs:261`)、`draw_alert` は `overlay_changed` のときだけ(`manager.rs:655-671`)なので、これをしないと写真画面では切り替えの瞬間にアラートが消える。Agent 画面は覆われると `Composite::Canvas` を返し、そのとき `draw_alert` は毎フレーム true(`agents.rs:934-953`、`manager.rs:657`)なので消えない。`invalidate()` は念のため |
 | `Frame::Photo` の `overlay`(`compose.rs:402-416`) | 変えない。写真が下地のとき、写真の文字はこれまでどおり下地の合成の中で出る |
 | 焼き付き対策: `glitch::shift` は Canvas と Radar の幾何だけで、写真と Agent は対象外(`manager.rs:636-654`) | `Composite::Gl` も対象外にする。3D は動き続けるので、位置のずらしを足さない。下地は、写真・Agent と同じく対象外のまま |
 
@@ -318,7 +318,7 @@ flowchart LR
 `GlScene::draw` が呼ばれた時点で、次が成り立つ。
 
 - `GlTarget::fbo` が bind 済み。viewport は `(0, 0, size.0, size.1)`。
-- 色は `(0,0,0,0)`、深度は 1.0 で塗ってある。`depth_mask` と `color_mask` は全許可、`DEPTH_TEST` は無効(画面が必要なら有効にする)。
+- 色は `(0,0,0,0)`、深度は 1.0、ステンシルは 0 で塗ってある。`depth_mask` と `color_mask` は全許可、`DEPTH_TEST` は無効(画面が必要なら有効にする)。
 - 上の「毎回設定する状態」がすべて既定値(`depth_func` は `LESS`、`cull_face` は `BACK`、`blend_func` は `ONE, ZERO` など。§5.1)。プログラム・VAO・バッファ・テクスチャ(`TEXTURE1` を含む)は bind されていない。
 - 前の画面の GL オブジェクトは残っているが、名前は使わない(`GlScene` は自分で作ったものだけを使う)。
 
@@ -341,7 +341,7 @@ flowchart LR
 
 - GL の可否は、作るときの `make_app(&Output)` で渡す。`Output.gpu_max_texture.is_some()` が「GLES を開けた」(`auto` で CPU に戻ったときは `None`)なので、これを GL の可否として使う(`runtime.rs:289-293`、`353-356`、`main.rs:153`)。`set_gl_available` のような実行中に呼ぶメソッドは作らない(GL の可否は起動後に変わらない。変わるのは「失敗」だけ)。
 - GL の可否の判断は **ScreenManager だけ**が行う(`Screen` には可否を渡さない)。`needs_gl()` の画面が GL 不可・失敗中なら、`render_composite` を呼ばずに `render` を呼ぶ(CPU の案内)。それ以外の画面は常に `render_composite` を呼び、`Composite::Gl` が返ってきて GL 不可・失敗中なら、`base` を取り出して使う(`None` なら `Composite::Canvas` と空の Canvas)。これで装飾(`WithScene`)は単純なまま、元の画面だけが出る。
-- **GL の可否・失敗状態が変わったとき**(起動時の GL なし、`report_scene_failure` による失敗、将来の復帰): ScreenManager は必ず `force_overlay = true` にし、現在の画面の `invalidate()` を呼ぶ。GL ありの `Composite::Gl`(下地は `base` の中)と、GL なしの `Composite::Photo` / `Composite::Agents` / `Composite::Canvas`(`base` を取り出したもの)では、画面が重ね絵・背景を描いたかどうかの前提が変わる。Photo の `overlay_changed` は `overlay_dirty || force_overlay`(`photo.rs:261`)、ScreenManager の `draw_alert` は `overlay_changed` のときだけ(`manager.rs:655-671`)、Agent 画面の `background_changed` も同じなので、これをしないとその切り替えのフレームにアラート・メニューが描かれず、消える。
+- **GL の可否・失敗状態が変わったとき**(起動時の GL なし、`report_scene_failure` による失敗、将来の復帰): ScreenManager は必ず `force_overlay = true` にし、現在の画面の `invalidate()` を呼ぶ。GL ありの `Composite::Gl`(下地は `base` の中)と、GL なしの `Composite::Photo` / `Composite::Agents` / `Composite::Canvas`(`base` を取り出したもの)では、画面が重ね絵・背景を描いたかどうかの前提が変わる。Photo の `overlay_changed` は `overlay_dirty || force_overlay`(`photo.rs:261`)、ScreenManager の `draw_alert` は `overlay_changed` のときだけ(`manager.rs:655-671`)なので、これをしないと写真画面ではその切り替えのフレームにアラート・メニューが描かれず、消える(Agent 画面は覆われると `Composite::Canvas` を返し、アラートを毎フレーム描くので消えない。`invalidate()` は念のため)。
 - **案内は共通の描画関数**(`miharashi-render` に `notice::gpu_required` を足す)で、GL 専用画面の `render` はそれを呼ぶだけ。これで、`Screen::render` が必須(`screen.rs:105`)でも、画面側の負担が小さい。
 - **焼き付き対策(`refresh_screens`)**: 3D の画面を指定しても、CPU の案内(`render`)がグリッチの素材になるだけで意味がない。GL の画面は対象にしない。今の `refresh_screens` は、対応外の id を**エラー**にする(許可は status / photo / room / aircraft。`config.rs:491-502`、テスト `config.rs:659`)ので、キューブの id は何もしなくてもエラーになる。これを警告 + 無視に変えるかは未決事項(§13)。既定は `["aircraft"]` のまま(`config.rs:393`)。
 - **PNG ヘッドレス**:
@@ -398,7 +398,7 @@ flowchart LR
 手順(`draw_scene`):
 
 1. **下地を描く**: `reset_gl_state` のあと、`base` が `Some` なら既存の `Compositor::draw`(`compose.rs:377`)と同じ処理。`None` なら全面を黒で塗る。標準の framebuffer を bind してから行う(`present_frame` の `display.rs:118` と同じ)。
-2. **3D を層に描く**: 層の FBO を bind、viewport を `region` の大きさにして、色 `(0,0,0,0)`・深度 1.0 で消去。`reset_gl_state` で既定値へ(FBO と viewport は層のものを保つ)。`GlScene::draw` を `catch_unwind(AssertUnwindSafe(..))` で呼ぶ。`draw` の**前**に `get_error` を読み出しきり(下地の合成のエラーを画面の失敗にしない。読んだエラーは通常ログに 1 回だけ)、戻ったあとにもう一度読み出しきる。
+2. **3D を層に描く**: `reset_gl_state` で既定値へ戻し、層の FBO を bind、viewport を `region` の大きさにして、色 `(0,0,0,0)`・深度 1.0・ステンシル 0 で消去。`GlScene::draw` を `catch_unwind(AssertUnwindSafe(..))` で呼ぶ。`draw` の**前**に `get_error` を読み出しきり(下地の合成のエラーを画面の失敗にしない。読んだエラーは通常ログに 1 回だけ)、戻ったあとにもう一度読み出しきる。
 3. **層を画面へ重ねる**: `reset_gl_state` のあと、標準の framebuffer を bind、viewport を `region` に合わせて(GL は左下原点なので換算)、層のテクスチャを `ONE, ONE_MINUS_SRC_ALPHA` で重ねる(`layer.rs` の `VrmLayer::composite` と同じ)。
 4. **最上段の重ね絵**: `top` が `Upload` ならテクスチャを更新、`Upload` か `Keep` なら全面に重ねる(`Frame::Photo` の重ね絵と同じ `ONE, ONE_MINUS_SRC_ALPHA`)。`Off` なら何もしない。
 5. **表示**: `flip`(swap → page flip → 完了待ち。`display.rs:176`)。一時停止中は、`present_frame` と同じく手順 1 の前に何もせず戻る(`draw` も呼ばない: `display.rs:113-115`)。
@@ -452,7 +452,7 @@ flowchart LR
 
 ### 9.4 #74 と #71 B でやること
 
-- **#74**: 故意に panic するキューブ(`draw` が N 回目で panic)・`Err` を返すキューブ・GL エラーを出すキューブで、(1) キオスクが止まらない、(2) そのフレームが下地とアラートで完成する、(3) 次の画面(写真)が正しく描ける、(4) 案内の表示と再試行を確かめる。`GlScene::release` が panic しても止まらないこと。
+- **#74**: 故意に panic するキューブ(`draw` が N 回目で panic)・`Err` を返すキューブ・GL エラーを出すキューブで、(1) キオスクが止まらない、(2) そのフレームが下地とアラートで完成する、(3) 次の画面(写真)が正しく描ける、(4) 案内(または元の画面)が出て、失敗した 3D が再び描かれないことを確かめる。`GlScene::release` が panic しても止まらないこと。
   - **アラート表示中に 3D を失敗させ、次のフレームからもアラートが見え続けること**(§4.5 と同じ。GL あり → なしの切り替えで `force_overlay` と `invalidate` が効いていること)。
   - **初回の `draw`(初期化の途中)で panic しても、`release` が作りかけのオブジェクトで動き(作っていないものは消さない)、その後の `draw` で作り直せること**(v1 は失敗後に `draw` を呼ばないので、`GlScene` の約束「`release` の後でも `draw` で作り直せる」の単体確認として、テストから直接呼ぶ)。
 - **#71 B**: 壊れた VRM(切り詰めた glb、範囲外の sparse index、**sparse の stride が要素より小さい glb**)で、読み込みスレッドが失敗しても画面全体が止まらないこと。
@@ -461,7 +461,7 @@ flowchart LR
 
 **決定**: 新しい仕組みは足さず、既存の `animating()` / `tick` の戻り値 / 消灯中は描かない、で表す。
 
-- **`animating()` が止めるのは 20ms の待ちだけ**(`runtime.rs:613`)。描くかどうかは `tick` の戻り値で決まる(`redraw |= app.tick(..)`、`runtime.rs:514`、`547`)。航空機の画面は動かし続けるとき tick も毎回 true を返す(`aircraft.rs:102-105`)。**動かし続ける画面は、`animating()` と `tick` の戻り値の両方を true にする**。静止している 3D は `animating() = false` で、必要なときに `tick` の戻り値(再描画)で要求する。VRM は待機中も呼吸・頭の揺れがある(POC-006)ので、「待機中は静止」とは限らない。
+- **`animating()` が止めるのは 20ms の待ちだけ**(`runtime.rs:613`)。描くかどうかは `tick` の戻り値で決まる(`redraw |= app.tick(..)`、`runtime.rs:514`、`547`)。航空機の画面は動かし続けるとき tick も毎回 true を返す(`aircraft.rs:102-105`)。**動かし続ける画面は、`animating()` と `tick` の戻り値の両方を true にする**。静止している 3D は `animating() = false`。GL 専用画面は必要なときに `tick` の戻り値(再描画)で要求できる。装飾(`WithScene`)には v1 では一回きりの再描画要求の手段がない(内側の画面の `tick` に 3D の分を混ぜない。§13)。VRM は待機中も呼吸・頭の揺れがある(POC-006)ので、「待機中は静止」とは限らない。
 - **3D 由来の分は内側の画面と分ける**: `Screen::scene_animating()`(§2.3)。ScreenManager は、**GL が使えて、失敗していないときだけ**これを `animating()` と `tick` の戻り値に足す。内側の画面(写真・Agent)の `animating()` / `tick` には 3D の分を混ぜない。混ぜると、`renderer = cpu` や失敗中に、動かない写真画面を CPU で毎回描き直してしまう(§6.1、§11.3 の「既存画面に影響しない」とも矛盾する)。案内だけを出すキューブ(GL なし・失敗中)も同じで、`scene_animating()` を足さないので、案内は変わったときだけ描く。待機の動きを何 fps で見せるか(`frame_interval`、または待機の動きの間引き)が、描き直しを減らす実際の手段になる。VRM は 1 回の描き直しが画面全体の描き直しになる。
 - **下地が `Composite::Canvas` のときの費用**: 下地が Canvas(Agent 画面でアラート・メニュー表示中: `agents.rs:933-955`、写真画面の最初の 1 枚が出るまで: `photo.rs:245-251`)だと、3D を毎フレーム描くたびに、Canvas の全画面 CPU 描画と GPU への転送(`Frame::Image` の `upload`: `compose.rs:381-386`)も毎フレーム走る。**推奨**: 下地が `Canvas` のときは「変わったときだけ」の印(`GlComposite` の `base_changed`)を付け、印が false のフレームは下地の CPU 描画と転送を飛ばして前の下地を使う。印の元は、内側の画面の `tick` の戻り値・`invalidate()`・アラート/メニューの変化。ほかの案: 下地が Canvas で、3D が画面を覆っている間は 3D を止める(下地は変わらないが、3D も止まってしまうので見た目が変わる)。**未検証**。#71 B で、Canvas 下地(アラート表示中の Agent + VRM)の CPU 使用率と描画時間を測る。
 - 3D は**保持しない**: 何かの理由(時計の 1 秒更新、アラートの開閉)で画面が再描画されると、毎回 `GlScene::draw` が呼ばれる。時間が止まっている間は同じ絵になるようにする(画面の状態が変わらなければ同じ入力)。
@@ -500,7 +500,7 @@ B に入る前の宿題(Issue #71 のコメント): sparse accessor の `byteStr
 手順(**推奨**):
 
 1. `miharashi-vrm` が `miharashi-glscene` に依存し、`VrmScene: GlScene` を実装する。`VrmLayer` の FBO・合成を Compositor に移し、VRM は層に描くだけにする。`Renderer` は自分で `clear_color` を塗り(`render.rs:924-928`、既定は不透明の `[0.08, 0.09, 0.12, 1.0]`: `render.rs:659`)、層の透明な背景を潰してしまうので、`VrmScene` では塗らないか `(0,0,0,0)` で塗る。姿勢・SpringBone・morph の CPU 計算は `draw` の中で行う(§2.1)。vrm のこの利用は `default-features = false`(§2.4)(`vrm-view` は PoC・計測用として、`VrmLayer` を使う現行の経路のまま残してよい)。
-2. モデルの読み込みを別スレッドにする。GL への転送は最初の `draw` で。モデルの場所は設定(リポジトリの外)で指定し、**ニケちゃんのモデルは同梱しない**(ライセンスの理由)。モデルがなければ 3D なしで動く。
+2. モデルの読み込みを別スレッドにする。GL への転送は最初の `draw` で。モデルの場所は設定(リポジトリの外)で指定し、**ニケちゃんのモデルは同梱しない**(ライセンスの理由)。モデルがなければ 3D なしで動く。`miharashi-vrm` はすでに自前の `Region` を公開している(`crates/miharashi-vrm/src/lib.rs:26`)ので、glscene に依存させるときはどちらかを改名するか別名で import する。
 3. **VRM を装飾として載せる画面**を `miharashi-app` に足す: `WithScene<S: Screen>`(推奨)。内側の画面(写真・Agent)のすべてのメソッドを委譲し(`gl_scene()` は自分の `VrmScene` を返し、`scene_animating()` は VRM が動いているかを返す)、`render_composite` の結果を `Composite::Gl { base: Some(内側の結果), scene, region, top: Off }` に包む。内側の画面と操作・`id`・巡回は変わらない。`needs_gl() = false`。`WithScene` は GL の可否を知らなくてよい(常に `Composite::Gl` で包んで返す)。GL が使えない・失敗中の処理は ScreenManager だけが行う(§6.1)。
 4. 表情・口パク・身振りの入力(`tick` から `VrmScene` の具体型へ)。T3 Agent の状態との連動は B の範囲で決める。
 5. 実機で B の確認: 写真 + VRM と Agent + VRM で巡回、アラートが体の手前に出る(失敗させても出続ける)、`renderer = cpu` で元の画面(動かない写真画面が毎フレーム描き直されない)、壊れたモデルで落ちない(sparse の stride 検査を含む)。VRAM+GTT の保持量を測り、タイムアウト解放の要否を決める(§3)。下地が `Canvas` のとき(アラート表示中の Agent + VRM など)の CPU 使用率・描画時間を測り、`base_changed` の要否を決める(§10)。12 時間試験(#74 の分もここでまとめて行う)。
@@ -525,7 +525,7 @@ B に入る前の宿題(Issue #71 のコメント): sparse accessor の `byteStr
 | 3D 失敗後の再試行をするか、するなら間隔と回数 | v1 は再起動まで戻さない。例: 5 分後に 1 回、3 回で停止 | #74 の実機で失敗が起きたら |
 | VRM を載せる画面の `id`: 内側の画面と同じにするか、別の id を足すか | 同じ id(設定 `ui.avatar` で有効化)。パネルの画面一覧が増えない | #71 B。別 id にする場合は操作パネルの契約(`DESIGN-screens.md` §2)を更新 |
 | VRM の `Region`(左右 1/3 は手が切れる。POC-006)と身振りの範囲 | 領域を広げるか身振りを収める。API は変えない | #71 B |
-| GPU リセット(context lost)からの復帰 | v1 は §9 の失敗の扱いで再試行する | 実機で起きたら |
+| GPU リセット(context lost)からの復帰 | v1 は §9 の失敗の扱いに入り、再起動まで 3D を出さない | 実機で起きたら |
 | `catch_unwind` を `tick` / `render` の panic にも広げるか | 広げない | 別の Issue |
 | `Cargo.toml` に `panic = "abort"` が無いことを確かめる単体テストを足すか(CI の grep は削った) | 足す(`catch_unwind` が効く前提を守る) | #74 |
 | `miharashi-app` が `miharashi-vrm` に依存するときの feature 名・既定のオン/オフ | optional 依存、既定オフ、`default-features = false`(vrm の既定 feature は Linux 以外を壊す) | #71 B |
