@@ -1264,6 +1264,8 @@ const BUST_BELOW_CHEST: f32 = 0.10;
 const WAIST_BELOW_HIPS: f32 = 0.0;
 /// 領域の半幅に最低限入れたい量 = 肩幅の半分 × この値 + 腕の長さ × `REACH_FRAC`
 const SHOULDER_FIT: f32 = 0.9;
+/// 腕を幅に入れる割合。0.0 のまま: ニケちゃんでは 0.3 まで構図が変わらず(高さで決まる)、0.4 で手が収まるが
+/// 顔が約 1 割小さくなり、バストアップに腰が入る(人の比率の試験モデルでも腰が入る)。0.8 は顔が小さすぎる。
 const REACH_FRAC: f32 = 0.0;
 
 impl Anchors {
