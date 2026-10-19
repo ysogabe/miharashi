@@ -744,6 +744,32 @@ fn bench_gpu(_: Cli) -> Result<(), String> {
     Err("bench-gpu は Linux 専用".into())
 }
 
+/// `bench-scene [--size WxH(既定は 1280x720・1920x1080・2560x1080 の全部)] [--frames N(連続、既定 600)]
+/// [--fps N(0 = 連続だけ、既定 30)] [--seconds N(--fps の間隔で描く秒数、既定 5)]`(キューブの GPU 時間)
+#[cfg(target_os = "linux")]
+fn bench_scene(cli: Cli) -> Result<(), String> {
+    use miharashi_linux::drm_select::{CardSel, choose_card, scan};
+    let cfg = load_config(&cli)?;
+    let cards = scan();
+    let card = choose_card(&cards, &CardSel::parse(&cfg.display.card))?;
+    let pci = card
+        .pci
+        .clone()
+        .ok_or("表示カードの PCI アドレスが分からない")?;
+    gpu_bench::run_scene(&gpu_bench::SceneOpts {
+        pci,
+        sizes: gpu_bench::scene_sizes(cli.size),
+        frames: cli.frames.unwrap_or(600),
+        fps: cli.fps.unwrap_or(30),
+        seconds: cli.seconds.unwrap_or(5),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bench_scene(_: Cli) -> Result<(), String> {
+    Err("bench-scene は Linux 専用".into())
+}
+
 #[cfg(target_os = "linux")]
 fn kms_info(cli: Cli) -> Result<(), String> {
     use miharashi_linux::drm_select::{CardSel, choose_card, choose_connector, scan};
@@ -804,11 +830,12 @@ fn main() -> Result<(), String> {
         "agents-demo" => agents_demo(cli),
         "bench" => bench(cli),
         "bench-gpu" => bench_gpu(cli),
+        "bench-scene" => bench_scene(cli),
         "bench-metrics" => bench_metrics(cli),
         "kms-info" => kms_info(cli),
         "check-config" => load_config(&cli).map(|_| println!("OK")),
         other => Err(format!(
-            "unknown command {other}(run / png / agents-demo / bench / bench-gpu / bench-metrics / kms-info / check-config)"
+            "unknown command {other}(run / png / agents-demo / bench / bench-gpu / bench-scene / bench-metrics / kms-info / check-config)"
         )),
     }
 }

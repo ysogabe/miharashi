@@ -2,9 +2,16 @@
 //! B1 コネクトーム: MaleCNS 全体級(ニューロン 16 万、結合 300 万本)の合成グラフを、表示カードの
 //! render node に surfaceless で描く。表示中の miharashi を止めずに測れる(KMS には出さない)。
 //! 1 秒ごとに fps、GPU の時間、CPU 使用率、iGPU の使用率、CPU パッケージの電力を出す。
+use crate::app::screens::cube::{CubeScene, CubeScreen, THIRD_BAND, THIRD_BASE};
+use glow::HasContext;
+use miharashi_glscene::{GlScene, GlTarget, ObjectCount};
 use miharashi_gpu::connectome::{self, FrameTimes, Lines, RunOpts, Scene};
+use miharashi_gpu::{Frame, SceneFrame, SceneOutcome, SceneTop};
 use miharashi_linux::sysinfo::{RaplTracker, SelfCpu};
+use miharashi_render::Canvas;
+use miharashi_render::canvas::rgba;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 pub struct Opts {
@@ -439,4 +446,459 @@ pub fn run_video(o: &VideoOpts) -> Result<(), String> {
     })?;
     result?;
     save_png(o.out.as_deref(), o.size, img)
+}
+
+/// `bench-scene` の条件。
+pub struct SceneOpts {
+    pub pci: String,
+    pub sizes: Vec<(u32, u32)>,
+    /// 連続で描くフレーム数(ウォームアップを除く)
+    pub frames: usize,
+    /// 0 なら連続だけ。0 より大きいと、そのあとに 1 秒あたりこの数のフレームで `seconds` 秒も測る
+    pub fps: u32,
+    pub seconds: u64,
+}
+
+/// `--size` が無いときに測る 3 つの大きさ。
+pub const SCENE_SIZES: [(u32, u32); 3] = [(1280, 720), (1920, 1080), (2560, 1080)];
+
+pub fn scene_sizes(opt: Option<(u32, u32)>) -> Vec<(u32, u32)> {
+    opt.map_or_else(|| SCENE_SIZES.to_vec(), |s| vec![s])
+}
+
+/// 最初の数フレーム(シェーダーのコンパイル、GPU のクロックの立ち上がり)は集計しない。
+const WARMUP: usize = 30;
+const WARMUP_PACED: usize = 10;
+
+/// 1 フレームの計測値。
+struct Sample {
+    /// timer query の GPU 時間 [ms]。無いとき、時計が飛んだときは None
+    gpu: Option<f32>,
+    /// 命令を出し始めてから `glFinish` が返るまで [ms]
+    wall: f32,
+    /// 計測の外で先にした CPU の仕事(下地の作成)[ms]。無ければ None
+    pre: Option<f32>,
+}
+
+#[derive(Default)]
+struct Samples {
+    gpu: Vec<f32>,
+    wall: Vec<f32>,
+    pre: Vec<f32>,
+    /// pre(無ければ 0)+ wall
+    total: Vec<f32>,
+}
+
+impl Samples {
+    fn push(&mut self, s: &Sample) {
+        self.gpu.extend(s.gpu);
+        self.wall.push(s.wall);
+        self.pre.extend(s.pre);
+        self.total.push(s.pre.unwrap_or(0.0) + s.wall);
+    }
+}
+
+/// 1 フレームを `glFinish` まで測る。timer query があれば GPU 時間も取る(フレームごとに待つので、重ならない 1 枚分)。
+struct Probe {
+    query: Option<glow::Query>,
+}
+
+impl Probe {
+    fn new(gl: &glow::Context) -> Self {
+        let query = gl
+            .supported_extensions()
+            .contains("GL_EXT_disjoint_timer_query")
+            .then(|| unsafe { gl.create_query().ok() })
+            .flatten();
+        Self { query }
+    }
+
+    fn method(&self) -> &'static str {
+        if self.query.is_some() {
+            "timer-query(GL_EXT_disjoint_timer_query)+wall(glFinish)"
+        } else {
+            "wall(glFinish)"
+        }
+    }
+
+    fn run(&self, gl: &glow::Context, pre: Option<f32>, f: impl FnOnce()) -> Sample {
+        unsafe {
+            if self.query.is_some() {
+                // 前の回に立った「時計が飛んだ」を持ち越さない
+                gl.get_parameter_i32(0x8FBB);
+            }
+            let t0 = Instant::now();
+            if let Some(q) = self.query {
+                gl.begin_query(0x88BF, q);
+            }
+            f();
+            if self.query.is_some() {
+                gl.end_query(0x88BF);
+            }
+            gl.finish();
+            let wall = t0.elapsed().as_secs_f32() * 1000.0;
+            let gpu = self.query.and_then(|q| {
+                let ok = gl.get_query_parameter_u32(q, glow::QUERY_RESULT_AVAILABLE) != 0
+                    && gl.get_parameter_i32(0x8FBB) == 0;
+                ok.then(|| gl.get_query_parameter_u64(q, glow::QUERY_RESULT) as f32 / 1e6)
+            });
+            Sample { gpu, wall, pre }
+        }
+    }
+
+    fn destroy(self, gl: &glow::Context) {
+        if let Some(q) = self.query {
+            unsafe { gl.delete_query(q) };
+        }
+    }
+}
+
+/// `step(i)` を `warmup + frames` 回呼び、ウォームアップを除いて集める。`period` があればその間隔で呼ぶ。
+fn measure(
+    frames: usize,
+    warmup: usize,
+    period: Option<Duration>,
+    mut step: impl FnMut(usize) -> Sample,
+) -> Samples {
+    let mut out = Samples::default();
+    let mut next = Instant::now();
+    for i in 0..warmup + frames {
+        let s = step(i);
+        if i >= warmup {
+            out.push(&s);
+        }
+        if let Some(p) = period {
+            next += p;
+            let now = Instant::now();
+            if next > now {
+                std::thread::sleep(next - now);
+            } else {
+                next = now;
+            }
+        }
+    }
+    out
+}
+
+fn report_line(size: (u32, u32), case: &str, pace: &str, s: &mut Samples, method: &str) -> String {
+    let mut line = format!(
+        "{}x{} {case:<34} {pace:<10} gpu={} wall={}",
+        size.0,
+        size.1,
+        fmt_ms(&mut s.gpu),
+        fmt_ms(&mut s.wall),
+    );
+    if !s.pre.is_empty() {
+        line += &format!(
+            " +下地作成(CPU)={} → 合計wall={}",
+            fmt_ms(&mut s.pre),
+            fmt_ms(&mut s.total)
+        );
+    }
+    format!("{line} ms 平均/p95 ({} フレーム) [{method}]", s.wall.len())
+}
+
+/// 色と深度つきの FBO(層を挟まず直接描く比較用)。
+struct DirectFbo {
+    fbo: glow::Framebuffer,
+    color: glow::Renderbuffer,
+    depth: glow::Renderbuffer,
+    size: (u32, u32),
+}
+
+impl DirectFbo {
+    fn new(gl: &glow::Context, size: (u32, u32)) -> Result<Self, String> {
+        unsafe {
+            let color = gl.create_renderbuffer()?;
+            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(color));
+            gl.renderbuffer_storage(
+                glow::RENDERBUFFER,
+                glow::RGBA8,
+                size.0 as i32,
+                size.1 as i32,
+            );
+            let depth = gl.create_renderbuffer()?;
+            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(depth));
+            gl.renderbuffer_storage(
+                glow::RENDERBUFFER,
+                glow::DEPTH24_STENCIL8,
+                size.0 as i32,
+                size.1 as i32,
+            );
+            let fbo = gl.create_framebuffer()?;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_renderbuffer(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::RENDERBUFFER,
+                Some(color),
+            );
+            gl.framebuffer_renderbuffer(
+                glow::FRAMEBUFFER,
+                glow::DEPTH_STENCIL_ATTACHMENT,
+                glow::RENDERBUFFER,
+                Some(depth),
+            );
+            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.bind_renderbuffer(glow::RENDERBUFFER, None);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                return Err(format!("直接描く FBO が不完全: 0x{status:x}"));
+            }
+            Ok(Self {
+                fbo,
+                color,
+                depth,
+                size,
+            })
+        }
+    }
+
+    /// 消去(色・深度)してから場面を描く(層の FBO と同じ中身。`reset_gl_state` は挟まない)。
+    fn draw(&self, gl: &glow::Context, scene: &mut dyn GlScene) -> Result<(), String> {
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
+            gl.viewport(0, 0, self.size.0 as i32, self.size.1 as i32);
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
+        }
+        scene.draw(
+            gl,
+            &GlTarget {
+                fbo: self.fbo,
+                size: self.size,
+            },
+        )
+    }
+
+    fn destroy(&self, gl: &glow::Context) {
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.delete_framebuffer(self.fbo);
+            gl.delete_renderbuffer(self.color);
+            gl.delete_renderbuffer(self.depth);
+        }
+    }
+}
+
+/// `bench-scene`: キューブ(`CubeScene`)の 1 フレームの GPU 時間を、`draw_scene`(下地 → 層 → 合成)と、
+/// 層を挟まず直接描く場合とで測る(Issue #74 T4)。表示カードの render node に surfaceless で描く(KMS には出さない)。
+pub fn run_scene(o: &SceneOpts) -> Result<(), String> {
+    let node = miharashi_gpu::render_node_for_pci(&o.pci);
+    let off = miharashi_gpu::Offscreen::open(&node)?;
+    println!("render node: {}", node.display());
+    for &size in &o.sizes {
+        let (r, _) = off.render_with_compositor(size, |gl, comp, target| {
+            scene_size(gl, comp, target, size, o)
+        })?;
+        r?;
+    }
+    println!(
+        "(gpu = timer query の GPU 時間。wall = 命令を出し始めてから glFinish が返るまで(CPU の壁時計、GPU 待ちを含む)。\
+         連続 = 待たずに続けて描く(GPU のクロックが上がった状態)、{}fps = 一定の間隔で描く(クロックが下がった状態)。\
+         ウォームアップ {WARMUP}/{WARMUP_PACED} フレームは除く)",
+        o.fps
+    );
+    Ok(())
+}
+
+fn scene_size(
+    gl: &glow::Context,
+    comp: &mut miharashi_gpu::compose::Compositor,
+    target: Option<glow::Framebuffer>,
+    size: (u32, u32),
+    o: &SceneOpts,
+) -> Result<(), String> {
+    let probe = Probe::new(gl);
+    let method = probe.method();
+    if size == o.sizes[0] {
+        println!("gl: {}", connectome::caps(gl));
+        println!("測り方: {method}");
+    }
+    let count = Rc::new(ObjectCount::default());
+    let mut cube = CubeScene::new(count);
+    let full = CubeScreen::region(false, size);
+    let third = CubeScreen::region(true, size);
+    let mut canvas = Canvas::new(size.0, size.1);
+    let mut paces = vec![("連続".to_string(), None, o.frames, WARMUP)];
+    if o.fps > 0 {
+        let frames = (o.fps as u64 * o.seconds).max(1) as usize;
+        let period = Duration::from_secs_f64(1.0 / f64::from(o.fps));
+        paces.push((format!("{}fps", o.fps), Some(period), frames, WARMUP_PACED));
+    }
+    let mut result = Ok(());
+    for (pace, period, frames, warmup) in paces {
+        let line = |case: &str, mut s: Samples| {
+            println!("{}", report_line(size, case, &pace, &mut s, method));
+        };
+        // 何も描かない glFinish だけ(計測の床)
+        line(
+            "noop(glFinish のみ)",
+            measure(frames, warmup, period, |_| probe.run(gl, None, || {})),
+        );
+        // draw_scene が呼ぶ reset_gl_state(下地、層、合成の 3 回)だけ
+        line(
+            "reset_gl_state x3",
+            measure(frames, warmup, period, |_| {
+                probe.run(gl, None, || {
+                    for _ in 0..3 {
+                        miharashi_gpu::compose::Compositor::reset_gl_state(gl, size, target);
+                    }
+                })
+            }),
+        );
+        for (name, region) in [("全面", full), ("1/3 幅", third)] {
+            let layered = |name: &str,
+                           base: bool,
+                           comp: &mut miharashi_gpu::compose::Compositor,
+                           cube: &mut CubeScene,
+                           canvas: &mut Canvas,
+                           r: &mut Result<(), String>|
+             -> Samples {
+                measure(frames, warmup, period, |i| {
+                    cube.set_secs(i as f32 / 30.0);
+                    let t0 = Instant::now();
+                    if base {
+                        canvas.clear(rgba(
+                            THIRD_BASE[0],
+                            THIRD_BASE[1],
+                            THIRD_BASE[2],
+                            THIRD_BASE[3],
+                        ));
+                        canvas.fill_rect(
+                            region.x as f32,
+                            region.y as f32,
+                            region.w as f32,
+                            region.h as f32,
+                            rgba(THIRD_BAND[0], THIRD_BAND[1], THIRD_BAND[2], THIRD_BAND[3]),
+                        );
+                    }
+                    let pre = base.then(|| t0.elapsed().as_secs_f32() * 1000.0);
+                    let base = base.then(|| Frame::Image(canvas.pixmap.data()));
+                    probe.run(gl, pre, || {
+                        let mut frame = SceneFrame {
+                            base,
+                            scene: cube,
+                            region,
+                            top: SceneTop::Off,
+                        };
+                        match comp.draw_scene(gl, target, &mut frame) {
+                            Ok(SceneOutcome::Drawn) => {}
+                            Ok(SceneOutcome::SceneFailed(m)) => {
+                                *r = Err(format!("{name}: 3D の失敗: {m}"))
+                            }
+                            Err(e) => *r = Err(format!("{name}: {e}")),
+                        }
+                    })
+                })
+            };
+            line(
+                &format!("{name} draw_scene(下地なし=黒)"),
+                layered(name, false, comp, &mut cube, &mut canvas, &mut result),
+            );
+            if region.w != size.0 {
+                line(
+                    &format!("{name} draw_scene(下地=CubeScreen)"),
+                    layered(name, true, comp, &mut cube, &mut canvas, &mut result),
+                );
+            }
+            let direct = DirectFbo::new(gl, (region.w, region.h))?;
+            let s = measure(frames, warmup, period, |i| {
+                cube.set_secs(i as f32 / 30.0);
+                probe.run(gl, None, || {
+                    if let Err(e) = direct.draw(gl, &mut cube) {
+                        result = Err(format!("{name} 直接: {e}"));
+                    }
+                })
+            });
+            direct.destroy(gl);
+            line(&format!("{name} 直接(層なし、色+深度の FBO)"), s);
+            result.clone()?;
+        }
+    }
+    cube.release(gl);
+    probe.destroy(gl);
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use miharashi_gpu::Offscreen;
+
+    #[test]
+    fn mean_p95_of_known_values() {
+        let mut v: Vec<f32> = (1..=100).map(|x| x as f32).collect();
+        let (m, p) = mean_p95(&mut v).unwrap();
+        assert!((m - 50.5).abs() < 1e-4);
+        assert_eq!(p, 95.0);
+        assert!(mean_p95(&mut []).is_none());
+    }
+
+    #[test]
+    fn scene_sizes_defaults_to_three_and_honors_size() {
+        assert_eq!(
+            scene_sizes(None),
+            vec![(1280, 720), (1920, 1080), (2560, 1080)]
+        );
+        assert_eq!(scene_sizes(Some((640, 360))), vec![(640, 360)]);
+    }
+
+    #[test]
+    fn samples_keep_gpu_separate_and_add_pre_to_total() {
+        let mut s = Samples::default();
+        s.push(&Sample {
+            gpu: Some(1.0),
+            wall: 2.0,
+            pre: Some(0.5),
+        });
+        s.push(&Sample {
+            gpu: None,
+            wall: 4.0,
+            pre: Some(0.5),
+        });
+        assert_eq!(s.gpu, vec![1.0]);
+        assert_eq!(s.wall, vec![2.0, 4.0]);
+        assert_eq!(s.total, vec![2.5, 4.5]);
+    }
+
+    #[test]
+    fn measure_skips_warmup_and_report_line_shows_method() {
+        let mut calls = 0;
+        let mut s = measure(5, 3, None, |_| {
+            calls += 1;
+            Sample {
+                gpu: None,
+                wall: 1.0,
+                pre: None,
+            }
+        });
+        assert_eq!((calls, s.wall.len()), (8, 5));
+        let line = report_line((1920, 1080), "case", "連続", &mut s, "wall(glFinish)");
+        assert!(line.starts_with("1920x1080 case"), "{line}");
+        assert!(line.contains("gpu=- wall=1.00/1.00"), "{line}");
+        assert!(line.ends_with("(5 フレーム) [wall(glFinish)]"), "{line}");
+        assert!(!line.contains("下地作成"), "{line}");
+    }
+
+    #[test]
+    fn scene_bench_runs_on_a_small_size() {
+        let Ok(off) = Offscreen::open(Path::new("/dev/dri/renderD128")) else {
+            eprintln!("GLES が使えないので skip");
+            return;
+        };
+        let o = SceneOpts {
+            pci: String::new(),
+            sizes: vec![(96, 54)],
+            frames: 3,
+            fps: 0,
+            seconds: 1,
+        };
+        let (r, _) = off
+            .render_with_compositor((96, 54), |gl, comp, target| {
+                scene_size(gl, comp, target, (96, 54), &o)
+            })
+            .unwrap();
+        r.unwrap();
+    }
 }

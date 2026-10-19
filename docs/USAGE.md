@@ -20,6 +20,7 @@ cargo test
 ./target/release/miharashi kms-info                            # DRM カード・コネクターの一覧と、設定で選ばれる表示先
 ./target/release/miharashi run --config config/example.toml    # 実機表示(直接オープンは video・input グループが必要)
 ./target/release/miharashi bench                               # CPU 描画のベースライン(PoC-005)
+./target/release/miharashi bench-scene                         # キューブの GPU 時間(Issue #74 T4。1280x720・1920x1080・2560x1080、`--size WxH` で 1 つだけ)
 ```
 
 `png` の主なオプション:
