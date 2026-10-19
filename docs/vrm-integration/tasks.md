@@ -24,7 +24,7 @@
 ## タスク
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
-| T1 | B の前の宿題(sparse の stride、コライダーの添字、関節 × コライダーの上限) | AC1 | - | quick | 未着手 | | | |
+| T1 | B の前の宿題(sparse の stride、コライダーの添字、関節 × コライダーの上限) | AC1 | - | quick | 実装中 | 2c48639 | | |
 | T2 | `VrmScene: GlScene` と別スレッドの読み込み | AC2, AC3 | T1 | full | 未着手 | | | |
 | T3 | `WithScene`・`[vrm]` 設定・演出の入力・png fixture | AC4, AC5, AC6 | T2 | full | 未着手 | | | |
 | T4 | 実機の確認と計測、判断(タイムアウト解放・base_changed)、記録 | AC7, AC9 | T3 | quick | 未着手 | | | |
