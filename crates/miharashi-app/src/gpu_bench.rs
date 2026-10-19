@@ -2,6 +2,8 @@
 //! B1 コネクトーム: MaleCNS 全体級(ニューロン 16 万、結合 300 万本)の合成グラフを、表示カードの
 //! render node に surfaceless で描く。表示中の miharashi を止めずに測れる(KMS には出さない)。
 //! 1 秒ごとに fps、GPU の時間、CPU 使用率、iGPU の使用率、CPU パッケージの電力を出す。
+//! `miharashi bench-scene`: キューブ(3D 画面)の 1 フレームの GPU 時間を、層を挟む `draw_scene` と
+//! 層なしの直接描画で比べる(Issue #74 T4)。同じく surfaceless で、KMS には出さない。
 use crate::app::screens::cube::{CubeScene, CubeScreen, THIRD_BAND, THIRD_BASE};
 use glow::HasContext;
 use miharashi_glscene::{GlScene, GlTarget, ObjectCount};
@@ -604,10 +606,13 @@ struct DirectFbo {
     color: glow::Renderbuffer,
     depth: glow::Renderbuffer,
     size: (u32, u32),
+    /// 画面の大きさの色だけの FBO。`draw_scene` が毎フレームする全画面の消去に合わせるために消す
+    screen: (glow::Framebuffer, glow::Renderbuffer),
+    screen_size: (u32, u32),
 }
 
 impl DirectFbo {
-    fn new(gl: &glow::Context, size: (u32, u32)) -> Result<Self, String> {
+    fn new(gl: &glow::Context, size: (u32, u32), screen_size: (u32, u32)) -> Result<Self, String> {
         unsafe {
             let color = gl.create_renderbuffer()?;
             gl.bind_renderbuffer(glow::RENDERBUFFER, Some(color));
@@ -640,26 +645,54 @@ impl DirectFbo {
                 Some(depth),
             );
             let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            let screen_color = gl.create_renderbuffer()?;
+            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(screen_color));
+            gl.renderbuffer_storage(
+                glow::RENDERBUFFER,
+                glow::RGBA8,
+                screen_size.0 as i32,
+                screen_size.1 as i32,
+            );
+            let screen_fbo = gl.create_framebuffer()?;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(screen_fbo));
+            gl.framebuffer_renderbuffer(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::RENDERBUFFER,
+                Some(screen_color),
+            );
+            let screen_status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             gl.bind_renderbuffer(glow::RENDERBUFFER, None);
-            if status != glow::FRAMEBUFFER_COMPLETE {
-                return Err(format!("直接描く FBO が不完全: 0x{status:x}"));
+            if status != glow::FRAMEBUFFER_COMPLETE || screen_status != glow::FRAMEBUFFER_COMPLETE {
+                return Err(format!(
+                    "直接描く FBO が不完全: 0x{status:x} / 画面側 0x{screen_status:x}"
+                ));
             }
             Ok(Self {
                 fbo,
                 color,
                 depth,
                 size,
+                screen: (screen_fbo, screen_color),
+                screen_size,
             })
         }
     }
 
-    /// 消去(色・深度)してから場面を描く(層の FBO と同じ中身。`reset_gl_state` は挟まない)。
+    /// 画面全体を黒で消してから、消去(色・深度・ステンシル)して場面を描く(層の FBO と同じ中身。
+    /// `reset_gl_state` は挟まない)。画面の消去は `draw_scene` の「下地なし」の黒の消去に合わせた。
     fn draw(&self, gl: &glow::Context, scene: &mut dyn GlScene) -> Result<(), String> {
         unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.screen.0));
+            gl.viewport(0, 0, self.screen_size.0 as i32, self.screen_size.1 as i32);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
             gl.viewport(0, 0, self.size.0 as i32, self.size.1 as i32);
             gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear_depth_f32(1.0);
+            gl.clear_stencil(0);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
         }
         scene.draw(
@@ -677,6 +710,8 @@ impl DirectFbo {
             gl.delete_framebuffer(self.fbo);
             gl.delete_renderbuffer(self.color);
             gl.delete_renderbuffer(self.depth);
+            gl.delete_framebuffer(self.screen.0);
+            gl.delete_renderbuffer(self.screen.1);
         }
     }
 }
@@ -727,6 +762,7 @@ fn scene_size(
         paces.push((format!("{}fps", o.fps), Some(period), frames, WARMUP_PACED));
     }
     let mut result = Ok(());
+    let mut flip = false;
     for (pace, period, frames, warmup) in paces {
         let line = |case: &str, mut s: Samples| {
             println!("{}", report_line(size, case, &pace, &mut s, method));
@@ -792,6 +828,21 @@ fn scene_size(
                     })
                 })
             };
+            let direct = DirectFbo::new(gl, (region.w, region.h), size)?;
+            let run_direct = |cube: &mut CubeScene, r: &mut Result<(), String>| {
+                measure(frames, warmup, period, |i| {
+                    cube.set_secs(i as f32 / 30.0);
+                    probe.run(gl, None, || {
+                        if let Err(e) = direct.draw(gl, cube) {
+                            *r = Err(format!("{name} 直接: {e}"));
+                        }
+                    })
+                })
+            };
+            // 測る順番の偏り(GPU のクロックや温度)を減らすため、直接を先に測るか後に測るかを交互にする
+            let direct_first = flip;
+            flip = !flip;
+            let mut direct_s = direct_first.then(|| run_direct(&mut cube, &mut result));
             line(
                 &format!("{name} draw_scene(下地なし=黒)"),
                 layered(name, false, comp, &mut cube, &mut canvas, &mut result),
@@ -802,17 +853,14 @@ fn scene_size(
                     layered(name, true, comp, &mut cube, &mut canvas, &mut result),
                 );
             }
-            let direct = DirectFbo::new(gl, (region.w, region.h))?;
-            let s = measure(frames, warmup, period, |i| {
-                cube.set_secs(i as f32 / 30.0);
-                probe.run(gl, None, || {
-                    if let Err(e) = direct.draw(gl, &mut cube) {
-                        result = Err(format!("{name} 直接: {e}"));
-                    }
-                })
-            });
+            let s = direct_s
+                .take()
+                .unwrap_or_else(|| run_direct(&mut cube, &mut result));
             direct.destroy(gl);
-            line(&format!("{name} 直接(層なし、色+深度の FBO)"), s);
+            line(
+                &format!("{name} 直接(層なし、色+深度の FBO + 全画面の消去)"),
+                s,
+            );
             result.clone()?;
         }
     }
