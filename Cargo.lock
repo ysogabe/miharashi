@@ -1121,7 +1121,9 @@ name = "miharashi-app"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "glow",
  "image",
+ "miharashi-glscene",
  "miharashi-gpu",
  "miharashi-linux",
  "miharashi-render",
@@ -1135,6 +1137,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "miharashi-glscene"
+version = "0.1.0"
+dependencies = [
+ "glow",
+]
+
+[[package]]
 name = "miharashi-gpu"
 version = "0.1.0"
 dependencies = [
@@ -1144,6 +1153,7 @@ dependencies = [
  "image",
  "khronos-egl",
  "libc",
+ "miharashi-glscene",
  "miharashi-linux",
  "miharashi-render",
 ]

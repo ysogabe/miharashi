@@ -2,11 +2,12 @@
 //! `App` を実装する `ScreenManager`(app/manager.rs)と、個々の画面(`Screen`)の契約もここに置く
 //! (docs/DESIGN-screen-interface.md §3)。
 use image::DynamicImage;
+pub use miharashi_glscene::{GlScene, Region};
 use miharashi_render::aircraft::RadarGeom;
 use miharashi_render::photo_layout::PhotoLayout;
 use miharashi_render::screens::Snapshot;
 use miharashi_render::{Canvas, Pixmap, TextEngine};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// 画面の識別子。操作パネルとの約束なので、決めたら変えない(docs/DESIGN-screens.md §2)。
 pub type ScreenId = &'static str;
@@ -114,6 +115,30 @@ pub trait Screen {
     fn animating(&self) -> bool {
         false
     }
+    /// GL が使えないと意味がない画面(3D だけの画面)。true なら、GL が使えない・3D が失敗した画面は
+    /// `render_composite` でなく `render`(CPU の案内)で描き、自動巡回では飛ばす(docs/DESIGN-screen-plugin-v2.md §6)。
+    /// GL の可否は ScreenManager だけが判断し、画面には渡さない。
+    fn needs_gl(&self) -> bool {
+        false
+    }
+    /// この画面が持つ `GlScene`(終了時の解放用)。`render_composite` が `Composite::Gl` で返す `scene` と同じもの。
+    fn gl_scene(&mut self) -> Option<&mut dyn GlScene> {
+        None
+    }
+    /// 3D が動き続けるか。`animating()` / `tick` とは分ける: ScreenManager が、GL が使えて失敗していない
+    /// 点灯中のときだけ、`animating()` と `tick` の戻り値に足す(CPU 経路や失敗中に、動かない画面を描き直させない。§10)。
+    fn scene_animating(&self) -> bool {
+        false
+    }
+    /// 動き続ける間の描画の間隔の下限。None は表示の完了待ち(vsync)だけで間隔をとる。
+    /// runtime が表示の完了後に残りを待つ(docs/DESIGN-screen-plugin-v2.md §10)。
+    fn frame_interval(&self) -> Option<Duration> {
+        None
+    }
+    /// 場面が今持っている GL オブジェクトの数(作成 − 削除。§3.3)。3D を持たない画面は None。
+    fn gl_live_objects(&self) -> Option<i64> {
+        None
+    }
     /// 出すものが無いか(自動巡回の `skip_if_empty`。航空機の画面で半径内に機体がいないとき)。
     fn is_empty(&self) -> bool {
         false
@@ -162,6 +187,17 @@ pub trait App {
     fn animating(&self) -> bool {
         false
     }
+    /// 動き続けている間の描画の間隔の下限(`Screen::frame_interval`)。None なら vsync だけ。
+    fn frame_interval(&self) -> Option<Duration> {
+        None
+    }
+    /// 持っているすべての `GlScene`(終了時の解放用)。runtime が `drop(display)` の前に集めて `release` を呼ばせる。
+    fn gl_scenes(&mut self) -> Vec<&mut dyn GlScene> {
+        Vec::new()
+    }
+    /// 3D の描画が失敗した(panic・`Err`・GL エラー)。その場面の `release` は表示側で済んでいる。
+    /// 今出していた画面を GL 失敗の扱いにする(再起動まで 3D を出さない)。キオスクは止めない。
+    fn report_scene_failure(&mut self, _msg: &str) {}
     /// 画面を消している間でも点けて見せたいもの(アラート)があるか。
     fn wants_screen(&self) -> bool {
         false
@@ -296,6 +332,30 @@ pub enum Composite<'a> {
         scrim_alpha: f32,
         focus_card_id: Option<u64>,
     },
+    /// 3D を含む画面(docs/DESIGN-screen-plugin-v2.md §2)。下地 → 3D → 最上段の重ね絵の順に出す
+    Gl(GlComposite<'a>),
+}
+
+/// `Composite::Gl` の中身。
+pub struct GlComposite<'a> {
+    /// 3D の下に出す下地。None なら黒。`Gl` は入れ子にできない(ScreenManager が検出して失敗扱いにする)
+    pub base: Option<Box<Composite<'a>>>,
+    /// 画面が持つ 3D(`Screen::gl_scene` と同じもの)
+    pub scene: &'a mut dyn GlScene,
+    /// 3D を置く画面上の矩形(画素。原点は左上)
+    pub region: Region,
+    /// アラート・メニューの重ね絵。画面は `Top::Off` で返し、ScreenManager が埋める
+    pub top: Top<'a>,
+}
+
+/// 最上段の重ね絵(アラート・メニュー)。透明背景の premultiplied RGBA8 で、画面と同じ大きさ。
+pub enum Top<'a> {
+    /// 重ねない
+    Off,
+    /// 前回の重ね絵のまま重ねる(前回が `Upload` か `Keep` のときだけ)
+    Keep,
+    /// この絵を転送して重ねる。`Off` の次のフレームと、`Gl` 以外のフレームのあとは必ずこちら
+    Upload(&'a Pixmap),
 }
 
 /// 画面のテストで使う: `key_labels()` が None のキーは `handle_action` でも何もしない(Ignored)、

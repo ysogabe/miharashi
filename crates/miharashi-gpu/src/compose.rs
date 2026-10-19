@@ -6,11 +6,13 @@
 //!   GPU で作る(PR3b、`photo.rs`)。
 //! - `Frame::Radar`: 航空機の画面。CPU で描いた背景(地図と文字)は変わったときだけ転送し、
 //!   回る線、残光、点はシェーダーで毎フレーム描く(PR4a)。
+//! - 3D の画面(`scene.rs`): 下地(上のどれか)→ 深度つきの層に描いた 3D → 最上段の重ね絵の順で描く。
 use crate::photo::{PhotoBuilder, SourceImage, program as link, texture as tex2d};
+use crate::scene::SceneState;
 use glow::HasContext;
 use std::time::Instant;
 
-const VERT: &str = r"#version 300 es
+pub(crate) const VERT: &str = r"#version 300 es
 out highp vec2 uv;
 void main() {
     // 頂点 3 つで画面全体を覆う三角形。画像の 1 行目(uv.y = 0)が画面の上に来る
@@ -211,11 +213,11 @@ pub enum Frame<'a> {
 
 pub struct Compositor {
     base: glow::Program,
-    overlay: glow::Program,
+    pub(crate) overlay: glow::Program,
     radar: glow::Program,
     card: glow::Program,
     scrim: glow::Program,
-    vao: glow::VertexArray,
+    pub(crate) vao: glow::VertexArray,
     /// `Frame::Radar` の背景(初めて使うときに作る)
     radar_bg: Option<glow::Texture>,
     agent_bg: Option<glow::Texture>,
@@ -227,8 +229,10 @@ pub struct Compositor {
     photos: Vec<(u64, glow::Texture)>,
     /// 重ね絵を 1 度でも転送したか(まだなら重ねない)
     overlay_ready: bool,
-    size: (u32, u32),
+    pub(crate) size: (u32, u32),
     builder: PhotoBuilder,
+    /// 3D の層と最上段の重ね絵(`scene.rs`。使うまで何も作らない)
+    pub(crate) scene: SceneState,
     /// 今の時点までの転送量 [バイト](ログ用)
     pub uploaded: u64,
     /// Agent background and card uploads, useful for verifying that pose-only frames transfer no pixels.
@@ -281,6 +285,7 @@ impl Compositor {
                 photos: Vec::new(),
                 overlay_ready: false,
                 size,
+                scene: SceneState::default(),
                 builder: PhotoBuilder::new(gl)?,
                 uploaded: 0,
                 agent_uploaded: 0,
@@ -289,7 +294,7 @@ impl Compositor {
         }
     }
 
-    fn upload(&mut self, gl: &glow::Context, tex: glow::Texture, rgba: &[u8]) {
+    pub(crate) fn upload(&mut self, gl: &glow::Context, tex: glow::Texture, rgba: &[u8]) {
         let (w, h) = self.size;
         assert_eq!(
             rgba.len(),
@@ -643,6 +648,7 @@ impl Compositor {
             gl.delete_program(self.card);
             gl.delete_program(self.scrim);
         }
+        self.scene.destroy(gl);
         self.builder.destroy(gl);
     }
 }

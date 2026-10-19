@@ -4,6 +4,8 @@ pub mod manager;
 pub mod screens {
     pub mod agents;
     pub mod aircraft;
+    pub mod cube;
+    pub mod gl_check;
     pub mod photo;
     pub mod room;
     pub mod status;
@@ -15,6 +17,8 @@ use manager::ScreenManager;
 use miharashi_render::TextEngine;
 use miharashi_render::screens::Snapshot;
 use screens::aircraft::AircraftScreen;
+use screens::cube::CubeScreen;
+use screens::gl_check::{Dirt, DirtyScreen};
 use screens::photo::PhotoScreen;
 use screens::room::{RoomFeeds, RoomScreen};
 use screens::status::StatusScreen;
@@ -81,6 +85,19 @@ pub fn kiosk(
             cfg.agents.stale_secs,
         )));
     }
+    // 3D の画面(既定は無効。GL が使えないときは案内を出し、自動巡回では飛ばす)
+    if cfg.cube.enabled {
+        let (full, third) = cfg.cube.layouts();
+        for (on, is_third) in [(full, false), (third, true)] {
+            if on {
+                screens.push(Box::new(CubeScreen::new(is_third, cfg.cube.fps)));
+            }
+        }
+    }
+    if cfg.gl_check.enabled {
+        screens.push(Box::new(DirtyScreen::new(Dirt::A)));
+        screens.push(Box::new(DirtyScreen::new(Dirt::B)));
+    }
     let mut m = ScreenManager::new(
         screens,
         &cfg.ui.start_screen,
@@ -89,6 +106,7 @@ pub fn kiosk(
         text_engine(&cfg.ui.font),
         Duration::from_secs(cfg.alerts.show_minutes * 60),
     )
+    .with_gl_available(gpu_max.is_some())
     .with_provider(Box::new(feed));
     if let Some(shared) = agent_shared {
         m = m.with_provider(Box::new(crate::agents::AgentProvider::new(shared)));
@@ -112,6 +130,11 @@ pub fn kiosk(
 }
 
 use screens::agents::AgentScreen;
+
+#[cfg(test)]
+mod cube_tests;
+#[cfg(test)]
+mod scene_tests;
 
 #[cfg(test)]
 mod tests {

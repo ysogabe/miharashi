@@ -31,6 +31,7 @@
 | [PoC-002 Kiosk Runtime](poc/POC-002.md) | seat / VT、systemd、設定、写真サーバーへの再接続、12 時間試験。運用と復旧の手順 |
 | [PoC-005 GPU Render Baseline](poc/POC-005.md) | 内蔵 GPU(OpenGL ES 3.2)での描画と、CPU 使用率の計測 |
 | [PoC-006 VRM 描画の単体スパイク](poc/POC-006.md) | VRM 1.0 モデルを内蔵 GPU(GLES 3.2)で描くときの速さの計測(合成モデル) |
+| [PoC-007 画面向け GLES 3D 描画境界](poc/POC-007.md) | 画面が GLES で 3D を描く口(`GlScene`)を、キューブ画面で確かめた記録(契約・実機の計測・受け入れ条件・制限事項) |
 | [T3 Agent カードボード — 実装・検証記録](poc/T3-AGENTS.md) | T3 Agent画面の実装状況、CPU/GPU合成検証、未確認事項 |
 
 ## 現在の状況

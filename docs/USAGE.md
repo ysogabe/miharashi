@@ -20,6 +20,7 @@ cargo test
 ./target/release/miharashi kms-info                            # DRM カード・コネクターの一覧と、設定で選ばれる表示先
 ./target/release/miharashi run --config config/example.toml    # 実機表示(直接オープンは video・input グループが必要)
 ./target/release/miharashi bench                               # CPU 描画のベースライン(PoC-005)
+./target/release/miharashi bench-scene                         # キューブの GPU 時間(Issue #74 T4。1280x720・1920x1080・2560x1080、`--size WxH` で 1 つだけ)
 ```
 
 `png` の主なオプション:
@@ -104,6 +105,8 @@ journalctl -t miharashi -f                  # ログ。PAM セッションに入
 | `[room]` | Home Assistant の室内センサー、履歴、気象庁の予報地域 |
 | `[rotation]` | 自動巡回の有効化、画面と表示秒数、操作後の休止時間 |
 | `[agents]` | T3 Code の閲覧用 Agent 一覧(既定は無効) |
+| `[cube]` | 3D のキューブ画面(全面 / 中央 1/3 幅、fps の上限。上限はリフレッシュレートの整数分の 1 に切り上げて守る。既定は無効) |
+| `[gl_check]` | GL の状態を汚す試験画面(実機の確認用。既定は無効) |
 | `[ui]` | フォント、起動時の画面 |
 | `[panel]` | 操作パネル向けの API(既定は無効) |
 

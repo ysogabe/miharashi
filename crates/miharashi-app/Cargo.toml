@@ -5,8 +5,11 @@ edition = "2024"
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+# 3D の試験用場面(scene_check)が GL を直接呼ぶ。miharashi-glscene と同じ版
+glow = "0.18.0"
 # bench の合成写真(JPEG のエンコード・デコード)。miharashi-render と同じ版
 image = "0.25.10"
+miharashi-glscene = { path = "../miharashi-glscene" }
 miharashi-render = { version = "0.1.0", path = "../miharashi-render" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.152"

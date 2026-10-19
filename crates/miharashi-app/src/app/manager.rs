@@ -6,10 +6,11 @@
 use super::DataSource;
 use crate::config::RotationStep;
 use crate::screen::{
-    App, Composite, KeyPress, PanelKeys, PanelRotation, PanelView, Provider, RenderContext, Screen,
-    ScreenAction, ScreenInfo, World,
+    App, Composite, GlScene, KeyPress, PanelKeys, PanelRotation, PanelView, Provider,
+    RenderContext, Screen, ScreenAction, ScreenInfo, Top, World,
 };
 use miharashi_render::alert::{self, AlertView};
+use miharashi_render::canvas::rgba;
 use miharashi_render::glitch;
 use miharashi_render::menu;
 use miharashi_render::{Canvas, TextEngine};
@@ -86,6 +87,19 @@ pub struct ScreenManager {
     refreshes: usize,
     /// 自動巡回(無効なら None)
     rotation: Option<Rotation>,
+    /// GL が使えるか(`Output.gpu_max_texture.is_some()`)。起動後は変わらない(変わるのは画面ごとの失敗だけ)
+    gl_available: bool,
+    /// 3D が失敗した画面(`screens` と同じ並び)。再起動まで 3D を出さない
+    scene_failed: Vec<bool>,
+    /// 3D の失敗の回数(状態ログの `scene_fail=`)
+    scene_fails: u64,
+    /// アラート・メニュー専用の最上段の層(`Composite::Gl` のときだけ使う)。出ていないあいだは持たない
+    top: Option<Canvas>,
+    /// 前回のフレームが最上段の重ね絵を出したか。`Gl` 以外のフレームは false(= `Off` とみなす)で、
+    /// false の次は `Top::Upload` にする(`Keep` は前回が `Upload` か `Keep` のときだけ)
+    top_valid: bool,
+    /// 前回 `Composite::Gl` で返した画面(`report_scene_failure` の対象)
+    scene_screen: Option<usize>,
     pub ticks: u64,
     pub keys: u64,
 }
@@ -102,6 +116,7 @@ impl ScreenManager {
     ) -> Self {
         assert!(!screens.is_empty(), "画面が 1 つもない");
         let current = screens.iter().position(|s| s.id() == start).unwrap_or(0);
+        let n_screens = screens.len();
         let now = Instant::now();
         let mut m = Self {
             screens,
@@ -128,6 +143,12 @@ impl ScreenManager {
             clean: None,
             refreshes: 0,
             rotation: None,
+            gl_available: false,
+            scene_failed: vec![false; n_screens],
+            scene_fails: 0,
+            top: None,
+            top_valid: false,
+            scene_screen: None,
             ticks: 0,
             keys: 0,
         };
@@ -143,6 +164,67 @@ impl ScreenManager {
         self
     }
 
+    /// GL が使えるか(`Output.gpu_max_texture.is_some()`)。既定は使えない。`with_rotation` より前に渡すこと
+    /// (巡回の最初の手順から、GL が要る画面を外す)。実行中に切り替える口は作らない: 変わるのは画面ごとの失敗だけ。
+    pub fn with_gl_available(mut self, available: bool) -> Self {
+        if self.gl_available != available {
+            self.gl_available = available;
+            self.gl_state_changed();
+        }
+        self
+    }
+
+    /// 画面 `i` の 3D を出してよいか(GL が使えて、その画面の 3D が失敗していない)。
+    fn gl_ok(&self, i: usize) -> bool {
+        self.gl_available && !self.scene_failed[i]
+    }
+
+    /// 自動巡回に入れてよい画面か。GL が要る画面は、GL が使えない・失敗中なら飛ばす(`skip_if_empty` に関係なく)。
+    fn rotatable(&self, i: usize) -> bool {
+        !self.screens[i].needs_gl() || self.gl_ok(i)
+    }
+
+    /// GL の可否・失敗の状態が変わった。GL ありの `Composite::Gl`(下地は `base` の中)と、GL なしの
+    /// `Photo` / `Agents` / `Canvas`(`base` を取り出したもの)では、画面が重ね絵・背景を描いたかどうかの前提が
+    /// 変わるので、重ね絵を描き直させる(でないと写真画面では切り替えのフレームからアラート・メニューが消える)。
+    fn gl_state_changed(&mut self) {
+        self.force_overlay = true;
+        self.top_valid = false;
+        self.screens[self.current].invalidate();
+    }
+
+    /// 3D が動き続けているか。GL が使えて失敗していない、点灯中の画面だけ(消灯中は描かない。
+    /// 内側の画面の `animating()` / `tick` には混ぜない)。
+    fn scene_animating(&self) -> bool {
+        self.display_on && self.gl_ok(self.current) && self.screens[self.current].scene_animating()
+    }
+
+    /// 持っているすべての `GlScene`(終了時の解放用)。3D が失敗した画面の場面は、失敗したその場で
+    /// `release` 済み(`present_scene`)なので含めない(`release` を 1 つの場面に高々 1 回にする)。
+    pub fn gl_scenes(&mut self) -> Vec<&mut dyn GlScene> {
+        self.screens
+            .iter_mut()
+            .zip(&self.scene_failed)
+            .filter(|(_, failed)| !**failed)
+            .filter_map(|(s, _)| s.gl_scene())
+            .collect()
+    }
+
+    /// 3D の描画が失敗した。直前に `Composite::Gl` で返した画面を、再起動まで GL なしの扱いにする。
+    pub fn report_scene_failure(&mut self, msg: &str) {
+        let i = self.scene_screen.take().unwrap_or(self.current);
+        eprintln!(
+            "3D: 画面 {} の描画に失敗(再起動まで 3D を出さない): {msg}",
+            self.screens[i].id()
+        );
+        self.scene_failed[i] = true;
+        self.scene_fails += 1;
+        self.gl_state_changed();
+        if i != self.current {
+            self.screens[i].invalidate();
+        }
+    }
+
     /// 焼き付き対策: `ids` の画面を `every` ごとに暗転して描き直す。
     pub fn with_refresh(mut self, every: Duration, ids: Vec<String>) -> Self {
         self.refresh_due = Instant::now() + every;
@@ -151,7 +233,8 @@ impl ScreenManager {
     }
 
     /// 自動巡回を始める。登録に無い画面の手順は飛ばす(航空機や室内環境の画面が無効なとき)。
-    /// 手順が 1 つも残らなければ巡回しない。最初の手順の画面から始める。
+    /// 手順が 1 つも残らない、または GL が使えず全部が飛ばす画面なら、巡回しない(今の画面のまま)。
+    /// 最初の手順の画面から始める。
     pub fn with_rotation(mut self, steps: &[RotationStep], pause: Duration) -> Self {
         let steps: Vec<Step> = steps
             .iter()
@@ -170,17 +253,23 @@ impl ScreenManager {
                 })
             })
             .collect();
-        let Some(first) = steps.first() else {
+        if steps.is_empty() {
             eprintln!("rotation: 回せる画面が無いので巡回しない");
+            return self;
+        }
+        // 最初の手順は、GL が使えず飛ばす画面(3D だけの画面)なら次から。
+        // 全部が飛ばす画面なら、今の画面のまま巡回しない(先頭の案内の画面に切り替えない)
+        let Some(start) = steps.iter().position(|st| self.rotatable(st.screen)) else {
+            eprintln!("rotation: GL が要る画面しか無いので巡回しない");
             return self;
         };
         let now = Instant::now();
-        let (screen, remaining) = (first.screen, first.secs);
+        let (screen, remaining) = (steps[start].screen, steps[start].secs);
         self.switch_to(screen, now);
         self.rotation = Some(Rotation {
             steps,
             pause,
-            index: 0,
+            index: start,
             remaining,
             mode: RotationMode::On,
             last: now,
@@ -230,7 +319,11 @@ impl ScreenManager {
     fn tick_rotation(&mut self, now: Instant) -> bool {
         let frozen = self.alert.is_some() || self.menu.is_some();
         let Self {
-            rotation, screens, ..
+            rotation,
+            screens,
+            gl_available,
+            scene_failed,
+            ..
         } = self;
         let Some(r) = rotation.as_mut() else {
             return false;
@@ -259,7 +352,10 @@ impl ScreenManager {
         let n = r.steps.len();
         let next = (1..=n).map(|k| (r.index + k) % n).find(|&i| {
             let st = &r.steps[i];
-            !(st.skip_if_empty && screens[st.screen].is_empty())
+            let screen = &screens[st.screen];
+            // GL が使えない・失敗中の 3D だけの画面は、CPU の案内を出すだけなので巡回では飛ばす
+            let gl_ok = *gl_available && !scene_failed[st.screen];
+            !(st.skip_if_empty && screen.is_empty()) && (!screen.needs_gl() || gl_ok)
         });
         let Some(i) = next else {
             // どの手順も飛ばす状態なら、今の画面のまま次の手順の時間だけ待つ
@@ -400,6 +496,8 @@ impl ScreenManager {
     pub fn set_display_on(&mut self, on: bool, now: Instant) {
         if self.display_on != on {
             self.display_on = on;
+            // 消灯・復帰をはさむと、GPU 側の重ね絵が最後に転送したものか分からない(描かずに戻ったフレームがある)
+            self.top_valid = false;
             self.update_presentation(now);
         }
     }
@@ -565,6 +663,8 @@ impl ScreenManager {
         for p in &mut self.providers {
             p.update(&mut self.world);
         }
+        // 動き続ける 3D は毎周期描き直す(`force_overlay` は立てない。重ね絵の転送は増やさない)
+        redraw |= self.scene_animating();
         redraw | self.tick_refresh(now)
     }
 
@@ -607,14 +707,19 @@ impl ScreenManager {
     }
 
     /// GPU 経路の描画。メニューとアラートは画面の完成画面か、写真の重ね絵の上に描く。
+    /// 3D の画面(`Composite::Gl`)では、専用の最上段の層(`top`)に描いて 3D の上に重ねる。
     pub fn render_composite(&mut self, canvas: &mut Canvas) -> Composite<'_> {
         if self.refreshing.is_some() {
             self.render_refresh(canvas);
+            self.top_valid = false;
+            self.scene_screen = None;
             return Composite::Canvas;
         }
         let force_overlay = std::mem::take(&mut self.force_overlay);
         let titles = self.titles();
         let (dx, dy) = self.offset(canvas.height());
+        let gl_ok = self.gl_ok(self.current);
+        let (w, h) = (canvas.width(), canvas.height());
         let Self {
             screens,
             current,
@@ -622,17 +727,34 @@ impl ScreenManager {
             text,
             alert,
             menu,
+            top,
+            top_valid,
+            scene_screen,
             ..
         } = self;
+        let covered = alert.is_some() || menu.is_some();
+        if !covered {
+            *top = None;
+        }
         let mut ctx = RenderContext {
             canvas,
             text,
             world,
-            covered: alert.is_some() || menu.is_some(),
+            covered,
             force_overlay,
         };
-        let mut comp = screens[*current].render_composite(&mut ctx);
-        // 焼き付き対策の位置のずらし。写真(重ね絵つき)は対象にしない
+        let screen = &mut screens[*current];
+        let mut comp = if screen.needs_gl() && !gl_ok {
+            // 3D だけの画面は、GL が使えない・失敗中なら CPU の案内(`render`)が完成画面になる
+            screen.render(&mut ctx);
+            Composite::Canvas
+        } else {
+            screen.render_composite(&mut ctx)
+        };
+        if !gl_ok {
+            comp = without_scene(comp, ctx.canvas);
+        }
+        // 焼き付き対策の位置のずらし。写真(重ね絵つき)と 3D は対象にしない
         match &mut comp {
             Composite::Canvas => glitch::shift(ctx.canvas, dx, dy),
             Composite::Radar {
@@ -651,6 +773,7 @@ impl ScreenManager {
             }
             Composite::Photo { .. } => {}
             Composite::Agents { .. } => {}
+            Composite::Gl(_) => {}
         }
         let draw_alert = match &comp {
             Composite::Canvas => true,
@@ -660,6 +783,8 @@ impl ScreenManager {
             // 航空機の画面は、重ねるものがあるときは Canvas で返る
             Composite::Radar { .. } => false,
             Composite::Agents { .. } => false,
+            // 3D の上に出すので、画面の Canvas(下地)でなく最上段の層に描く
+            Composite::Gl(_) => false,
         };
         if draw_alert {
             layers(
@@ -671,8 +796,50 @@ impl ScreenManager {
                 alert.as_ref(),
             );
         }
+        match &mut comp {
+            Composite::Gl(g) => {
+                g.top = if !covered {
+                    Top::Off
+                } else if force_overlay || !*top_valid {
+                    if top
+                        .as_ref()
+                        .is_none_or(|c| (c.width(), c.height()) != (w, h))
+                    {
+                        *top = Some(Canvas::new(w, h));
+                    }
+                    let c = top.as_mut().expect("上で作った");
+                    c.clear(rgba(0, 0, 0, 0));
+                    layers(c, ctx.text, &titles, *current, *menu, alert.as_ref());
+                    Top::Upload(&c.pixmap)
+                } else {
+                    Top::Keep
+                };
+                *top_valid = !matches!(g.top, Top::Off);
+                *scene_screen = Some(*current);
+            }
+            // `Gl` 以外のフレームは最上段の層を出さない(`Off` とみなす)
+            _ => {
+                *top_valid = false;
+                *scene_screen = None;
+            }
+        }
         comp
     }
+}
+
+/// `Composite::Gl` から 3D を外し、下地だけにする(GL が使えない・3D が失敗した画面)。下地が無ければ黒の Canvas。
+/// 入れ子の `Gl` は、中まで外す。
+fn without_scene<'a>(mut comp: Composite<'a>, canvas: &mut Canvas) -> Composite<'a> {
+    while let Composite::Gl(g) = comp {
+        comp = match g.base {
+            Some(base) => *base,
+            None => {
+                canvas.clear(rgba(0, 0, 0, 255));
+                Composite::Canvas
+            }
+        };
+    }
+    comp
 }
 
 /// 画面の上に重ねるもの。メニューの上にアラート。
@@ -730,7 +897,25 @@ impl App for ScreenManager {
     }
 
     fn animating(&self) -> bool {
-        self.refreshing.is_some() || self.screens[self.current].animating()
+        self.refreshing.is_some()
+            || self.screens[self.current].animating()
+            || self.scene_animating()
+    }
+
+    fn frame_interval(&self) -> Option<Duration> {
+        // 演出(焼き付き対策)は自分の間隔で動く。動いていない画面に間隔は要らない
+        if self.refreshing.is_some() || !self.animating() {
+            return None;
+        }
+        self.screens[self.current].frame_interval()
+    }
+
+    fn gl_scenes(&mut self) -> Vec<&mut dyn GlScene> {
+        ScreenManager::gl_scenes(self)
+    }
+
+    fn report_scene_failure(&mut self, msg: &str) {
+        ScreenManager::report_scene_failure(self, msg)
     }
 
     fn stats(&self) -> Vec<(&'static str, String)> {
@@ -770,6 +955,18 @@ impl App for ScreenManager {
         if let Some(r) = self.rotation_state() {
             out.push(("rotation", r.to_string()));
         }
+        if self.scene_fails > 0 {
+            out.push(("scene_fail", self.scene_fails.to_string()));
+        }
+        // GL の場面が作ったオブジェクトの「作成 − 削除」の合計(§3.3)。場面を持つ画面があるときだけ出す
+        let live: Vec<i64> = self
+            .screens
+            .iter()
+            .filter_map(|s| s.gl_live_objects())
+            .collect();
+        if !live.is_empty() {
+            out.push(("gl_objs", live.iter().sum::<i64>().to_string()));
+        }
         out
     }
 
@@ -795,5 +992,81 @@ impl App for ScreenManager {
                 RotationMode::Off => PanelRotation::Off,
             }),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::{DummyData, dummy_snapshot};
+    use crate::scene_check::{Base, CheckScreen};
+    use crate::screen::ScreenId;
+
+    struct Plain;
+
+    impl Screen for Plain {
+        fn id(&self) -> ScreenId {
+            "plain"
+        }
+        fn title(&self) -> &'static str {
+            "PLAIN"
+        }
+        fn render(&mut self, ctx: &mut RenderContext<'_>) {
+            ctx.canvas.clear(rgba(0, 0, 0, 255));
+        }
+    }
+
+    fn top_of(app: &mut ScreenManager) -> &'static str {
+        let mut c = Canvas::new(320, 180);
+        match app.render_composite(&mut c) {
+            Composite::Gl(g) => match g.top {
+                Top::Off => "off",
+                Top::Keep => "keep",
+                Top::Upload(_) => "upload",
+            },
+            _ => "not-gl",
+        }
+    }
+
+    /// `Gl` 以外のフレームは最上段の層を出さない(`Off` とみなす)ので、そのあとの `Gl` は、
+    /// `force_overlay` が立っていなくても `Keep` でなく `Upload` から始める。
+    #[test]
+    fn non_gl_frame_counts_as_off_for_the_top_layer() {
+        let screens: Vec<Box<dyn Screen>> = vec![
+            Box::new(CheckScreen::new(
+                "a",
+                false,
+                Base::Canvas,
+                Default::default(),
+            )),
+            Box::new(Plain),
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = ScreenManager::new(
+            screens,
+            "a",
+            Box::new(DummyData::new()),
+            dummy_snapshot(0.0),
+            crate::app::text_engine(""),
+            Duration::from_secs(60),
+        )
+        .with_gl_available(true)
+        .with_alerts(Some(rx));
+        tx.send(AlertView::Quake(crate::quake::demo_view()))
+            .unwrap();
+        app.tick(Instant::now());
+        assert_eq!(top_of(&mut app), "upload");
+        assert_eq!(top_of(&mut app), "keep");
+        // 画面の切り替えは force_overlay も立てるので、キーを通さずに現在の画面だけを替える
+        app.current = 1;
+        assert_eq!(top_of(&mut app), "not-gl");
+        app.current = 0;
+        assert!(!app.force_overlay);
+        assert_eq!(
+            top_of(&mut app),
+            "upload",
+            "非 Gl のフレームのあとは Keep に頼らない"
+        );
+        assert_eq!(top_of(&mut app), "keep");
     }
 }

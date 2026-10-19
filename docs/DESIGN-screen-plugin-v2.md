@@ -1,6 +1,6 @@
 # Screen Plugin API v2 — 画面に GL を貸す口(Issue #72)
 
-状態: **設計(コードは未変更)**。2026-10-19 作成、同日 Opus のレビュー指摘を反映。2026-10-18 午後の計画見直し後の範囲で書く。対象: [#72](https://github.com/ysogabe/miharashi/issues/72)(Screen Plugin API v2 の設計)。実装は [#74](https://github.com/ysogabe/miharashi/issues/74)(GLES 3D 描画境界。キューブで確かめる)と [#71](https://github.com/ysogabe/miharashi/issues/71) の B(VRM の組み込み)。
+状態: **#74 で実装済み**(2026-10-19。実測は [POC-007](poc/POC-007.md)。#71 B は未着手)。設計は 2026-10-19 作成、同日 Opus のレビュー指摘を反映。2026-10-18 午後の計画見直し後の範囲で書く。対象: [#72](https://github.com/ysogabe/miharashi/issues/72)(Screen Plugin API v2 の設計)。実装は [#74](https://github.com/ysogabe/miharashi/issues/74)(GLES 3D 描画境界。キューブで確かめる)と [#71](https://github.com/ysogabe/miharashi/issues/71) の B(VRM の組み込み)。
 
 前提にする文書: [画面管理インターフェース](DESIGN-screen-interface.md)(現行契約は §0)、[画面の全体構成](DESIGN-screens.md)、[技術設計](DESIGN.md)、[POC-006](poc/POC-006.md)(VRM の単体・実モニター試験)。
 
@@ -143,15 +143,20 @@ pub struct SceneFrame<'a> {
     pub top: Top2<'a>,                     // Off / Keep / Upload(&[u8])。Pixmap でなく画素列
 }
 impl GlesDisplay {
-    pub fn present_scene(&mut self, f: &mut SceneFrame<'_>) -> Result<SceneOutcome, String>;
+    pub fn present_scene(&mut self, f: &mut SceneFrame<'_>) -> Result<SceneOutcome, SceneError>;
     pub fn release_scenes(&mut self, scenes: &mut [&mut dyn GlScene]);
 }
 /// 3D の失敗は表示全体の失敗にしない(Err は DRM・EGL などの致命的なもの)。
 /// `SceneFailed` のとき、失敗した scene の `release`(catch_unwind つき)は `present_scene` の中で済んでいる
 pub enum SceneOutcome { Drawn, SceneFailed(String) }
+/// 致命的な失敗(下地の描画・最上段の重ね絵・swap・page flip・DRM)。場面の失敗より**後**に起きたときも
+/// 場面の失敗を失わない(`Err` だけ返すと、`release` 済みの場面が終了時にもう一度 `release` される)
+pub struct SceneError { pub message: String, pub scene_failed: Option<String> }
 ```
 
-`Top` と `Top2` は、app が `Pixmap`、gpu が `&[u8]` を持つだけの違い(app は gpu の型に依存できない)。名前は実装で整える。
+呼び出し側は、`Ok(SceneFailed)` でも `Err(e)` の `e.scene_failed` が `Some` でも、**必ず** `App::report_scene_failure` を呼んでから終了処理(`end_run`)へ進む。`Compositor::draw_scene`・`Offscreen::render_scene` も同じ `SceneError` を返す。
+
+`Top`(app。`Pixmap`)と `SceneTop`(gpu。`&[u8]`)は持つものが違うだけ(app は gpu の型に依存できない)。実装(#74 T2)では、`runtime.rs` の `FrameParts`(`Frame` が借りるレーダーの点・Agent のカードの置き場)・`frame_of`(`Gl` 以外の `Composite` → `Frame`)・`scene_frame`(`GlComposite` → `SceneFrame`)が変換を受け持つ。
 
 ### 2.4 依存の向き
 
@@ -198,6 +203,7 @@ flowchart LR
 - 解放するのは、(a) 終了時、(b) その画面の 3D が失敗したとき(§9)。
   - (a) 終了時: runtime が `App::gl_scenes()`(ScreenManager が各画面の `gl_scene()` を集める)で全部の `GlScene` を取り、`drop(display)`(`runtime.rs:624`)の前に `GlesDisplay::release_scenes` で GL を current にして `release` を呼ぶ。
   - (b) 失敗時: ScreenManager は `glow::Context` を持たないので、後からは `release` できない。**scene を手に持っている `present_scene` の中で、Compositor がその場で `release`(`catch_unwind` つき)を呼ぶ**。`SceneFailed` を返した時点で解放は済んでいる。
+  - **`release` は 1 つの場面に高々 1 回**。(b) で解放済みの場面(3D が失敗した画面)は、`gl_scenes()` が返さないので終了時には呼ばれない。実行ループが描画の致命的なエラー(下地・EGL・page flip)で終わるときも、エラーを持ったまま同じ終了処理(`runtime::end_run`)に進み、`drop(display)` の前に (a) を行ってからエラーを返す(解放はベストエフォート)。場面の失敗のあとに致命的なエラーが起きたとき(最上段の重ね絵、swap・page flip の失敗)も、場面の失敗は `SceneError::scene_failed` で届くので、`report_scene_failure` を通して `gl_scenes()` から外れる(二重の `release` にならない)。`GlScene` 実装も、2 回目の呼び出しに耐える書き方(`Option::take()` など)を勧める。
   - 層(FBO)の作り直しは `region` の大きさが変わったときに Compositor が行う。表示サイズは実行中に変わらない(`resume` も同じモードで設定し直すだけ: `display.rs:88-97`)ので、きっかけは `region` の大きさの変化だけ。層は Compositor の持ち物なので、`GlScene` の解放は伴わない(`GlScene` は毎回 `GlTarget::size` を見る)。
   - `present_scene` は、一時停止中(VT が離れている間)は `draw` を呼ばずに戻る(`present_frame` と同じ: `display.rs:113-115`)。
 - 将来「しばらく見えていない画面を解放する」を足せる形にする。ScreenManager が `gl_scenes()` の返す一覧から、離れてからの経過が長いものを選び、runtime が `release_scenes` で解放する。**v1 のタイムアウトは無限(= 解放しない)**。足すかは #74 の VRAM+GTT の実測で決める。
@@ -278,14 +284,18 @@ flowchart LR
   - `get_error` を読み切るのは Compositor(`draw` の前にも読み切って、下地の合成のエラーを 3D の失敗にしない。§8、§9.1)。
   - 自分の GL オブジェクトを自分で作り、`release` で消す。
   - 層の FBO に、premultiplied alpha で描く。深度が要るなら、深度テストは自分で有効にする。
-- Compositor が毎回設定する状態(1 フレーム 2 回、数十回の GL 呼び出しで、描画時間への影響は #74 で測る):
-  - framebuffer の bind(READ / DRAW とも)、viewport。
-  - `DEPTH_TEST`・`CULL_FACE`・`BLEND`・`SCISSOR_TEST`・`STENCIL_TEST` の無効化、`depth_mask` と `color_mask` の全許可。
-  - 無効化した機能の**パラメーター**も既定へ: `depth_func(LESS)`、`front_face(CCW)`、`cull_face(BACK)`、stencil の関数(`ALWAYS, 0, 0xFF`)・動作(`KEEP, KEEP, KEEP`)・`stencil_mask(0xFF)`、`clear_depth(1.0)`。VRM は `depth_func(LEQUAL)`(`render.rs:930`)と `cull_face(FRONT)`(`render.rs:973`)を設定して残すので、設定し直さないと次の画面に漏れる。
-  - `RASTERIZER_DISCARD`・`SAMPLE_ALPHA_TO_COVERAGE`・`PRIMITIVE_RESTART_FIXED_INDEX` の無効化。
-  - プログラム・VAO・`ARRAY_BUFFER`・`ELEMENT_ARRAY_BUFFER` の bind 解除。
-  - `TEXTURE0` を選んで `TEXTURE_2D` の bind 解除、`UNPACK_ALIGNMENT` / `PACK_ALIGNMENT` を 4。
-  - **追加**(今の `restore_gl_state` にない): `UNPACK_ROW_LENGTH`・`UNPACK_SKIP_PIXELS`・`UNPACK_SKIP_ROWS` を 0(テクスチャ転送に効く)、`TEXTURE1` の bind 解除、`blend_func`(`ONE, ZERO`)と `blend_equation`(`FUNC_ADD`)を既定、ポリゴンオフセット無効、`DRAW_BUFFER0` を `COLOR_ATTACHMENT0`/`BACK`。
+- Compositor が毎回設定する状態(`Compositor::reset_gl_state`。1 フレーム 3〜4 回。実測は 1 回 約 0.7µs(リリースビルド、内蔵 GPU)で、描画時間への影響は無視できる):
+  - framebuffer の bind(READ / DRAW とも)、viewport、scissor の矩形(描画先の全体)。`DRAW_BUFFER0` と `READ_BUFFER` は、FBO なら `COLOR_ATTACHMENT0`、画面なら `BACK`(FBO ごとの状態なので、描画先に対して設定する)。
+  - `DEPTH_TEST`・`CULL_FACE`・`BLEND`・`SCISSOR_TEST`・`STENCIL_TEST` の無効化、`DITHER` の有効化、`depth_mask` と `color_mask` の全許可。
+  - 無効化した機能の**パラメーター**も既定へ: `depth_func(LESS)`、`depth_range(0, 1)`、`front_face(CCW)`、`cull_face(BACK)`、stencil の関数(`ALWAYS, 0, 0xFF`)・動作(`KEEP, KEEP, KEEP`)・`stencil_mask(0xFF)`(`stencil_func` などは表と裏の両方を設定する)、`clear_depth(1.0)`、`clear_stencil(0)`。VRM は `depth_func(LEQUAL)`(`render.rs:930`)と `cull_face(FRONT)`(`render.rs:973`)を設定して残すので、設定し直さないと次の画面に漏れる。
+  - ブレンド: `blend_func(ONE, ZERO)` と `blend_equation(FUNC_ADD)`(RGB とアルファの両方が戻るので、`blend_func_separate` などで別々にした値も戻る)、`blend_color(0, 0, 0, 0)`。
+  - ポリゴンオフセット無効(`POLYGON_OFFSET_FILL`、`polygon_offset(0, 0)`)、`line_width(1.0)`。
+  - `RASTERIZER_DISCARD`・`SAMPLE_ALPHA_TO_COVERAGE`・`SAMPLE_COVERAGE`・`SAMPLE_MASK`・`PRIMITIVE_RESTART_FIXED_INDEX` の無効化、`sample_coverage(1.0, false)`。
+  - プログラム・VAO の bind 解除。バッファの bind 解除(VAO を外してから): `ARRAY_BUFFER`・`ELEMENT_ARRAY_BUFFER`・`PIXEL_UNPACK_BUFFER`・`PIXEL_PACK_BUFFER`・`DRAW_INDIRECT_BUFFER`。
+  - テクスチャユニット `TEXTURE0`〜`TEXTURE15` それぞれで、`TEXTURE_2D`・`TEXTURE_CUBE_MAP`・`TEXTURE_3D`・`TEXTURE_2D_ARRAY` の bind 解除と、**sampler オブジェクトの bind 解除**(`bind_texture(None)` では sampler は外れず、残るとテクスチャ自身のフィルター設定より優先されて、次の画面の見え方が変わる)。最後にアクティブユニットを `TEXTURE0` にする。Compositor が使うのは 0〜3 だけだが、3D の場面が使うユニットにも前の場面の sampler を残さないため、GLES の最低保証の 16 まで外す。
+  - pixel store: `UNPACK_ROW_LENGTH`・`UNPACK_SKIP_PIXELS`・`UNPACK_SKIP_ROWS`・`UNPACK_IMAGE_HEIGHT`・`UNPACK_SKIP_IMAGES` と `PACK_ROW_LENGTH`・`PACK_SKIP_PIXELS`・`PACK_SKIP_ROWS` を 0、`UNPACK_ALIGNMENT` と `PACK_ALIGNMENT` を 4(テクスチャの転送と読み戻しに効く)。
+  - ヒント: `GENERATE_MIPMAP_HINT` と `FRAGMENT_SHADER_DERIVATIVE_HINT` を `DONT_CARE`。
+  - **設定し直さないもの**(理由): clear 色(`draw_scene` が消去の前に設定する。3D には `(0,0,0,0)` で消した状態で渡す)、uniform の値(プログラムごとの状態)、インデックスつきのバッファ束縛(`UNIFORM_BUFFER` などの `bind_buffer_base`。プログラムが自分で束縛する)、`COPY_READ_BUFFER`・`COPY_WRITE_BUFFER`・`UNIFORM_BUFFER`・`TRANSFORM_FEEDBACK_BUFFER`・`SHADER_STORAGE_BUFFER` などの汎用の束縛(描画結果に効かず、使う前に必ず束縛し直される)、`TEXTURE_2D_MULTISAMPLE` / `TEXTURE_BUFFER` / `TEXTURE_CUBE_MAP_ARRAY` の bind(使う画面がない)、`SAMPLE_SHADING` と `sample_mask_i`(マルチサンプルの描画先がない)、既定の VAO(VAO 0)の属性配列(Compositor は自分の VAO を使う)、レンダーバッファの bind(使う前に必ず束縛する)、開始した query・transform feedback・debug group(画面が `draw` の中で終える。上記)。
 - Compositor が**自分の描画では**使う直前に設定するので、画面が残しても Compositor の絵には影響しないもの(`with_gl` の doc の「戻さないもの」と同じ): `blend_func`(`compose.rs:411`、`469`、`555`、`616`)、`use_program`、`TEXTURE1` を含むテクスチャ・VAO の bind、uniform の値、clear 色。ただし**次の 3D 画面へ漏らさないため**、3D の `draw` を呼ぶ前には、このうち `blend_func`・`TEXTURE1` の bind・プログラム・VAO・バッファ・テクスチャの bind も上の既定へ戻す(「毎回設定する」側が優先。どちらの扱いかで迷ったら、設定し直す)。
 
 ### 5.2 ほかの案と、選ばなかった理由
@@ -319,12 +329,12 @@ flowchart LR
 
 - `GlTarget::fbo` が bind 済み。viewport は `(0, 0, size.0, size.1)`。
 - 色は `(0,0,0,0)`、深度は 1.0、ステンシルは 0 で塗ってある。`depth_mask` と `color_mask` は全許可、`DEPTH_TEST` は無効(画面が必要なら有効にする)。
-- 上の「毎回設定する状態」がすべて既定値(`depth_func` は `LESS`、`cull_face` は `BACK`、`blend_func` は `ONE, ZERO` など。§5.1)。プログラム・VAO・バッファ・テクスチャ(`TEXTURE1` を含む)は bind されていない。
+- 上の「毎回設定する状態」がすべて既定値(`depth_func` は `LESS`、`depth_range` は `0, 1`、`cull_face` は `BACK`、`blend_func` は `ONE, ZERO` など。§5.1)。プログラム・VAO・バッファ・テクスチャ(`TEXTURE1` を含む)・sampler は bind されていない。
 - 前の画面の GL オブジェクトは残っているが、名前は使わない(`GlScene` は自分で作ったものだけを使う)。
 
 ### 5.5 #74 と #71 B でやること
 
-- **#74**: `reset_gl_state` を作り、`draw_scene` の中で 2 回呼ぶ。**わざと状態を汚す試験画面**を作る(`CULL_FACE` 有効、`SCISSOR` を小さく、`color_mask` の一部を false、`UNPACK_ROW_LENGTH` を非ゼロ、`TEXTURE1` に別のテクスチャ、blend を有効のまま、FBO を別のものに)。その直後に写真画面を描いて、PNG が汚していないときと一致することを確かめる。汚す項目に `depth_func(ALWAYS)`・`front_face(CW)`・`cull_face(FRONT)`・stencil の関数と動作・`clear_depth(0.0)`・`RASTERIZER_DISCARD` 有効を足す。
+- **#74**: `reset_gl_state` を作り、`draw_scene` の中で 3 回(下地の前・場面の前・合成の前)呼ぶ。**わざと状態を汚す試験画面**を作る(`CULL_FACE` 有効、`SCISSOR` を小さく、`color_mask` の一部を false、`UNPACK_ROW_LENGTH` を非ゼロ、`TEXTURE1` に別のテクスチャ、blend を有効のまま、FBO を別のものに)。その直後に写真画面を描いて、PNG が汚していないときと一致することを確かめる。汚す項目に `depth_func(ALWAYS)`・`front_face(CW)`・`cull_face(FRONT)`・stencil の関数と動作(表と裏)・`clear_depth(0.0)`・`RASTERIZER_DISCARD` 有効・`depth_range(1, 0)`・sampler の bind・blend の separate と色・pixel store・各種バッファの bind を足す。2D のフレームは、本番の `present_frame` と同じ呼び方(framebuffer を bind するだけで、試験の側で `reset_gl_state` を呼ばない)で、成功した 3D と失敗した 3D のそれぞれの直後に写真・Radar・Agent を描く(sampler の漏れは Agent 画面の拡大したカードに出る)。
   - **2D → 3D と 3D → 3D(別の画面どうし)の漏れ**も確かめる: 写真・Agent 画面の直後にキューブを描いた PNG と、キューブだけを描いた PNG が一致すること。キューブを 2 種類(別の状態を汚す 2 つのテスト用画面)で続けて描いても、後ろの絵が前の画面の状態に影響されないこと。補助に、デバッグビルドで `draw` の先頭に `glGet` で §5.4 の約束(`DEPTH_TEST` 無効、`depth_func` が `LESS` など)が成り立っているかを調べる検査を入れる(リリースでは外す)。
 - **#71 B**: `VrmLayer` が行っていた `composite` の部分が Compositor に移ること。VRM が残す状態(blend_func_separate など)が次のフレームに影響しないこと。
 
@@ -339,10 +349,10 @@ flowchart LR
 | GL 専用(キューブ。`needs_gl() = true`) | `Composite::Gl` | CPU の案内(「この画面は GPU 描画が必要です」)を `render` で描く。自動巡回では**飛ばす**(`is_empty` と同じ扱い。**飛ばすのは GL 専用画面だけ**)。手動(メニュー・パネル)では選べて、案内が出る |
 | 既存画面に 3D を足す装飾(VRM を載せた写真・Agent 画面。`needs_gl() = false`) | 下地の `Composite` に `Composite::Gl` をかぶせる | **3D だけをやめて、元の画面をそのまま出す**(ScreenManager が `Composite::Gl` の `base` を取り出す)。**巡回には元の写真・Agent 画面として残す**(飛ばさない)。CPU 経路の写真は今のまま |
 
-- GL の可否は、作るときの `make_app(&Output)` で渡す。`Output.gpu_max_texture.is_some()` が「GLES を開けた」(`auto` で CPU に戻ったときは `None`)なので、これを GL の可否として使う(`runtime.rs:289-293`、`353-356`、`main.rs:153`)。`set_gl_available` のような実行中に呼ぶメソッドは作らない(GL の可否は起動後に変わらない。変わるのは「失敗」だけ)。
+- GL の可否は、作るときの `make_app(&Output)` で渡す。`Output.gpu_max_texture.is_some()` が「GLES を開けた」(`auto` で CPU に戻ったときは `None`)なので、これを GL の可否として使う(`runtime.rs:289-293`、`353-356`、`main.rs:153`)。`set_gl_available` のような実行中に呼ぶメソッドは作らない(GL の可否は起動後に変わらない。変わるのは「失敗」だけ)。実装は、作成時のビルダー `ScreenManager::with_gl_available(bool)`(既定は使えない。`kiosk()` が渡す。`with_rotation` より前に呼ぶ: 巡回の最初の手順から GL が要る画面を外すため)。
 - GL の可否の判断は **ScreenManager だけ**が行う(`Screen` には可否を渡さない)。`needs_gl()` の画面が GL 不可・失敗中なら、`render_composite` を呼ばずに `render` を呼ぶ(CPU の案内)。それ以外の画面は常に `render_composite` を呼び、`Composite::Gl` が返ってきて GL 不可・失敗中なら、`base` を取り出して使う(`None` なら `Composite::Canvas` と空の Canvas)。これで装飾(`WithScene`)は単純なまま、元の画面だけが出る。
 - **GL の可否・失敗状態が変わったとき**(起動時の GL なし、`report_scene_failure` による失敗、将来の復帰): ScreenManager は必ず `force_overlay = true` にし、現在の画面の `invalidate()` を呼ぶ。GL ありの `Composite::Gl`(下地は `base` の中)と、GL なしの `Composite::Photo` / `Composite::Agents` / `Composite::Canvas`(`base` を取り出したもの)では、画面が重ね絵・背景を描いたかどうかの前提が変わる。Photo の `overlay_changed` は `overlay_dirty || force_overlay`(`photo.rs:261`)、ScreenManager の `draw_alert` は `overlay_changed` のときだけ(`manager.rs:655-671`)なので、これをしないと写真画面ではその切り替えのフレームにアラート・メニューが描かれず、消える(Agent 画面は覆われると `Composite::Canvas` を返し、アラートを毎フレーム描くので消えない。`invalidate()` は念のため)。
-- **案内は共通の描画関数**(`miharashi-render` に `notice::gpu_required` を足す)で、GL 専用画面の `render` はそれを呼ぶだけ。これで、`Screen::render` が必須(`screen.rs:105`)でも、画面側の負担が小さい。
+- **案内は共通の描画関数**(`miharashi-render` の `notice::gpu_required(canvas, text, title)`。`title` は画面の題名)で、GL 専用画面の `render` はそれを呼ぶだけ。これで、`Screen::render` が必須(`screen.rs:105`)でも、画面側の負担が小さい。
 - **焼き付き対策(`refresh_screens`)**: 3D の画面を指定しても、CPU の案内(`render`)がグリッチの素材になるだけで意味がない。GL の画面は対象にしない。今の `refresh_screens` は、対応外の id を**エラー**にする(許可は status / photo / room / aircraft。`config.rs:491-502`、テスト `config.rs:659`)ので、キューブの id は何もしなくてもエラーになる。これを警告 + 無視に変えるかは未決事項(§13)。既定は `["aircraft"]` のまま(`config.rs:393`)。
 - **PNG ヘッドレス**:
   - `png`(既定、CPU): GL 専用画面は案内の 1 枚(`cube.png` など)。GL の装飾は元の画面。Linux 以外でもビルドできる。
@@ -426,9 +436,10 @@ flowchart LR
   2. **その場で、手に持っている scene に `release`(`catch_unwind` つき)を呼ぶ**。ScreenManager は `glow::Context` を持たず、`Composite::Gl` の借用からも解放できないので、後からは呼べない。作りかけのオブジェクトがあっても `release` が壊れないことが `GlScene` の約束(§9.4)。
   3. 手順 3 の層の合成は**しない**(中途半端な絵を出さない)。下地と最上段の重ね絵だけで、そのフレームを完成させて表示する。
   4. `SceneFailed(msg)` を返す(runtime は `Err` として扱わず、実行ループを続ける)。
-- runtime は `App::report_scene_failure(msg)` を呼び、1 回だけ `eprintln!` する(状態ログの `scene_fail=` に回数も出す)。
+- 失敗した場面は `release` 済みなので、終了時の解放(§3.1 の (a))からは外す(`ScreenManager::gl_scenes()` が失敗した画面を返さない)。実行ループが `Err`(致命的な描画の失敗)で終わるときも、場面の解放を通ってからエラーを返す(`runtime::end_run`)。場面の失敗のあとの致命的な失敗でも、場面の失敗を失わない(`SceneError::scene_failed`。上の API)。実装の `runtime::draw_gles` が `Err` でも報告し、`runtime::draw_frame` は描画の失敗を `?` で関数の外へ出さずに `run_err` へ入れて、ループを `break` させる(表示を `GlesSurface` / `FrameSink` に差し替えて試験する)。
+- runtime は `App::report_scene_failure(msg)` を呼ぶ。ScreenManager が、画面の id つきで 1 回だけ `eprintln!` し(runtime は出さない)、状態ログの `scene_fail=` に回数を出す(失敗が 1 回以上あるときだけ)。
 - ScreenManager は、今出していた画面を「GL 失敗」にする。
-  - その画面は GL が使えないときと同じ扱い(§6): GL 専用画面は案内、装飾は元の画面。巡回では、**GL 専用画面だけ**飛ばす(装飾は元の写真・Agent 画面として巡回に残す)。
+  - その画面は GL が使えないときと同じ扱い(§6): GL 専用画面は案内、装飾は元の画面。巡回では、**GL 専用画面だけ**飛ばす(装飾は元の写真・Agent 画面として巡回に残す)。巡回の手順が全部 GL 専用で GL が使えないときは、案内の画面に切り替えず、今の画面のまま巡回を始めない(手動で選んだときの案内は出る)。
   - **`force_overlay = true` にし、現在の画面の `invalidate()` を呼ぶ**(必須)。失敗したフレームは `Composite::Gl` で返っていて、次のフレームは `Composite::Photo` / `Agents` / `Canvas` になる。重ね絵・背景を描き直させないと、切り替えのフレームからアラート・メニューが消える(§6.1)。失敗したそのフレームの `Top` は `present_scene` が下地の上に出すので見える。
   - **戻し方(v1)**: 再起動まで戻さない。再試行(例: 5 分後に 1 回、3 回で停止)は v1 に入れず、未決事項にする(§13)。
 - 壊れたモデルなど、CPU 側の失敗の隔離は **GL の外**で行う。モデルの読み込みは別スレッドで行い(`std::thread` の panic は `join` の `Err` になる)、結果をチャネルで受ける。画面は読み込み中・失敗中のあいだ、3D を出さずに下地(または案内)だけを出す。GL への転送は最初の `draw`(UI スレッド)で行う。#71 の「壊れたモデルで panic しても画面全体が落ちない」はこの方針で扱う。
@@ -447,7 +458,7 @@ flowchart LR
 
 | 今 | 変更 |
 |---|---|
-| `let (r, p) = display.draw(app.as_mut(), &mut canvas)?;`(`runtime.rs:549`)。`Presenter::draw` の `d.present_frame(&frame)?`(`runtime.rs:268`) | `Presenter::draw` が `SceneOutcome::SceneFailed` を `Ok` として扱い、`App::report_scene_failure` を呼ぶ。`Err` は従来どおり致命的。`Composite::Gl` の入れ子など呼び出し側の誤りは `Err` にせず、`debug_assert!` + `SceneFailed` 扱い(`?` で実行ループを抜けないため) |
+| `let (r, p) = display.draw(app.as_mut(), &mut canvas)?;`(`runtime.rs:549`)。`Presenter::draw` の `d.present_frame(&frame)?`(`runtime.rs:268`) | `Presenter::draw` が `SceneOutcome::SceneFailed` を `Ok` として扱い、`App::report_scene_failure` を呼ぶ。`Err` は従来どおり致命的(ただし `SceneError::scene_failed` があれば、その報告は先に行う)。`Composite::Gl` の入れ子など呼び出し側の誤りは `Err` にせず、`debug_assert!` + `SceneFailed` 扱い(`?` で実行ループを抜けないため)。実装は `scene_frame` が領域を空にして `present_scene` の失敗の経路(その場面の `release` と、3D 抜きでの完成)に載せる。GL が使えない・失敗中のときは、ScreenManager が入れ子の中まで `base` を外す |
 | `catch_unwind` は `crates/` に 1 件もない | `compose.rs` の `draw_scene`(と `present_scene` の失敗時の `release`)に追加 |
 
 ### 9.4 #74 と #71 B でやること
@@ -467,31 +478,31 @@ flowchart LR
 - 3D は**保持しない**: 何かの理由(時計の 1 秒更新、アラートの開閉)で画面が再描画されると、毎回 `GlScene::draw` が呼ばれる。時間が止まっている間は同じ絵になるようにする(画面の状態が変わらなければ同じ入力)。
 - **消灯中は描かない**: 既存どおり、`redraw && screen_on` のときだけ描く(`runtime.rs:547`)。`set_presentation(display_on = false)`(`manager.rs:393-398`)で、画面は自分の演出の時計を止められる。復帰時に溜まった動きを再生しない。
 - 非表示の画面は `draw` が呼ばれない。`tick` は呼ばれる(Provider と同じ)ので、データの取り込み(エージェントの状態など)は続くが、3D は描かれない。
-- **フレームの上限(推奨)**: POC-006 の実測は 30fps だった(Agent 画面 + VRM で iGPU が +4.2 ポイント、写真画面 + VRM で +4.6 ポイント。`animating` で 60Hz のままにすると描画量がほぼ倍になる)。`Screen::frame_interval() -> Option<Duration>`(既定 None = vsync)を足し、runtime が表示の完了後に残りを待つ形を**推奨**する。**#74 で実測して決める**(720p / 1080p の fps・平均・p95 描画時間を記録)。
+- **フレームの上限(決定。#74 で実測した)**: `Screen::frame_interval() -> Option<Duration>`(既定 None = vsync)を足した。動いている間だけ、runtime が表示の完了後に `frame_wait`(間隔 − vsync の半分)で残りを待つ。vsync の境界いっぱいを待つと 30fps が 20fps になるため。キューブは**既定 30fps**(設定 `[cube] fps`、0 = 制限なし)。理由は計測: 2560x1080 で 30fps は iGPU 6.5%・CPU 1.2%、60fps は iGPU 14.3%・CPU 1.6%(POC-007)。表示は vsync の境界でしか変わらないので、間隔は vsync の整数倍に切り上げ(`ceil(間隔 / vsync) × vsync`)、vsync の半分だけ早く起きる。状態ログの `anim=` の「遅れ」も、この切り上げた表示間隔 + 半フレームを閾値にする。つまり設定の fps は**リフレッシュレートの整数分の 1 に切り上げて守る**(60Hz で 50fps は 30fps、75Hz で 30fps は 25fps)。単体試験で fps と Hz の組み合わせを確かめた。実機は 60Hz の 30fps で 10 秒に 300 フレーム・遅れ 0 を確認したが、他のリフレッシュレートは実機では未確認。
 - 領域の幅(POC-006 の所見): 左右 1/3(853px)では、身振りで手が領域の端で切れる。これは API の問題ではなく、`Region` の大きさと身振りの範囲の問題。B で決める(§13)。
 
 ## 11. 移行計画
 
 ### 11.1 #74: キューブ画面で確かめる項目
 
-- [ ] `miharashi-glscene` クレートを作る(依存は glow だけ)。`cargo check` が Linux 以外でも通る。
-- [ ] `Compositor` に層(色 + 深度の FBO)・`reset_gl_state`・`draw_scene` を足す。`restore_gl_state` を移す。`with_gl` / `draw_frame_with` は PoC 用に残す。
-- [ ] `SceneFrame` / `GlesDisplay::present_scene` / `release_scenes`。`Frame` は変えない。
-- [ ] `Composite::Gl` と `runtime.rs` の変換(下地の変換を関数に分ける)。
-- [ ] 最上段の重ね絵(`Top`)と ScreenManager の描画。
-- [ ] `Screen::needs_gl` / `gl_scene` / `scene_animating`、`App::gl_scenes` / `report_scene_failure`。GL の可否は `Output.gpu_max_texture.is_some()` を `kiosk()` から ScreenManager へ渡す(`set_gl_available` は作らない)。
-- [ ] キューブ画面(回転する立方体 1 個。深度テストあり。VRM に依存しない)。全面と、1/3 幅の `Region` の両方。
-- [ ] 実機(DRM/GBM/EGL)で、キューブが描かれる。標準の framebuffer に深度がなくても正しく見える。
-- [ ] 2D/3D 切替とアラート: キューブ → 写真 → 状況 → Agent と巡回、アラートとメニューが 3D の上に出て、3D が下に見える。残像・状態漏れがない。
-- [ ] 状態を汚す試験画面(§5.5)の直後に写真・Radar・Agent を描いて、PNG が一致する。2D → 3D と 3D → 3D(別の画面どうし)で状態が漏れない。
-- [ ] 切り替え数百回で VRAM+GTT が増えない。`GlScene` 内の作成 − 削除の数が増えない(§3.3)。
-- [ ] 故意の panic・`Err`・GL エラー(§9.4)でキオスクが止まらない。**アラート表示中に 3D を失敗させ、次のフレームからもアラートが見え続ける**。初回の `draw` の途中で panic しても `release` が作りかけのオブジェクトで動き、作り直せる。
-- [ ] `renderer = cpu` と失敗中に、動かない写真画面が毎フレーム CPU で描き直されない(`scene_animating()` を足さない。§10)。
-- [ ] `renderer = cpu` と GL なしの `auto` で案内が出て、巡回から外れる。`png` に fixture(案内、gles)を足す。
-- [ ] 消灯中に描かない、復帰で動きがまとめて再生されない。
-- [ ] 720p / 1080p の fps・平均/p95 描画時間・CPU 使用率・iGPU の使用率を記録する。層の FBO を挟む追加コスト(全面の層と、標準の framebuffer へ直接描く場合の比較)も測る。
+- [x] `miharashi-glscene` クレートを作る(依存は glow だけ)。`cargo check` が Linux 以外でも通る。
+- [x] `Compositor` に層(色 + 深度の FBO)・`reset_gl_state`・`draw_scene` を足す。`restore_gl_state` を移す。`with_gl` / `draw_frame_with` は PoC 用に残す。
+- [x] `SceneFrame` / `GlesDisplay::present_scene` / `release_scenes`。`Frame` は変えない。
+- [x] `Composite::Gl` と `runtime.rs` の変換(下地の変換を関数に分ける)。
+- [x] 最上段の重ね絵(`Top`)と ScreenManager の描画。
+- [x] `Screen::needs_gl` / `gl_scene` / `scene_animating`、`App::gl_scenes` / `report_scene_failure`。GL の可否は `Output.gpu_max_texture.is_some()` を `kiosk()` から ScreenManager へ渡す(`set_gl_available` は作らない)。
+- [x] キューブ画面(回転する立方体 1 個。深度テストあり。VRM に依存しない)。全面と、1/3 幅の `Region` の両方。
+- [x] 実機(DRM/GBM/EGL)で、キューブが描かれる。標準の framebuffer に深度がなくても正しく見える。(実機で描画してエラーなしを確認。画面の目視はしておらず、見た目の正しさはオフスクリーンの画素比較のテストで確かめた)
+- [x] 2D/3D 切替とアラート: キューブ → 写真 → 状況 → Agent と巡回、アラートとメニューが 3D の上に出て、3D が下に見える。残像・状態漏れがない。(実機ではアラートは出していない(メニューだけ出し入れした)。巡回とメニューはエラーなしを確認。アラートの重なり・残像の見た目はオフスクリーンの画素比較のテストで確かめた)
+- [x] 状態を汚す試験画面(§5.5)の直後に写真・Radar・Agent を描いて、PNG が一致する。2D → 3D と 3D → 3D(別の画面どうし)で状態が漏れない。(オフスクリーンで、陰性対照つき)
+- [x] 切り替え数百回で VRAM+GTT が増えない。`GlScene` 内の作成 − 削除の数が増えない(§3.3)。(約 300 回の切り替えで gl_objs 24 一定、VRAM+GTT の区間平均は増えていない)
+- [x] 故意の panic・`Err`・GL エラー(§9.4)でキオスクが止まらない。**アラート表示中に 3D を失敗させ、次のフレームからもアラートが見え続ける**。初回の `draw` の途中で panic しても `release` が作りかけのオブジェクトで動き、作り直せる。(テストで確認。実機では起こしていない。本物の `GlesDisplay::flip` の DRM 失敗で失敗が運ばれる経路はコードの確認だけ)
+- [x] `renderer = cpu` と失敗中に、動かない写真画面が毎フレーム CPU で描き直されない(`scene_animating()` を足さない。§10)。
+- [x] `renderer = cpu` と GL なしの `auto` で案内が出て、巡回から外れる。`png` に fixture(案内、gles)を足す。
+- [x] 消灯中に描かない、復帰で動きがまとめて再生されない。(ScreenManager を通したテストで代えた。実機の消灯・復帰は HA の設定を変えないため行っていない)
+- [x] 720p / 1080p の fps・平均/p95 描画時間・CPU 使用率・iGPU の使用率を記録する。層の FBO を挟む追加コスト(全面の層と、標準の framebuffer へ直接描く場合の比較)も測る。(POC-007。描画時間はオフスクリーンの `bench-scene` で測った。層の費用は全面 2560x1080 の 30fps 間隔で約 1.1ms(draw_scene 1.27 − 直接 0.15。直接にも全画面の消去を含めた))
 - [ ] 12 時間試験は #71 B の 12 時間試験とまとめる(#74 では行わない。キューブは #71 B の VRM と同じ形の画面で、長時間の確認は 1 回で足りる)。
-- [ ] 制限事項と API の契約を `docs/` に残す(この文書の更新と PoC 記録)。
+- [x] 制限事項と API の契約を `docs/` に残す(この文書の更新と [POC-007](poc/POC-007.md))。
 
 ### 11.2 #71 B: VRM を載せる手順
 
@@ -518,18 +529,18 @@ B に入る前の宿題(Issue #71 のコメント): sparse accessor の `byteStr
 
 | 項目 | 現状の推奨 | 決める場所 |
 |---|---|---|
-| 新クレートの名前(`miharashi-glscene` は仮) | 仮の名前のまま | #74 の最初の PR |
-| 3D の層を「全面が深度つき FBO」で毎回合成するコスト。`Direct`(標準の framebuffer へ直接描く)モードを足すか | 層だけ(1 つの契約)。実測で重ければ足す | #74 の計測 |
-| フレームの上限(`frame_interval`)の API と値(30fps 想定) | §10 | #74 の計測 |
+| 新クレートの名前(`miharashi-glscene` は仮) | **決定**: `miharashi-glscene` のまま(#74) | 済 |
+| 3D の層を「全面が深度つき FBO」で毎回合成するコスト。`Direct`(標準の framebuffer へ直接描く)モードを足すか | **決定**: 足さない(層だけ)。全面 2560x1080 で 30fps 間隔 約 1.1ms(draw_scene 1.27 − 直接 0.15。予算 33ms の 3〜4%)、連続で約 0.3ms(0.37 − 0.04)。直接の側にも全画面の消去を含めた比較(POC-007) | 済(#74) |
+| フレームの上限(`frame_interval`)の API と値(30fps 想定) | **決定**: `Screen::frame_interval`、キューブは既定 30fps(§10) | 済(#74) |
 | 非表示中の保持 vs. タイムアウト解放 | 保持(v1)。VRM の VRAM+GTT を測って決める(GL オブジェクトは `GlScene` 内の作成 − 削除の数でも見る) | #71 B |
-| 3D 失敗後の再試行をするか、するなら間隔と回数 | v1 は再起動まで戻さない。例: 5 分後に 1 回、3 回で停止 | #74 の実機で失敗が起きたら |
+| 3D 失敗後の再試行をするか、するなら間隔と回数 | v1 は再起動まで戻さない。実機では失敗が起きていない(テストでのみ確認) | 実機で失敗が起きたら |
 | VRM を載せる画面の `id`: 内側の画面と同じにするか、別の id を足すか | 同じ id(設定 `ui.avatar` で有効化)。パネルの画面一覧が増えない | #71 B。別 id にする場合は操作パネルの契約(`DESIGN-screens.md` §2)を更新 |
 | VRM の `Region`(左右 1/3 は手が切れる。POC-006)と身振りの範囲 | 領域を広げるか身振りを収める。API は変えない | #71 B |
 | GPU リセット(context lost)からの復帰 | v1 は §9 の失敗の扱いに入り、再起動まで 3D を出さない | 実機で起きたら |
 | `catch_unwind` を `tick` / `render` の panic にも広げるか | 広げない | 別の Issue |
-| `Cargo.toml` に `panic = "abort"` が無いことを確かめる単体テストを足すか(CI の grep は削った) | 足す(`catch_unwind` が効く前提を守る) | #74 |
+| `Cargo.toml` に `panic = "abort"` が無いことを確かめる単体テストを足すか(CI の grep は削った) | 足す(`catch_unwind` が効く前提を守る)。**#74 では足していない** | 別の機会(#71 B など) |
 | `miharashi-app` が `miharashi-vrm` に依存するときの feature 名・既定のオン/オフ | optional 依存、既定オフ、`default-features = false`(vrm の既定 feature は Linux 以外を壊す) | #71 B |
-| `refresh_screens` に GL 画面の id を書いたとき | 今のとおりエラー(対応外の id は `config.rs:491-502` が弾く)。警告 + 無視に変えるかは必要になったら | #74 |
-| 下地が `Canvas` のときの毎フレームの CPU 描画 + 転送(`base_changed` の印、または覆われている間 3D を止める) | 印を付ける(§10)。実測で要否を決める | #71 B |
+| `refresh_screens` に GL 画面の id を書いたとき | 今のとおりエラー(キューブの id を書くとエラー)。警告 + 無視に変えるかは必要になったら | 必要になったら |
+| 下地が `Canvas` のときの毎フレームの CPU 描画 + 転送(`base_changed` の印、または覆われている間 3D を止める) | 印を付ける(§10)。#74 の実測で、下地を毎フレーム描く 1/3 幅は CPU 3.4%(全面は 1.2%)。`base_changed` は未実装。減る量は #71 B で測って決める | #71 B |
 | MSAA(輪郭線が細いと途切れる: POC-006 の「輪郭線」の所見、199 行・239 行付近) | **範囲外**(v1 の層は MSAA なし)。VRM の輪郭線の見た目は B で `outline-scale` などで調整。MSAA が要るなら層をマルチサンプルにする別の Issue | 別の Issue |
 | 一回きりの 3D 再描画要求(`scene_animating()` の継続でなく、状態が変わった時だけの要求) | v1 は作らない(キューブも VRM も動き続ける) | 静止する 3D 画面が出たとき |

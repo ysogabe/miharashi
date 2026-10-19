@@ -3,10 +3,11 @@
 //! 状態ログは共通部分(t / rss / fds / frames / worst_frame)に `App::stats()` の `k=v` を続けて出す。
 use crate::config::Config;
 use crate::panel::{DisplayControl, DisplayStatus, Panel, PanelInput};
-use crate::screen::{App, Composite, KeyPress, PhotoData, PhotoRef};
+use crate::screen::{App, Composite, GlComposite, GlScene, KeyPress, PhotoData, PhotoRef, Top};
 use crate::screen_power::{Mode as PowerMode, ScreenPower};
 use miharashi_gpu::{
-    AgentGpuCard, Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, Radar, SourceImage,
+    AgentGpuCard, Frame, GlesDisplay, PhotoLayer, PhotoSource, Placement, Radar, SceneError,
+    SceneFrame, SceneOutcome, SceneTop, SourceImage,
 };
 use miharashi_linux::drm_select::{self, CardSel, ModeSel};
 use miharashi_linux::input::{Action, Keys};
@@ -46,6 +47,33 @@ fn format_stats(
         line.push_str(&format!(" {k}={v}"));
     }
     line
+}
+
+/// 描画の間隔の上限(`App::frame_interval`)のとき、表示の完了後に待つ時間。
+/// 表示の完了待ち(vsync)は vsync の境界で終わるので、間隔いっぱいを待つと次のフレームが 1 つあとの vsync に
+/// ずれる(30fps が 20fps になる)。vsync 半分だけ早く起きて、描画を次の vsync の手前に間に合わせる。
+/// 表示できるのは vsync の境界だけなので、間隔は vsync の整数倍に切り上げて上限を守る
+/// (60Hz で 50fps は 2 vsync = 30fps。半分だけ引くやり方のままだと次の vsync に間に合って 60fps になる)。
+fn frame_wait(interval: Duration, refresh_hz: u32) -> Duration {
+    let vsyncs = display_vsyncs(interval, refresh_hz);
+    if vsyncs <= 1.0 {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64((vsyncs - 0.5) / f64::from(refresh_hz.max(1)))
+}
+
+/// 間隔を表示できる vsync の数(間隔を vsync の整数倍に切り上げた値、最小 1)。`frame_wait` と遅れの判定で共通。
+fn display_vsyncs(interval: Duration, refresh_hz: u32) -> f64 {
+    let hz = f64::from(refresh_hz.max(1));
+    // 30fps と 60Hz のような割り切れる組が、浮動小数点の誤差で 1 vsync 多くならないように少し引く
+    (interval.as_secs_f64() * hz - 1e-6).ceil().max(1.0)
+}
+
+/// 間隔の上限があるときの「遅れ」の閾値 [ms]。切り上げた後の表示間隔に半フレームの余裕を足す
+/// (60Hz で 50fps は表示間隔が 33.3ms なので、設定の間隔 20ms を基にすると正常なフレームが遅れになる)。
+fn late_limit_ms(interval: Duration, refresh_hz: u32) -> f32 {
+    let hz = f64::from(refresh_hz.max(1));
+    ((display_vsyncs(interval, refresh_hz) + 0.5) / hz * 1000.0) as f32
 }
 
 /// 区間内のフレーム時間 [ms] を "平均/p95" にする(PoC-005 のベースライン用)。空なら "-"。
@@ -114,6 +142,113 @@ pub fn radar_layer<'a>(
         trail,
         scale: photo_layout::scale(screen_h),
         blips,
+    }
+}
+
+/// `Composite` を GPU の合成器の `Frame` にするとき、`Frame` が借りるもの(レーダーの点・Agent のカード)の置き場。
+/// `fill` で詰めてから `frame_of` / `scene_frame` に渡す。
+#[derive(Default)]
+pub struct FrameParts<'a> {
+    blips: Vec<[f32; 3]>,
+    cards: Vec<AgentGpuCard<'a>>,
+}
+
+impl<'a> FrameParts<'a> {
+    /// `comp`(`Gl` なら下地)の分を詰める。
+    pub fn fill(&mut self, comp: &Composite<'a>) {
+        match comp {
+            Composite::Radar { geom, .. } => self.blips = radar_blips(geom),
+            Composite::Agents { cards, .. } => {
+                self.cards.extend(cards.iter().map(|c| AgentGpuCard {
+                    id: c.id,
+                    revision: c.revision,
+                    pixels: c.surface.data(),
+                    size: (c.surface.width(), c.surface.height()),
+                    rect: (c.pose.x, c.pose.y, c.pose.width, c.pose.height),
+                    alpha: c.pose.alpha,
+                }));
+            }
+            Composite::Gl(g) => {
+                if let Some(base) = &g.base {
+                    self.fill(base);
+                }
+            }
+            Composite::Canvas | Composite::Photo { .. } => {}
+        }
+    }
+}
+
+/// `Gl` 以外の `Composite` を GPU の合成器の `Frame` にする(`Gl` は None)。`canvas` は、完成画面か、
+/// 写真の重ね絵・レーダーやカードの背景を描いたもの。
+pub fn frame_of<'a>(
+    comp: &Composite<'a>,
+    canvas: &'a Canvas,
+    parts: &'a FrameParts<'a>,
+) -> Option<Frame<'a>> {
+    let h = canvas.height();
+    Some(match comp {
+        Composite::Canvas => Frame::Image(canvas.pixmap.data()),
+        Composite::Photo {
+            photo,
+            old,
+            overlay_changed,
+        } => Frame::Photo {
+            photo: photo_layer(*photo, h),
+            old: old.map(|(p, t)| (photo_layer(p, h), t)),
+            overlay: overlay_changed.then(|| canvas.pixmap.data()),
+        },
+        Composite::Radar {
+            background_changed,
+            geom,
+            sweep,
+        } => Frame::Radar {
+            background: background_changed.then(|| canvas.pixmap.data()),
+            radar: radar_layer(geom, *sweep, aircraft::TRAIL, h, &parts.blips),
+        },
+        Composite::Agents {
+            background_changed,
+            scrim_alpha,
+            focus_card_id,
+            ..
+        } => Frame::Agents {
+            background: background_changed.then(|| canvas.pixmap.data()),
+            cards: &parts.cards,
+            scrim_alpha: *scrim_alpha,
+            focus_card_id: *focus_card_id,
+        },
+        Composite::Gl(_) => return None,
+    })
+}
+
+/// `Composite::Gl` を GPU の `present_scene` の入力にする。下地は `frame_of` で `Frame` にする。
+/// `Gl` の入れ子は呼び出し側の誤り: `debug_assert!` で検出し、リリースでは領域を空にして
+/// `present_scene` の失敗(その場面の `release` と、3D 抜きでの完成)として扱う(`Err` で実行ループを抜けない)。
+pub fn scene_frame<'a>(
+    g: GlComposite<'a>,
+    canvas: &'a Canvas,
+    parts: &'a FrameParts<'a>,
+) -> SceneFrame<'a> {
+    let GlComposite {
+        base,
+        scene,
+        mut region,
+        top,
+    } = g;
+    let base = base.as_deref();
+    if base.is_some_and(|b| matches!(b, Composite::Gl(_))) {
+        debug_assert!(false, "Composite::Gl の base に Gl は入れられない");
+        region.w = 0;
+        region.h = 0;
+    }
+    SceneFrame {
+        base: base.and_then(|b| frame_of(b, canvas, parts)),
+        scene,
+        region,
+        top: match top {
+            Top::Off => SceneTop::Off,
+            Top::Keep => SceneTop::Keep,
+            Top::Upload(p) => SceneTop::Upload(p.data()),
+        },
     }
 }
 
@@ -207,67 +342,105 @@ impl Presenter {
     /// Canvas には重ね絵だけを、変わったときだけ描く。
     fn draw(&mut self, app: &mut dyn App, canvas: &mut Canvas) -> Result<(f32, f32), String> {
         let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f32() * 1000.0;
-        let t0 = Instant::now();
         match self {
             Self::Cpu(d) => {
+                let t0 = Instant::now();
                 app.render(canvas);
                 let t1 = Instant::now();
                 d.present(|buf, pitch| canvas.write_xrgb8888(buf, pitch))?;
                 Ok((ms(t0, t1), ms(t1, Instant::now())))
             }
-            Self::Gles(d) => {
-                let h = canvas.height();
-                let comp = app.render_composite(canvas);
-                let t1 = Instant::now();
-                let blips = match &comp {
-                    Composite::Radar { geom, .. } => radar_blips(geom),
-                    _ => Vec::new(),
-                };
-                let mut agent_gpu_cards = Vec::new();
-                let frame = match comp {
-                    Composite::Canvas => Frame::Image(canvas.pixmap.data()),
-                    Composite::Photo {
-                        photo,
-                        old,
-                        overlay_changed,
-                    } => Frame::Photo {
-                        photo: photo_layer(photo, h),
-                        old: old.map(|(p, t)| (photo_layer(p, h), t)),
-                        overlay: overlay_changed.then(|| canvas.pixmap.data()),
-                    },
-                    Composite::Radar {
-                        background_changed,
-                        geom,
-                        sweep,
-                    } => Frame::Radar {
-                        background: background_changed.then(|| canvas.pixmap.data()),
-                        radar: radar_layer(&geom, sweep, aircraft::TRAIL, h, &blips),
-                    },
-                    Composite::Agents {
-                        background_changed,
-                        cards,
-                        scrim_alpha,
-                        focus_card_id,
-                    } => {
-                        agent_gpu_cards.extend(cards.iter().map(|c| AgentGpuCard {
-                            id: c.id,
-                            revision: c.revision,
-                            pixels: c.surface.data(),
-                            size: (c.surface.width(), c.surface.height()),
-                            rect: (c.pose.x, c.pose.y, c.pose.width, c.pose.height),
-                            alpha: c.pose.alpha,
-                        }));
-                        Frame::Agents {
-                            background: background_changed.then(|| canvas.pixmap.data()),
-                            cards: &agent_gpu_cards,
-                            scrim_alpha,
-                            focus_card_id,
-                        }
-                    }
-                };
-                d.present_frame(&frame)?;
-                Ok((ms(t0, t1), ms(t1, Instant::now())))
+            Self::Gles(d) => draw_gles(d, app, canvas),
+        }
+    }
+
+    /// 持っている `GlScene` を、GL が使えるうちに解放する(終了時。`drop` の前に呼ぶ)。CPU 経路は何もしない。
+    fn release_scenes(&mut self, scenes: &mut [&mut dyn GlScene]) -> Vec<String> {
+        match self {
+            Self::Cpu(_) => Vec::new(),
+            Self::Gles(d) => d.release_scenes(scenes),
+        }
+    }
+}
+
+/// GLES 経路が `draw_gles` に求めること(試験で DRM なしの表示に差し替えるため)。
+pub(crate) trait GlesSurface {
+    fn present_scene(&mut self, f: &mut SceneFrame<'_>) -> Result<SceneOutcome, SceneError>;
+    fn present_frame(&mut self, f: &Frame<'_>) -> Result<(), String>;
+}
+
+impl GlesSurface for GlesDisplay {
+    fn present_scene(&mut self, f: &mut SceneFrame<'_>) -> Result<SceneOutcome, SceneError> {
+        GlesDisplay::present_scene(self, f)
+    }
+
+    fn present_frame(&mut self, f: &Frame<'_>) -> Result<(), String> {
+        GlesDisplay::present_frame(self, f)
+    }
+}
+
+/// GLES 経路の 1 枚。戻り値は (描画, 転送) の時間 [ms]。
+/// 3D の失敗は `Err` でなく `SceneFailed`(表示は続く)。場面の失敗は、そのあとに致命的な失敗(最上段の重ね絵・
+/// swap・page flip)が起きて `Err` になるときも、必ず `app.report_scene_failure` に届ける。届けないと、`release` 済みの
+/// 場面が `app.gl_scenes()` に残って終了時にもう一度 `release` される。
+pub(crate) fn draw_gles(
+    d: &mut impl GlesSurface,
+    app: &mut dyn App,
+    canvas: &mut Canvas,
+) -> Result<(f32, f32), String> {
+    let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f32() * 1000.0;
+    let t0 = Instant::now();
+    let comp = app.render_composite(canvas);
+    let t1 = Instant::now();
+    let mut parts = FrameParts::default();
+    parts.fill(&comp);
+    // `comp` が `app` を借りているので、報告は借用が終わってから
+    let (shown, scene_failed) = match comp {
+        Composite::Gl(g) => {
+            let mut frame = scene_frame(g, canvas, &parts);
+            match d.present_scene(&mut frame) {
+                Ok(SceneOutcome::Drawn) => (Ok(()), None),
+                Ok(SceneOutcome::SceneFailed(msg)) => (Ok(()), Some(msg)),
+                Err(e) => (Err(e.message), e.scene_failed),
             }
+        }
+        other => {
+            let frame = frame_of(&other, canvas, &parts).expect("Gl 以外");
+            (d.present_frame(&frame), None)
+        }
+    };
+    let times = (ms(t0, t1), ms(t1, Instant::now()));
+    if let Some(msg) = scene_failed {
+        app.report_scene_failure(&msg);
+    }
+    shown.map(|()| times)
+}
+
+/// 実行ループが表示に求めること(試験で DRM なしの表示に差し替えるため)。
+pub(crate) trait FrameSink {
+    fn draw(&mut self, app: &mut dyn App, canvas: &mut Canvas) -> Result<(f32, f32), String>;
+}
+
+impl FrameSink for Presenter {
+    fn draw(&mut self, app: &mut dyn App, canvas: &mut Canvas) -> Result<(f32, f32), String> {
+        Presenter::draw(self, app, canvas)
+    }
+}
+
+/// 実行ループの 1 枚。描画の失敗(下地・EGL・page flip など)は、`?` で関数を抜けずに `run_err` へ入れて
+/// None を返す。呼び出し側(ループ)は `break` して、場面の解放を通る終了処理(`end_run`)へ進む。
+pub(crate) fn draw_frame(
+    display: &mut impl FrameSink,
+    app: &mut dyn App,
+    canvas: &mut Canvas,
+    run_err: &mut Option<String>,
+) -> Option<(f32, f32)> {
+    match display.draw(app, canvas) {
+        Ok(times) => Some(times),
+        Err(e) => {
+            eprintln!("描画に失敗: {e}");
+            *run_err = Some(e);
+            None
         }
     }
 }
@@ -327,6 +500,14 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     let mut display = Presenter::open(&drm_dev.fd, &cfg.display.renderer, &connector.name, mode)?;
     let (w, h) = display.size();
     eprintln!("mode: {w}x{h}@{}Hz", display.refresh());
+    // vrefresh が 0 のモードでも fps の上限と遅れの判定が効くよう、60Hz とみなす
+    let refresh_hz = match display.refresh() {
+        0 => {
+            eprintln!("mode: リフレッシュレートが 0Hz なので 60Hz とみなす");
+            60
+        }
+        hz => hz,
+    };
 
     let vt = VtGuard::enter();
     eprintln!(
@@ -384,6 +565,8 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     let mut panel_err: Option<String> = None;
     let mut panel_retry = Instant::now();
 
+    // ループが描画の失敗で終わったときのエラー(終了処理のあとに返す)
+    let mut run_err = None;
     let reason = loop {
         if term.load(Ordering::Relaxed) {
             break "シグナルを受信";
@@ -544,9 +727,14 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             published_display = ds;
         }
 
+        let mut drew = false;
         if redraw && screen_on {
             let t0 = Instant::now();
-            let (r, p) = display.draw(app.as_mut(), &mut canvas)?;
+            // 描画の失敗(下地・EGL・page flip など)でも、場面の解放を通る終了処理へ進む(`end_run`)
+            let Some((r, p)) = draw_frame(&mut display, app.as_mut(), &mut canvas, &mut run_err)
+            else {
+                break "描画エラー";
+            };
             render_ms.push(r);
             present_ms.push(p);
             photo_ms.extend(display.take_photo_build_ms());
@@ -554,12 +742,17 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             frames += 1;
             worst_ms = worst_ms.max(t0.elapsed().as_millis());
             // 60Hz で 1 枚飛ぶと間隔が 25ms を超える。どこで時間を使ったかを分けて残す(1 分に 10 件まで)
+            drew = true;
             if app.animating() {
                 let now = Instant::now();
                 if let Some(last) = anim_last {
                     let gap = now.duration_since(last).as_secs_f32() * 1000.0;
                     anim_frames += 1;
-                    if gap > 25.0 {
+                    // 間隔の上限があるときは、vsync 単位に切り上げた表示間隔に半フレームの余裕を足した値を超えたら遅れ
+                    let limit = app
+                        .frame_interval()
+                        .map_or(25.0, |d| late_limit_ms(d, refresh_hz));
+                    if gap > limit {
                         anim_slow += 1;
                         if anim_slow <= 10 {
                             eprintln!(
@@ -610,8 +803,13 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
         }
         // 動かし続ける画面は、表示の完了待ち(vsync)だけで間隔をとる(20ms 待つと 30fps に落ち、
         // 背景を描き直すフレームで 1 枚飛んで引っかかって見える)
-        if !(screen_on && app.animating()) {
-            std::thread::sleep(Duration::from_millis(20));
+        // 間隔の上限がある画面(キューブ)は、描いた直後に残りを待つ
+        match app.frame_interval().filter(|_| drew && screen_on) {
+            Some(d) => std::thread::sleep(frame_wait(d, refresh_hz)),
+            None if !(screen_on && app.animating()) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None => {}
         }
     };
 
@@ -620,12 +818,30 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     if !screen_on && session.is_enabled() {
         let _ = display.set_power(true);
     }
+    // 3D の GL オブジェクトは、表示を閉じる前に(GL が使えるうちに)消す
+    let result = end_run(run_err, app.as_mut(), |scenes| {
+        display.release_scenes(scenes)
+    });
     // 表示(元の CRTC を復元)→ 入力 → デバイスの順に解放する。VT は VtGuard が TEXT に戻す。
     drop(display);
     keys.close(&mut session);
     session.close_device(drm_dev);
     drop(vt);
-    Ok(())
+    result
+}
+
+/// 実行ループを抜けたあとの、場面の解放。`release_scenes` は GL が使えるうちに(表示を閉じる前に)呼ぶ。
+/// 描画の失敗で抜けたとき(`run_err`)も呼ぶ。解放はベストエフォートで、panic はログに出すだけ。元のエラーを返す。
+/// 3D が失敗した画面の場面は `app.gl_scenes()` に入らない(失敗したその場で `release` 済み)。
+pub(crate) fn end_run(
+    run_err: Option<String>,
+    app: &mut dyn App,
+    release_scenes: impl FnOnce(&mut [&mut dyn GlScene]) -> Vec<String>,
+) -> Result<(), String> {
+    for panic in release_scenes(&mut app.gl_scenes()) {
+        eprintln!("3D: release が panic した: {panic}");
+    }
+    run_err.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -653,6 +869,87 @@ mod tests {
             "stats: t=60s rss=81MB fds=26 frames=62 worst_frame=19ms ticks=61 keys=0 screen=Status(Overview) photo=1 feed=online cpu=Some(13.0) gpu=Some(45.0)"
         );
         eprintln!("{line}");
+    }
+
+    /// 間隔の上限の待ちは、間隔を vsync の整数倍に切り上げて vsync 半分を引いた時間(1 vsync 以下なら 0)。
+    #[test]
+    fn frame_wait_is_the_interval_minus_half_a_vsync() {
+        let w = frame_wait(Duration::from_secs_f64(1.0 / 30.0), 60);
+        assert!(
+            (w.as_secs_f64() - (1.0 / 30.0 - 1.0 / 120.0)).abs() < 1e-9,
+            "{w:?}"
+        );
+        assert_eq!(frame_wait(Duration::from_millis(2), 60), Duration::ZERO);
+        assert_eq!(frame_wait(Duration::from_millis(33), 0), Duration::ZERO);
+    }
+
+    /// 設定の fps と実際の表示間隔(待ち + vsync 半分 = vsync の整数倍)。上限を超えて速くならない。
+    #[test]
+    fn frame_wait_keeps_the_fps_cap_for_any_refresh_rate() {
+        let shown = |fps: u32, hz: u32| -> f64 {
+            let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
+            let wait = frame_wait(interval, hz).as_secs_f64();
+            // 待ち明けの直後の vsync で表示される(描画は一瞬で終わるとする。待ちが 0 なら毎 vsync)
+            let vsync = 1.0 / f64::from(hz);
+            (wait / vsync).ceil().max(1.0) * vsync
+        };
+        let fps = |f: u32, hz: u32| 1.0 / shown(f, hz);
+        // (設定の fps, Hz, 実際の fps)
+        for (set, hz, want) in [
+            (30, 60, 30.0),
+            (50, 60, 30.0),
+            (60, 60, 60.0),
+            (20, 60, 20.0),
+            (45, 60, 30.0),
+            (30, 75, 25.0),
+            (25, 75, 25.0),
+            (30, 144, 28.8),
+            (60, 144, 48.0),
+        ] {
+            let got = fps(set, hz);
+            assert!((got - want).abs() < 0.01, "{set}fps {hz}Hz: {got}");
+            assert!(
+                got <= f64::from(set) + 1e-6,
+                "{set}fps {hz}Hz が上限を超えた: {got}"
+            );
+        }
+        // 0(制限なし)は呼ばれないが、1 vsync 以下の間隔は待たない
+        assert_eq!(
+            frame_wait(Duration::from_secs_f64(1.0 / 120.0), 60),
+            Duration::ZERO
+        );
+        assert_eq!(
+            frame_wait(Duration::from_secs_f64(1.0 / 60.0), 60),
+            Duration::ZERO
+        );
+    }
+
+    /// 遅れの閾値は切り上げ後の表示間隔 + 半フレーム。正常な間隔は遅れにならず、1 vsync 落ちた間隔は遅れになる。
+    #[test]
+    fn late_limit_follows_the_displayed_interval() {
+        // (設定の fps, Hz, 正常な表示間隔 [ms])
+        for (set, hz, shown_ms) in [
+            (30, 60, 1000.0 / 30.0),
+            (50, 60, 1000.0 / 30.0),
+            (60, 60, 1000.0 / 60.0),
+            (30, 75, 40.0),
+            (60, 144, 1000.0 / 48.0),
+        ] {
+            let limit = late_limit_ms(Duration::from_secs_f64(1.0 / f64::from(set)), hz);
+            let vsync_ms = 1000.0 / hz as f32;
+            assert!(
+                shown_ms <= limit,
+                "{set}fps {hz}Hz: 正常な間隔が遅れになる {limit}"
+            );
+            assert!(
+                shown_ms + vsync_ms > limit,
+                "{set}fps {hz}Hz: 1 vsync 落ちても遅れにならない {limit}"
+            );
+        }
+        // 従来の 60Hz・30fps と同じ
+        let old = 1000.0 / 30.0 + 500.0 / 60.0;
+        let l = late_limit_ms(Duration::from_secs_f64(1.0 / 30.0), 60);
+        assert!((l - old).abs() < 0.01, "{l}");
     }
 
     #[test]
