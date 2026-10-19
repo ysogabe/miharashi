@@ -516,6 +516,14 @@ B に入る前の宿題(Issue #71 のコメント): sparse accessor の `byteStr
 4. 表情・口パク・身振りの入力(`tick` から `VrmScene` の具体型へ)。T3 Agent の状態との連動は B の範囲で決める。
 5. 実機で B の確認: 写真 + VRM と Agent + VRM で巡回、アラートが体の手前に出る(失敗させても出続ける)、`renderer = cpu` で元の画面(動かない写真画面が毎フレーム描き直されない)、壊れたモデルで落ちない(sparse の stride 検査を含む)。VRAM+GTT の保持量を測り、タイムアウト解放の要否を決める(§3)。下地が `Canvas` のとき(アラート表示中の Agent + VRM など)の CPU 使用率・描画時間を測り、`base_changed` の要否を決める(§10)。12 時間試験(#74 の分もここでまとめて行う)。
 
+T3 で決めたこと(実装: `app/screens/with_scene.rs`、設定 `[vrm]`):
+
+- 包むかどうかは `kiosk` が決める: `[vrm].enabled` で、その画面が `vrm.screens` にあり、GL が使える(`gpu_max.is_some()`)ときだけ `WithScene` で包む。`renderer = cpu` や `auto` で GLES を開けなかったときは包まない(包んでも ScreenManager が 3D を外すが、読み込みスレッドとモデルの RAM が無駄になる)。`WithScene` は GL の可否を知らない。
+- モデルの読み込みは、その画面が最初に表示されるとき(`on_enter` / `set_presentation(visible)`)に始める(`VrmScene::lazy` + `start`)。巡回に出ない画面のモデルは読まない。写真と Agent の両方に載せると、モデルは 2 回読む(RAM・VRAM が 2 倍。T4 で測る)。
+- 時刻・身振り・口パクは `tick` で進める(表示中かつ点灯中に経った時間。復帰でまとめて進めない)。SpringBone の `dt` と頭の向き(Agent 画面の拡大中のカードの方)は、描画の間隔で進めるため `render_composite` で入れる。指さしは使わない。
+- `scene_animating()` は、読み込みが `Ready` で、表示中かつ点灯中のあいだだけ true(アラート・メニューで覆われていても true)。読み込み中・失敗・非表示・消灯では false。`Ready` になった周期の `tick` は true を返して描き直させる。
+- `vrm.enabled = true` なのに `model` が空なら設定エラー(`panel.enabled` の `token_file` と同じ扱い)。ファイルの有無は確かめない(無い・壊れているモデルは 3D なしで動かす約束)。
+
 ### 11.3 既存 5 画面への影響
 
 **なし**。`Screen` / `App` に足すのは既定値つきのメソッドだけで、`Composite` に足すのは `Gl` の 1 つ。status / photo / room / aircraft / agents のコード・操作・巡回・パネルの契約は変えない。`runtime.rs` の `Composite` から `Frame` への変換は、`Gl` の腕を足し、下地の変換を関数に分けるだけで、既存の腕の中身は変えない。#5 の機能維持と MVP(#7)を阻害しない。回帰は #74 の項目(切り替え・汚した状態の後の描画)と、既存の PNG・テストで確かめる。

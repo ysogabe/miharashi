@@ -128,6 +128,18 @@
 # fps = 30          # 動いている間の描画の上限(0 = 制限せず vsync だけ)。リフレッシュレートの整数分の 1 に切り上げて守る
 #                   # (60Hz で 50 は 30fps、75Hz で 30 は 25fps)
 
+[vrm]
+# VRM のキャラクターを、写真画面と Agent 画面の脇に載せる(Issue #71 B。GLES のときだけ。既定は無効)。
+# 身振り・口パク・まばたきをし、Agent 画面では拡大したカードの方へ頭を向ける。画面の id・操作・巡回は変わらない。
+# renderer = cpu や、auto で GLES を開けなかったときは、載せずに元の画面のまま(モデルも読まない)。
+# モデルのファイルが無い・壊れているときも、3D なしで元の画面のまま動く(理由は journal に 1 回出る)。
+# モデルはリポジトリに入れず、ライセンスを確かめたものを自分で置く(VRM 1.0 のみ。0.x は読めない)。
+# enabled = false
+# model = "/var/lib/miharashi/vrm/model.vrm"   # 有効にするなら必須
+# screens = ["photo", "agents"]   # 載せる画面。agents は [agents] が無効なら出ない
+# region = "left"   # キャラクターの領域(画面の 1/3 幅): left / center / right。身振りの手は端で切れる
+# fps = 30          # 動いている間の描画の上限(1〜60)。リフレッシュレートの整数分の 1 に切り上げて守る
+
 [gl_check]
 # GL の状態をわざと汚したまま返す試験画面 dirty-a・dirty-b(実機の確認用。docs/DESIGN-screen-plugin-v2.md §5.5)。既定は無効。
 # 巡回の steps に書くと、直後の写真・Radar・Agent・キューブが崩れないことを目で確かめられる。

@@ -23,6 +23,7 @@ pub struct Config {
     pub agents: ConfigAgents,
     pub cube: Cube,
     pub gl_check: GlCheck,
+    pub vrm: Vrm,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -184,11 +185,51 @@ pub struct Cube {
     pub fps: u32,
 }
 
+/// VRM のキャラクターを写真・Agent 画面の脇に載せる(Issue #71 B。GLES のときだけ。既定は無効)。
+/// モデルはリポジトリに置かず、`model` でパスを指定する。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Vrm {
+    pub enabled: bool,
+    /// VRM 1.0 の glb ファイルのパス。有効にするなら必須。ファイルが無い・壊れていても、キオスクは 3D なしで動く
+    pub model: String,
+    /// 載せる画面の id(photo / agents)。agents は agents.enabled = false なら出ない
+    pub screens: Vec<String>,
+    /// キャラクターを描く領域(画面の 1/3 幅): left / center / right
+    pub region: String,
+    /// 動いている間の描画の上限 fps(1〜60)
+    pub fps: u32,
+}
+
 /// GL の状態をわざと汚す試験画面(`dirty-a`・`dirty-b`。実機の確認用)。既定は無効。
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct GlCheck {
     pub enabled: bool,
+}
+
+impl Vrm {
+    /// キャラクターを描く領域。`region` は検証済みの前提(それ以外は left)。
+    pub fn stage_region(&self) -> miharashi_vrm::StageRegion {
+        use miharashi_vrm::StageRegion;
+        match self.region.as_str() {
+            "center" => StageRegion::Center,
+            "right" => StageRegion::Right,
+            _ => StageRegion::Left,
+        }
+    }
+}
+
+impl Default for Vrm {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: String::new(),
+            screens: vec!["photo".into(), "agents".into()],
+            region: "left".into(),
+            fps: 30,
+        }
+    }
 }
 
 impl Default for Cube {
@@ -538,6 +579,26 @@ impl Config {
         if self.cube.fps > 240 {
             return Err("cube.fps は 0〜240(0 = 制限なし)".into());
         }
+        // VRM は無効でも値の形は確かめる(有効にしたときに初めて typo が分かるのを避ける)。
+        // モデルのパスは、有効なのに無いときだけエラー(panel.enabled の token_file と同じ)。
+        // ファイルがあるかは確かめない: 無い・壊れているモデルは 3D なしで動かす約束で、起動を止めない
+        let v = &self.vrm;
+        if let Some(id) = v
+            .screens
+            .iter()
+            .find(|id| !matches!(id.as_str(), "photo" | "agents"))
+        {
+            return Err(format!("vrm.screens に未知の画面 {id:?}(photo / agents)"));
+        }
+        if !matches!(v.region.as_str(), "left" | "center" | "right") {
+            return Err("vrm.region は left / center / right".into());
+        }
+        if !(1..=60).contains(&v.fps) {
+            return Err("vrm.fps は 1〜60".into());
+        }
+        if v.enabled && (v.model.is_empty() || v.screens.is_empty()) {
+            return Err("vrm.enabled = true には vrm.model と vrm.screens が要る".into());
+        }
         let start = self.ui.start_screen.as_str();
         if GL_SCREENS.contains(&start) {
             if !gl_enabled(start) {
@@ -877,6 +938,60 @@ mod tests {
         assert!(on("geoframe-n100:8790").is_err(), "名前ではなく IP");
         // 無効なら listen が空でもよい
         assert!(Config::parse("[panel]\nmax_rate_per_sec = 5\n").is_ok());
+    }
+
+    /// VRM は既定で無効(設定を足さなければ本番の動きは変わらない)。有効にするにはモデルのパスが要り、
+    /// 値の形は無効でも確かめる。ファイルがあるかは確かめない(無くても 3D なしで動く)。
+    #[test]
+    fn vrm_is_off_by_default_and_validates() {
+        let c = Config::default();
+        assert!(!c.vrm.enabled && c.vrm.model.is_empty());
+        assert_eq!(c.vrm.screens, ["photo", "agents"]);
+        assert_eq!((c.vrm.region.as_str(), c.vrm.fps), ("left", 30));
+        assert!(Config::parse("").is_ok());
+
+        let ok = "[vrm]\nenabled = true\nmodel = \"/var/lib/miharashi/vrm/model.vrm\"\n";
+        let c = Config::parse(ok).unwrap();
+        assert!(c.vrm.enabled);
+        assert_eq!(c.vrm.model, "/var/lib/miharashi/vrm/model.vrm");
+        assert!(
+            Config::parse("[vrm]\nenabled = true\n").is_err(),
+            "有効なのにモデルが無い"
+        );
+        assert!(
+            Config::parse(&format!("{ok}screens = []\n")).is_err(),
+            "有効なのに載せる画面が無い"
+        );
+        assert!(Config::parse(&format!("{ok}screens = [\"photo\"]\n")).is_ok());
+        assert!(Config::parse(&format!("{ok}screens = [\"agents\"]\n")).is_ok());
+        assert!(
+            Config::parse(&format!("{ok}screens = [\"room\"]\n")).is_err(),
+            "未知の画面"
+        );
+        assert!(Config::parse("[vrm]\nscreens = [\"status\"]\n").is_err());
+        for region in ["left", "center", "right"] {
+            assert!(Config::parse(&format!("{ok}region = \"{region}\"\n")).is_ok());
+        }
+        assert!(Config::parse(&format!("{ok}region = \"full\"\n")).is_err());
+        for fps in [1, 30, 60] {
+            assert!(
+                Config::parse(&format!("{ok}fps = {fps}\n")).is_ok(),
+                "{fps}"
+            );
+        }
+        for fps in [0, 61, 240] {
+            assert!(
+                Config::parse(&format!("{ok}fps = {fps}\n")).is_err(),
+                "{fps}"
+            );
+        }
+        assert!(
+            Config::parse("[vrm]\nfps = 100\n").is_err(),
+            "無効でも形は確かめる"
+        );
+        assert!(Config::parse("[vrm]\nenabled = false\nfpss = 30\n").is_err());
+        // agents が無効でも agents を載せる設定は通る(既定が両方なので、agents を使わない構成で困らない)
+        assert!(Config::parse(&format!("{ok}screens = [\"photo\", \"agents\"]\n")).is_ok());
     }
 
     #[test]

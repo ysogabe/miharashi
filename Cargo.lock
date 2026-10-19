@@ -1128,6 +1128,7 @@ dependencies = [
  "miharashi-linux",
  "miharashi-render",
  "miharashi-video",
+ "miharashi-vrm",
  "serde",
  "serde_json",
  "signal-hook",
