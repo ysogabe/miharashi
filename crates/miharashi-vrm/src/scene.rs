@@ -28,7 +28,8 @@ pub struct SceneInput {
     pub framing: Framing,
     /// カメラをモデルのまわりで回す角度 [rad]
     pub yaw: f32,
-    /// expression の weight。ここに挙げないものは 0 に戻る(未知の名前は無視してログに 1 回出す)
+    /// expression の weight。ここに挙げないものは 0 に戻る(このモデルにない名前は外し、ログに 1 回出す。
+    /// ほかの名前は適用する)
     pub expressions: Vec<(String, f32)>,
     /// 身振りを付けるか(humanoid の腕の骨がないモデルでは付かない)
     pub gesture: bool,
@@ -199,13 +200,18 @@ impl VrmScene {
             }
         }
         r.set_aim(self.input.aim);
-        let list: Vec<(&str, f32)> = self
+        // 未知の名前はこのモデルにないものとして外す(`set_expressions` は最初の未知の名前で止まり、
+        // 残りの有効な表情まで適用されなくなる)
+        let (known, unknown): (Vec<_>, Vec<_>) = self
             .input
             .expressions
             .iter()
             .map(|(n, w)| (n.as_str(), *w))
-            .collect();
-        if let Err(e) = r.set_expressions(&list) {
+            .partition(|(n, _)| r.model().vrm.expression(n).is_some());
+        if let Some((n, _)) = unknown.first() {
+            problem = Some(format!("expression {n} がない(ほかの表情は適用する)"));
+        }
+        if let Err(e) = r.set_expressions(&known) {
             problem = Some(e);
         }
         if let Some(e) = problem
@@ -495,6 +501,29 @@ mod tests {
             .filter(|&(x, y)| px(x, y)[..3] != [0, 0, 0])
             .count();
         assert!(inside > 500, "領域の中にモデルが重なっていない: {inside}");
+    }
+
+    /// 表情の入力: このモデルにない名前が混ざっても、ほかの表情は適用される。
+    #[test]
+    fn unknown_expression_does_not_block_the_others() {
+        let Some(off) = offscreen() else { return };
+        let count = Rc::new(ObjectCount::default());
+        off.with_fbo((64, 64), |gl| {
+            let mut scene = VrmScene::from_model(synth_model(), count.clone());
+            let _ = draw_layer(gl, &mut scene, (64, 64));
+            let base = scene.renderer.as_ref().unwrap().morphed_vertices(0);
+            scene.input.expressions = vec![("nothing".into(), 1.0), ("blink".into(), 1.0)];
+            let _ = draw_layer(gl, &mut scene, (64, 64));
+            let blinked = scene.renderer.as_ref().unwrap().morphed_vertices(0);
+            assert_ne!(base, blinked, "未知の名前のせいで blink が適用されない");
+            assert!(scene.input_warned, "未知の名前がログに出ていない");
+            // 空にすると 0 に戻る
+            scene.input.expressions.clear();
+            let _ = draw_layer(gl, &mut scene, (64, 64));
+            assert_eq!(base, scene.renderer.as_ref().unwrap().morphed_vertices(0));
+            scene.release(gl);
+        })
+        .unwrap();
     }
 
     /// 描かずに release しても安全(作っていないものは消さない)で、数えもずれない。
