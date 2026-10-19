@@ -9,7 +9,7 @@
 //! その理由は 1 回だけログに出し、`state` / `error` で外から問い合わせられる。
 use crate::gesture::Aim;
 use crate::model::Model;
-use crate::render::{Framing, Level, Renderer};
+use crate::render::{Created, Framing, Level, Renderer};
 use miharashi_glscene::{GlScene, GlTarget, ObjectCount};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
@@ -72,8 +72,11 @@ pub struct VrmScene {
     count: Rc<ObjectCount>,
     load: Load,
     level: Level,
-    /// GL 側。最初の `draw` で作り、`release` で消す
+    /// GL 側。最初の `draw` で作り、`release` で消す。描画中も持ったままにして、途中の panic でも
+    /// `release` が見つけられるようにする
     renderer: Option<Renderer>,
+    /// `renderer` を作っている途中の GL オブジェクトの控え。作りかけで panic しても残り、`release` が消す
+    building: Created,
     /// 次の `draw` が使う入力
     pub input: SceneInput,
     /// `renderer` に反映済みの身振りの有無(`renderer` を作り直すと `None` に戻る)
@@ -97,6 +100,7 @@ impl VrmScene {
             load,
             level: Level::Spring,
             renderer: None,
+            building: Created::default(),
             input: SceneInput::default(),
             gesture_applied: None,
             input_warned: false,
@@ -188,38 +192,46 @@ impl VrmScene {
         eprintln!("vrm: {reason}(3D なしで続ける)");
         self.load = Load::Failed(reason);
     }
+}
 
-    /// 入力を `Renderer` に流す。身振りを付けられない・未知の expression は、ログに 1 回出して続ける。
-    fn apply_input(&mut self, r: &mut Renderer) {
-        let mut problem = None;
-        if self.gesture_applied != Some(self.input.gesture) {
-            // 反映済みとして扱う(付けられないモデルで毎フレーム試さない)
-            self.gesture_applied = Some(self.input.gesture);
-            if let Err(e) = r.set_gesture(self.input.gesture) {
-                problem = Some(e);
-            }
-        }
-        r.set_aim(self.input.aim);
-        // 未知の名前はこのモデルにないものとして外す(`set_expressions` は最初の未知の名前で止まり、
-        // 残りの有効な表情まで適用されなくなる)
-        let (known, unknown): (Vec<_>, Vec<_>) = self
-            .input
-            .expressions
-            .iter()
-            .map(|(n, w)| (n.as_str(), *w))
-            .partition(|(n, _)| r.model().vrm.expression(n).is_some());
-        if let Some((n, _)) = unknown.first() {
-            problem = Some(format!("expression {n} がない(ほかの表情は適用する)"));
-        }
-        if let Err(e) = r.set_expressions(&known) {
+/// 入力を `Renderer` に流す。身振りを付けられない・未知の expression は、ログに 1 回出して続ける。
+/// `VrmScene` の別のフィールドを借りたまま呼べるよう、メソッドにしない(`renderer` を外さずに済ませる)。
+/// 毎フレーム呼ぶので、未知の名前がないふつうの場合はアロケーションしない。
+fn apply_input(
+    r: &mut Renderer,
+    model: &Model,
+    input: &SceneInput,
+    gesture_applied: &mut Option<bool>,
+    warned: &mut bool,
+) {
+    let mut problem = None;
+    if *gesture_applied != Some(input.gesture) {
+        // 反映済みとして扱う(付けられないモデルで毎フレーム試さない)
+        *gesture_applied = Some(input.gesture);
+        if let Err(e) = r.set_gesture(input.gesture) {
             problem = Some(e);
         }
-        if let Some(e) = problem
-            && !self.input_warned
-        {
-            self.input_warned = true;
-            eprintln!("vrm: {e}");
-        }
+    }
+    r.set_aim(input.aim);
+    // 未知の名前はこのモデルにないものとして外す(`set_expressions` は最初の未知の名前で止まり、
+    // 残りの有効な表情まで適用されなくなる)。警告の文字列は、これから警告するときだけ作る
+    let known = |n: &str| model.vrm.expression(n).is_some();
+    if !*warned && let Some((n, _)) = input.expressions.iter().find(|(n, _)| !known(n)) {
+        problem = Some(format!("expression {n} がない(ほかの表情は適用する)"));
+    }
+    let known_list = input
+        .expressions
+        .iter()
+        .filter(|(n, _)| known(n))
+        .map(|(n, w)| (n.as_str(), *w));
+    if let Err(e) = r.set_expressions_iter(known_list) {
+        problem = Some(e);
+    }
+    if let Some(e) = problem
+        && !*warned
+    {
+        *warned = true;
+        eprintln!("vrm: {e}");
     }
 }
 
@@ -235,7 +247,14 @@ impl GlScene for VrmScene {
             return Ok(());
         }
         if self.renderer.is_none() {
-            match Renderer::with_shared(gl, model, self.level, self.count.clone()) {
+            let built = Renderer::with_shared_tracked(
+                gl,
+                model.clone(),
+                self.level,
+                self.count.clone(),
+                &mut self.building,
+            );
+            match built {
                 Ok(mut r) => {
                     // 層は Compositor が (0,0,0,0) で塗ってある。不透明な既定色で塗り直して潰さない
                     r.clear_color = [0.0; 4];
@@ -243,20 +262,27 @@ impl GlScene for VrmScene {
                     self.renderer = Some(r);
                 }
                 Err(e) => {
-                    // 転送できないモデル(関節が多すぎるなど)。作りかけは `with_shared` が消している
+                    // 転送できないモデル(関節が多すぎるなど)。作りかけは `with_shared_tracked` が消している
                     self.fail(format!("GPU に転送できない: {e}"));
                     return Ok(());
                 }
             }
         }
-        // 入力の反映のために `renderer` を一時的に外す(`apply_input` が `self` も使うので)
-        let mut r = self.renderer.take().expect("直前に作った");
-        self.apply_input(&mut r);
+        // `renderer` は外さずに使う(途中で panic しても、`release` が見つけて消せる)
+        let Some(r) = self.renderer.as_mut() else {
+            return Ok(());
+        };
+        apply_input(
+            r,
+            &model,
+            &self.input,
+            &mut self.gesture_applied,
+            &mut self.input_warned,
+        );
         r.animate(self.input.t, self.input.dt);
         r.update(gl);
         let (vp, eye) = r.framing_camera(self.input.framing, target.size, self.input.yaw);
         r.render_camera(gl, target.size, &vp, eye);
-        self.renderer = Some(r);
         Ok(())
     }
 
@@ -264,6 +290,8 @@ impl GlScene for VrmScene {
         if let Some(r) = self.renderer.take() {
             r.destroy(gl);
         }
+        // 作りかけ(転送の途中で panic した)があれば、それも消す
+        std::mem::take(&mut self.building).delete(gl, &self.count);
         self.gesture_applied = None;
     }
 }
@@ -563,6 +591,166 @@ mod tests {
             assert_eq!(count.live(), 0);
         })
         .unwrap();
+    }
+
+    /// 層の FBO を作って `scene.draw` をそのまま呼ぶ(panic や Err を呼び出し側で受けるため、unwrap しない)。
+    fn draw_raw(gl: &glow::Context, scene: &mut VrmScene, size: (u32, u32)) -> Result<(), String> {
+        unsafe {
+            let (fbo, color, depth) = make_layer(gl, size);
+            gl.viewport(0, 0, size.0 as i32, size.1 as i32);
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
+            let r = catch_unwind(AssertUnwindSafe(|| scene.draw(gl, &GlTarget { fbo, size })));
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.delete_framebuffer(fbo);
+            gl.delete_texture(color);
+            gl.delete_renderbuffer(depth);
+            r.unwrap_or_else(|p| Err(format!("panic: {}", panic_message(&*p))))
+        }
+    }
+
+    /// 転送の途中で GL エラーになる(texture の wrap が不正)と、作りかけは Renderer が消して Err を返す。
+    /// 場面は 3D なしで続け、`release` のあとも数えがずれず、同じ `count` で正しいモデルを作り直せる。
+    #[test]
+    fn gl_error_after_creating_objects_leaves_nothing() {
+        let Some(off) = offscreen() else { return };
+        let count = Rc::new(ObjectCount::default());
+        off.with_fbo((64, 64), |gl| {
+            let mut model = synth_model();
+            model.textures[0].wrap_s = 0xFFFF;
+            let mut created = Created::default();
+            let err = Renderer::with_shared_tracked(
+                gl,
+                Rc::new(model),
+                Level::Spring,
+                count.clone(),
+                &mut created,
+            )
+            .err()
+            .expect("不正な wrap が通った");
+            assert!(err.contains("GL エラー"), "{err}");
+            assert!(count.created() > 5, "失敗を作りかけのあとに起こせていない");
+            assert_eq!(count.live(), 0, "Err のあとに作りかけが残る");
+            // 控えは空に戻っている(もう一度消しても数えは変わらない)
+            let deleted = count.deleted();
+            created.delete(gl, &count);
+            assert_eq!(count.deleted(), deleted);
+
+            // 場面を通しても同じ: Err にせず Failed で続け、release のあとも 0
+            let mut bad = synth_model();
+            bad.textures[0].wrap_s = 0xFFFF;
+            let mut scene = VrmScene::from_model(bad, count.clone());
+            draw_raw(gl, &mut scene, (64, 64)).unwrap();
+            assert_eq!(scene.state(), LoadState::Failed);
+            assert_eq!(count.live(), 0);
+            scene.release(gl);
+            scene.release(gl);
+            assert_eq!(count.live(), 0);
+
+            // 同じ count で、正しいモデルは作り直せる
+            let mut ok = VrmScene::from_model(synth_model(), count.clone());
+            draw_raw(gl, &mut ok, (64, 64)).unwrap();
+            assert!(count.live() > 0);
+            ok.release(gl);
+            assert_eq!(count.live(), 0);
+        })
+        .unwrap();
+    }
+
+    /// 転送の途中で panic しても(ここでは material の番号が範囲外)、作りかけは `release` が消し、
+    /// 2 回呼んでも安全で、その後の `draw` で作り直せる。
+    #[test]
+    fn panic_while_building_is_cleaned_by_release() {
+        let Some(off) = offscreen() else { return };
+        let count = Rc::new(ObjectCount::default());
+        off.with_fbo((64, 64), |gl| {
+            let mut model = synth_model();
+            model.primitives[0].material = usize::MAX;
+            let mut scene = VrmScene::from_model(model, count.clone());
+            let r = draw_raw(gl, &mut scene, (64, 64));
+            assert!(r.unwrap_err().starts_with("panic"), "panic しなかった");
+            assert!(count.live() > 0, "作りかけの状態を作れていない");
+            scene.release(gl);
+            assert_eq!(count.live(), 0, "作りかけが漏れた");
+            scene.release(gl);
+            assert_eq!(count.live(), 0);
+            no_gl_error(gl, "panic のあとの release");
+
+            // 解析結果を正しいものに差し替えて、同じ場面で作り直せる
+            scene.load = Load::Ready(Rc::new(synth_model()));
+            let created = count.created();
+            draw_raw(gl, &mut scene, (64, 64)).unwrap();
+            let fresh = count.created() - created;
+            assert!(count.live() > 0 && scene.renderer.is_some());
+            scene.release(gl);
+            assert_eq!(count.live(), 0);
+
+            let probe = Rc::new(ObjectCount::default());
+            let mut other = VrmScene::from_model(synth_model(), probe.clone());
+            draw_raw(gl, &mut other, (64, 64)).unwrap();
+            assert_eq!(fresh, probe.created(), "作り直しの数が違う");
+            other.release(gl);
+        })
+        .unwrap();
+    }
+
+    /// 描画の途中で panic しても Renderer を失わず、`release` で GL オブジェクトが 0 に戻る。
+    #[test]
+    fn panic_while_rendering_still_releases_renderer() {
+        let Some(off) = offscreen() else { return };
+        let count = Rc::new(ObjectCount::default());
+        off.with_fbo((64, 64), |gl| {
+            let mut scene = VrmScene::from_model(synth_model(), count.clone());
+            draw_raw(gl, &mut scene, (64, 64)).unwrap();
+            scene.renderer.as_mut().unwrap().break_render_for_test();
+            let r = draw_raw(gl, &mut scene, (64, 64));
+            assert!(r.unwrap_err().starts_with("panic"), "panic しなかった");
+            assert!(scene.renderer.is_some(), "panic で Renderer を失った");
+            assert!(count.live() > 0);
+            scene.release(gl);
+            assert_eq!(count.live(), 0, "描画中の panic で漏れた");
+            scene.release(gl);
+            assert_eq!(count.live(), 0);
+            // 作り直せる
+            draw_raw(gl, &mut scene, (64, 64)).unwrap();
+            assert!(count.live() > 0);
+            scene.release(gl);
+            assert_eq!(count.live(), 0);
+        })
+        .unwrap();
+    }
+
+    /// 半透明の素材(BLEND・alpha 0.5)でも出力は premultiplied(色 <= アルファ)で、半透明の画素が実際にある。
+    #[test]
+    fn translucent_material_output_is_premultiplied() {
+        let Some(off) = offscreen() else { return };
+        let size = (200u32, 300u32);
+        let count = Rc::new(ObjectCount::default());
+        let (img, _) = off
+            .with_fbo(size, |gl| {
+                let mut model = synth_model();
+                for m in &mut model.materials {
+                    m.alpha_mode = crate::AlphaMode::Blend;
+                    m.base_color[3] = 0.5;
+                }
+                let mut scene = VrmScene::from_model(model, count.clone());
+                let img = draw_layer(gl, &mut scene, size);
+                scene.release(gl);
+                img
+            })
+            .unwrap();
+        let px = img.as_chunks::<4>().0;
+        let translucent = px.iter().filter(|p| p[3] > 0 && p[3] < 255).count();
+        assert!(translucent > 500, "半透明の画素が少ない: {translucent}");
+        assert!(
+            px.iter().all(|p| p[..3].iter().all(|&c| c <= p[3])),
+            "色がアルファを超える(premultiplied でない)"
+        );
+        assert!(
+            px.iter().any(|p| p[..3].iter().any(|&c| c > 0)),
+            "色が全部 0"
+        );
+        assert_eq!(count.live(), 0);
     }
 
     /// 読み込みが終わるまで何も描かず Ok を返し、終わったあとの draw で描かれる。

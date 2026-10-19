@@ -295,9 +295,11 @@ struct Prog {
     locs: Locs,
 }
 
-/// `Renderer::new` の途中で作った GL オブジェクトの控え。失敗したときにまとめて消す。
+/// `Renderer` の転送の途中で作った GL オブジェクトの控え。失敗したときにまとめて消す。
+/// 呼び出し側が持つ(`Renderer::with_shared_tracked`)と、転送の途中で panic しても控えが残るので、
+/// 呼び出し側が `delete` で作りかけを消せる(Drop では GL の Context を使えない)。
 #[derive(Default)]
-struct Created {
+pub struct Created {
     programs: Vec<glow::Program>,
     vaos: Vec<glow::VertexArray>,
     buffers: Vec<glow::Buffer>,
@@ -305,7 +307,8 @@ struct Created {
 }
 
 impl Created {
-    fn delete(self, gl: &glow::Context, count: &ObjectCount) {
+    /// 控えにあるものをすべて消す(空なら何もしない)。
+    pub fn delete(self, gl: &glow::Context, count: &ObjectCount) {
         for v in self.vaos {
             count.delete_vertex_array(gl, v);
         }
@@ -454,18 +457,34 @@ impl Renderer {
 
     /// 解析結果を共有し(失敗しても、`release` したあとも呼び出し側に残る)、GL オブジェクトの作成・削除を
     /// `count` で数えて転送する。`with_level` と同じく、失敗したときは作りかけを消して返る。
+    /// 転送の途中で panic すると作りかけが残る。それを回収したいときは `with_shared_tracked` を使う。
     pub fn with_shared(
         gl: &glow::Context,
         model: Rc<Model>,
         level: Level,
         count: Rc<ObjectCount>,
     ) -> Result<Self, String> {
-        let mut created = Created::default();
+        Self::with_shared_tracked(gl, model, level, count, &mut Created::default())
+    }
+
+    /// `with_shared` と同じだが、作ったものの控えを呼び出し側の `created` に付ける。
+    /// 失敗(Err)では控えを消して空に戻す。成功すると控えは空に戻り、以後の所有は `Renderer` が持つ(`destroy` で消す)。
+    /// 転送の途中で panic した場合は、作りかけが `created` に残る。呼び出し側がその `delete` で回収する。
+    pub fn with_shared_tracked(
+        gl: &glow::Context,
+        model: Rc<Model>,
+        level: Level,
+        count: Rc<ObjectCount>,
+        created: &mut Created,
+    ) -> Result<Self, String> {
         unsafe {
-            match Self::build(gl, model, level, count.clone(), &mut created) {
-                Ok(r) => Ok(r),
+            match Self::build(gl, model, level, count.clone(), created) {
+                Ok(r) => {
+                    *created = Created::default();
+                    Ok(r)
+                }
                 Err(e) => {
-                    created.delete(gl, &count);
+                    std::mem::take(created).delete(gl, &count);
                     // 途中で立った GL エラーを呼び出し側に残さない
                     for _ in 0..32 {
                         if gl.get_error() == glow::NO_ERROR {
@@ -757,10 +776,18 @@ impl Renderer {
     /// expression の weight(0..1)を与える。ここに挙げないものは 0 に戻る。
     /// 実際の頂点の更新は `update` で行う。
     pub fn set_expressions(&mut self, list: &[(&str, f32)]) -> Result<(), String> {
+        self.set_expressions_iter(list.iter().copied())
+    }
+
+    /// `set_expressions` の、スライスを作らずに渡せる版(毎フレーム呼ぶ側がアロケーションを避けるため)。
+    pub fn set_expressions_iter<'a>(
+        &mut self,
+        list: impl IntoIterator<Item = (&'a str, f32)>,
+    ) -> Result<(), String> {
         for w in self.weights.values_mut() {
             w.fill(0.0);
         }
-        for &(name, value) in list {
+        for (name, value) in list {
             let e = self
                 .model
                 .vrm
@@ -1056,6 +1083,13 @@ impl Renderer {
             gl.disable(glow::CULL_FACE);
             gl.disable(glow::DEPTH_TEST);
         }
+    }
+
+    /// 試験用: 描画の途中で panic させる(`order_solid` に存在しないプリミティブ番号を足す)。
+    /// 持っている GL オブジェクトは変えないので、`destroy` の結果は変わらない。
+    #[cfg(test)]
+    pub(crate) fn break_render_for_test(&mut self) {
+        self.order_solid.push(usize::MAX);
     }
 
     /// GPU リソースをすべて解放する。
