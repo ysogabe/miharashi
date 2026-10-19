@@ -216,6 +216,42 @@ fn inner_interval_wins_while_the_inner_screen_animates() {
             self.0.get()
         }
     }
+    /// 動いていて、決まった間隔(33ms の VRM より短い・長い)を返す画面
+    struct Paced(Duration);
+    impl Screen for Paced {
+        fn id(&self) -> ScreenId {
+            "paced"
+        }
+        fn title(&self) -> &'static str {
+            "PACED"
+        }
+        fn render(&mut self, ctx: &mut RenderContext<'_>) {
+            ctx.canvas.clear(rgba(40, 80, 120, 255));
+        }
+        fn animating(&self) -> bool {
+            true
+        }
+        fn frame_interval(&self) -> Option<Duration> {
+            Some(self.0)
+        }
+    }
+    // VRM が 33ms でも、内側が動いていれば 10ms でも 77ms でも内側の値(短い方を選ぶのではない)
+    for ms in [10, 77] {
+        let mut s = WithScene::new(
+            Paced(Duration::from_millis(ms)),
+            ready_scene(),
+            StageRegion::Left,
+            30,
+        );
+        s.set_presentation(true, false, true, Instant::now());
+        assert!(s.scene_animating());
+        assert_eq!(
+            s.frame_interval(),
+            Some(Duration::from_millis(ms)),
+            "{ms}ms"
+        );
+    }
+
     let moving = Rc::new(std::cell::Cell::new(true));
     let screens: Vec<Box<dyn Screen>> = vec![Box::new(WithScene::new(
         Mover(moving.clone()),

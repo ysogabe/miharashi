@@ -1052,12 +1052,24 @@ mod tests {
             .unwrap();
         let names = ["photo-vrm-gles.png", "agents-vrm-gles.png"];
         let (a, b) = (dir.join("a"), dir.join("b"));
-        if png_with(cli_for(&a, &photo, "auto"), &open_gles_checker).is_err()
-            || !names.iter().all(|n| a.join(n).exists())
-        {
+        // skip は GLES を開けないときだけ。開けたあとの描画・保存の失敗はテストの失敗にする。
+        let opened = std::rc::Rc::new(std::cell::Cell::new(false));
+        let open = {
+            let opened = opened.clone();
+            move |cfg: &Config| {
+                let r = open_gles_checker(cfg);
+                opened.set(r.is_ok());
+                r
+            }
+        };
+        png_with(cli_for(&a, &photo, "auto"), &open).unwrap();
+        if !opened.get() {
             eprintln!("skip: GLES を開けない");
             let _ = std::fs::remove_dir_all(&dir);
             return;
+        }
+        for n in names {
+            assert!(a.join(n).exists(), "{n} がない");
         }
         // 時計の秒が必ず変わるだけ待つ
         std::thread::sleep(std::time::Duration::from_millis(1100));
