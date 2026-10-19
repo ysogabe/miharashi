@@ -106,16 +106,37 @@ pub struct Stats {
 }
 
 impl Model {
+    /// 外から来るファイルを読む入口。壊れていても panic せず `Err` を返す(`from_glb` を参照)。
     pub fn from_path(path: &Path) -> Result<Self, String> {
-        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Self::from_glb(&bytes)
+        Self::from_path_with(path, &LIMITS)
     }
 
+    fn from_path_with(path: &Path, limits: &Limits) -> Result<Self, String> {
+        let name = path.display();
+        // 読む前に大きさを見る(読んだあとの複製で、ファイルの 3〜4 倍のメモリを使うので)
+        let len = std::fs::metadata(path)
+            .map_err(|e| format!("{name}: {e}"))?
+            .len();
+        limits.check_file_size(len)?;
+        let bytes = std::fs::read(path).map_err(|e| format!("{name}: {e}"))?;
+        Self::from_glb_with(&bytes, limits)
+    }
+
+    /// 外から来るバイト列を読む入口。kiosk はこちら(か `from_path`)を使う。
+    ///
+    /// 読み込み全体を `catch_unwind` で包んでおり、gltf などの依存クレートの中で panic しても
+    /// `Err` として返す(個別の検査で塞ぎきれなかった panic への最後の防御)。
+    /// ワークスペースの profile を `panic = "abort"` にすると、この防御は効かなくなる。
     pub fn from_glb(bytes: &[u8]) -> Result<Self, String> {
         Self::from_glb_with(bytes, &LIMITS)
     }
 
     fn from_glb_with(bytes: &[u8], limits: &Limits) -> Result<Self, String> {
+        guard_panic(|| Self::load_glb(bytes, limits))
+    }
+
+    fn load_glb(bytes: &[u8], limits: &Limits) -> Result<Self, String> {
+        limits.check_file_size(bytes.len() as u64)?;
         let json = vrm::glb_json(bytes)?;
         let mut vrm = vrm::parse(&json)?;
         let patched = zero_fill_empty_accessors(bytes, &json)?;
@@ -127,6 +148,7 @@ impl Model {
         } = gltf::Gltf::from_slice(patched.as_deref().unwrap_or(bytes))
             .map_err(|e| format!("glb を読めない: {e}"))?;
         limits.check_counts(&doc)?;
+        check_buffer_sources(&doc)?;
         let buffers =
             gltf::import_buffers(&doc, None, blob).map_err(|e| format!("glb を読めない: {e}"))?;
         for v in doc.views() {
@@ -264,6 +286,8 @@ impl Model {
             meshes.insert(mesh.index());
             let skin = node.skin().map(|s| s.index());
             for prim in mesh.primitives() {
+                // 三角形でないものも、ノードの数だけ回るので先に数える
+                spend("プリミティブ", &mut spent.primitives, 1, limits.primitives)?;
                 if prim.mode() != gltf::mesh::Mode::Triangles {
                     continue;
                 }
@@ -450,7 +474,7 @@ struct Limits {
     skins: usize,
     /// 全スキンの関節数の合計
     joints: usize,
-    /// 読んだ(三角形の)プリミティブの数。同じ mesh を指すノードは数だけ読み直す
+    /// ノードが指すプリミティブの数(三角形以外も数える)。同じ mesh を指すノードは数だけ読み直す
     primitives: usize,
     vertices: usize,
     indices: usize,
@@ -466,6 +490,9 @@ struct Limits {
     image_bytes: u64,
     /// 全画像の RGBA 換算の大きさの合計(Model が持ち続ける量)の上限
     image_total: u64,
+    /// glb ファイルの大きさ。ニケちゃん(約 24 MB)の 40 倍あまり。読んだあとの複製で、
+    /// ファイルの 3〜4 倍のメモリを使う
+    file_bytes: u64,
 }
 
 const LIMITS: Limits = Limits {
@@ -481,6 +508,7 @@ const LIMITS: Limits = Limits {
     image_side: 8192,
     image_bytes: 256 << 20,
     image_total: 1 << 30,
+    file_bytes: 1 << 30,
 };
 
 /// ここまでに使った予算(`Limits` と同じ単位)。
@@ -503,7 +531,47 @@ fn spend(what: &str, used: &mut usize, add: usize, limit: usize) -> Result<(), S
     Ok(())
 }
 
+/// `f` の中の panic を `Err` にして返す。
+///
+/// 前提: profile が `panic = "unwind"`(既定)であること。`abort` にすると捕まえられない。
+fn guard_panic<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|p| {
+        let msg = p
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "(メッセージなし)".into());
+        Err(format!("モデルの読み込みで内部エラー: {msg}"))
+    })
+}
+
+/// buffer は glb の BIN チャンクか `data:` URI だけ読む。`gltf::import_buffers` は、
+/// 不正なパーセントエンコードの相対 URI(`%FF` など)で、外部参照を断る前に panic するので、
+/// 呼ぶ前に弾く。
+fn check_buffer_sources(doc: &gltf::Document) -> Result<(), String> {
+    for b in doc.buffers() {
+        match b.source() {
+            gltf::buffer::Source::Bin => {}
+            gltf::buffer::Source::Uri(u) if u.starts_with("data:") => {}
+            gltf::buffer::Source::Uri(_) => {
+                return Err(format!("buffer {} が外部ファイルを参照している", b.index()));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Limits {
+    fn check_file_size(&self, len: u64) -> Result<(), String> {
+        if len > self.file_bytes {
+            return Err(format!(
+                "ファイルが大きすぎる({len} バイト、上限 {})",
+                self.file_bytes
+            ));
+        }
+        Ok(())
+    }
+
     /// buffer を読む前に、数だけで分かる上限を確かめる。
     fn check_counts(&self, doc: &gltf::Document) -> Result<(), String> {
         let counts = [
@@ -1020,7 +1088,6 @@ fn read_primitive(
     let n = check_attributes(prim)?;
     // 確保の前に予算を使う(同じ mesh を指すノードや同じ accessor を指す target を並べても、
     // ここで頭打ちになる)
-    spend("プリミティブ", &mut spent.primitives, 1, limits.primitives)?;
     spend("頂点", &mut spent.vertices, n, limits.vertices)?;
     let index_count = prim.indices().map_or(n, |a| a.count());
     spend(
@@ -1631,7 +1698,9 @@ mod tests {
                 ..LIMITS
             },
         );
-        assert!(e.is_err());
+        // image クレートの幅・高さの上限の文言
+        let e = e.err().unwrap();
+        assert!(e.contains("画像 0") && e.contains("exceeds limit"), "{e}");
         let e = load_with(
             &copies(1),
             &b,
@@ -1648,7 +1717,93 @@ mod tests {
             .unwrap();
         let mut d = d0.clone();
         d["images"][0] = json!({ "uri": format!("data:image/png;base64,{}", base64(&enc)) });
-        assert!(load(&d, &b).is_err());
+        let e = load(&d, &b).err().unwrap();
+        assert!(e.contains("exceeds limit"), "{e}");
+    }
+
+    #[test]
+    fn buffer_uri_is_rejected_without_panicking() {
+        // 不正なパーセントエンコードは、gltf の import_buffers が外部参照を断る前に panic する
+        let (d0, b) = doc();
+        for uri in [
+            "%FF",
+            "tex.bin",
+            "../tex.bin",
+            "file:///etc/passwd",
+            "http://x/y",
+        ] {
+            let mut d = d0.clone();
+            d["buffers"][0]["uri"] = json!(uri);
+            let e = load(&d, &b).err().unwrap();
+            assert!(e.contains("外部"), "{uri}: {e}");
+        }
+        // data: URI の buffer は読める(BIN チャンクを使わない)
+        let mut d = d0.clone();
+        d["buffers"][0]["uri"] = json!(format!(
+            "data:application/octet-stream;base64,{}",
+            base64(&b)
+        ));
+        let want = load(&d0, &b).unwrap().stats();
+        assert_eq!(load(&d, &[]).unwrap().stats().vertices, want.vertices);
+    }
+
+    #[test]
+    fn panic_inside_loading_becomes_error() {
+        let e = guard_panic::<()>(|| panic!("boom {}", 1)).err().unwrap();
+        assert!(e.contains("内部エラー") && e.contains("boom 1"), "{e}");
+        let e = guard_panic::<()>(|| panic!("literal")).err().unwrap();
+        assert!(e.contains("literal"), "{e}");
+        assert_eq!(guard_panic(|| Ok(3)).unwrap(), 3);
+        assert_eq!(guard_panic::<()>(|| Err("x".into())).err().unwrap(), "x");
+    }
+
+    #[test]
+    fn non_triangle_primitives_count_against_the_budget() {
+        let (mut d, b) = doc();
+        d["meshes"][1]["primitives"][0]["mode"] = json!(0);
+        add_nodes(&mut d, 1, 50);
+        let e = load_with(
+            &d,
+            &b,
+            &Limits {
+                primitives: 20,
+                ..LIMITS
+            },
+        );
+        assert!(e.err().unwrap().contains("プリミティブ"));
+    }
+
+    #[test]
+    fn oversized_file_is_rejected_before_reading() {
+        let (d, b) = doc();
+        let glb = pack_glb(&d, &b);
+        let tight = Limits {
+            file_bytes: glb.len() as u64 - 1,
+            ..LIMITS
+        };
+        assert!(
+            Model::from_glb_with(&glb, &tight)
+                .err()
+                .unwrap()
+                .contains("大きすぎる")
+        );
+        let ok = Limits {
+            file_bytes: glb.len() as u64,
+            ..LIMITS
+        };
+        assert!(Model::from_glb_with(&glb, &ok).is_ok());
+        // from_path は、読む前に metadata の大きさで弾く(中身は 1 バイトも読まない疎なファイル)
+        let path =
+            std::env::temp_dir().join(format!("miharashi-vrm-big-{}.glb", std::process::id()));
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(LIMITS.file_bytes + 1).unwrap();
+        let e = Model::from_path(&path).err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(e.unwrap().contains("大きすぎる"));
+        std::fs::write(&path, &glb).unwrap();
+        let r = Model::from_path(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(r.is_ok());
     }
 
     /// 同じ mesh を指すノードを `n` 個足す(シーンの根に並べる)。
