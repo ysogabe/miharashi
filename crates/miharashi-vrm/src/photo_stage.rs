@@ -288,7 +288,7 @@ mod tests {
     /// VRM の外は写真のまま、VRM のある所は変わること(vrm-view の描き方を表示なしで確かめる)。
     #[test]
     fn vrm_layer_overlays_photo_frame_offscreen() {
-        use crate::{Framing, Model, Region, Renderer, VrmLayer, synth};
+        use crate::{Framing, Model, Renderer, StageRegion, VrmLayer, synth};
         use miharashi_gpu::Offscreen;
         use miharashi_gpu::compose::Compositor;
         let Ok(off) = Offscreen::open(Path::new("/dev/dri/renderD128")) else {
@@ -303,7 +303,7 @@ mod tests {
             Duration::from_secs(10),
             t0,
         );
-        let (rx, ry, rw, rh) = Region::Left.rect(size);
+        let (rx, ry, rw, rh) = StageRegion::Left.rect(size);
         let (_, img) = off
             .with_fbo(size, |gl| {
                 let target = unsafe {

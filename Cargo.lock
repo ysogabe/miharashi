@@ -1197,6 +1197,7 @@ dependencies = [
  "gltf",
  "image",
  "libc",
+ "miharashi-glscene",
  "miharashi-gpu",
  "miharashi-linux",
  "miharashi-render",

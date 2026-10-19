@@ -23,5 +23,5 @@ pub mod vrm;
 pub use layer::VrmLayer;
 pub use model::{AlphaMode, Model, Stats};
 pub use render::{
-    Framing, Level, Region, Renderer, UpdateTimes, attach_depth, detach_depth, view_proj,
+    Framing, Level, Renderer, StageRegion, UpdateTimes, attach_depth, detach_depth, view_proj,
 };

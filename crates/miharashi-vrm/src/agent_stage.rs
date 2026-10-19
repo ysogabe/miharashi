@@ -1081,7 +1081,7 @@ mod tests {
         off: &miharashi_gpu::Offscreen,
         size: (u32, u32),
         model_path: Option<&str>,
-        region: crate::Region,
+        region: crate::StageRegion,
         frame: crate::Framing,
         follow: bool,
         secs: f32,
@@ -1150,7 +1150,7 @@ mod tests {
 
     #[test]
     fn vrm_layer_overlays_agent_frame_offscreen() {
-        use crate::{Framing, Region};
+        use crate::{Framing, StageRegion};
         let Ok(off) = miharashi_gpu::Offscreen::open(std::path::Path::new("/dev/dri/renderD128"))
         else {
             eprintln!("GLES が使えないので skip");
@@ -1162,23 +1162,29 @@ mod tests {
             let dir = std::path::Path::new(&dir);
             std::fs::create_dir_all(dir).unwrap();
             // (名前, 時刻, 領域, 構図, 連動)。カードの変化は 3 秒ごと、最初のフォーカスは 3.0〜9.5 秒
-            let shots: &[(&str, f32, Region, Framing, bool)] = &[
-                ("a-before-right", 2.0, Region::Right, Framing::Bust, true),
-                ("b-in-right", 3.4, Region::Right, Framing::Bust, true),
-                ("c-hold-right", 6.0, Region::Right, Framing::Bust, true),
-                ("d-out-right", 9.1, Region::Right, Framing::Bust, true),
-                ("e-hold-left", 6.0, Region::Left, Framing::Bust, true),
+            let shots: &[(&str, f32, StageRegion, Framing, bool)] = &[
+                (
+                    "a-before-right",
+                    2.0,
+                    StageRegion::Right,
+                    Framing::Bust,
+                    true,
+                ),
+                ("b-in-right", 3.4, StageRegion::Right, Framing::Bust, true),
+                ("c-hold-right", 6.0, StageRegion::Right, Framing::Bust, true),
+                ("d-out-right", 9.1, StageRegion::Right, Framing::Bust, true),
+                ("e-hold-left", 6.0, StageRegion::Left, Framing::Bust, true),
                 (
                     "f-hold-right-nofollow",
                     6.0,
-                    Region::Right,
+                    StageRegion::Right,
                     Framing::Bust,
                     false,
                 ),
                 (
                     "g-hold-right-waist",
                     6.0,
-                    Region::Right,
+                    StageRegion::Right,
                     Framing::Waist,
                     true,
                 ),
@@ -1202,9 +1208,25 @@ mod tests {
         }
         // 合成モデルで: 領域の中にモデルが描かれ、領域の外はカードのまま。フォーカス中は scrim で暗くなる
         let size = (1280u32, 540u32);
-        let (rx, _, rw, _) = Region::Right.rect(size);
-        let before = render_at(&off, size, None, Region::Right, Framing::Full, false, 1.0);
-        let hold = render_at(&off, size, None, Region::Right, Framing::Full, false, 6.0);
+        let (rx, _, rw, _) = StageRegion::Right.rect(size);
+        let before = render_at(
+            &off,
+            size,
+            None,
+            StageRegion::Right,
+            Framing::Full,
+            false,
+            1.0,
+        );
+        let hold = render_at(
+            &off,
+            size,
+            None,
+            StageRegion::Right,
+            Framing::Full,
+            false,
+            6.0,
+        );
         let px = |img: &[u8], x: u32, y: u32| -> [u8; 4] {
             img[((y * size.0 + x) * 4) as usize..][..4]
                 .try_into()
