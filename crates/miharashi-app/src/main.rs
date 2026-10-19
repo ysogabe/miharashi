@@ -191,6 +191,11 @@ fn run(_: Cli) -> Result<(), String> {
 }
 
 fn png(cli: Cli) -> Result<(), String> {
+    png_with(cli, &open_gles_checker)
+}
+
+/// `png` の本体。GPU の検出と初期化(`open`)を差し替えられる(GPU のない環境の試験用)。
+fn png_with(cli: Cli, open: &OpenGles) -> Result<(), String> {
     let cfg = load_config(&cli)?;
     let size = cli.size.unwrap_or((1920, 1080));
     let out = cli.out.clone().unwrap_or_else(|| "work/out".into());
@@ -206,7 +211,7 @@ fn png(cli: Cli) -> Result<(), String> {
         app::set_clock(&mut s);
         snap = s;
     }
-    let mut gles = gles_checker(&cfg, cli.renderer.is_some())?;
+    let mut gles = gles_checker(&cfg, cli.renderer.is_some(), open)?;
     // GLES の検証では写真をデコードしただけで受け取って GPU で合成し、CPU 版の完成フレームは別に作る
     let src = source(&cfg, &cli);
     let grouping = Grouping {
@@ -545,12 +550,28 @@ enum Layers<'a> {
     Scene(miharashi_gpu::SceneFrame<'a>),
 }
 
-#[cfg(target_os = "linux")]
-fn gles_checker(cfg: &Config, asked: bool) -> Result<Option<GlesCheck>, String> {
-    use miharashi_linux::drm_select::{CardSel, choose_card, scan};
+/// GPU の検出と初期化(表示カードの選択・PCI・render node を開く)をまとめたもの。
+type OpenGles = dyn Fn(&Config) -> Result<GlesCheck, String>;
+
+/// `--renderer` が指定されたときの GLES 検証の準備。`auto` は GPU が使えなければ理由をログに出して
+/// None(GPU なし。CPU の画像と案内だけ保存する)、`gles` は明示なのでエラーにする。
+fn gles_checker(cfg: &Config, asked: bool, open: &OpenGles) -> Result<Option<GlesCheck>, String> {
     if !asked || cfg.display.renderer == "cpu" {
         return Ok(None);
     }
+    match open(cfg) {
+        Ok(check) => Ok(Some(check)),
+        Err(e) if cfg.display.renderer == "auto" => {
+            eprintln!("gles: GPU を使えない({e})。CPU の画像と案内だけ保存する");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_gles_checker(cfg: &Config) -> Result<GlesCheck, String> {
+    use miharashi_linux::drm_select::{CardSel, choose_card, scan};
     let cards = scan();
     let card = choose_card(&cards, &CardSel::parse(&cfg.display.card))?;
     let pci = card
@@ -560,7 +581,7 @@ fn gles_checker(cfg: &Config, asked: bool) -> Result<Option<GlesCheck>, String> 
     let node = miharashi_gpu::render_node_for_pci(pci);
     let off = miharashi_gpu::Offscreen::open(&node)?;
     println!("gles: {} ({})", node.display(), off.describe());
-    Ok(Some(Box::new(
+    Ok(Box::new(
         move |c: &Canvas, layers, path: &std::path::Path| {
             use miharashi_gpu::{Frame, SceneOutcome};
             let (w, h) = (c.width(), c.height());
@@ -609,15 +630,12 @@ fn gles_checker(cfg: &Config, asked: bool) -> Result<Option<GlesCheck>, String> 
             );
             Ok(())
         },
-    )))
+    ))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn gles_checker(_: &Config, asked: bool) -> Result<Option<GlesCheck>, String> {
-    if asked {
-        return Err("--renderer は Linux 専用".into());
-    }
-    Ok(None)
+fn open_gles_checker(_: &Config) -> Result<GlesCheck, String> {
+    Err("--renderer は Linux 専用".into())
 }
 
 /// CPU 描画のベースライン。`--size` を省くと 1920x1080 と 2560x1080 の両方を測る。
@@ -837,5 +855,54 @@ fn main() -> Result<(), String> {
         other => Err(format!(
             "unknown command {other}(run / png / agents-demo / bench / bench-gpu / bench-scene / bench-metrics / kms-info / check-config)"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli_for(out: &std::path::Path, photo: &std::path::Path, renderer: &str) -> Cli {
+        Cli {
+            config: Some("/dev/null".into()),
+            out: Some(out.into()),
+            size: Some((96, 54)),
+            photo: Some(photo.into()),
+            renderer: Some(renderer.into()),
+            ..Cli::default()
+        }
+    }
+
+    fn no_gpu(_: &Config) -> Result<GlesCheck, String> {
+        Err("GPU が見えない(試験)".into())
+    }
+
+    /// GPU が使えない環境の `png --renderer auto` は、CPU の画像と案内を保存して成功し、
+    /// `*-gles.png` は作らない。明示した `gles` はエラーのまま。
+    #[test]
+    fn png_auto_without_gpu_saves_the_notice_but_gles_fails() {
+        let dir = std::env::temp_dir().join(format!("miharashi-png-nogpu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = dir.join("in.png");
+        image::RgbImage::from_pixel(64, 48, image::Rgb([90, 120, 200]))
+            .save(&photo)
+            .unwrap();
+
+        let out = dir.join("auto");
+        png_with(cli_for(&out, &photo, "auto"), &no_gpu).expect("auto は GPU なしで続ける");
+        assert!(out.join("scene-notice.png").exists());
+        assert!(out.join("status.png").exists());
+        let gles: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.ends_with("-gles.png"))
+            .collect();
+        assert!(gles.is_empty(), "{gles:?}");
+
+        let out = dir.join("gles");
+        let err = png_with(cli_for(&out, &photo, "gles"), &no_gpu).unwrap_err();
+        assert!(err.contains("GPU が見えない"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

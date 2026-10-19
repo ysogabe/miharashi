@@ -334,7 +334,7 @@ flowchart LR
 
 ### 5.5 #74 と #71 B でやること
 
-- **#74**: `reset_gl_state` を作り、`draw_scene` の中で 2 回呼ぶ。**わざと状態を汚す試験画面**を作る(`CULL_FACE` 有効、`SCISSOR` を小さく、`color_mask` の一部を false、`UNPACK_ROW_LENGTH` を非ゼロ、`TEXTURE1` に別のテクスチャ、blend を有効のまま、FBO を別のものに)。その直後に写真画面を描いて、PNG が汚していないときと一致することを確かめる。汚す項目に `depth_func(ALWAYS)`・`front_face(CW)`・`cull_face(FRONT)`・stencil の関数と動作(表と裏)・`clear_depth(0.0)`・`RASTERIZER_DISCARD` 有効・`depth_range(1, 0)`・sampler の bind・blend の separate と色・pixel store・各種バッファの bind を足す。2D のフレームは、本番の `present_frame` と同じ呼び方(framebuffer を bind するだけで、試験の側で `reset_gl_state` を呼ばない)で、成功した 3D と失敗した 3D のそれぞれの直後に写真・Radar・Agent を描く(sampler の漏れは Agent 画面の拡大したカードに出る)。
+- **#74**: `reset_gl_state` を作り、`draw_scene` の中で 3 回(下地の前・場面の前・合成の前)呼ぶ。**わざと状態を汚す試験画面**を作る(`CULL_FACE` 有効、`SCISSOR` を小さく、`color_mask` の一部を false、`UNPACK_ROW_LENGTH` を非ゼロ、`TEXTURE1` に別のテクスチャ、blend を有効のまま、FBO を別のものに)。その直後に写真画面を描いて、PNG が汚していないときと一致することを確かめる。汚す項目に `depth_func(ALWAYS)`・`front_face(CW)`・`cull_face(FRONT)`・stencil の関数と動作(表と裏)・`clear_depth(0.0)`・`RASTERIZER_DISCARD` 有効・`depth_range(1, 0)`・sampler の bind・blend の separate と色・pixel store・各種バッファの bind を足す。2D のフレームは、本番の `present_frame` と同じ呼び方(framebuffer を bind するだけで、試験の側で `reset_gl_state` を呼ばない)で、成功した 3D と失敗した 3D のそれぞれの直後に写真・Radar・Agent を描く(sampler の漏れは Agent 画面の拡大したカードに出る)。
   - **2D → 3D と 3D → 3D(別の画面どうし)の漏れ**も確かめる: 写真・Agent 画面の直後にキューブを描いた PNG と、キューブだけを描いた PNG が一致すること。キューブを 2 種類(別の状態を汚す 2 つのテスト用画面)で続けて描いても、後ろの絵が前の画面の状態に影響されないこと。補助に、デバッグビルドで `draw` の先頭に `glGet` で §5.4 の約束(`DEPTH_TEST` 無効、`depth_func` が `LESS` など)が成り立っているかを調べる検査を入れる(リリースでは外す)。
 - **#71 B**: `VrmLayer` が行っていた `composite` の部分が Compositor に移ること。VRM が残す状態(blend_func_separate など)が次のフレームに影響しないこと。
 
@@ -478,7 +478,7 @@ flowchart LR
 - 3D は**保持しない**: 何かの理由(時計の 1 秒更新、アラートの開閉)で画面が再描画されると、毎回 `GlScene::draw` が呼ばれる。時間が止まっている間は同じ絵になるようにする(画面の状態が変わらなければ同じ入力)。
 - **消灯中は描かない**: 既存どおり、`redraw && screen_on` のときだけ描く(`runtime.rs:547`)。`set_presentation(display_on = false)`(`manager.rs:393-398`)で、画面は自分の演出の時計を止められる。復帰時に溜まった動きを再生しない。
 - 非表示の画面は `draw` が呼ばれない。`tick` は呼ばれる(Provider と同じ)ので、データの取り込み(エージェントの状態など)は続くが、3D は描かれない。
-- **フレームの上限(決定。#74 で実測した)**: `Screen::frame_interval() -> Option<Duration>`(既定 None = vsync)を足した。動いている間だけ、runtime が表示の完了後に `frame_wait`(間隔 − vsync の半分)で残りを待つ。vsync の境界いっぱいを待つと 30fps が 20fps になるため。キューブは**既定 30fps**(設定 `[cube] fps`、0 = 制限なし)。理由は計測: 2560x1080 で 30fps は iGPU 6.5%・CPU 1.2%、60fps は iGPU 14.3%・CPU 1.6%(POC-007)。60Hz の 30fps で 10 秒に 300 フレーム・遅れ 0 を確認したが、他のリフレッシュレートは未確認。
+- **フレームの上限(決定。#74 で実測した)**: `Screen::frame_interval() -> Option<Duration>`(既定 None = vsync)を足した。動いている間だけ、runtime が表示の完了後に `frame_wait`(間隔 − vsync の半分)で残りを待つ。vsync の境界いっぱいを待つと 30fps が 20fps になるため。キューブは**既定 30fps**(設定 `[cube] fps`、0 = 制限なし)。理由は計測: 2560x1080 で 30fps は iGPU 6.5%・CPU 1.2%、60fps は iGPU 14.3%・CPU 1.6%(POC-007)。表示は vsync の境界でしか変わらないので、間隔は vsync の整数倍に切り上げ(`ceil(間隔 / vsync) × vsync`)、vsync の半分だけ早く起きる。つまり設定の fps は**リフレッシュレートの整数分の 1 に切り上げて守る**(60Hz で 50fps は 30fps、75Hz で 30fps は 25fps)。単体試験で fps と Hz の組み合わせを確かめた。実機は 60Hz の 30fps で 10 秒に 300 フレーム・遅れ 0 を確認したが、他のリフレッシュレートは実機では未確認。
 - 領域の幅(POC-006 の所見): 左右 1/3(853px)では、身振りで手が領域の端で切れる。これは API の問題ではなく、`Region` の大きさと身振りの範囲の問題。B で決める(§13)。
 
 ## 11. 移行計画

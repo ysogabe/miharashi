@@ -52,9 +52,16 @@ fn format_stats(
 /// 描画の間隔の上限(`App::frame_interval`)のとき、表示の完了後に待つ時間。
 /// 表示の完了待ち(vsync)は vsync の境界で終わるので、間隔いっぱいを待つと次のフレームが 1 つあとの vsync に
 /// ずれる(30fps が 20fps になる)。vsync 半分だけ早く起きて、描画を次の vsync の手前に間に合わせる。
+/// 表示できるのは vsync の境界だけなので、間隔は vsync の整数倍に切り上げて上限を守る
+/// (60Hz で 50fps は 2 vsync = 30fps。半分だけ引くやり方のままだと次の vsync に間に合って 60fps になる)。
 fn frame_wait(interval: Duration, refresh_hz: u32) -> Duration {
-    let half_vsync = Duration::from_secs_f64(0.5 / f64::from(refresh_hz.max(1)));
-    interval.saturating_sub(half_vsync)
+    let hz = f64::from(refresh_hz.max(1));
+    // 30fps と 60Hz のような割り切れる組が、浮動小数点の誤差で 1 vsync 多くならないように少し引く
+    let vsyncs = (interval.as_secs_f64() * hz - 1e-6).ceil();
+    if vsyncs <= 1.0 {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64((vsyncs - 0.5) / hz)
 }
 
 /// 区間内のフレーム時間 [ms] を "平均/p95" にする(PoC-005 のベースライン用)。空なら "-"。
@@ -852,7 +859,7 @@ mod tests {
         eprintln!("{line}");
     }
 
-    /// 間隔の上限の待ちは、間隔から vsync 半分を引いた時間(間隔より短いときは 0)。
+    /// 間隔の上限の待ちは、間隔を vsync の整数倍に切り上げて vsync 半分を引いた時間(1 vsync 以下なら 0)。
     #[test]
     fn frame_wait_is_the_interval_minus_half_a_vsync() {
         let w = frame_wait(Duration::from_secs_f64(1.0 / 30.0), 60);
@@ -862,6 +869,47 @@ mod tests {
         );
         assert_eq!(frame_wait(Duration::from_millis(2), 60), Duration::ZERO);
         assert_eq!(frame_wait(Duration::from_millis(33), 0), Duration::ZERO);
+    }
+
+    /// 設定の fps と実際の表示間隔(待ち + vsync 半分 = vsync の整数倍)。上限を超えて速くならない。
+    #[test]
+    fn frame_wait_keeps_the_fps_cap_for_any_refresh_rate() {
+        let shown = |fps: u32, hz: u32| -> f64 {
+            let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
+            let wait = frame_wait(interval, hz).as_secs_f64();
+            // 待ち明けの直後の vsync で表示される(描画は一瞬で終わるとする。待ちが 0 なら毎 vsync)
+            let vsync = 1.0 / f64::from(hz);
+            (wait / vsync).ceil().max(1.0) * vsync
+        };
+        let fps = |f: u32, hz: u32| 1.0 / shown(f, hz);
+        // (設定の fps, Hz, 実際の fps)
+        for (set, hz, want) in [
+            (30, 60, 30.0),
+            (50, 60, 30.0),
+            (60, 60, 60.0),
+            (20, 60, 20.0),
+            (45, 60, 30.0),
+            (30, 75, 25.0),
+            (25, 75, 25.0),
+            (30, 144, 28.8),
+            (60, 144, 48.0),
+        ] {
+            let got = fps(set, hz);
+            assert!((got - want).abs() < 0.01, "{set}fps {hz}Hz: {got}");
+            assert!(
+                got <= f64::from(set) + 1e-6,
+                "{set}fps {hz}Hz が上限を超えた: {got}"
+            );
+        }
+        // 0(制限なし)は呼ばれないが、1 vsync 以下の間隔は待たない
+        assert_eq!(
+            frame_wait(Duration::from_secs_f64(1.0 / 120.0), 60),
+            Duration::ZERO
+        );
+        assert_eq!(
+            frame_wait(Duration::from_secs_f64(1.0 / 60.0), 60),
+            Duration::ZERO
+        );
     }
 
     #[test]

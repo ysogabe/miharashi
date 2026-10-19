@@ -125,7 +125,8 @@
 # ui.start_screen に書ける(start_screen は有効にした画面だけ)。
 # enabled = false
 # layout = "both"   # full / third / both
-# fps = 30          # 動いている間の描画の上限(0 = 制限せず vsync だけ)
+# fps = 30          # 動いている間の描画の上限(0 = 制限せず vsync だけ)。リフレッシュレートの整数分の 1 に切り上げて守る
+#                   # (60Hz で 50 は 30fps、75Hz で 30 は 25fps)
 
 [gl_check]
 # GL の状態をわざと汚したまま返す試験画面 dirty-a・dirty-b(実機の確認用。docs/DESIGN-screen-plugin-v2.md §5.5)。既定は無効。
