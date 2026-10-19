@@ -130,7 +130,7 @@ impl Model {
         let buffers =
             gltf::import_buffers(&doc, None, blob).map_err(|e| format!("glb を読めない: {e}"))?;
         for v in doc.views() {
-            check_view("bufferView", &v)?;
+            check_view(&format!("bufferView {}", v.index()), &v)?;
         }
         check_bufferless_accessors(&doc)?;
         let images = decode_images(&doc, &buffers, limits)?;
@@ -438,9 +438,13 @@ impl Model {
 /// 読むので、壊れた(または細工された)ファイルで panic やメモリの使い果たしが起きてはいけない。
 /// 小さな JSON で確保を増やせる形(同じ mesh を指すノード、同じ accessor を指す morph target、
 /// 同じ画像を指す images、同じ inverseBindMatrices を指すスキン)を、確保の前に頭打ちにする。
-/// 値はニケちゃん(ノード 212、スキン 1、関節 177、プリミティブ 14、頂点 81647、インデックス 425238、
-/// morph target 232、target × 頂点 4.6 百万、画像 16 枚で RGBA 換算 35 MB)の十数倍から数十倍で、
-/// 一般的な VRM(頂点 20〜30 万、morph target 100 前後、2048〜4096 のテクスチャ 10〜20 枚)も通る。
+/// ニケちゃんの実測値と、上限がその何倍か:
+/// ノード 212(77 倍)、スキン 1(64 倍)、関節 177(46 倍)、プリミティブ 14(73 倍)、
+/// 頂点 81647(24 倍)、インデックス 425238(19 倍)、morph target 232(70 倍)、
+/// 中身のある target × 頂点 1100666(14 倍)、画像 16 枚(4 倍)、最大の画像 2048(4 倍)、
+/// 画像の RGBA 換算の合計 35 MB(30 倍)。
+/// 画像は一般的な VRM(2048〜4096 を 10〜20 枚)が通れば十分なので、倍率を小さめにしている。
+/// 頂点 20〜30 万、morph target 100 前後の一般的なモデルも通る。
 struct Limits {
     nodes: usize,
     skins: usize,
@@ -457,7 +461,8 @@ struct Limits {
     images: usize,
     /// 画像の幅・高さの上限
     image_side: u32,
-    /// 画像 1 枚のデコード後の大きさ(元の色形式)の上限
+    /// 画像 1 枚のデコード後の大きさ(元の色形式)の上限。8192 × 8192 の RGBA8 がちょうど入る。
+    /// 16 ビットの PNG は RGBA8 に直す間、この大きさ + 変換後が同時に要る
     image_bytes: u64,
     /// 全画像の RGBA 換算の大きさの合計(Model が持ち続ける量)の上限
     image_total: u64,
@@ -474,7 +479,7 @@ const LIMITS: Limits = Limits {
     target_vertices: 16_000_000,
     images: 64,
     image_side: 8192,
-    image_bytes: 512 << 20,
+    image_bytes: 256 << 20,
     image_total: 1 << 30,
 };
 
@@ -1589,7 +1594,6 @@ mod tests {
     #[test]
     fn image_limits_apply_before_decoding() {
         let (d0, b) = doc();
-        let png = png_bytes(&d0, &b);
         let rgba = 8 * 8 * 4;
         let copies = |n: usize| {
             let mut d = d0.clone();
@@ -1645,7 +1649,6 @@ mod tests {
         let mut d = d0.clone();
         d["images"][0] = json!({ "uri": format!("data:image/png;base64,{}", base64(&enc)) });
         assert!(load(&d, &b).is_err());
-        assert!(!png.is_empty());
     }
 
     /// 同じ mesh を指すノードを `n` 個足す(シーンの根に並べる)。
