@@ -54,6 +54,8 @@ impl Default for SceneInput {
 /// モデルの読み込みの状況。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadState {
+    /// まだ読み始めていない(`VrmScene::lazy`。`start` で読み始める)。`draw` は何も描かない
+    Idle,
     /// 別スレッドで読んでいる最中。`draw` は何も描かない
     Loading,
     /// 解析が済んでいる(GPU への転送は最初の `draw`、`release` のあとは次の `draw`)
@@ -63,6 +65,8 @@ pub enum LoadState {
 }
 
 enum Load {
+    /// 読み込みを始めていない。始めるときに使うパス
+    Idle(PathBuf),
     Loading(Receiver<Result<Model, String>>),
     Ready(Rc<Model>),
     Failed(String),
@@ -112,6 +116,21 @@ impl VrmScene {
         Self::from_loader(count, move || Model::from_path(&path))
     }
 
+    /// `path` の glb を、`start` が呼ばれるまで読まない(スレッドも作らず、モデルを RAM に置かない)。
+    /// 画面に VRM を載せるとき、その画面が最初に出るまで読み込みを遅らせるのに使う。
+    pub fn lazy(path: PathBuf, count: Rc<ObjectCount>) -> Self {
+        Self::with_load(count, Load::Idle(path))
+    }
+
+    /// `lazy` で作った場面の読み込みを始める(始めていたら何もしない)。
+    pub fn start(&mut self) {
+        if let Load::Idle(path) = &mut self.load {
+            let path = std::mem::take(path);
+            let started = Self::from_path(path, self.count.clone());
+            self.load = started.load;
+        }
+    }
+
     /// `load` を別スレッドで走らせる(試験で、遅い読み込みや panic を作るための入口でもある)。
     /// `load` の panic は `Failed` として受け、スレッドを作れなかったときも `Failed` にする。
     pub fn from_loader(
@@ -151,6 +170,7 @@ impl VrmScene {
     /// 読み込みの状況。`Loading` から `Ready`・`Failed` への切り替えは `poll` か `draw` で起きる。
     pub fn state(&self) -> LoadState {
         match self.load {
+            Load::Idle(_) => LoadState::Idle,
             Load::Loading(_) => LoadState::Loading,
             Load::Ready(_) => LoadState::Ready,
             Load::Failed(_) => LoadState::Failed,
@@ -161,6 +181,14 @@ impl VrmScene {
     pub fn error(&self) -> Option<&str> {
         match &self.load {
             Load::Failed(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// 読み込みが済んだモデル(`Ready` のときだけ)。表情に使える名前を調べるのに使う。
+    pub fn model(&self) -> Option<&Model> {
+        match &self.load {
+            Load::Ready(m) => Some(m),
             _ => None,
         }
     }
@@ -885,6 +913,56 @@ mod tests {
             })
             .unwrap();
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `lazy` は `start` まで何も読まない(存在しないパスでも失敗しない)。`start` で読み始め、2 回呼んでも読み直さない。
+    #[test]
+    fn lazy_scene_reads_nothing_until_started() {
+        let wait = |scene: &mut VrmScene| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while scene.state() == LoadState::Loading {
+                assert!(Instant::now() < deadline, "読み込みが終わらない");
+                std::thread::sleep(Duration::from_millis(2));
+                scene.poll();
+            }
+        };
+        let mut missing = VrmScene::lazy(
+            "/nonexistent/vrm/lazy.glb".into(),
+            Rc::new(ObjectCount::default()),
+        );
+        for _ in 0..3 {
+            missing.poll();
+            assert_eq!(missing.state(), LoadState::Idle);
+            assert!(missing.error().is_none() && missing.model().is_none());
+        }
+        missing.start();
+        assert_eq!(missing.state(), LoadState::Loading);
+        wait(&mut missing);
+        assert_eq!(missing.state(), LoadState::Failed);
+        assert!(missing.error().unwrap().contains("lazy.glb"));
+        // 失敗のあとの start は何もしない
+        missing.start();
+        assert_eq!(missing.state(), LoadState::Failed);
+
+        let dir = std::env::temp_dir().join(format!("vrm-lazy-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ok.glb");
+        std::fs::write(
+            &path,
+            synth::build_vrm_glb(&synth::Opts {
+                segments: 12,
+                texture_size: 64,
+            }),
+        )
+        .unwrap();
+        let mut ok = VrmScene::lazy(path, Rc::new(ObjectCount::default()));
+        assert_eq!(ok.state(), LoadState::Idle);
+        ok.start();
+        ok.start();
+        wait(&mut ok);
+        assert_eq!(ok.state(), LoadState::Ready);
+        assert!(ok.model().is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
