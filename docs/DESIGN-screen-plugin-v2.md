@@ -1,6 +1,6 @@
 # Screen Plugin API v2 — 画面に GL を貸す口(Issue #72)
 
-状態: **設計(コードは未変更)**。2026-10-19 作成、同日 Opus のレビュー指摘を反映。2026-10-18 午後の計画見直し後の範囲で書く。対象: [#72](https://github.com/ysogabe/miharashi/issues/72)(Screen Plugin API v2 の設計)。実装は [#74](https://github.com/ysogabe/miharashi/issues/74)(GLES 3D 描画境界。キューブで確かめる)と [#71](https://github.com/ysogabe/miharashi/issues/71) の B(VRM の組み込み)。
+状態: **#74 で実装済み**(2026-10-19。実測は [POC-007](poc/POC-007.md)。#71 B は未着手)。設計は 2026-10-19 作成、同日 Opus のレビュー指摘を反映。2026-10-18 午後の計画見直し後の範囲で書く。対象: [#72](https://github.com/ysogabe/miharashi/issues/72)(Screen Plugin API v2 の設計)。実装は [#74](https://github.com/ysogabe/miharashi/issues/74)(GLES 3D 描画境界。キューブで確かめる)と [#71](https://github.com/ysogabe/miharashi/issues/71) の B(VRM の組み込み)。
 
 前提にする文書: [画面管理インターフェース](DESIGN-screen-interface.md)(現行契約は §0)、[画面の全体構成](DESIGN-screens.md)、[技術設計](DESIGN.md)、[POC-006](poc/POC-006.md)(VRM の単体・実モニター試験)。
 
@@ -478,31 +478,31 @@ flowchart LR
 - 3D は**保持しない**: 何かの理由(時計の 1 秒更新、アラートの開閉)で画面が再描画されると、毎回 `GlScene::draw` が呼ばれる。時間が止まっている間は同じ絵になるようにする(画面の状態が変わらなければ同じ入力)。
 - **消灯中は描かない**: 既存どおり、`redraw && screen_on` のときだけ描く(`runtime.rs:547`)。`set_presentation(display_on = false)`(`manager.rs:393-398`)で、画面は自分の演出の時計を止められる。復帰時に溜まった動きを再生しない。
 - 非表示の画面は `draw` が呼ばれない。`tick` は呼ばれる(Provider と同じ)ので、データの取り込み(エージェントの状態など)は続くが、3D は描かれない。
-- **フレームの上限(推奨)**: POC-006 の実測は 30fps だった(Agent 画面 + VRM で iGPU が +4.2 ポイント、写真画面 + VRM で +4.6 ポイント。`animating` で 60Hz のままにすると描画量がほぼ倍になる)。`Screen::frame_interval() -> Option<Duration>`(既定 None = vsync)を足し、runtime が表示の完了後に残りを待つ形を**推奨**する。**#74 で実測して決める**(720p / 1080p の fps・平均・p95 描画時間を記録)。
+- **フレームの上限(決定。#74 で実測した)**: `Screen::frame_interval() -> Option<Duration>`(既定 None = vsync)を足した。動いている間だけ、runtime が表示の完了後に `frame_wait`(間隔 − vsync の半分)で残りを待つ。vsync の境界いっぱいを待つと 30fps が 20fps になるため。キューブは**既定 30fps**(設定 `[cube] fps`、0 = 制限なし)。理由は計測: 2560x1080 で 30fps は iGPU 6.5%・CPU 1.2%、60fps は iGPU 14.3%・CPU 1.6%(POC-007)。60Hz の 30fps で 10 秒に 300 フレーム・遅れ 0 を確認したが、他のリフレッシュレートは未確認。
 - 領域の幅(POC-006 の所見): 左右 1/3(853px)では、身振りで手が領域の端で切れる。これは API の問題ではなく、`Region` の大きさと身振りの範囲の問題。B で決める(§13)。
 
 ## 11. 移行計画
 
 ### 11.1 #74: キューブ画面で確かめる項目
 
-- [ ] `miharashi-glscene` クレートを作る(依存は glow だけ)。`cargo check` が Linux 以外でも通る。
-- [ ] `Compositor` に層(色 + 深度の FBO)・`reset_gl_state`・`draw_scene` を足す。`restore_gl_state` を移す。`with_gl` / `draw_frame_with` は PoC 用に残す。
-- [ ] `SceneFrame` / `GlesDisplay::present_scene` / `release_scenes`。`Frame` は変えない。
-- [ ] `Composite::Gl` と `runtime.rs` の変換(下地の変換を関数に分ける)。
-- [ ] 最上段の重ね絵(`Top`)と ScreenManager の描画。
-- [ ] `Screen::needs_gl` / `gl_scene` / `scene_animating`、`App::gl_scenes` / `report_scene_failure`。GL の可否は `Output.gpu_max_texture.is_some()` を `kiosk()` から ScreenManager へ渡す(`set_gl_available` は作らない)。
-- [ ] キューブ画面(回転する立方体 1 個。深度テストあり。VRM に依存しない)。全面と、1/3 幅の `Region` の両方。
-- [ ] 実機(DRM/GBM/EGL)で、キューブが描かれる。標準の framebuffer に深度がなくても正しく見える。
-- [ ] 2D/3D 切替とアラート: キューブ → 写真 → 状況 → Agent と巡回、アラートとメニューが 3D の上に出て、3D が下に見える。残像・状態漏れがない。
-- [ ] 状態を汚す試験画面(§5.5)の直後に写真・Radar・Agent を描いて、PNG が一致する。2D → 3D と 3D → 3D(別の画面どうし)で状態が漏れない。
-- [ ] 切り替え数百回で VRAM+GTT が増えない。`GlScene` 内の作成 − 削除の数が増えない(§3.3)。
-- [ ] 故意の panic・`Err`・GL エラー(§9.4)でキオスクが止まらない。**アラート表示中に 3D を失敗させ、次のフレームからもアラートが見え続ける**。初回の `draw` の途中で panic しても `release` が作りかけのオブジェクトで動き、作り直せる。
-- [ ] `renderer = cpu` と失敗中に、動かない写真画面が毎フレーム CPU で描き直されない(`scene_animating()` を足さない。§10)。
-- [ ] `renderer = cpu` と GL なしの `auto` で案内が出て、巡回から外れる。`png` に fixture(案内、gles)を足す。
-- [ ] 消灯中に描かない、復帰で動きがまとめて再生されない。
-- [ ] 720p / 1080p の fps・平均/p95 描画時間・CPU 使用率・iGPU の使用率を記録する。層の FBO を挟む追加コスト(全面の層と、標準の framebuffer へ直接描く場合の比較)も測る。
+- [x] `miharashi-glscene` クレートを作る(依存は glow だけ)。`cargo check` が Linux 以外でも通る。
+- [x] `Compositor` に層(色 + 深度の FBO)・`reset_gl_state`・`draw_scene` を足す。`restore_gl_state` を移す。`with_gl` / `draw_frame_with` は PoC 用に残す。
+- [x] `SceneFrame` / `GlesDisplay::present_scene` / `release_scenes`。`Frame` は変えない。
+- [x] `Composite::Gl` と `runtime.rs` の変換(下地の変換を関数に分ける)。
+- [x] 最上段の重ね絵(`Top`)と ScreenManager の描画。
+- [x] `Screen::needs_gl` / `gl_scene` / `scene_animating`、`App::gl_scenes` / `report_scene_failure`。GL の可否は `Output.gpu_max_texture.is_some()` を `kiosk()` から ScreenManager へ渡す(`set_gl_available` は作らない)。
+- [x] キューブ画面(回転する立方体 1 個。深度テストあり。VRM に依存しない)。全面と、1/3 幅の `Region` の両方。
+- [x] 実機(DRM/GBM/EGL)で、キューブが描かれる。標準の framebuffer に深度がなくても正しく見える。(実機で動かして GL エラーなしを確認。画面の目視はせず、見た目はオフスクリーンの画素比較のテストで代えた)
+- [x] 2D/3D 切替とアラート: キューブ → 写真 → 状況 → Agent と巡回、アラートとメニューが 3D の上に出て、3D が下に見える。残像・状態漏れがない。(実機で巡回とメニューを動かした。重なり・残像の見た目はオフスクリーンの画素比較のテストで代えた)
+- [x] 状態を汚す試験画面(§5.5)の直後に写真・Radar・Agent を描いて、PNG が一致する。2D → 3D と 3D → 3D(別の画面どうし)で状態が漏れない。(オフスクリーンで、陰性対照つき)
+- [x] 切り替え数百回で VRAM+GTT が増えない。`GlScene` 内の作成 − 削除の数が増えない(§3.3)。(約 300 回の切り替えで gl_objs 24 一定、VRAM+GTT の区間平均は増えていない)
+- [x] 故意の panic・`Err`・GL エラー(§9.4)でキオスクが止まらない。**アラート表示中に 3D を失敗させ、次のフレームからもアラートが見え続ける**。初回の `draw` の途中で panic しても `release` が作りかけのオブジェクトで動き、作り直せる。(テストで確認。実機では起こしていない。本物の `GlesDisplay::flip` の DRM 失敗で失敗が運ばれる経路はコードの確認だけ)
+- [x] `renderer = cpu` と失敗中に、動かない写真画面が毎フレーム CPU で描き直されない(`scene_animating()` を足さない。§10)。
+- [x] `renderer = cpu` と GL なしの `auto` で案内が出て、巡回から外れる。`png` に fixture(案内、gles)を足す。
+- [x] 消灯中に描かない、復帰で動きがまとめて再生されない。(ScreenManager を通したテストで代えた。実機の消灯・復帰は HA の設定を変えないため行っていない)
+- [x] 720p / 1080p の fps・平均/p95 描画時間・CPU 使用率・iGPU の使用率を記録する。層の FBO を挟む追加コスト(全面の層と、標準の framebuffer へ直接描く場合の比較)も測る。(POC-007。層は全面 2560x1080 の 30fps 間隔で約 1.1ms)
 - [ ] 12 時間試験は #71 B の 12 時間試験とまとめる(#74 では行わない。キューブは #71 B の VRM と同じ形の画面で、長時間の確認は 1 回で足りる)。
-- [ ] 制限事項と API の契約を `docs/` に残す(この文書の更新と PoC 記録)。
+- [x] 制限事項と API の契約を `docs/` に残す(この文書の更新と [POC-007](poc/POC-007.md))。
 
 ### 11.2 #71 B: VRM を載せる手順
 
@@ -529,18 +529,18 @@ B に入る前の宿題(Issue #71 のコメント): sparse accessor の `byteStr
 
 | 項目 | 現状の推奨 | 決める場所 |
 |---|---|---|
-| 新クレートの名前(`miharashi-glscene` は仮) | 仮の名前のまま | #74 の最初の PR |
-| 3D の層を「全面が深度つき FBO」で毎回合成するコスト。`Direct`(標準の framebuffer へ直接描く)モードを足すか | 層だけ(1 つの契約)。実測で重ければ足す | #74 の計測 |
-| フレームの上限(`frame_interval`)の API と値(30fps 想定) | §10 | #74 の計測 |
+| 新クレートの名前(`miharashi-glscene` は仮) | **決定**: `miharashi-glscene` のまま(#74) | 済 |
+| 3D の層を「全面が深度つき FBO」で毎回合成するコスト。`Direct`(標準の framebuffer へ直接描く)モードを足すか | **決定**: 足さない(層だけ)。全面 2560x1080 で 30fps 間隔 約 1.1ms(予算の 3〜4%)、連続で約 0.3ms(POC-007) | 済(#74) |
+| フレームの上限(`frame_interval`)の API と値(30fps 想定) | **決定**: `Screen::frame_interval`、キューブは既定 30fps(§10) | 済(#74) |
 | 非表示中の保持 vs. タイムアウト解放 | 保持(v1)。VRM の VRAM+GTT を測って決める(GL オブジェクトは `GlScene` 内の作成 − 削除の数でも見る) | #71 B |
-| 3D 失敗後の再試行をするか、するなら間隔と回数 | v1 は再起動まで戻さない。例: 5 分後に 1 回、3 回で停止 | #74 の実機で失敗が起きたら |
+| 3D 失敗後の再試行をするか、するなら間隔と回数 | v1 は再起動まで戻さない。実機では失敗が起きていない(テストでのみ確認) | 実機で失敗が起きたら |
 | VRM を載せる画面の `id`: 内側の画面と同じにするか、別の id を足すか | 同じ id(設定 `ui.avatar` で有効化)。パネルの画面一覧が増えない | #71 B。別 id にする場合は操作パネルの契約(`DESIGN-screens.md` §2)を更新 |
 | VRM の `Region`(左右 1/3 は手が切れる。POC-006)と身振りの範囲 | 領域を広げるか身振りを収める。API は変えない | #71 B |
 | GPU リセット(context lost)からの復帰 | v1 は §9 の失敗の扱いに入り、再起動まで 3D を出さない | 実機で起きたら |
 | `catch_unwind` を `tick` / `render` の panic にも広げるか | 広げない | 別の Issue |
-| `Cargo.toml` に `panic = "abort"` が無いことを確かめる単体テストを足すか(CI の grep は削った) | 足す(`catch_unwind` が効く前提を守る) | #74 |
+| `Cargo.toml` に `panic = "abort"` が無いことを確かめる単体テストを足すか(CI の grep は削った) | 足す(`catch_unwind` が効く前提を守る)。**#74 では足していない** | 別の機会(#71 B など) |
 | `miharashi-app` が `miharashi-vrm` に依存するときの feature 名・既定のオン/オフ | optional 依存、既定オフ、`default-features = false`(vrm の既定 feature は Linux 以外を壊す) | #71 B |
-| `refresh_screens` に GL 画面の id を書いたとき | 今のとおりエラー(対応外の id は `config.rs:491-502` が弾く)。警告 + 無視に変えるかは必要になったら | #74 |
-| 下地が `Canvas` のときの毎フレームの CPU 描画 + 転送(`base_changed` の印、または覆われている間 3D を止める) | 印を付ける(§10)。実測で要否を決める | #71 B |
+| `refresh_screens` に GL 画面の id を書いたとき | 今のとおりエラー(キューブの id を書くとエラー)。警告 + 無視に変えるかは必要になったら | 必要になったら |
+| 下地が `Canvas` のときの毎フレームの CPU 描画 + 転送(`base_changed` の印、または覆われている間 3D を止める) | 印を付ける(§10)。#74 の実測で、下地を毎フレーム描く 1/3 幅は CPU 3.4%(全面は 1.2%)。`base_changed` は未実装。減る量は #71 B で測って決める | #71 B |
 | MSAA(輪郭線が細いと途切れる: POC-006 の「輪郭線」の所見、199 行・239 行付近) | **範囲外**(v1 の層は MSAA なし)。VRM の輪郭線の見た目は B で `outline-scale` などで調整。MSAA が要るなら層をマルチサンプルにする別の Issue | 別の Issue |
 | 一回きりの 3D 再描画要求(`scene_animating()` の継続でなく、状態が変わった時だけの要求) | v1 は作らない(キューブも VRM も動き続ける) | 静止する 3D 画面が出たとき |
