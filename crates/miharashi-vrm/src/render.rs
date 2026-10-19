@@ -767,15 +767,16 @@ impl Renderer {
             if wt == 0.0 {
                 continue;
             }
-            for (i, v) in out
-                .as_chunks_mut::<FLOATS_PER_VERTEX>()
-                .0
-                .iter_mut()
-                .enumerate()
-            {
+            // 空の側は差分なし(zip が止まる)
+            let verts = out.as_chunks_mut::<FLOATS_PER_VERTEX>().0;
+            for (v, d) in verts.iter_mut().zip(&t.positions) {
                 for k in 0..3 {
-                    v[k] += wt * t.positions[i][k];
-                    v[3 + k] += wt * t.normals[i][k];
+                    v[k] += wt * d[k];
+                }
+            }
+            for (v, d) in verts.iter_mut().zip(&t.normals) {
+                for k in 0..3 {
+                    v[3 + k] += wt * d[k];
                 }
             }
         }

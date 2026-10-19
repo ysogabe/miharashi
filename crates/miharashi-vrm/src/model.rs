@@ -39,6 +39,7 @@ pub struct Texture {
 }
 
 /// 1 つの morph target の差分(ベース形状と同じ空間に変換済み)。
+/// 属性のない側は空(差分なし)。空でなければ頂点数と同じ長さ。
 pub struct Target {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
@@ -111,16 +112,28 @@ impl Model {
     }
 
     pub fn from_glb(bytes: &[u8]) -> Result<Self, String> {
+        Self::from_glb_with(bytes, &LIMITS)
+    }
+
+    fn from_glb_with(bytes: &[u8], limits: &Limits) -> Result<Self, String> {
         let json = vrm::glb_json(bytes)?;
         let mut vrm = vrm::parse(&json)?;
         let patched = zero_fill_empty_accessors(bytes, &json)?;
-        let (doc, buffers, images) = gltf::import_slice(patched.as_deref().unwrap_or(bytes))
+        // `gltf::import_slice` は画像の bufferView の範囲を確かめずに切り出して panic するので、
+        // buffer の読み込みまでを自分で呼び、画像は範囲と大きさの検査をしてから自分でデコードする
+        let gltf::Gltf {
+            document: doc,
+            blob,
+        } = gltf::Gltf::from_slice(patched.as_deref().unwrap_or(bytes))
             .map_err(|e| format!("glb を読めない: {e}"))?;
+        limits.check_counts(&doc)?;
+        let buffers =
+            gltf::import_buffers(&doc, None, blob).map_err(|e| format!("glb を読めない: {e}"))?;
+        for v in doc.views() {
+            check_view("bufferView", &v)?;
+        }
         check_bufferless_accessors(&doc)?;
-        let images = images
-            .into_iter()
-            .map(to_rgba)
-            .collect::<Result<Vec<_>, _>>()?;
+        let images = decode_images(&doc, &buffers, limits)?;
         let textures: Vec<Texture> = doc
             .textures()
             .map(|t| Texture {
@@ -199,15 +212,23 @@ impl Model {
         }
         // スタックで辿るので、親は必ず子より先に出る
 
+        let mut spent = Spent::default();
         let mut skins = Vec::new();
         for s in doc.skins() {
             if let Some(a) = s.inverse_bind_matrices() {
                 check_accessor("inverseBindMatrices", &a, Dimensions::Mat4, &[F32], None)?;
             }
+            spend(
+                "スキンの関節",
+                &mut spent.joints,
+                s.joints().len(),
+                limits.joints,
+            )?;
             let reader = s.reader(|b| Some(&buffers[b.index()]));
+            // 関節数より多い行列は使わない(accessor が巨大でも、スキンの数だけ読み直さない)
             let ibm: Vec<Mat4> = reader
                 .read_inverse_bind_matrices()
-                .map(|i| i.collect())
+                .map(|i| i.take(s.joints().len()).collect())
                 .unwrap_or_default();
             let joints: Vec<usize> = s.joints().map(|j| j.index()).collect();
             let inverse_bind = (0..joints.len())
@@ -236,8 +257,9 @@ impl Model {
         let mut meshes = std::collections::BTreeSet::new();
         let mut sorted = order.clone();
         sorted.sort_unstable();
+        let doc_nodes: Vec<gltf::Node> = doc.nodes().collect();
         for &ni in &sorted {
-            let node = doc.nodes().nth(ni).ok_or("ノード番号が不正")?;
+            let node = doc_nodes.get(ni).ok_or("ノード番号が不正")?;
             let Some(mesh) = node.mesh() else { continue };
             meshes.insert(mesh.index());
             let skin = node.skin().map(|s| s.index());
@@ -252,6 +274,7 @@ impl Model {
                     ni,
                     material,
                     skin.map(|k| skins[k].joints.len()),
+                    (limits, &mut spent),
                 )?;
                 // JOINTS/WEIGHTS を持つスキンのプリミティブだけが、スキンの関節を使う
                 p.0.joint_base = match (skin, p.1) {
@@ -411,6 +434,220 @@ impl Model {
     }
 }
 
+/// 読み込み全体の予算。VRM は設定で指定するローカルのファイルだが、キオスクのプロセスの中で
+/// 読むので、壊れた(または細工された)ファイルで panic やメモリの使い果たしが起きてはいけない。
+/// 小さな JSON で確保を増やせる形(同じ mesh を指すノード、同じ accessor を指す morph target、
+/// 同じ画像を指す images、同じ inverseBindMatrices を指すスキン)を、確保の前に頭打ちにする。
+/// 値はニケちゃん(ノード 212、スキン 1、関節 177、プリミティブ 14、頂点 81647、インデックス 425238、
+/// morph target 232、target × 頂点 4.6 百万、画像 16 枚で RGBA 換算 35 MB)の十数倍から数十倍で、
+/// 一般的な VRM(頂点 20〜30 万、morph target 100 前後、2048〜4096 のテクスチャ 10〜20 枚)も通る。
+struct Limits {
+    nodes: usize,
+    skins: usize,
+    /// 全スキンの関節数の合計
+    joints: usize,
+    /// 読んだ(三角形の)プリミティブの数。同じ mesh を指すノードは数だけ読み直す
+    primitives: usize,
+    vertices: usize,
+    indices: usize,
+    /// 全プリミティブの morph target の数(中身のないものも数える)
+    targets: usize,
+    /// 全プリミティブの「中身のある morph target の数 × 頂点数」(24 バイト/個)
+    target_vertices: usize,
+    images: usize,
+    /// 画像の幅・高さの上限
+    image_side: u32,
+    /// 画像 1 枚のデコード後の大きさ(元の色形式)の上限
+    image_bytes: u64,
+    /// 全画像の RGBA 換算の大きさの合計(Model が持ち続ける量)の上限
+    image_total: u64,
+}
+
+const LIMITS: Limits = Limits {
+    nodes: 16_384,
+    skins: 64,
+    joints: 8_192,
+    primitives: 1_024,
+    vertices: 2_000_000,
+    indices: 8_000_000,
+    targets: 16_384,
+    target_vertices: 16_000_000,
+    images: 64,
+    image_side: 8192,
+    image_bytes: 512 << 20,
+    image_total: 1 << 30,
+};
+
+/// ここまでに使った予算(`Limits` と同じ単位)。
+#[derive(Default, Debug)]
+struct Spent {
+    joints: usize,
+    primitives: usize,
+    vertices: usize,
+    indices: usize,
+    targets: usize,
+    target_vertices: usize,
+}
+
+fn spend(what: &str, used: &mut usize, add: usize, limit: usize) -> Result<(), String> {
+    let total = used.saturating_add(add);
+    if total > limit {
+        return Err(format!("{what}が多すぎる({total}、上限 {limit})"));
+    }
+    *used = total;
+    Ok(())
+}
+
+impl Limits {
+    /// buffer を読む前に、数だけで分かる上限を確かめる。
+    fn check_counts(&self, doc: &gltf::Document) -> Result<(), String> {
+        let counts = [
+            ("ノード", doc.nodes().len(), self.nodes),
+            ("スキン", doc.skins().len(), self.skins),
+            ("画像", doc.images().len(), self.images),
+        ];
+        for (what, n, limit) in counts {
+            if n > limit {
+                return Err(format!("{what}が多すぎる({n}、上限 {limit})"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 画像を自分でデコードする(`gltf::import_slice` は bufferView の範囲を確かめずに切り出す)。
+/// bufferView の画像と data URI の画像を読み、外部ファイルの URI は読まない。
+/// 幅・高さ・1 枚の大きさ・合計の大きさに上限をかけ、デコードの前(ヘッダの時点)に弾く。
+fn decode_images(
+    doc: &gltf::Document,
+    buffers: &[gltf::buffer::Data],
+    limits: &Limits,
+) -> Result<Vec<Image>, String> {
+    use gltf::image::Source;
+    let mut total = 0u64;
+    let mut out = Vec::with_capacity(doc.images().len());
+    for im in doc.images() {
+        let (bytes, mime): (std::borrow::Cow<[u8]>, Option<&str>) = match im.source() {
+            Source::View { view, mime_type } => {
+                // 範囲は `check_view` が確かめ済み(buffer の長さは import_buffers が確かめ済み)
+                let data = &buffers[view.buffer().index()].0;
+                let range = view.offset()..view.offset() + view.length();
+                (std::borrow::Cow::Borrowed(&data[range]), Some(mime_type))
+            }
+            Source::Uri { uri, mime_type } => {
+                let (header, payload) = uri
+                    .strip_prefix("data:")
+                    .and_then(|r| r.split_once(','))
+                    .ok_or_else(|| {
+                    format!("画像 {}: 外部ファイルの画像は読めない", im.index())
+                })?;
+                let header = header
+                    .strip_suffix(";base64")
+                    .ok_or_else(|| format!("画像 {}: data URI が base64 でない", im.index()))?;
+                let bytes = base64_decode(payload)
+                    .ok_or_else(|| format!("画像 {}: base64 を読めない", im.index()))?;
+                let mime = if header.is_empty() {
+                    mime_type
+                } else {
+                    Some(header)
+                };
+                (std::borrow::Cow::Owned(bytes), mime)
+            }
+        };
+        out.push(
+            decode_image(&bytes, mime, limits, &mut total)
+                .map_err(|e| format!("画像 {}: {e}", im.index()))?,
+        );
+    }
+    Ok(out)
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.trim_end_matches('=').bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// PNG / JPEG を RGBA8 にする。`total` は、ここまでの RGBA 換算の大きさの合計。
+fn decode_image(
+    bytes: &[u8],
+    mime: Option<&str>,
+    limits: &Limits,
+    total: &mut u64,
+) -> Result<Image, String> {
+    use image::{DynamicImage, ImageDecoder, ImageFormat};
+    let format = match mime {
+        Some("image/png") => ImageFormat::Png,
+        Some("image/jpeg") => ImageFormat::Jpeg,
+        _ if bytes.starts_with(&[0x89, b'P', b'N', b'G']) => ImageFormat::Png,
+        _ if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) => ImageFormat::Jpeg,
+        _ => return Err("PNG / JPEG ではない".into()),
+    };
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    let mut l = image::Limits::default();
+    l.max_image_width = Some(limits.image_side);
+    l.max_image_height = Some(limits.image_side);
+    l.max_alloc = Some(limits.image_bytes);
+    reader.limits(l);
+    // ヘッダを読んだ時点で、幅・高さの上限と大きさを確かめる(ピクセルはまだ確保しない)
+    let decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+    let (w, h) = decoder.dimensions();
+    if decoder.total_bytes() > limits.image_bytes {
+        return Err(format!("大きすぎる({w}x{h})"));
+    }
+    let rgba = u64::from(w) * u64::from(h) * 4;
+    *total = total.saturating_add(rgba);
+    if *total > limits.image_total {
+        return Err(format!(
+            "画像の合計が大きすぎる({} バイト以上、上限 {})",
+            *total, limits.image_total
+        ));
+    }
+    let img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    to_rgba(into_data(img)?)
+}
+
+/// デコードした画像を、gltf クレートの `image::Data` と同じ形式の分類にする。
+fn into_data(img: image::DynamicImage) -> Result<gltf::image::Data, String> {
+    use gltf::image::Format as F;
+    use image::DynamicImage as D;
+    let format = match img {
+        D::ImageLuma8(_) => F::R8,
+        D::ImageLumaA8(_) => F::R8G8,
+        D::ImageRgb8(_) => F::R8G8B8,
+        D::ImageRgba8(_) => F::R8G8B8A8,
+        D::ImageLuma16(_) => F::R16,
+        D::ImageLumaA16(_) => F::R16G16,
+        D::ImageRgb16(_) => F::R16G16B16,
+        D::ImageRgba16(_) => F::R16G16B16A16,
+        _ => return Err("未対応のテクスチャ形式".into()),
+    };
+    let (width, height) = (img.width(), img.height());
+    Ok(gltf::image::Data {
+        pixels: img.into_bytes(),
+        format,
+        width,
+        height,
+    })
+}
+
 /// 0 詰めの大きさの下限(BIN チャンクが短くても、これだけは許す)。
 const MIN_ZERO_LIMIT: u64 = 1 << 20;
 
@@ -537,7 +774,7 @@ fn to_rgba(d: gltf::image::Data) -> Result<Image, String> {
     let n = d.width as usize * d.height as usize;
     let p = &d.pixels;
     let rgba = match d.format {
-        F::R8G8B8A8 => d.pixels.clone(),
+        F::R8G8B8A8 => d.pixels,
         F::R8G8B8 => p
             .as_chunks::<3>()
             .0
@@ -773,8 +1010,37 @@ fn read_primitive(
     node: usize,
     material: usize,
     skin_joints: Option<usize>,
+    (limits, spent): (&Limits, &mut Spent),
 ) -> Result<(Primitive, bool), String> {
     let n = check_attributes(prim)?;
+    // 確保の前に予算を使う(同じ mesh を指すノードや同じ accessor を指す target を並べても、
+    // ここで頭打ちになる)
+    spend("プリミティブ", &mut spent.primitives, 1, limits.primitives)?;
+    spend("頂点", &mut spent.vertices, n, limits.vertices)?;
+    let index_count = prim.indices().map_or(n, |a| a.count());
+    spend(
+        "インデックス",
+        &mut spent.indices,
+        index_count,
+        limits.indices,
+    )?;
+    let (mut targets_total, mut data_targets) = (0usize, 0usize);
+    for t in prim.morph_targets() {
+        targets_total += 1;
+        data_targets += usize::from(t.positions().is_some() || t.normals().is_some());
+    }
+    spend(
+        "morph target",
+        &mut spent.targets,
+        targets_total,
+        limits.targets,
+    )?;
+    spend(
+        "morph target の頂点(target 数 × 頂点数)",
+        &mut spent.target_vertices,
+        data_targets.saturating_mul(n),
+        limits.target_vertices,
+    )?;
     let reader = prim.reader(|b| Some(&buffers[b.index()]));
     let pos: Vec<[f32; 3]> = reader
         .read_positions()
@@ -828,15 +1094,12 @@ fn read_primitive(
     }
     let mut targets = Vec::new();
     for (tp, tn, _) in reader.read_morph_targets() {
-        let positions: Vec<[f32; 3]> = match tp {
-            Some(i) => i.collect(),
-            None => vec![[0.0; 3]; n],
-        };
-        let normals: Vec<[f32; 3]> = match tn {
-            Some(i) => i.collect(),
-            None => vec![[0.0; 3]; n],
-        };
-        if positions.len() != n || normals.len() != n {
+        // 属性のない側は空のまま持つ(差分なし。大きさ n の 0 は確保しない)
+        let positions: Vec<[f32; 3]> = tp.map(|i| i.collect()).unwrap_or_default();
+        let normals: Vec<[f32; 3]> = tn.map(|i| i.collect()).unwrap_or_default();
+        if (!positions.is_empty() && positions.len() != n)
+            || (!normals.is_empty() && normals.len() != n)
+        {
             return Err("morph target の頂点数が合わない".into());
         }
         targets.push(Target { positions, normals });
@@ -895,6 +1158,10 @@ mod tests {
         Model::from_glb(&pack_glb(doc, bin))
     }
 
+    fn load_with(doc: &Value, bin: &[u8], limits: &Limits) -> Result<Model, String> {
+        Model::from_glb_with(&pack_glb(doc, bin), limits)
+    }
+
     /// 名前の属性が指す accessor の番号(メッシュ `mesh` の最初のプリミティブ)。
     fn attr(doc: &Value, mesh: usize, name: &str) -> usize {
         doc["meshes"][mesh]["primitives"][0]["attributes"][name]
@@ -913,7 +1180,10 @@ mod tests {
         };
         let view = doc["accessors"][acc]["bufferView"].as_u64().unwrap() as usize;
         doc["accessors"][acc]["type"] = json!(ty);
-        doc["bufferViews"][view]["byteLength"] = json!(count * comps * size);
+        // buffer の外までは広げない(bufferView 全体の検査が、型の検査より先に弾くので)
+        let room = doc["buffers"][0]["byteLength"].as_u64().unwrap()
+            - doc["bufferViews"][view]["byteOffset"].as_u64().unwrap_or(0);
+        doc["bufferViews"][view]["byteLength"] = json!((count * comps * size).min(room));
     }
 
     #[test]
@@ -1244,6 +1514,275 @@ mod tests {
         assert!(load(&d, &b).is_err());
         d["buffers"] = json!([]);
         assert!(load(&d, &b).is_err());
+    }
+
+    /// 画像 0 の bufferView の番号。
+    fn image_view(doc: &Value) -> usize {
+        doc["images"][0]["bufferView"].as_u64().unwrap() as usize
+    }
+
+    /// 画像 0 の PNG のバイト列(BIN から切り出す)。
+    fn png_bytes(doc: &Value, bin: &[u8]) -> Vec<u8> {
+        let v = &doc["bufferViews"][image_view(doc)];
+        let off = v["byteOffset"].as_u64().unwrap_or(0) as usize;
+        bin[off..off + v["byteLength"].as_u64().unwrap() as usize].to_vec()
+    }
+
+    fn base64(data: &[u8]) -> String {
+        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut s = String::new();
+        for c in data.chunks(3) {
+            let n = c.iter().fold(0u32, |a, &b| a << 8 | u32::from(b)) << (8 * (3 - c.len()));
+            for k in 0..=c.len() {
+                s.push(A[(n >> (18 - 6 * k) & 63) as usize] as char);
+            }
+            s.extend(std::iter::repeat_n('=', 3 - c.len()));
+        }
+        s
+    }
+
+    #[test]
+    fn rejects_image_view_out_of_buffer_without_panicking() {
+        // gltf の import_slice は、この範囲を確かめずに切り出して panic した
+        let (d0, b) = doc();
+        let view = image_view(&d0);
+        for off in [b.len() as u64 + 100, u64::MAX - 1, u64::MAX] {
+            let mut d = d0.clone();
+            d["bufferViews"][view]["byteOffset"] = json!(off);
+            let e = load(&d, &b).err().unwrap();
+            assert!(e.contains("範囲"), "{off}: {e}");
+        }
+        let mut d = d0.clone();
+        d["bufferViews"][view]["byteLength"] = json!(b.len() as u64 + 1);
+        assert!(load(&d, &b).err().unwrap().contains("範囲"));
+        // 壊れた PNG / PNG でも JPEG でもないバイト列は Err
+        let mut b2 = b.clone();
+        let off = d0["bufferViews"][view]["byteOffset"].as_u64().unwrap_or(0) as usize;
+        b2[off + 20] ^= 0xff;
+        assert!(load(&d0, &b2).is_err());
+        b2[off..off + 4].fill(0);
+        assert!(load(&d0, &b2).is_err());
+    }
+
+    #[test]
+    fn data_uri_image_decodes_and_external_uri_is_error() {
+        let (mut d, b) = doc();
+        let want = load(&d, &b).unwrap().images.remove(0);
+        let uri = format!("data:image/png;base64,{}", base64(&png_bytes(&d, &b)));
+        d["images"][0] = json!({ "uri": uri });
+        let got = load(&d, &b).unwrap().images.remove(0);
+        assert_eq!((got.width, got.height), (want.width, want.height));
+        assert!(got.rgba == want.rgba);
+        // MIME が空でも、中身で PNG と分かる
+        d["images"][0] = json!({ "uri": uri.replace("image/png", "") });
+        assert!(load(&d, &b).is_ok());
+        d["images"][0] = json!({ "uri": uri.replace(";base64", "") });
+        assert!(load(&d, &b).err().unwrap().contains("base64"));
+        d["images"][0] = json!({ "uri": "data:image/png;base64,@@@@" });
+        assert!(load(&d, &b).err().unwrap().contains("base64"));
+        d["images"][0] = json!({ "uri": "tex.png" });
+        assert!(load(&d, &b).err().unwrap().contains("外部"));
+        d["images"][0] = json!({ "uri": "file:///etc/passwd" });
+        assert!(load(&d, &b).err().unwrap().contains("外部"));
+    }
+
+    #[test]
+    fn image_limits_apply_before_decoding() {
+        let (d0, b) = doc();
+        let png = png_bytes(&d0, &b);
+        let rgba = 8 * 8 * 4;
+        let copies = |n: usize| {
+            let mut d = d0.clone();
+            let imgs: Vec<Value> = (0..n).map(|_| d["images"][0].clone()).collect();
+            d["images"] = json!(imgs);
+            d
+        };
+        // 枚数
+        let e = load_with(
+            &copies(3),
+            &b,
+            &Limits {
+                images: 2,
+                ..LIMITS
+            },
+        )
+        .err();
+        assert!(e.unwrap().contains("画像が多すぎる"));
+        let e = load(&copies(LIMITS.images + 1), &b).err().unwrap();
+        assert!(e.contains("画像が多すぎる"), "{e}");
+        // 合計(同じ小さな PNG を並べても、枚数分だけ予算を使う)
+        let tight = Limits {
+            image_total: rgba * 2,
+            ..LIMITS
+        };
+        assert!(load_with(&copies(2), &b, &tight).is_ok());
+        let e = load_with(&copies(3), &b, &tight).err().unwrap();
+        assert!(e.contains("合計"), "{e}");
+        // 幅・高さ、1 枚の大きさ
+        let e = load_with(
+            &copies(1),
+            &b,
+            &Limits {
+                image_side: 7,
+                ..LIMITS
+            },
+        );
+        assert!(e.is_err());
+        let e = load_with(
+            &copies(1),
+            &b,
+            &Limits {
+                image_bytes: rgba - 1,
+                ..LIMITS
+            },
+        );
+        assert!(e.err().unwrap().contains("大きすぎる"));
+        // 既定の上限を超える幅(ヘッダだけで弾く。ピクセルは確保しない)
+        let wide = image::RgbaImage::new(LIMITS.image_side + 1, 1);
+        let mut enc = Vec::new();
+        wide.write_to(&mut std::io::Cursor::new(&mut enc), image::ImageFormat::Png)
+            .unwrap();
+        let mut d = d0.clone();
+        d["images"][0] = json!({ "uri": format!("data:image/png;base64,{}", base64(&enc)) });
+        assert!(load(&d, &b).is_err());
+        assert!(!png.is_empty());
+    }
+
+    /// 同じ mesh を指すノードを `n` 個足す(シーンの根に並べる)。
+    fn add_nodes(d: &mut Value, mesh: usize, n: usize) {
+        let first = d["nodes"].as_array().unwrap().len();
+        for _ in 0..n {
+            d["nodes"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({ "mesh": mesh }));
+        }
+        let scene = d["scenes"][0]["nodes"].as_array_mut().unwrap();
+        scene.extend((first..first + n).map(|i| json!(i)));
+    }
+
+    #[test]
+    fn duplicated_mesh_nodes_hit_the_budget_before_reading() {
+        let (d0, b) = doc();
+        let st = load(&d0, &b).unwrap().stats();
+        let mut d = d0.clone();
+        add_nodes(&mut d, 1, 50);
+        let e = load_with(
+            &d,
+            &b,
+            &Limits {
+                primitives: 20,
+                ..LIMITS
+            },
+        )
+        .err();
+        assert!(e.unwrap().contains("プリミティブ"));
+        let e = load_with(
+            &d,
+            &b,
+            &Limits {
+                vertices: st.vertices * 3,
+                ..LIMITS
+            },
+        )
+        .err();
+        assert!(e.unwrap().contains("頂点"));
+        let e = load_with(
+            &d,
+            &b,
+            &Limits {
+                indices: st.triangles * 6,
+                ..LIMITS
+            },
+        )
+        .err();
+        assert!(e.unwrap().contains("インデックス"));
+        // 既定の上限: ノードの数
+        let mut d = d0.clone();
+        add_nodes(&mut d, 1, LIMITS.nodes + 1);
+        let e = load(&d, &b).err().unwrap();
+        assert!(e.contains("ノードが多すぎる"), "{e}");
+        // 予算の中なら、そのまま読める
+        let mut d = d0.clone();
+        add_nodes(&mut d, 1, 2);
+        assert!(load(&d, &b).is_ok());
+    }
+
+    #[test]
+    fn morph_targets_are_budgeted_and_empty_ones_hold_nothing() {
+        let (d0, b) = doc();
+        let head = load(&d0, &b).unwrap().primitives[0].vertices.len() / FLOATS_PER_VERTEX;
+        let target = d0["meshes"][0]["primitives"][0]["targets"][0].clone();
+        let with = |t: &Value, n: usize| {
+            let mut d = d0.clone();
+            let ts = d["meshes"][0]["primitives"][0]["targets"]
+                .as_array_mut()
+                .unwrap();
+            ts.extend((0..n).map(|_| t.clone()));
+            d
+        };
+        // 中身のない target は、大きさ n の 0 を確保しない
+        let m = load(&with(&json!({}), 100), &b).unwrap();
+        let ts = &m.primitives[0].targets;
+        assert_eq!(ts.len(), 101);
+        assert_eq!(ts[0].positions.len(), head);
+        assert!(
+            ts[1..]
+                .iter()
+                .all(|t| t.positions.is_empty() && t.normals.is_empty())
+        );
+        // 数の上限
+        let e = load(&with(&json!({}), LIMITS.targets), &b).err().unwrap();
+        assert!(e.contains("morph target"), "{e}");
+        // 同じ accessor を指す target を並べても、target × 頂点で頭打ちになる
+        let limits = Limits {
+            target_vertices: 5 * head,
+            ..LIMITS
+        };
+        assert!(load_with(&with(&target, 4), &b, &limits).is_ok());
+        let e = load_with(&with(&target, 5), &b, &limits).err().unwrap();
+        assert!(e.contains("target"), "{e}");
+        // 中身のない target は target × 頂点に数えない
+        assert!(load_with(&with(&json!({}), 50), &b, &limits).is_ok());
+    }
+
+    #[test]
+    fn duplicated_skins_hit_the_budget() {
+        let (d0, b) = doc();
+        let more = |n: usize| {
+            let mut d = d0.clone();
+            let skin = d["skins"][0].clone();
+            d["skins"]
+                .as_array_mut()
+                .unwrap()
+                .extend((0..n).map(|_| skin.clone()));
+            d
+        };
+        let e = load_with(&more(4), &b, &Limits { skins: 4, ..LIMITS }).err();
+        assert!(e.unwrap().contains("スキンが多すぎる"));
+        let e = load_with(
+            &more(4),
+            &b,
+            &Limits {
+                joints: 4,
+                ..LIMITS
+            },
+        )
+        .err();
+        assert!(e.unwrap().contains("関節"));
+        let e = load(&more(LIMITS.skins), &b).err().unwrap();
+        assert!(e.contains("スキンが多すぎる"), "{e}");
+        assert!(
+            load_with(
+                &more(3),
+                &b,
+                &Limits {
+                    joints: 4,
+                    ..LIMITS
+                }
+            )
+            .is_ok()
+        );
     }
 
     #[test]
