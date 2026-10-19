@@ -85,6 +85,9 @@ pub struct VrmScene {
     pub input: SceneInput,
     /// `renderer` に反映済みの身振りの有無(`renderer` を作り直すと `None` に戻る)
     gesture_applied: Option<bool>,
+    /// `renderer` が最後に評価した姿勢の入力(時刻・身振り・視線)。同じ入力で `dt` が 0 なら評価し直さない
+    /// (`renderer` を作り直す・消すと `None` に戻り、次の `draw` が必ず評価する)
+    animated: Option<(f32, bool, Option<Aim>)>,
     /// 入力の不具合(未知の expression・身振りを付けられないモデル)をログに出したか
     input_warned: bool,
 }
@@ -107,6 +110,7 @@ impl VrmScene {
             building: Created::default(),
             input: SceneInput::default(),
             gesture_applied: None,
+            animated: None,
             input_warned: false,
         }
     }
@@ -287,6 +291,7 @@ impl GlScene for VrmScene {
                     // 層は Compositor が (0,0,0,0) で塗ってある。不透明な既定色で塗り直して潰さない
                     r.clear_color = [0.0; 4];
                     self.gesture_applied = None;
+                    self.animated = None;
                     self.renderer = Some(r);
                 }
                 Err(e) => {
@@ -307,7 +312,13 @@ impl GlScene for VrmScene {
             &mut self.gesture_applied,
             &mut self.input_warned,
         );
-        r.animate(self.input.t, self.input.dt);
+        // 時間が進んでいない(dt = 0)描き直しは、前のフレームで評価した姿勢のまま描く。
+        // 初回(まだ評価していない)や、時刻・身振り・視線が変わったときは評価する
+        let key = (self.input.t, self.input.gesture, self.input.aim);
+        if self.input.dt != 0.0 || self.animated != Some(key) {
+            r.animate(self.input.t, self.input.dt);
+            self.animated = Some(key);
+        }
         r.update(gl);
         let (vp, eye) = r.framing_camera(self.input.framing, target.size, self.input.yaw);
         r.render_camera(gl, target.size, &vp, eye);
@@ -321,6 +332,7 @@ impl GlScene for VrmScene {
         // 作りかけ(転送の途中で panic した)があれば、それも消す
         std::mem::take(&mut self.building).delete(gl, &self.count);
         self.gesture_applied = None;
+        self.animated = None;
     }
 }
 
@@ -499,6 +511,61 @@ mod tests {
         let (first, second) = res;
         assert!(first.iter().any(|&b| b != 0), "何も描かれていない");
         assert_eq!(first, second, "作り直したら絵が変わった");
+    }
+
+    /// 時間が進まない(dt = 0)描き直しは、何度やっても前の姿勢のまま(髪などの SpringBone が動かない)。
+    /// 時間が進めば動く。release のあとの作り直しは、dt = 0 でも 1 回は評価する。
+    #[test]
+    fn redraw_with_zero_dt_keeps_the_last_pose() {
+        let Some(off) = offscreen() else { return };
+        let size = (160u32, 240u32);
+        let count = Rc::new(ObjectCount::default());
+        // 髪の骨は関節行列に入らないモデルもあるので、ノードのワールド行列で見る
+        let joints = |s: &VrmScene| s.renderer.as_ref().unwrap().rig().world.clone();
+        let (res, _) = off
+            .with_fbo(size, |gl| {
+                let mut scene = VrmScene::from_model(synth_model(), count.clone());
+                scene.input.gesture = true;
+                // 揺れの途中まで進める
+                for k in 0..30 {
+                    scene.input.t = k as f32 / 30.0;
+                    scene.input.dt = 1.0 / 30.0;
+                    draw_layer(gl, &mut scene, size);
+                }
+                scene.input.dt = 0.0;
+                let first = draw_layer(gl, &mut scene, size);
+                let held = joints(&scene);
+                let mut same = true;
+                for _ in 0..3 {
+                    same &= draw_layer(gl, &mut scene, size) == first;
+                    same &= joints(&scene) == held;
+                }
+                // 時間が進めば動く
+                scene.input.t += 1.0 / 30.0;
+                scene.input.dt = 1.0 / 30.0;
+                draw_layer(gl, &mut scene, size);
+                let moved = joints(&scene) != held;
+                // release のあとの作り直しは、dt = 0 でも評価する(姿勢が単位行列のままにならない)
+                scene.release(gl);
+                scene.input.dt = 0.0;
+                let rebuilt = draw_layer(gl, &mut scene, size);
+                let rebuilt_joints = joints(&scene);
+                scene.release(gl);
+                (same, moved, rebuilt, rebuilt_joints, held)
+            })
+            .unwrap();
+        let (same, moved, rebuilt, rebuilt_joints, held) = res;
+        assert!(same, "dt = 0 の描き直しで絵か関節行列が変わった");
+        assert!(moved, "dt > 0 で動かない");
+        assert!(
+            rebuilt.iter().any(|&b| b != 0),
+            "作り直したあと何も描かれていない"
+        );
+        assert_eq!(rebuilt_joints.len(), held.len());
+        assert_ne!(
+            rebuilt_joints, held,
+            "作り直したあとの dt = 0 の描画が評価されていない(古い姿勢のまま)"
+        );
     }
 
     /// 実際の経路(`Compositor::draw_scene`)で、GL エラーや panic なしに `Drawn` で描かれ、領域の外は下地のまま、

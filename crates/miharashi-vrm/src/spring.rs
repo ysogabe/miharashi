@@ -179,6 +179,9 @@ impl SpringSim {
     /// 揺れる骨の `override_rot` を設定し、その骨と子のワールドを更新する。
     pub fn step(&mut self, model: &Model, rig: &mut Rig, dt: f32) {
         let dt = dt.clamp(0.0, 1.0 / 20.0);
+        // 時間が進んでいない(dt = 0)ときは揺れを進めない。慣性の項は dt に依存しないので、
+        // そのまま積分すると、同じ時刻の描き直しのたびに毛先が動いてしまう
+        let frozen = dt == 0.0;
         let sb = &model.vrm.spring;
         let pos = |w: &math::Mat4| [w[3][0], w[3][1], w[3][2]];
         if !self.initialized {
@@ -203,15 +206,19 @@ impl SpringSim {
                 let head = pos(&rig.world[j.node]);
                 let rest_world_rot = math::quat_mul(parent_rot, j.rest_rot);
                 let axis_w = math::quat_rotate(rest_world_rot, j.bone_axis);
-                let mut next = verlet(
-                    j.prev_tail,
-                    j.curr_tail,
-                    axis_w,
-                    j.stiffness,
-                    j.drag,
-                    j.gravity,
-                    dt,
-                );
+                let mut next = if frozen {
+                    j.curr_tail
+                } else {
+                    verlet(
+                        j.prev_tail,
+                        j.curr_tail,
+                        axis_w,
+                        j.stiffness,
+                        j.drag,
+                        j.gravity,
+                        dt,
+                    )
+                };
                 next = keep_length(head, next, j.bone_length);
                 for &ci in cols {
                     let c = &sb.colliders[ci];
@@ -239,8 +246,10 @@ impl SpringSim {
                     };
                     next = keep_length(head, next, j.bone_length);
                 }
-                j.prev_tail = j.curr_tail;
-                j.curr_tail = next;
+                if !frozen {
+                    j.prev_tail = j.curr_tail;
+                    j.curr_tail = next;
+                }
                 // 回転: 初期の骨の向き → 次の尾の向き(骨の初期ローカル系で見たもの)
                 let to_local =
                     math::quat_rotate(math::quat_conj(rest_world_rot), math::vec_sub(next, head));

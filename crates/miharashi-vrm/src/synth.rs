@@ -473,6 +473,36 @@ mod tests {
         assert_eq!(rig.joints.len(), m.joint_nodes.len());
     }
 
+    /// 時間が進まない(dt = 0)更新を同じ時刻で繰り返しても、揺れの姿勢は動かない
+    /// (慣性の項は dt に依存しないので、積分を止めないと描き直しのたびに毛先が動く)。
+    #[test]
+    fn spring_bone_holds_still_while_dt_is_zero() {
+        use crate::anim::Rig;
+        use crate::spring::SpringSim;
+        let m = small();
+        let mut rig = Rig::new(&m, true);
+        let mut sim = SpringSim::new(&m, &rig);
+        let mut run = |rig: &mut Rig, t: f32, dt: f32| {
+            let mut f = |r: &mut Rig, md: &crate::model::Model| sim.step(md, r, dt);
+            rig.update(&m, t, Some(&mut f));
+        };
+        for k in 0..45 {
+            run(&mut rig, k as f32 / 30.0, 1.0 / 30.0);
+        }
+        // 揺れの途中(まだ動いている最中)で止める
+        let t = 44.0 / 30.0;
+        run(&mut rig, t, 0.0);
+        let held = (rig.world.clone(), rig.joints.clone());
+        for _ in 0..3 {
+            run(&mut rig, t, 0.0);
+            assert_eq!(rig.world, held.0, "dt = 0 の更新でノードの姿勢が変わった");
+            assert_eq!(rig.joints, held.1, "dt = 0 の更新で関節行列が変わった");
+        }
+        // 止めている間も速度は失われず、時間が進めば続きから動く
+        run(&mut rig, t + 1.0 / 30.0, 1.0 / 30.0);
+        assert_ne!(rig.world, held.0, "dt > 0 で動かない");
+    }
+
     #[test]
     fn rejects_vrm0_glb() {
         let mut doc = serde_json::json!({"asset": {"version": "2.0"}, "extensions": {"VRM": {"specVersion": "0.0"}}});
