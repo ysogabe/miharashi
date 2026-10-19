@@ -116,6 +116,7 @@ impl Model {
         let patched = zero_fill_empty_accessors(bytes, &json)?;
         let (doc, buffers, images) = gltf::import_slice(patched.as_deref().unwrap_or(bytes))
             .map_err(|e| format!("glb を読めない: {e}"))?;
+        check_bufferless_accessors(&doc)?;
         let images = images
             .into_iter()
             .map(to_rgba)
@@ -580,6 +581,39 @@ fn to_rgba(d: gltf::image::Data) -> Result<Image, String> {
     })
 }
 
+/// bufferView のない accessor(sparse だけで「残りは 0」の形)は、reader が `count` 個の 0 を
+/// 出して `collect()` が先に確保するので、`count` が巨大だと確保の失敗で abort する。
+/// 大きさは `zero_fill_empty_accessors` と同じく、buffer の長さ(下限 1 MiB)までに限る。
+/// 頂点数・index 数は bufferView のある accessor では bufferView(= buffer)の長さで決まる。
+fn check_bufferless_accessors(doc: &gltf::Document) -> Result<(), String> {
+    let limit = doc
+        .buffers()
+        .map(|b| b.length() as u64)
+        .max()
+        .unwrap_or(0)
+        .max(MIN_ZERO_LIMIT);
+    for a in doc.accessors().filter(|a| a.view().is_none()) {
+        let bytes = (a.count() as u64).saturating_mul(a.size() as u64);
+        if bytes > limit {
+            return Err(format!(
+                "accessor {} は bufferView がないのに大きすぎる({bytes} バイト、上限 {limit})",
+                a.index()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// bufferView 自身が buffer に収まるか。reader は `offset + length` をそのまま足すので、
+/// 収まらない値だと debug ビルドで桁あふれの panic、release では回り込む。
+fn check_view(what: &str, view: &gltf::buffer::View) -> Result<(), String> {
+    let end = view.offset().checked_add(view.length());
+    if end.is_none_or(|e| e > view.buffer().length()) {
+        return Err(format!("{what} の bufferView が buffer の範囲を超える"));
+    }
+    Ok(())
+}
+
 /// accessor が属性の期待する型(要素数・成分の型)かを、読む前に確かめる。
 /// gltf クレートの reader は型が違うと assert で panic するので、ここで Err にする。
 const F32: (DataType, bool) = (DataType::F32, false);
@@ -604,14 +638,24 @@ fn check_accessor(
             if a.normalized() { "、正規化" } else { "" }
         ));
     }
-    // byteStride が要素より小さいと reader が panic する
-    if let Some(s) = a.view().and_then(|v| v.stride())
-        && s < a.size()
-    {
-        return Err(format!(
-            "{what} の byteStride({s})が要素の大きさ({})より小さい",
-            a.size()
-        ));
+    if let Some(v) = a.view() {
+        check_view(what, &v)?;
+        // byteStride が要素より小さいと reader が panic する
+        let stride = v.stride().unwrap_or(a.size());
+        if stride < a.size() {
+            return Err(format!(
+                "{what} の byteStride({stride})が要素の大きさ({})より小さい",
+                a.size()
+            ));
+        }
+        // 最後の要素の終わりが bufferView に収まること(sparse の base もこの範囲を読む)
+        let end = stride
+            .checked_mul(a.count().saturating_sub(1))
+            .and_then(|e| e.checked_add(a.offset()))
+            .and_then(|e| e.checked_add(a.size()));
+        if end.is_none_or(|e| e > v.length()) {
+            return Err(format!("{what} が bufferView の範囲を超える"));
+        }
     }
     if let Some(c) = count
         && a.count() != c
@@ -646,6 +690,7 @@ fn check_sparse(what: &str, a: &gltf::Accessor) -> Result<(), String> {
         ("values", val.view(), val.offset(), a.size()),
     ];
     for (name, view, offset, size) in parts {
+        check_view(&format!("{what} の sparse {name}"), &view)?;
         let stride = view.stride().unwrap_or(size);
         if stride < size {
             return Err(format!(
@@ -943,24 +988,36 @@ mod tests {
         load(&d, &b).unwrap();
     }
 
+    /// sparse の indices / values 自身の byteOffset を書き換える。
+    fn set_sparse_offset(doc: &mut Value, which: &str, offset: u64) {
+        let t = doc["meshes"][0]["primitives"][0]["targets"][0]["POSITION"]
+            .as_u64()
+            .unwrap() as usize;
+        doc["accessors"][t]["sparse"][which]["byteOffset"] = json!(offset);
+    }
+
     #[test]
     fn rejects_broken_sparse_views_without_panic() {
-        // (indices, values, エラーに含まれる語)
+        // (indices, values, エラーに含まれる文言)。gltf の検査を通り、check_sparse で弾く形だけ
         type View = (u64, u64, Option<u64>);
-        let cases: [(View, View, &str); 5] = [
+        let cases: [(View, View, &str); 3] = [
             // indices が bufferView からはみ出す(u16 × 2 に 2 バイトしかない)
-            ((0, 2, None), (0, 24, None), "indices"),
-            // values が bufferView からはみ出す
-            ((0, 4, None), (0, 12, None), "values"),
-            // values の byteStride が要素(12)より小さい
-            ((0, 4, None), (0, 24, Some(4)), "byteStride"),
-            // indices の byteStride が要素(2)より小さい
-            ((0, 4, Some(1)), (0, 24, None), "byteStride"),
-            // byteOffset が大きすぎて、stride との掛け算が桁あふれする
             (
-                (u64::MAX - 1, 4, Some(u32::MAX as u64)),
+                (0, 2, None),
                 (0, 24, None),
-                "indices",
+                "sparse indices が bufferView の範囲を超える",
+            ),
+            // values が bufferView からはみ出す
+            (
+                (0, 4, None),
+                (0, 12, None),
+                "sparse values が bufferView の範囲を超える",
+            ),
+            // values の byteStride が要素(12)より小さい
+            (
+                (0, 4, None),
+                (0, 24, Some(4)),
+                "sparse values の byteStride(4)",
             ),
         ];
         for (idx, val, word) in cases {
@@ -969,13 +1026,99 @@ mod tests {
             let e = load(&d, &b)
                 .err()
                 .unwrap_or_else(|| panic!("{idx:?} {val:?}"));
-            assert!(e.contains(word) || e.contains("glb を読めない"), "{e}");
+            assert!(e.contains(word), "{word}: {e}");
         }
         // sparse の数が 0、または accessor の数を超える
         for n in [0, 1 << 20] {
             let (mut d, b) = doc();
             add_sparse(&mut d, n, (0, 4, None), (0, 24, None));
-            assert!(load(&d, &b).is_err());
+            let e = load(&d, &b).err().unwrap();
+            assert!(e.contains("sparse の数"), "{e}");
+        }
+        // indices / values 自身の byteOffset が大きく、足し算や掛け算が桁あふれする
+        for which in ["indices", "values"] {
+            for offset in [u64::MAX - 1, u32::MAX as u64, 1 << 40] {
+                let (mut d, b) = doc();
+                add_sparse(&mut d, 2, (0, 4, None), (0, 24, None));
+                set_sparse_offset(&mut d, which, offset);
+                let e = load(&d, &b).err().unwrap();
+                assert!(
+                    e.contains(&format!("sparse {which} が bufferView の範囲を超える")),
+                    "{which} {offset}: {e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_sparse_views_that_gltf_refuses() {
+        // byteStride は 4〜252 に限られるので、gltf の検査が先に弾く
+        for (idx, val) in [
+            ((0, 4, Some(1)), (0, 24, None)),
+            ((0, 4, Some(u32::MAX as u64)), (0, 24, None)),
+        ] {
+            let (mut d, b) = doc();
+            add_sparse(&mut d, 2, idx, val);
+            let e = load(&d, &b).err().unwrap();
+            assert!(e.contains("glb を読めない"), "{e}");
+        }
+    }
+
+    #[test]
+    fn rejects_buffer_view_outside_buffer() {
+        // bufferView の offset + length が buffer を超える(桁あふれを含む)
+        for (offset, len) in [(u64::MAX - 1, 8u64), (1 << 40, 8), (0, 1 << 40)] {
+            let (mut d, b) = doc();
+            add_sparse(&mut d, 2, (0, 4, None), (0, 24, None));
+            let views = d["bufferViews"].as_array_mut().unwrap();
+            let iv = views.len() - 2;
+            views[iv]["byteOffset"] = json!(offset);
+            views[iv]["byteLength"] = json!(len);
+            let e = load(&d, &b)
+                .err()
+                .unwrap_or_else(|| panic!("{offset} {len}"));
+            assert!(e.contains("bufferView が buffer の範囲を超える"), "{e}");
+        }
+        // sparse でない accessor の bufferView
+        let (mut d, b) = doc();
+        let acc = d["meshes"][0]["primitives"][0]["attributes"]["POSITION"]
+            .as_u64()
+            .unwrap() as usize;
+        let view = d["accessors"][acc]["bufferView"].as_u64().unwrap() as usize;
+        d["bufferViews"][view]["byteOffset"] = json!(u64::MAX - 8);
+        let e = load(&d, &b).err().unwrap();
+        assert!(e.contains("bufferView が buffer の範囲を超える"), "{e}");
+    }
+
+    #[test]
+    fn sparse_only_accessor_with_huge_count_is_rejected() {
+        // bufferView なし・sparse だけ・count が巨大でも、確保せずに Err にする
+        for count in [2_000_000_000u64, 1 << 33, u64::MAX >> 1] {
+            for morph in [false, true] {
+                let (mut d, b) = doc();
+                let p = &d["meshes"][0]["primitives"][0];
+                let acc = if morph {
+                    p["targets"][0]["POSITION"].as_u64()
+                } else {
+                    p["attributes"]["POSITION"].as_u64()
+                }
+                .unwrap() as usize;
+                let a = d["accessors"][acc].as_object_mut().unwrap();
+                a.remove("bufferView");
+                a.insert("count".into(), json!(count));
+                a.insert(
+                    "sparse".into(),
+                    json!({
+                        "count": 1,
+                        "indices": {"bufferView": 0, "componentType": 5123},
+                        "values": {"bufferView": 0},
+                    }),
+                );
+                let e = load(&d, &b)
+                    .err()
+                    .unwrap_or_else(|| panic!("{count} {morph}"));
+                assert!(e.contains("bufferView がないのに大きすぎる"), "{e}");
+            }
         }
     }
 
@@ -1110,10 +1253,7 @@ mod tests {
         let view = d["accessors"][n]["bufferView"].as_u64().unwrap() as usize;
         d["bufferViews"][view]["byteStride"] = json!(4);
         let e = load(&d, &b).err().unwrap();
-        assert!(
-            e.contains("byteStride") || e.contains("glb を読めない"),
-            "{e}"
-        );
+        assert!(e.contains("byteStride"), "{e}");
     }
 
     #[test]

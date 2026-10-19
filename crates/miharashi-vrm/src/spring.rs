@@ -145,11 +145,6 @@ impl SpringSim {
                 }
                 let n = (joints.len() - start).saturating_mul(cols.len());
                 if pairs.saturating_add(n) > MAX_COLLISION_PAIRS {
-                    eprintln!(
-                        "SpringBone: 関節 × コライダーが上限({MAX_COLLISION_PAIRS})を超えるので、\
-                         spring「{}」の衝突を無効にする",
-                        sp.name
-                    );
                     cols.clear();
                     collision_disabled += 1;
                 } else {
@@ -157,6 +152,12 @@ impl SpringSim {
                 }
                 springs.push((start..joints.len(), cols));
             }
+        }
+        if collision_disabled > 0 {
+            eprintln!(
+                "SpringBone: 関節 × コライダーが上限({MAX_COLLISION_PAIRS})を超えるので、\
+                 {collision_disabled} 本の spring の衝突を無効にする"
+            );
         }
         Self {
             springs,
