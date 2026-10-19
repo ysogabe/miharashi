@@ -3,7 +3,7 @@
 use crate::anim::Rig;
 use crate::math::{self, Quat};
 use crate::model::Model;
-use crate::vrm::{ColliderShape, SPRING_LIMIT};
+use crate::vrm::{ColliderShape, NO_NODE, SPRING_LIMIT};
 
 type V3 = [f32; 3];
 
@@ -59,6 +59,14 @@ pub fn push_out_capsule(p: V3, a: V3, b: V3, r: f32) -> V3 {
     push_out_sphere(p, math::vec_add(a, math::vec_scale(ab, t)), r)
 }
 
+/// 1 フレームに計算する「関節 × コライダー」の組の数の上限(全 spring の合計)。
+/// 読み込みの上限(関節 1024 × コライダー 1024)のままだと最悪 100 万組を毎フレーム計算し、
+/// 30fps の予算を食いつぶす。組 1 つは数十 ns なので、16384 組なら 1ms 前後に収まる。
+/// ニケちゃんは髪 55 本・計 110 関節・コライダー 31 で、最悪(全関節が全コライダーに当たる)でも
+/// 3410 組(上限の約 1/5)なので、実モデルは引っかからない。
+/// 超えた spring は、その spring のコライダーを外して(衝突なしで揺らして)落ちないようにする。
+pub const MAX_COLLISION_PAIRS: usize = 16384;
+
 struct SJoint {
     node: usize,
     /// 子ノード(なければ仮の尾)
@@ -81,12 +89,15 @@ pub struct SpringSim {
     springs: Vec<(std::ops::Range<usize>, Vec<usize>)>,
     joints: Vec<SJoint>,
     initialized: bool,
+    /// `MAX_COLLISION_PAIRS` を超えて、コライダーを外した spring の数
+    collision_disabled: usize,
 }
 
 impl SpringSim {
     pub fn new(model: &Model, _rig: &Rig) -> Self {
         let sb = &model.vrm.spring;
         let (mut springs, mut joints) = (Vec::new(), Vec::new());
+        let (mut pairs, mut collision_disabled) = (0usize, 0usize);
         for sp in &sb.springs {
             let start = joints.len();
             for (k, j) in sp.joints.iter().enumerate() {
@@ -132,6 +143,18 @@ impl SpringSim {
                         }
                     }
                 }
+                let n = (joints.len() - start).saturating_mul(cols.len());
+                if pairs.saturating_add(n) > MAX_COLLISION_PAIRS {
+                    eprintln!(
+                        "SpringBone: 関節 × コライダーが上限({MAX_COLLISION_PAIRS})を超えるので、\
+                         spring「{}」の衝突を無効にする",
+                        sp.name
+                    );
+                    cols.clear();
+                    collision_disabled += 1;
+                } else {
+                    pairs += n;
+                }
                 springs.push((start..joints.len(), cols));
             }
         }
@@ -139,7 +162,12 @@ impl SpringSim {
             springs,
             joints,
             initialized: false,
+            collision_disabled,
         }
+    }
+
+    pub fn collision_disabled_springs(&self) -> usize {
+        self.collision_disabled
     }
 
     pub fn joint_count(&self) -> usize {
@@ -186,7 +214,8 @@ impl SpringSim {
                 next = keep_length(head, next, j.bone_length);
                 for &ci in cols {
                     let c = &sb.colliders[ci];
-                    if c.node >= rig.world.len() {
+                    // node のないコライダー(NO_NODE)や範囲外は無視する
+                    if c.node == NO_NODE || c.node >= rig.world.len() {
                         continue;
                     }
                     let m = &rig.world[c.node];

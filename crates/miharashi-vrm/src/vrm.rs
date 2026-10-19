@@ -70,6 +70,9 @@ pub enum ColliderShape {
     },
 }
 
+/// node のないコライダーの印(`Collider::node`)。衝突判定はこの印のコライダーを無視する。
+pub const NO_NODE: usize = usize::MAX;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Collider {
     pub node: usize,
@@ -244,9 +247,11 @@ pub fn parse_spring(gltf: &Value) -> SpringBone {
         .flatten()
         .take(SPRING_LIMIT)
     {
-        let Some(node) = c.get("node").and_then(Value::as_u64) else {
-            continue;
-        };
+        // node のないコライダーも飛ばさず、無効の印で入れる(後ろのコライダーの番号がずれるため)
+        let node = c
+            .get("node")
+            .and_then(Value::as_u64)
+            .map_or(NO_NODE, |n| n as usize);
         let shape = c.get("shape");
         let sh = if let Some(s) = shape.and_then(|s| s.get("sphere")) {
             ColliderShape::Sphere {
@@ -266,10 +271,16 @@ pub fn parse_spring(gltf: &Value) -> SpringBone {
                 radius: 0.0,
             }
         };
-        out.colliders.push(Collider {
-            node: node as usize,
-            shape: sh,
-        });
+        // node がないものは、形も半径 0 の球にして衝突に効かせない
+        let sh = if node == NO_NODE {
+            ColliderShape::Sphere {
+                offset: [0.0; 3],
+                radius: 0.0,
+            }
+        } else {
+            sh
+        };
+        out.colliders.push(Collider { node, shape: sh });
     }
     for g in sb
         .get("colliderGroups")

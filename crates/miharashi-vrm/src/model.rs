@@ -621,6 +621,48 @@ fn check_accessor(
             a.count()
         ));
     }
+    check_sparse(what, a)
+}
+
+/// sparse accessor の indices / values の bufferView を検査する。
+/// gltf クレートの reader は、これらの stride や範囲が壊れていると panic するか、読み出しが
+/// 範囲外にならないことを保証しないので、読む前にここで Err にする。
+fn check_sparse(what: &str, a: &gltf::Accessor) -> Result<(), String> {
+    let Some(sp) = a.sparse() else {
+        return Ok(());
+    };
+    let n = sp.count();
+    if n == 0 || n > a.count() {
+        return Err(format!(
+            "{what} の sparse の数({n})が 1〜accessor の数({})の範囲にない",
+            a.count()
+        ));
+    }
+    // (名前, bufferView, byteOffset, 要素の大きさ)
+    let idx = sp.indices();
+    let val = sp.values();
+    let parts = [
+        ("indices", idx.view(), idx.offset(), idx.index_type().size()),
+        ("values", val.view(), val.offset(), a.size()),
+    ];
+    for (name, view, offset, size) in parts {
+        let stride = view.stride().unwrap_or(size);
+        if stride < size {
+            return Err(format!(
+                "{what} の sparse {name} の byteStride({stride})が要素の大きさ({size})より小さい"
+            ));
+        }
+        // 最後の要素の終わりが bufferView に収まること(usize の桁あふれも弾く)
+        let end = stride
+            .checked_mul(n - 1)
+            .and_then(|v| v.checked_add(offset))
+            .and_then(|v| v.checked_add(size));
+        if end.is_none_or(|e| e > view.length()) {
+            return Err(format!(
+                "{what} の sparse {name} が bufferView の範囲を超える"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -864,6 +906,140 @@ mod tests {
         let rig = Rig::new(&m, false);
         let sim = SpringSim::new(&m, &rig);
         assert_eq!(sim.joint_count(), SPRING_LIMIT);
+    }
+
+    /// 形態ターゲットの POSITION accessor に、sparse(indices と values の bufferView)を付ける。
+    /// bufferView は BIN の先頭を指す。`idx` / `val` は (byteOffset, byteLength, byteStride)。
+    fn add_sparse(
+        doc: &mut Value,
+        count: u64,
+        idx: (u64, u64, Option<u64>),
+        val: (u64, u64, Option<u64>),
+    ) {
+        let t = doc["meshes"][0]["primitives"][0]["targets"][0]["POSITION"]
+            .as_u64()
+            .unwrap() as usize;
+        let views = doc["bufferViews"].as_array_mut().unwrap();
+        let mut push = |(off, len, stride): (u64, u64, Option<u64>)| {
+            let mut v = json!({"buffer": 0, "byteOffset": off, "byteLength": len});
+            if let Some(s) = stride {
+                v["byteStride"] = json!(s);
+            }
+            views.push(v);
+            views.len() - 1
+        };
+        let (iv, vv) = (push(idx), push(val));
+        doc["accessors"][t]["sparse"] = json!({
+            "count": count,
+            "indices": {"bufferView": iv, "componentType": 5123},
+            "values": {"bufferView": vv},
+        });
+    }
+
+    #[test]
+    fn sparse_accessor_with_valid_views_loads() {
+        let (mut d, b) = doc();
+        add_sparse(&mut d, 2, (0, 4, None), (0, 24, None));
+        load(&d, &b).unwrap();
+    }
+
+    #[test]
+    fn rejects_broken_sparse_views_without_panic() {
+        // (indices, values, エラーに含まれる語)
+        type View = (u64, u64, Option<u64>);
+        let cases: [(View, View, &str); 5] = [
+            // indices が bufferView からはみ出す(u16 × 2 に 2 バイトしかない)
+            ((0, 2, None), (0, 24, None), "indices"),
+            // values が bufferView からはみ出す
+            ((0, 4, None), (0, 12, None), "values"),
+            // values の byteStride が要素(12)より小さい
+            ((0, 4, None), (0, 24, Some(4)), "byteStride"),
+            // indices の byteStride が要素(2)より小さい
+            ((0, 4, Some(1)), (0, 24, None), "byteStride"),
+            // byteOffset が大きすぎて、stride との掛け算が桁あふれする
+            (
+                (u64::MAX - 1, 4, Some(u32::MAX as u64)),
+                (0, 24, None),
+                "indices",
+            ),
+        ];
+        for (idx, val, word) in cases {
+            let (mut d, b) = doc();
+            add_sparse(&mut d, 2, idx, val);
+            let e = load(&d, &b)
+                .err()
+                .unwrap_or_else(|| panic!("{idx:?} {val:?}"));
+            assert!(e.contains(word) || e.contains("glb を読めない"), "{e}");
+        }
+        // sparse の数が 0、または accessor の数を超える
+        for n in [0, 1 << 20] {
+            let (mut d, b) = doc();
+            add_sparse(&mut d, n, (0, 4, None), (0, 24, None));
+            assert!(load(&d, &b).is_err());
+        }
+    }
+
+    #[test]
+    fn collider_without_node_keeps_later_indices() {
+        use crate::spring::SpringSim;
+        use crate::vrm::{ColliderShape, NO_NODE};
+        let (mut d, b) = doc();
+        let sphere = |r: f64| json!({"sphere": {"offset": [0, 0, 0], "radius": r}});
+        let sb = &mut d["extensions"]["VRMC_springBone"];
+        sb["colliders"] = json!([
+            {"node": 9, "shape": sphere(0.1)},
+            {"shape": sphere(5.0)},
+            {"node": 9, "shape": {"capsule": {"offset": [0, 0, 0], "radius": 0.2, "tail": [0, 1, 0]}}},
+        ]);
+        sb["colliderGroups"] = json!([{"colliders": [0, 1, 2]}]);
+        sb["springs"][0]["colliderGroups"] = json!([0]);
+        let m = load(&d, &b).unwrap();
+        let cs = &m.vrm.spring.colliders;
+        assert_eq!(cs.len(), 3);
+        assert_eq!(cs[0].node, 9);
+        // node のないものは印の node と半径 0 の球(元の半径 5.0 は捨てる)
+        assert_eq!(cs[1].node, NO_NODE);
+        assert_eq!(
+            cs[1].shape,
+            ColliderShape::Sphere {
+                offset: [0.0; 3],
+                radius: 0.0
+            }
+        );
+        // 後ろのコライダーの番号はずれない
+        assert_eq!(cs[2].node, 9);
+        assert!(matches!(cs[2].shape, ColliderShape::Capsule { .. }));
+        assert_eq!(m.vrm.spring.collider_groups[0], [0, 1, 2]);
+        let mut rig = Rig::new(&m, true);
+        let mut sim = SpringSim::new(&m, &rig);
+        assert_eq!(sim.collision_disabled_springs(), 0);
+        for _ in 0..3 {
+            rig.update(&m, 0.0, None);
+            sim.step(&m, &mut rig, 1.0 / 30.0);
+        }
+    }
+
+    #[test]
+    fn joint_times_collider_over_limit_disables_collision() {
+        use crate::spring::{MAX_COLLISION_PAIRS, SpringSim};
+        let (mut d, b) = doc();
+        let colliders: Vec<Value> = (0..1000)
+            .map(|_| json!({"node": 9, "shape": {"sphere": {"offset": [0, 0, 0], "radius": 0.1}}}))
+            .collect();
+        let ids: Vec<u32> = (0..1000).collect();
+        let joints: Vec<Value> = (0..100).map(|_| json!({"node": 9})).collect();
+        const { assert!(100 * 1000 > MAX_COLLISION_PAIRS) };
+        let sb = &mut d["extensions"]["VRMC_springBone"];
+        sb["colliders"] = json!(colliders);
+        sb["colliderGroups"] = json!([{"colliders": ids}]);
+        sb["springs"] = json!([{"colliderGroups": [0], "joints": joints}]);
+        let m = load(&d, &b).unwrap();
+        let mut rig = Rig::new(&m, false);
+        let mut sim = SpringSim::new(&m, &rig);
+        assert_eq!(sim.joint_count(), 100);
+        assert_eq!(sim.collision_disabled_springs(), 1);
+        rig.update(&m, 0.0, None);
+        sim.step(&m, &mut rig, 1.0 / 30.0);
     }
 
     #[test]
