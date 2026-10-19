@@ -171,12 +171,12 @@ flowchart LR
     VRM --> GS
     APP --> GS
     APP -->|Linux のみ| GPU
-    APP -->|"B: 任意の依存"| VRM
+    APP -->|"B: 依存"| VRM
     APP --> RND
 ```
 
 - 矢印は「依存する」。glscene は何にも依存しない(glow を除く)ので、循環は起きない。
-- app → vrm は B で足す任意の依存(`vrm` feature)。**静的登録の手順(#73 で決める)ではなく**、ただの optional 依存。feature をオフにしたビルドは今と同じ。app から vrm への依存は **`default-features = false`** にする。vrm の既定 feature(`bench` / `view`)は `miharashi-gpu`・`miharashi-linux`・`signal-hook`・`miharashi-render` を引き込み、Linux 以外のビルドが壊れる(`miharashi-vrm/Cargo.toml` の `[features]`)。
+- app → vrm は B で足した**必須の依存**(optional でも `vrm` feature でもない。`crates/miharashi-app/Cargo.toml`)。**静的登録の手順(#73 で決める)ではなく**、ただの依存。必須にした理由: `WithScene` は app の画面の一部で、VRM を使うかは実行時の設定 `[vrm].enabled`(既定は無効)とモデルの有無で決まり、無効のときは何も読まず何も描かないので、ビルドの feature で切り替える意味がない(feature を分けると、オフのビルドも試験の対象が二重になる)。依存は **`default-features = false`** にする。vrm の既定 feature(`bench` / `view`)は `miharashi-gpu`・`miharashi-linux`・`signal-hook`・`miharashi-render` を引き込み、Linux 以外のビルドが壊れる(`miharashi-vrm/Cargo.toml` の `[features]`)。
 - `miharashi-linux` は gpu が依存するまま(DRM・入力)。変えない。
 
 ### 2.5 今のコードとの対応
@@ -443,7 +443,7 @@ flowchart LR
   - **`force_overlay = true` にし、現在の画面の `invalidate()` を呼ぶ**(必須)。失敗したフレームは `Composite::Gl` で返っていて、次のフレームは `Composite::Photo` / `Agents` / `Canvas` になる。重ね絵・背景を描き直させないと、切り替えのフレームからアラート・メニューが消える(§6.1)。失敗したそのフレームの `Top` は `present_scene` が下地の上に出すので見える。
   - **戻し方(v1)**: 再起動まで戻さない。再試行(例: 5 分後に 1 回、3 回で停止)は v1 に入れず、未決事項にする(§13)。
 - 壊れたモデルなど、CPU 側の失敗の隔離は **GL の外**で行う。モデルの読み込みは別スレッドで行い(`std::thread` の panic は `join` の `Err` になる)、結果をチャネルで受ける。画面は読み込み中・失敗中のあいだ、3D を出さずに下地(または案内)だけを出す。GL への転送は最初の `draw`(UI スレッド)で行う。#71 の「壊れたモデルで panic しても画面全体が落ちない」はこの方針で扱う。
-- **sparse accessor の `byteStride` の検査は未実装**。`check_accessor`(`model.rs:587-`)が見るのは accessor 自身の bufferView の stride だけ(`model.rs:608`)で、`sparse()` の `indices` / `values` の bufferView は見ない(`sparse()` は呼ばれていない)。#71 B の最初に足し、壊れた glb(sparse の stride が要素より小さい)で確かめる。
+- sparse accessor の `byteStride` の検査は**実装済み**(#71 B の T1)。`check_accessor` が `check_sparse`(`model.rs`)を呼び、`sparse` の `indices` / `values` の bufferView の stride・範囲を読む前に検査する。壊れた glb(sparse の stride が要素より小さい)は `Err` になる。
 - `panic = "abort"` を設定しない(今の `Cargo.toml` にはない)ことは、CI の grep では守らない(Rust の CI はなく、`pages.yml` だけ)。必要なら、`Cargo.toml` に `panic = "abort"` が無いことを確かめる単体テストを足す(未決事項。§13)。
 
 ### 9.2 ほかの案と、選ばなかった理由
@@ -506,7 +506,7 @@ flowchart LR
 
 ### 11.2 #71 B: VRM を載せる手順
 
-B に入る前の宿題(Issue #71 のコメント): sparse accessor の `byteStride` 検査(**未実装**。`check_accessor`(`model.rs:587-`)は accessor 自身の bufferView の stride しか見ず、`sparse()` は呼ばれていない。#71 B の最初に足し、壊れた glb で確かめる)、panic の隔離(§9)、SpringBone の node のないコライダーの添字ずれと、関節数 × コライダー数の積の上限(PR #77 からの持ち越し。状態は B の最初に確認する)。
+B に入る前の宿題(Issue #71 のコメント): sparse accessor の `byteStride` 検査(**実装済み**: T1。`check_sparse`)、panic の隔離(§9)、SpringBone の node のないコライダーの添字ずれと、関節数 × コライダー数の積の上限(PR #77 からの持ち越し。状態は B の最初に確認する)。
 
 手順(**推奨**):
 
@@ -569,12 +569,12 @@ T4 の実測と判断(2560x1080、iGPU は Radeon、VRM はニケちゃん、左
 | フレームの上限(`frame_interval`)の API と値(30fps 想定) | **決定**: `Screen::frame_interval`、キューブは既定 30fps(§10) | 済(#74) |
 | 非表示中の保持 vs. タイムアウト解放 | **決定**: 保持し、タイムアウト解放は入れない。VRM は両方の画面で VRAM+GTT 約 +150 MiB、60 回の切り替えで増えず([POC-008](poc/POC-008.md)) | 済(#71 B) |
 | 3D 失敗後の再試行をするか、するなら間隔と回数 | v1 は再起動まで戻さない。実機では失敗が起きていない(テストでのみ確認) | 実機で失敗が起きたら |
-| VRM を載せる画面の `id`: 内側の画面と同じにするか、別の id を足すか | 同じ id(設定 `ui.avatar` で有効化)。パネルの画面一覧が増えない | #71 B。別 id にする場合は操作パネルの契約(`DESIGN-screens.md` §2)を更新 |
+| VRM を載せる画面の `id`: 内側の画面と同じにするか、別の id を足すか | 同じ id(設定 `[vrm].enabled` で有効化)。パネルの画面一覧が増えない | #71 B。別 id にする場合は操作パネルの契約(`DESIGN-screens.md` §2)を更新 |
 | VRM の `Region`(左右 1/3 は手が切れる。POC-006)と身振りの範囲 | 領域を広げるか身振りを収める。API は変えない | #71 B |
 | GPU リセット(context lost)からの復帰 | v1 は §9 の失敗の扱いに入り、再起動まで 3D を出さない | 実機で起きたら |
 | `catch_unwind` を `tick` / `render` の panic にも広げるか | 広げない | 別の Issue |
 | `Cargo.toml` に `panic = "abort"` が無いことを確かめる単体テストを足すか(CI の grep は削った) | 足す(`catch_unwind` が効く前提を守る)。**#74 では足していない** | 別の機会(#71 B など) |
-| `miharashi-app` が `miharashi-vrm` に依存するときの feature 名・既定のオン/オフ | optional 依存、既定オフ、`default-features = false`(vrm の既定 feature は Linux 以外を壊す) | #71 B |
+| `miharashi-app` が `miharashi-vrm` に依存するときの feature 名・既定のオン/オフ | **決定**: 必須の依存、feature なし、`default-features = false`(vrm の既定 feature は Linux 以外を壊す)。有効にするかは実行時の `[vrm].enabled`(既定は無効)で、無効のときは何も読まない | 済(#71 B) |
 | `refresh_screens` に GL 画面の id を書いたとき | 今のとおりエラー(キューブの id を書くとエラー)。警告 + 無視に変えるかは必要になったら | 必要になったら |
 | 下地が `Canvas` のときの毎フレームの CPU 描画 + 転送(`base_changed` の印、または覆われている間 3D を止める) | 印は付けない。覆われているあいだは VRM を止める(§11.2 の「T4 の実測と判断」)。`base_changed` は、覆われているあいだも動かしたくなったときに入れる | #71 B |
 | MSAA(輪郭線が細いと途切れる: POC-006 の「輪郭線」の所見、199 行・239 行付近) | **範囲外**(v1 の層は MSAA なし)。VRM の輪郭線の見た目は B で `outline-scale` などで調整。MSAA が要るなら層をマルチサンプルにする別の Issue | 別の Issue |
