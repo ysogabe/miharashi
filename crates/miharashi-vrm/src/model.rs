@@ -112,13 +112,22 @@ impl Model {
     }
 
     fn from_path_with(path: &Path, limits: &Limits) -> Result<Self, String> {
+        use std::io::Read;
         let name = path.display();
+        let file = std::fs::File::open(path).map_err(|e| format!("{name}: {e}"))?;
+        let meta = file.metadata().map_err(|e| format!("{name}: {e}"))?;
+        // /dev/zero や FIFO のように終わりのないものは読まない
+        if !meta.is_file() {
+            return Err(format!("{name}: 通常のファイルではない"));
+        }
         // 読む前に大きさを見る(読んだあとの複製で、ファイルの 3〜4 倍のメモリを使うので)
-        let len = std::fs::metadata(path)
-            .map_err(|e| format!("{name}: {e}"))?
-            .len();
-        limits.check_file_size(len)?;
-        let bytes = std::fs::read(path).map_err(|e| format!("{name}: {e}"))?;
+        limits.check_file_size(meta.len())?;
+        // 確かめたあとに伸びるファイルに備え、上限 + 1 バイトで読み止める
+        let mut bytes = Vec::new();
+        file.take(limits.file_bytes + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("{name}: {e}"))?;
+        limits.check_file_size(bytes.len() as u64)?;
         Self::from_glb_with(&bytes, limits)
     }
 
@@ -137,6 +146,7 @@ impl Model {
 
     fn load_glb(bytes: &[u8], limits: &Limits) -> Result<Self, String> {
         limits.check_file_size(bytes.len() as u64)?;
+        limits.check_json_size(bytes)?;
         let json = vrm::glb_json(bytes)?;
         let mut vrm = vrm::parse(&json)?;
         let patched = zero_fill_empty_accessors(bytes, &json)?;
@@ -493,6 +503,11 @@ struct Limits {
     /// glb ファイルの大きさ。ニケちゃん(約 24 MB)の 40 倍あまり。読んだあとの複製で、
     /// ファイルの 3〜4 倍のメモリを使う
     file_bytes: u64,
+    /// glb の JSON チャンクの大きさ。ニケちゃんは約 0.2 MB(約 24 MB のほとんどは画像)で、
+    /// その 75 倍あまり。JSON は serde_json の Value に展開すると 1 要素あたり数十〜200 バイト
+    /// 以上になる(`{}` のノード 1000 万個の 28 MiB で RSS 2.2 GiB)ので、個数の検査より前に
+    /// 大きさで弾く
+    json_bytes: u64,
 }
 
 const LIMITS: Limits = Limits {
@@ -509,6 +524,7 @@ const LIMITS: Limits = Limits {
     image_bytes: 256 << 20,
     image_total: 1 << 30,
     file_bytes: 1 << 30,
+    json_bytes: 16 << 20,
 };
 
 /// ここまでに使った予算(`Limits` と同じ単位)。
@@ -567,6 +583,22 @@ impl Limits {
             return Err(format!(
                 "ファイルが大きすぎる({len} バイト、上限 {})",
                 self.file_bytes
+            ));
+        }
+        Ok(())
+    }
+
+    /// JSON チャンクを展開する前に、ヘッダの長さ(オフセット 12 の u32)を上限と比べる。
+    /// ヘッダの形が不正なときは、`glb_json` が詳しいエラーを返すのでここでは通す。
+    fn check_json_size(&self, glb: &[u8]) -> Result<(), String> {
+        let Some(b) = glb.get(12..16) else {
+            return Ok(());
+        };
+        let len = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64;
+        if len > self.json_bytes {
+            return Err(format!(
+                "JSON チャンクが大きすぎる({len} バイト、上限 {})",
+                self.json_bytes
             ));
         }
         Ok(())
@@ -1284,7 +1316,12 @@ mod tests {
         let sb = &mut d["extensions"]["VRMC_springBone"];
         sb["colliderGroups"] = json!(groups);
         sb["springs"] = json!([{"colliderGroups": vec![0u32; 20_000], "joints": joints}]);
-        let m = load(&d, &b).unwrap();
+        // この JSON は 100 MB を超えるので、JSON の大きさの上限だけ外して読む
+        let big = Limits {
+            json_bytes: 1 << 30,
+            ..LIMITS
+        };
+        let m = load_with(&d, &b, &big).unwrap();
         let sb = &m.vrm.spring;
         assert!(sb.collider_groups.len() <= SPRING_LIMIT);
         assert_eq!(sb.collider_groups[0], [0]);
@@ -1804,6 +1841,39 @@ mod tests {
         let r = Model::from_path(&path);
         std::fs::remove_file(&path).unwrap();
         assert!(r.is_ok());
+    }
+
+    #[test]
+    fn oversized_json_chunk_is_rejected_before_parsing() {
+        let (mut d, b) = doc();
+        add_nodes(&mut d, 1, 200);
+        let glb = pack_glb(&d, &b);
+        let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as u64;
+        let tight = Limits {
+            json_bytes: json_len - 1,
+            ..LIMITS
+        };
+        let e = Model::from_glb_with(&glb, &tight).err().unwrap();
+        assert!(e.contains("JSON チャンクが大きすぎる"), "{e}");
+        let ok = Limits {
+            json_bytes: json_len,
+            ..LIMITS
+        };
+        assert!(Model::from_glb_with(&glb, &ok).is_ok());
+    }
+
+    #[test]
+    fn from_path_rejects_non_regular_files() {
+        let e = Model::from_path(Path::new("/dev/zero")).err().unwrap();
+        assert!(e.contains("通常のファイルではない"), "{e}");
+    }
+
+    #[test]
+    fn guard_panic_turns_a_panic_into_err() {
+        let e = guard_panic::<()>(|| panic!("boom")).err().unwrap();
+        assert!(e.contains("内部エラー") && e.contains("boom"), "{e}");
+        let e = guard_panic::<()>(|| panic!("{}", String::from("fmt"))).err();
+        assert!(e.unwrap().contains("fmt"));
     }
 
     /// 同じ mesh を指すノードを `n` 個足す(シーンの根に並べる)。
