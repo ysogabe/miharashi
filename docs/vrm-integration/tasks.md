@@ -26,6 +26,6 @@
 |---|---|---|---|---|---|---|---|---|
 | T1 | B の前の宿題(sparse の stride、コライダーの添字、関節 × コライダーの上限) | AC1 | - | quick | 完了 | 2c48639 | cbc3259..31d5e21 | Opus のレビューを 5 回。宿題 3 件に加え、壊れた・悪意のある glb への上限を追加(bufferView・画像の範囲検査と自前のデコード、buffer の uri、個数・頂点・morph・画像の予算、ファイル 1 GiB、JSON チャンク 2 MiB、読み込み全体の panic 防御)。JSON の最悪入力で RSS 約 270 MB、ニケちゃんの画素は変わらず。ユーザーの了承で修正の上限を超えて 5 回目まで直した |
 | T2 | `VrmScene: GlScene` と別スレッドの読み込み | AC2, AC3 | T1 | full | 完了 | 31d5e21 | b20e439..86869f2 | Sol のレビュー 2 回(1 回目で必須 2 件: 転送中・描画中の panic で GL オブジェクトが漏れる → 作りかけの控えを場面が持ち、Renderer を take しない)。`Region` は vrm 側を `StageRegion` に改名。ニケちゃん: 解析 60ms(別スレッド)、初回 draw 23ms、以後 1〜2ms、GL オブジェクト 79 個。T3 への申し送り: `input.t`/`dt` は呼び出し側が毎フレーム設定、`from_path` は構築時にスレッドを起動(cpu のときは作らない)、release 後は姿勢・SpringBone が初期化 |
-| T3 | `WithScene`・`[vrm]` 設定・演出の入力・png fixture | AC4, AC5, AC6 | T2 | full | 実装済み(レビュー待ち) | 86869f2 | | 時刻・身振り・口パクは tick、SpringBone の dt と頭の向きは render_composite(描画の間隔で進めるため) |
-| T4 | 実機の確認と計測、判断(タイムアウト解放・base_changed)、記録 | AC7, AC9 | T3 | quick | 未着手 | | | |
+| T3 | `WithScene`・`[vrm]` 設定・演出の入力・png fixture | AC4, AC5, AC6 | T2 | full | 完了 | 86869f2 | d860235..62a8e7c | Sol のレビュー 2 回(1 回目で必須 2 件: GL 失敗後も VRM の 33ms 間隔が残る → 内側が動いていれば内側の間隔、png の壁時計が固定されていない → 固定してバイト一致を試験)。包むのは `[vrm]` 有効・`screens` に含む・GL ありのときだけで、読み込みは初回表示で開始。時刻・身振り・口パクは tick、SpringBone の dt と頭の向きは render_composite。左 1/3 で手の先が切れる(REACH_FRAC は 0.4 以上でないと効かず顔が小さくなるので 0.0 のまま)→ T4 で region を選ぶ |
+| T4 | 実機の確認と計測、判断(タイムアウト解放・base_changed)、記録 | AC7, AC9 | T3 | quick | 確認待ち | | | |
 | T5 | 12 時間試験 | AC8 | T4 | quick | 未着手 | | | 本番の設定で VRM を有効にして行うので、始める前にユーザーに確認する |
