@@ -55,13 +55,25 @@ fn format_stats(
 /// 表示できるのは vsync の境界だけなので、間隔は vsync の整数倍に切り上げて上限を守る
 /// (60Hz で 50fps は 2 vsync = 30fps。半分だけ引くやり方のままだと次の vsync に間に合って 60fps になる)。
 fn frame_wait(interval: Duration, refresh_hz: u32) -> Duration {
-    let hz = f64::from(refresh_hz.max(1));
-    // 30fps と 60Hz のような割り切れる組が、浮動小数点の誤差で 1 vsync 多くならないように少し引く
-    let vsyncs = (interval.as_secs_f64() * hz - 1e-6).ceil();
+    let vsyncs = display_vsyncs(interval, refresh_hz);
     if vsyncs <= 1.0 {
         return Duration::ZERO;
     }
-    Duration::from_secs_f64((vsyncs - 0.5) / hz)
+    Duration::from_secs_f64((vsyncs - 0.5) / f64::from(refresh_hz.max(1)))
+}
+
+/// 間隔を表示できる vsync の数(間隔を vsync の整数倍に切り上げた値、最小 1)。`frame_wait` と遅れの判定で共通。
+fn display_vsyncs(interval: Duration, refresh_hz: u32) -> f64 {
+    let hz = f64::from(refresh_hz.max(1));
+    // 30fps と 60Hz のような割り切れる組が、浮動小数点の誤差で 1 vsync 多くならないように少し引く
+    (interval.as_secs_f64() * hz - 1e-6).ceil().max(1.0)
+}
+
+/// 間隔の上限があるときの「遅れ」の閾値 [ms]。切り上げた後の表示間隔に半フレームの余裕を足す
+/// (60Hz で 50fps は表示間隔が 33.3ms なので、設定の間隔 20ms を基にすると正常なフレームが遅れになる)。
+fn late_limit_ms(interval: Duration, refresh_hz: u32) -> f32 {
+    let hz = f64::from(refresh_hz.max(1));
+    ((display_vsyncs(interval, refresh_hz) + 0.5) / hz * 1000.0) as f32
 }
 
 /// 区間内のフレーム時間 [ms] を "平均/p95" にする(PoC-005 のベースライン用)。空なら "-"。
@@ -736,10 +748,10 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                 if let Some(last) = anim_last {
                     let gap = now.duration_since(last).as_secs_f32() * 1000.0;
                     anim_frames += 1;
-                    // 間隔の上限があるときは、その間隔に半フレーム(表示のリフレッシュレートから求める)の余裕を足した値を超えたら遅れ
-                    let limit = app.frame_interval().map_or(25.0, |d| {
-                        d.as_secs_f32() * 1000.0 + 500.0 / refresh_hz as f32
-                    });
+                    // 間隔の上限があるときは、vsync 単位に切り上げた表示間隔に半フレームの余裕を足した値を超えたら遅れ
+                    let limit = app
+                        .frame_interval()
+                        .map_or(25.0, |d| late_limit_ms(d, refresh_hz));
                     if gap > limit {
                         anim_slow += 1;
                         if anim_slow <= 10 {
@@ -910,6 +922,34 @@ mod tests {
             frame_wait(Duration::from_secs_f64(1.0 / 60.0), 60),
             Duration::ZERO
         );
+    }
+
+    /// 遅れの閾値は切り上げ後の表示間隔 + 半フレーム。正常な間隔は遅れにならず、1 vsync 落ちた間隔は遅れになる。
+    #[test]
+    fn late_limit_follows_the_displayed_interval() {
+        // (設定の fps, Hz, 正常な表示間隔 [ms])
+        for (set, hz, shown_ms) in [
+            (30, 60, 1000.0 / 30.0),
+            (50, 60, 1000.0 / 30.0),
+            (60, 60, 1000.0 / 60.0),
+            (30, 75, 40.0),
+            (60, 144, 1000.0 / 48.0),
+        ] {
+            let limit = late_limit_ms(Duration::from_secs_f64(1.0 / f64::from(set)), hz);
+            let vsync_ms = 1000.0 / hz as f32;
+            assert!(
+                shown_ms <= limit,
+                "{set}fps {hz}Hz: 正常な間隔が遅れになる {limit}"
+            );
+            assert!(
+                shown_ms + vsync_ms > limit,
+                "{set}fps {hz}Hz: 1 vsync 落ちても遅れにならない {limit}"
+            );
+        }
+        // 従来の 60Hz・30fps と同じ
+        let old = 1000.0 / 30.0 + 500.0 / 60.0;
+        let l = late_limit_ms(Duration::from_secs_f64(1.0 / 30.0), 60);
+        assert!((l - old).abs() < 0.01, "{l}");
     }
 
     #[test]
