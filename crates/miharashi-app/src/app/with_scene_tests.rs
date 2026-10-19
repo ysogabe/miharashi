@@ -305,21 +305,21 @@ fn inner_interval_wins_while_the_inner_screen_animates() {
     assert_eq!(App::frame_interval(&mgr2), None);
 }
 
-/// 動き続けるのは、読み込みが終わっていて、表示中かつ点灯中だけ。
-/// 読み込み中・失敗・非表示・消灯・on_leave のあとでは止まる。
+/// 動き続けるのは、読み込みが終わっていて、表示中かつ点灯中で、覆われていないときだけ。
+/// 読み込み中・失敗・非表示・消灯・on_leave のあと・メニューやアラートの表示中は止まる。
 #[test]
 fn scene_animates_only_while_ready_visible_and_on() {
     let t0 = Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
     let mk = |scene| WithScene::new(probe().0, scene, StageRegion::Left, 30);
 
-    // Ready: 表示 → 動く。アラート・メニューが上にあっても動く
+    // Ready: 表示 → 動く。アラート・メニューが上にあるあいだは止まる
     let mut s = mk(ready_scene());
     assert!(!s.scene_animating(), "出る前は動かさない");
     s.on_enter(at(0));
     assert!(s.scene_animating());
     s.set_presentation(true, true, true, at(1));
-    assert!(s.scene_animating(), "覆われていても下の VRM は動く");
+    assert!(!s.scene_animating(), "覆われているあいだは止まる");
     s.set_presentation(true, false, false, at(2));
     assert!(!s.scene_animating(), "消灯中は止まる");
     s.set_presentation(true, false, true, at(3));
@@ -531,6 +531,202 @@ fn agent_focus_aims_the_head_and_photo_does_not() {
         "描画の間隔で進む: {}",
         s.input().dt
     );
+}
+
+/// メニューかアラートが上にあるあいだは、VRM の時計が止まって継続描画にならない。閉じると戻る。
+/// 止まっているあいだも、体は最後の姿勢のまま(入力の時刻 `t` を進めない)。
+#[test]
+fn covered_stops_the_clock_and_the_continuous_redraw() {
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    let w = world();
+    let mut s = WithScene::new(probe().0, ready_scene(), StageRegion::Left, 30);
+    s.on_enter(at(0));
+    s.set_presentation(true, false, true, at(0));
+    s.tick(&w, at(1000));
+    assert_eq!(s.input().t, 1.0);
+    assert!(s.scene_animating());
+
+    s.set_presentation(true, true, true, at(1000));
+    assert!(!s.scene_animating(), "覆われると継続描画の理由にしない");
+    s.tick(&w, at(31_000));
+    assert_eq!(
+        s.active(),
+        Duration::from_secs(1),
+        "覆われているあいだは進まない"
+    );
+    assert_eq!(s.input().t, 1.0, "最後の姿勢のまま");
+
+    s.set_presentation(true, false, true, at(31_000));
+    assert!(s.scene_animating(), "閉じると戻る");
+    s.tick(&w, at(31_500));
+    assert_eq!(s.active(), Duration::from_millis(1500));
+    assert_eq!(s.input().t, 1.5);
+}
+
+/// ScreenManager 越しでも、メニューかアラートが出ているあいだは継続描画にならず、閉じると戻る。
+#[test]
+fn manager_stops_animating_while_a_menu_or_alert_is_shown() {
+    use super::screens::agents::AgentScreen;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut mgr = ScreenManager::new(
+        vec![Box::new(WithScene::new(
+            AgentScreen::new(SIZE, true, 30),
+            ready_scene(),
+            StageRegion::Left,
+            30,
+        ))],
+        "agents",
+        Box::new(DummyData::new()),
+        dummy_snapshot(0.0),
+        text_engine(""),
+        Duration::from_secs(60),
+    )
+    .with_gl_available(true)
+    .with_alerts(Some(rx));
+    let t = Instant::now();
+    mgr.tick(t);
+    mgr.tick(t + Duration::from_millis(5));
+    assert!(App::animating(&mgr), "VRM が動いている");
+
+    // メニュー
+    assert!(mgr.on_key(KeyPress::Menu));
+    mgr.tick(t + Duration::from_millis(40));
+    assert!(mgr.menu_open());
+    assert!(!App::animating(&mgr), "メニュー中は継続描画にしない");
+    assert_eq!(App::frame_interval(&mgr), None);
+    assert!(!mgr.tick(t + Duration::from_millis(80)), "描き直させない");
+    assert!(mgr.on_key(KeyPress::Menu));
+    mgr.tick(t + Duration::from_millis(120));
+    assert!(!mgr.menu_open());
+    assert!(App::animating(&mgr), "閉じると戻る");
+
+    // アラート
+    tx.send(miharashi_render::alert::AlertView::Quake(
+        crate::quake::demo_view(),
+    ))
+    .unwrap();
+    mgr.tick(t + Duration::from_millis(160));
+    assert!(App::wants_screen(&mgr));
+    assert!(!App::animating(&mgr), "アラート中は継続描画にしない");
+    assert!(!mgr.tick(t + Duration::from_millis(200)), "描き直させない");
+    mgr.tick(t + Duration::from_secs(120));
+    assert!(!App::wants_screen(&mgr), "表示時間が過ぎて閉じた");
+    assert!(App::animating(&mgr), "閉じると戻る");
+}
+
+/// 内側が動く画面(Agent のカードの移動など)は、メニューやアラートが出ていても内側の頻度で描く。
+/// VRM は止まるが、内側の間隔は変わらない。
+#[test]
+fn inner_cadence_is_kept_while_covered() {
+    struct Mover;
+    impl Screen for Mover {
+        fn id(&self) -> ScreenId {
+            "mover"
+        }
+        fn title(&self) -> &'static str {
+            "MOVER"
+        }
+        fn render(&mut self, ctx: &mut RenderContext<'_>) {
+            ctx.canvas.clear(rgba(40, 80, 120, 255));
+        }
+        fn animating(&self) -> bool {
+            true
+        }
+        fn frame_interval(&self) -> Option<Duration> {
+            Some(Duration::from_millis(10))
+        }
+    }
+    let mut s = WithScene::new(Mover, ready_scene(), StageRegion::Left, 30);
+    s.set_presentation(true, true, true, Instant::now());
+    assert!(!s.scene_animating());
+    assert!(s.animating(), "内側は動き続ける");
+    assert_eq!(s.frame_interval(), Some(Duration::from_millis(10)));
+
+    let mut mgr = ScreenManager::new(
+        vec![Box::new(WithScene::new(
+            Mover,
+            ready_scene(),
+            StageRegion::Left,
+            30,
+        ))],
+        "mover",
+        Box::new(DummyData::new()),
+        dummy_snapshot(0.0),
+        text_engine(""),
+        Duration::from_secs(60),
+    )
+    .with_gl_available(true);
+    let t = Instant::now();
+    mgr.tick(t);
+    assert!(mgr.on_key(KeyPress::Menu));
+    mgr.tick(t + Duration::from_millis(10));
+    assert!(mgr.menu_open());
+    assert!(App::animating(&mgr), "内側が動いているので描き続ける");
+    assert_eq!(App::frame_interval(&mgr), Some(Duration::from_millis(10)));
+}
+
+/// 止まっていた時間(覆われていた・非表示・消灯)が、復帰の最初の dt に入らない。
+/// 止まっていなくても、描画の間隔が空いたときは上限(0.1 秒)で切る。
+#[test]
+fn first_dt_after_a_long_pause_is_capped() {
+    struct Quiet;
+    impl Screen for Quiet {
+        fn id(&self) -> ScreenId {
+            "quiet"
+        }
+        fn title(&self) -> &'static str {
+            "QUIET"
+        }
+        fn render(&mut self, _: &mut RenderContext<'_>) {}
+    }
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    let w = world();
+    let mut text = text_engine("");
+    let mut c = miharashi_render::Canvas::new(SIZE.0, SIZE.1);
+    let mut s = WithScene::new(Quiet, ready_scene(), StageRegion::Left, 30);
+    let mut draw = |s: &mut WithScene<Quiet>| {
+        let mut ctx = RenderContext {
+            canvas: &mut c,
+            text: &mut text,
+            world: &w,
+            covered: false,
+            force_overlay: false,
+        };
+        let _ = s.render_composite(&mut ctx);
+        s.input().dt
+    };
+    s.on_enter(at(0));
+    s.set_presentation(true, false, true, at(0));
+    s.tick(&w, at(33));
+    assert!((draw(&mut s) - 0.033).abs() < 1e-3);
+
+    // 覆われる / 消灯 / 非表示のあと、60 秒たって戻る: 最初の描画の dt は止まっていた分を含まない
+    for (k, (visible, covered, on)) in [
+        (true, true, true),
+        (true, false, false),
+        (false, false, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let k = k as u64;
+        let from = 1_000 + k * 100_000;
+        s.tick(&w, at(from));
+        draw(&mut s);
+        s.set_presentation(visible, covered, on, at(from));
+        s.tick(&w, at(from + 60_000));
+        s.set_presentation(true, false, true, at(from + 60_000));
+        s.tick(&w, at(from + 60_033));
+        let dt = draw(&mut s);
+        assert!(dt > 0.0 && dt <= 0.1, "復帰の最初の dt: {dt}");
+        assert!(dt < 0.05, "止まっていた分は入らない: {dt}");
+    }
+
+    // 動いたまま描画だけが 10 秒空いた: 上限で切る
+    s.tick(&w, at(400_000));
+    assert_eq!(draw(&mut s), 0.1);
 }
 
 /// 頭の追従の時計は、表示中かつ点灯中だけ進む。向きの重みが増えている途中で見えなくなり、あとで戻っても、

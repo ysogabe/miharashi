@@ -474,7 +474,7 @@ flowchart LR
 
 - **`animating()` が止めるのは 20ms の待ちだけ**(`runtime.rs:613`)。描くかどうかは `tick` の戻り値で決まる(`redraw |= app.tick(..)`、`runtime.rs:514`、`547`)。航空機の画面は動かし続けるとき tick も毎回 true を返す(`aircraft.rs:102-105`)。**動かし続ける画面は、`animating()` と `tick` の戻り値の両方を true にする**。静止している 3D は `animating() = false`。GL 専用画面は必要なときに `tick` の戻り値(再描画)で要求できる。装飾(`WithScene`)には v1 では一回きりの再描画要求の手段がない(内側の画面の `tick` に 3D の分を混ぜない。§13)。VRM は待機中も呼吸・頭の揺れがある(POC-006)ので、「待機中は静止」とは限らない。
 - **3D 由来の分は内側の画面と分ける**: `Screen::scene_animating()`(§2.3)。ScreenManager は、**GL が使えて、失敗していないときだけ**これを `animating()` と `tick` の戻り値に足す。内側の画面(写真・Agent)の `animating()` / `tick` には 3D の分を混ぜない。混ぜると、`renderer = cpu` や失敗中に、動かない写真画面を CPU で毎回描き直してしまう(§6.1、§11.3 の「既存画面に影響しない」とも矛盾する)。案内だけを出すキューブ(GL なし・失敗中)も同じで、`scene_animating()` を足さないので、案内は変わったときだけ描く。待機の動きを何 fps で見せるか(`frame_interval`、または待機の動きの間引き)が、描き直しを減らす実際の手段になる。VRM は 1 回の描き直しが画面全体の描き直しになる。
-- **下地が `Composite::Canvas` のときの費用**: 下地が Canvas(Agent 画面でアラート・メニュー表示中: `agents.rs:933-955`、写真画面の最初の 1 枚が出るまで: `photo.rs:245-251`)だと、3D を毎フレーム描くたびに、Canvas の全画面 CPU 描画と GPU への転送(`Frame::Image` の `upload`: `compose.rs:381-386`)も毎フレーム走る。**推奨**: 下地が `Canvas` のときは「変わったときだけ」の印(`GlComposite` の `base_changed`)を付け、印が false のフレームは下地の CPU 描画と転送を飛ばして前の下地を使う。印の元は、内側の画面の `tick` の戻り値・`invalidate()`・アラート/メニューの変化。ほかの案: 下地が Canvas で、3D が画面を覆っている間は 3D を止める(下地は変わらないが、3D も止まってしまうので見た目が変わる)。**未検証**。#71 B で、Canvas 下地(アラート表示中の Agent + VRM)の CPU 使用率と描画時間を測る。
+- **下地が `Composite::Canvas` のときの費用**: 下地が Canvas(Agent 画面でアラート・メニュー表示中: `agents.rs:933-955`、写真画面の最初の 1 枚が出るまで: `photo.rs:245-251`)だと、3D を毎フレーム描くたびに、Canvas の全画面 CPU 描画と GPU への転送(`Frame::Image` の `upload`: `compose.rs:381-386`)も毎フレーム走る。**推奨**: 下地が `Canvas` のときは「変わったときだけ」の印(`GlComposite` の `base_changed`)を付け、印が false のフレームは下地の CPU 描画と転送を飛ばして前の下地を使う。印の元は、内側の画面の `tick` の戻り値・`invalidate()`・アラート/メニューの変化。ほかの案: 下地が Canvas で、3D が画面を覆っている間は 3D を止める(下地は変わらないが、3D も止まってしまうので見た目が変わる)。#71 B の T4 で測った(§11.2 の「T4 の実測と判断」): 覆われているあいだは CPU 35%・15fps。**今回は `base_changed` でなく、覆われているあいだ VRM を止める**ことにした。
 - 3D は**保持しない**: 何かの理由(時計の 1 秒更新、アラートの開閉)で画面が再描画されると、毎回 `GlScene::draw` が呼ばれる。時間が止まっている間は同じ絵になるようにする(画面の状態が変わらなければ同じ入力)。
 - **消灯中は描かない**: 既存どおり、`redraw && screen_on` のときだけ描く(`runtime.rs:547`)。`set_presentation(display_on = false)`(`manager.rs:393-398`)で、画面は自分の演出の時計を止められる。復帰時に溜まった動きを再生しない。
 - 非表示の画面は `draw` が呼ばれない。`tick` は呼ばれる(Provider と同じ)ので、データの取り込み(エージェントの状態など)は続くが、3D は描かれない。
@@ -514,15 +514,29 @@ B に入る前の宿題(Issue #71 のコメント): sparse accessor の `byteStr
 2. モデルの読み込みを別スレッドにする。GL への転送は最初の `draw` で。モデルの場所は設定(リポジトリの外)で指定し、**ニケちゃんのモデルは同梱しない**(ライセンスの理由)。モデルがなければ 3D なしで動く。`miharashi-vrm` はすでに自前の `Region` を公開している(`crates/miharashi-vrm/src/lib.rs:26`)ので、glscene に依存させるときはどちらかを改名するか別名で import する。
 3. **VRM を装飾として載せる画面**を `miharashi-app` に足す: `WithScene<S: Screen>`(推奨)。内側の画面(写真・Agent)のすべてのメソッドを委譲し(`gl_scene()` は自分の `VrmScene` を返し、`scene_animating()` は VRM が動いているかを返す)、`render_composite` の結果を `Composite::Gl { base: Some(内側の結果), scene, region, top: Off }` に包む。内側の画面と操作・`id`・巡回は変わらない。`needs_gl() = false`。`WithScene` は GL の可否を知らなくてよい(常に `Composite::Gl` で包んで返す)。GL が使えない・失敗中の処理は ScreenManager だけが行う(§6.1)。
 4. 表情・口パク・身振りの入力(`tick` から `VrmScene` の具体型へ)。T3 Agent の状態との連動は B の範囲で決める。
-5. 実機で B の確認: 写真 + VRM と Agent + VRM で巡回、アラートが体の手前に出る(失敗させても出続ける)、`renderer = cpu` で元の画面(動かない写真画面が毎フレーム描き直されない)、壊れたモデルで落ちない(sparse の stride 検査を含む)。VRAM+GTT の保持量を測り、タイムアウト解放の要否を決める(§3)。下地が `Canvas` のとき(アラート表示中の Agent + VRM など)の CPU 使用率・描画時間を測り、`base_changed` の要否を決める(§10)。12 時間試験(#74 の分もここでまとめて行う)。
+5. 実機で B の確認: 写真 + VRM と Agent + VRM で巡回、アラートが体の手前に出る(失敗させても出続ける)、`renderer = cpu` で元の画面(動かない写真画面が毎フレーム描き直されない)、壊れたモデルで落ちない(sparse の stride 検査を含む)。VRAM+GTT の保持量を測り、タイムアウト解放の要否を決める(§3)。下地が `Canvas` のとき(アラート表示中の Agent + VRM など)の CPU 使用率・描画時間を測り、`base_changed` の要否を決める(§10。結果は下の「T4 の実測と判断」)。12 時間試験(#74 の分もここでまとめて行う)。
 
 T3 で決めたこと(実装: `app/screens/with_scene.rs`、設定 `[vrm]`):
 
 - 包むかどうかは `kiosk` が決める: `[vrm].enabled` で、その画面が `vrm.screens` にあり、GL が使える(`gpu_max.is_some()`)ときだけ `WithScene` で包む。`renderer = cpu` や `auto` で GLES を開けなかったときは包まない(包んでも ScreenManager が 3D を外すが、読み込みスレッドとモデルの RAM が無駄になる)。`WithScene` は GL の可否を知らない。
 - モデルの読み込みは、その画面が最初に表示されるとき(`on_enter` / `set_presentation(visible)`)に始める(`VrmScene::lazy` + `start`)。巡回に出ない画面のモデルは読まない。写真と Agent の両方に載せると、モデルは 2 回読む(RAM・VRAM が 2 倍。T4 で測る)。
-- 時刻・身振り・口パクは `tick` で進める(表示中かつ点灯中に経った時間。復帰でまとめて進めない)。SpringBone の `dt` と頭の向き(Agent 画面の拡大中のカードの方)は、描画の間隔で進めるため `render_composite` で入れる。指さしは使わない。
-- `scene_animating()` は、読み込みが `Ready` で、表示中かつ点灯中のあいだだけ true(アラート・メニューで覆われていても true)。読み込み中・失敗・非表示・消灯では false。`Ready` になった周期の `tick` は true を返して描き直させる。
+- 時刻・身振り・口パクは `tick` で進める(表示中かつ点灯中で、覆われていない間に経った時間。復帰でまとめて進めない)。SpringBone の `dt` と頭の向き(Agent 画面の拡大中のカードの方)は、描画の間隔で進めるため `render_composite` で入れる。指さしは使わない。
+- `scene_animating()` は、読み込みが `Ready` で、表示中かつ点灯中で、アラート・メニューに覆われていないあいだだけ true(覆われているあいだは止める。下の「T4 の実測と判断」)。読み込み中・失敗・非表示・消灯でも false。`Ready` になった周期の `tick` は true を返して描き直させる。
 - `vrm.enabled = true` なのに `model` が空なら設定エラー(`panel.enabled` の `token_file` と同じ扱い)。ファイルの有無は確かめない(無い・壊れているモデルは 3D なしで動かす約束)。
+
+T4 の実測と判断(2560x1080、iGPU は Radeon、VRM はニケちゃん、左 1/3、30fps):
+
+| 場面 | iGPU | CPU | 描画 |
+|---|---|---|---|
+| 写真 + VRM | 11% | 2.5% | 30fps、遅れなし |
+| Agent + VRM | 17% | 3.6% | 30fps、遅れ 4% |
+| Agent + VRM の上にメニュー | 9% | **35%** | **15fps、全フレーム遅れ** |
+| Agent + VRM の上にアラート(地震・災害のデモ) | 6% | **36%** | 15fps |
+
+- メニュー・アラートの表示中は下地が `Composite::Canvas` になり、VRM が動くあいだ、全画面の CPU 描画(render 約 22ms)と転送(present 約 19ms)が 30fps で毎フレーム走って間に合わない(ログに `anim: 遅れ 66.7ms` が続く)。アラートは最長 5 分(`show_minutes`)出る。
+- **判断: `base_changed` は入れず、覆われているあいだは VRM を止める。** `WithScene` が `set_presentation` の `covered` を見て、時計(`active`)を止め、`scene_animating()` を false にする。体は最後の姿勢のまま、アラート・メニューの奥に見える。閉じると時計が戻り、止まっていた分は進めない(SpringBone の `dt` は 0.1 秒で切り、頭の追従も `active` の時計)。内側の画面が自分で動くとき(Agent のカードの移動)は、これまでどおり内側の `animating()` と `frame_interval()` で描く(覆われていても変わらない)。VRM なしの画面と、キューブのように 3D だけの画面(下地が Canvas でなく、重ね絵は最上段の層)は変えない。止めるのは `WithScene` の中だけで、ScreenManager の `scene_animating()` は画面の答えをそのまま使う。
+- 下地が Canvas でなくても(写真 + VRM で重ね絵だけが変わる場合)、覆われているあいだは止める。下地の種類で動きを変えないほうが単純で、覆われている間の VRM は見えにくいため。
+- **`base_changed` は、覆われているあいだも VRM を動かしたくなったときに入れる**(§10 の推奨どおり、下地が `Canvas` のフレームは CPU 描画と転送を飛ばして前の下地を使う)。そのとき、この「止める」判断は外す。
 
 ### 11.3 既存 5 画面への影響
 
@@ -549,6 +563,6 @@ T3 で決めたこと(実装: `app/screens/with_scene.rs`、設定 `[vrm]`):
 | `Cargo.toml` に `panic = "abort"` が無いことを確かめる単体テストを足すか(CI の grep は削った) | 足す(`catch_unwind` が効く前提を守る)。**#74 では足していない** | 別の機会(#71 B など) |
 | `miharashi-app` が `miharashi-vrm` に依存するときの feature 名・既定のオン/オフ | optional 依存、既定オフ、`default-features = false`(vrm の既定 feature は Linux 以外を壊す) | #71 B |
 | `refresh_screens` に GL 画面の id を書いたとき | 今のとおりエラー(キューブの id を書くとエラー)。警告 + 無視に変えるかは必要になったら | 必要になったら |
-| 下地が `Canvas` のときの毎フレームの CPU 描画 + 転送(`base_changed` の印、または覆われている間 3D を止める) | 印を付ける(§10)。#74 の実測で、下地を毎フレーム描く 1/3 幅は CPU 3.4%(全面は 1.2%)。`base_changed` は未実装。減る量は #71 B で測って決める | #71 B |
+| 下地が `Canvas` のときの毎フレームの CPU 描画 + 転送(`base_changed` の印、または覆われている間 3D を止める) | 印は付けない。覆われているあいだは VRM を止める(§11.2 の「T4 の実測と判断」)。`base_changed` は、覆われているあいだも動かしたくなったときに入れる | #71 B |
 | MSAA(輪郭線が細いと途切れる: POC-006 の「輪郭線」の所見、199 行・239 行付近) | **範囲外**(v1 の層は MSAA なし)。VRM の輪郭線の見た目は B で `outline-scale` などで調整。MSAA が要るなら層をマルチサンプルにする別の Issue | 別の Issue |
 | 一回きりの 3D 再描画要求(`scene_animating()` の継続でなく、状態が変わった時だけの要求) | v1 は作らない(キューブも VRM も動き続ける) | 静止する 3D 画面が出たとき |

@@ -8,7 +8,9 @@
 //! 演出は PoC-006 と同じ: バストアップ、待機 → 説明 → 両手を広げる → 手を振る → 指さしの身振り、
 //! 口パク(母音・まばたき・笑顔)。Agent 画面では、拡大中のカードの方へ頭を向ける
 //! (T3 Agent の状態との連動はここまで。指さしはしない)。
-//! 時間(`active`)は、表示中かつ点灯中に経った分だけ進める。非表示・消灯の間は止まり、復帰でまとめて進めない。
+//! 時間(`active`)は、表示中かつ点灯中で、メニュー・アラートに覆われていない間に経った分だけ進める。
+//! 非表示・消灯・覆われている間は止まり、復帰でまとめて進めない。覆われている間は、体を最後の姿勢のまま描く
+//! (下地が Canvas になると、VRM の動きで全画面の CPU 描画と転送が毎フレーム走るため。実測は §11.2)。
 use crate::screen::{
     Composite, GlComposite, GlScene, KeyLabels, Outcome, Region, RenderContext, Screen,
     ScreenAction, ScreenId, Top, World,
@@ -31,7 +33,9 @@ pub struct WithScene<S: Screen> {
     /// 画面が見えているか(`on_enter` / `on_leave` / `set_presentation`)
     visible: bool,
     display_on: bool,
-    /// 表示中かつ点灯中に経った時間。身振り・口パクの時刻はこれで決まる
+    /// 上にメニューかアラートがあるか(`set_presentation`)。覆われている間は時計を止め、VRM を動かさない
+    covered: bool,
+    /// 表示中かつ点灯中で、覆われていない間に経った時間。身振り・口パクの時刻はこれで決まる
     active: Duration,
     /// `active` を最後に更新した時刻
     last: Option<Instant>,
@@ -57,6 +61,7 @@ impl<S: Screen> WithScene<S> {
             interval: (fps > 0).then(|| Duration::from_secs_f64(1.0 / f64::from(fps))),
             visible: false,
             display_on: true,
+            covered: false,
             active: Duration::ZERO,
             last: None,
             drawn: Duration::ZERO,
@@ -95,8 +100,9 @@ impl<S: Screen> WithScene<S> {
         self.active
     }
 
+    /// VRM の時計が進むか: 表示中・点灯中で、メニューやアラートに覆われていない。
     fn running(&self) -> bool {
-        self.visible && self.display_on
+        self.visible && self.display_on && !self.covered
     }
 
     /// 動いているあいだだけ `now` まで時間を進め、どちらにしても基準の時刻を `now` にする
@@ -198,6 +204,7 @@ impl<S: Screen> Screen for WithScene<S> {
         // 状態が変わる前の分までを数えてから切り替える
         self.advance(now);
         self.visible = visible;
+        self.covered = covered;
         self.display_on = display_on;
         if visible {
             self.scene.start();
@@ -293,7 +300,8 @@ impl<S: Screen> Screen for WithScene<S> {
         Some(&mut self.scene)
     }
 
-    /// VRM が動いているか: 読み込みが終わっていて、表示中かつ点灯中。読み込み中・失敗・非表示・消灯では動かさない。
+    /// VRM が動いているか: 読み込みが終わっていて、表示中かつ点灯中で、覆われていない。
+    /// 読み込み中・失敗・非表示・消灯・メニューやアラートの表示中は動かさない(覆われている間は内側の画面の頻度のまま)。
     fn scene_animating(&self) -> bool {
         self.running() && self.scene.state() == LoadState::Ready
     }
