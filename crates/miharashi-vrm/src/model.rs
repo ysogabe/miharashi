@@ -123,9 +123,18 @@ impl Model {
         // 読む前に大きさを見る(読んだあとの複製で、ファイルの 3〜4 倍のメモリを使うので)
         limits.check_file_size(meta.len())?;
         // 確かめたあとに伸びるファイルに備え、上限 + 1 バイトで読み止める
+        let mut file = file.take(limits.file_bytes + 1);
+        // 全体を読む前に、先頭のヘッダ(20 バイト)で magic と JSON チャンクの長さを確かめる
         let mut bytes = Vec::new();
-        file.take(limits.file_bytes + 1)
+        (&mut file)
+            .take(20)
             .read_to_end(&mut bytes)
+            .map_err(|e| format!("{name}: {e}"))?;
+        if bytes.len() >= 4 && &bytes[..4] != b"glTF" {
+            return Err(format!("{name}: glb ではない(先頭が glTF でない)"));
+        }
+        limits.check_json_size(&bytes)?;
+        file.read_to_end(&mut bytes)
             .map_err(|e| format!("{name}: {e}"))?;
         limits.check_file_size(bytes.len() as u64)?;
         Self::from_glb_with(&bytes, limits)
@@ -147,9 +156,9 @@ impl Model {
     fn load_glb(bytes: &[u8], limits: &Limits) -> Result<Self, String> {
         limits.check_file_size(bytes.len() as u64)?;
         limits.check_json_size(bytes)?;
-        let json = vrm::glb_json(bytes)?;
+        let mut json = vrm::glb_json(bytes)?;
         let mut vrm = vrm::parse(&json)?;
-        let patched = zero_fill_empty_accessors(bytes, &json)?;
+        let patched = zero_fill_empty_accessors(bytes, &mut json, limits)?;
         // `gltf::import_slice` は画像の bufferView の範囲を確かめずに切り出して panic するので、
         // buffer の読み込みまでを自分で呼び、画像は範囲と大きさの検査をしてから自分でデコードする
         let gltf::Gltf {
@@ -503,10 +512,11 @@ struct Limits {
     /// glb ファイルの大きさ。ニケちゃん(約 24 MB)の 40 倍あまり。読んだあとの複製で、
     /// ファイルの 3〜4 倍のメモリを使う
     file_bytes: u64,
-    /// glb の JSON チャンクの大きさ。ニケちゃんは約 0.2 MB(約 24 MB のほとんどは画像)で、
-    /// その 75 倍あまり。JSON は serde_json の Value に展開すると 1 要素あたり数十〜200 バイト
-    /// 以上になる(`{}` のノード 1000 万個の 28 MiB で RSS 2.2 GiB)ので、個数の検査より前に
-    /// 大きさで弾く
+    /// glb の JSON チャンクの大きさ。ニケちゃんは 211,852 バイト(約 24 MB のほとんどは画像)で、
+    /// その約 10 倍。JSON は serde_json の Value に展開すると 1 バイトあたり最大で約 128 倍
+    /// (`{"":{"":…0…}}` を深さ 120 まで入れ子にした細工で、2 MiB → RSS 約 260 MiB。
+    /// 16 MiB だと 4 GiB 超)になるので、個数の検査より前に大きさで弾く。
+    /// 書き直した JSON の長さにも同じ上限をかける
     json_bytes: u64,
 }
 
@@ -524,7 +534,7 @@ const LIMITS: Limits = Limits {
     image_bytes: 256 << 20,
     image_total: 1 << 30,
     file_bytes: 1 << 30,
-    json_bytes: 16 << 20,
+    json_bytes: 2 << 20,
 };
 
 /// ここまでに使った予算(`Limits` と同じ単位)。
@@ -762,9 +772,15 @@ const MIN_ZERO_LIMIT: u64 = 1 << 20;
 /// 対象は morph target が参照する accessor だけで、0 の大きさは BIN チャンクの長さ
 /// (下限 1 MiB)までに限る(小さな glb で大きなメモリを確保させない)。
 /// 該当する accessor がなければ `Ok(None)`(元のバイト列をそのまま読む)。
+///
+/// Value は複製せず、その場で書き換える(複製すると展開済みの JSON が 2 つ同時に残る)。
+/// 書き換えるのは bufferViews・accessors・buffers[0] だけで、呼び出し側がこのあと読む
+/// materials などには触れない。書き直した JSON が `json_bytes` を超えたら `Err` にする
+/// (serde で書き直すと `1e9` → `1000000000.0` のように元より長くなることがある)。
 fn zero_fill_empty_accessors(
     bytes: &[u8],
-    json: &serde_json::Value,
+    json: &mut serde_json::Value,
+    limits: &Limits,
 ) -> Result<Option<Vec<u8>>, String> {
     use serde_json::Value;
     let Some(accessors) = json.get("accessors").and_then(Value::as_array) else {
@@ -837,7 +853,6 @@ fn zero_fill_empty_accessors(
     let pad = bin.len().next_multiple_of(4) - bin.len();
     let offset = bin.len() + pad;
 
-    let mut json = json.clone();
     let Some(views) = json.get_mut("bufferViews").and_then(Value::as_array_mut) else {
         return Ok(None);
     };
@@ -861,9 +876,32 @@ fn zero_fill_empty_accessors(
         "byteLength".into(),
         serde_json::json!(offset as u64 + zeros),
     );
-    let mut new_bin = bin.to_vec();
-    new_bin.resize(offset + zeros as usize, 0);
-    Ok(Some(crate::synth::pack_glb(&json, &new_bin)))
+    let mut new_json =
+        serde_json::to_vec(&*json).map_err(|e| format!("JSON を書き直せない: {e}"))?;
+    if new_json.len() as u64 > limits.json_bytes {
+        return Err(format!(
+            "書き直した JSON が大きすぎる({} バイト、上限 {})",
+            new_json.len(),
+            limits.json_bytes
+        ));
+    }
+    new_json.resize(new_json.len().next_multiple_of(4), b' ');
+    let new_bin_len = (offset + zeros as usize).next_multiple_of(4);
+    let total = 12 + 8 + new_json.len() + 8 + new_bin_len;
+    let total32 = u32::try_from(total).map_err(|_| "書き直した glb が大きすぎる".to_string())?;
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"glTF");
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&total32.to_le_bytes());
+    out.extend_from_slice(&(new_json.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"JSON");
+    out.extend_from_slice(&new_json);
+    drop(new_json);
+    out.extend_from_slice(&(new_bin_len as u32).to_le_bytes());
+    out.extend_from_slice(b"BIN\0");
+    out.extend_from_slice(bin);
+    out.resize(total, 0);
+    Ok(Some(out))
 }
 
 fn wrap(m: gltf::texture::WrappingMode) -> u32 {
@@ -1860,6 +1898,68 @@ mod tests {
             ..LIMITS
         };
         assert!(Model::from_glb_with(&glb, &ok).is_ok());
+    }
+
+    /// morph target の NORMAL accessor から bufferView を外す(書き直しの経路に入る)
+    fn make_empty_morph_accessor(d: &mut Value) {
+        let t = d["meshes"][0]["primitives"][0]["targets"][0]["NORMAL"]
+            .as_u64()
+            .unwrap() as usize;
+        d["accessors"][t]
+            .as_object_mut()
+            .unwrap()
+            .remove("bufferView");
+    }
+
+    #[test]
+    fn json_size_limit_applies_to_the_rewrite_path() {
+        let (mut d, b) = doc();
+        make_empty_morph_accessor(&mut d);
+        let glb = pack_glb(&d, &b);
+        let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as u64;
+        assert!(Model::from_glb_with(&glb, &LIMITS).is_ok());
+        let tight = Limits {
+            json_bytes: json_len - 1,
+            ..LIMITS
+        };
+        let e = Model::from_glb_with(&glb, &tight).err().unwrap();
+        assert!(e.contains("JSON チャンクが大きすぎる"), "{e}");
+    }
+
+    #[test]
+    fn rewritten_json_length_is_checked() {
+        let (mut d, b) = doc();
+        make_empty_morph_accessor(&mut d);
+        let glb = pack_glb(&d, &b);
+        let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as u64;
+        // 書き直すと bufferView と accessor の bufferView の分だけ長くなる。元の長さはちょうど通る
+        let exact = Limits {
+            json_bytes: json_len,
+            ..LIMITS
+        };
+        let e = Model::from_glb_with(&glb, &exact).err().unwrap();
+        assert!(e.contains("書き直した JSON が大きすぎる"), "{e}");
+    }
+
+    #[test]
+    fn from_path_checks_the_header_before_reading_everything() {
+        let (d, b) = doc();
+        let glb = pack_glb(&d, &b);
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("miharashi-vrm-header-{}.glb", std::process::id()));
+        let mut bad = glb.clone();
+        bad[..4].copy_from_slice(b"XXXX");
+        std::fs::write(&path, &bad).unwrap();
+        let e = Model::from_path(&path).err().unwrap();
+        assert!(e.contains("glb ではない"), "{e}");
+        let tight = Limits {
+            json_bytes: 10,
+            ..LIMITS
+        };
+        std::fs::write(&path, &glb).unwrap();
+        let e = Model::from_path_with(&path, &tight).err().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(e.contains("JSON チャンクが大きすぎる"), "{e}");
     }
 
     #[test]
