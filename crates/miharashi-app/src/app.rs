@@ -44,8 +44,12 @@ pub fn text_engine(font: &str) -> TextEngine {
 }
 
 pub fn set_clock(s: &mut Snapshot) {
+    set_clock_at(s, chrono::Local::now());
+}
+
+/// 日付・時刻を `now` にする(`png` の fixture が、実時刻に依らない絵を作るため)。
+pub fn set_clock_at(s: &mut Snapshot, now: chrono::DateTime<chrono::Local>) {
     use chrono::Datelike;
-    let now = chrono::Local::now();
     let wd =
         ["月", "火", "水", "木", "金", "土", "日"][now.weekday().num_days_from_monday() as usize];
     s.date = format!("{} ({wd})", now.format("%Y/%m/%d"));

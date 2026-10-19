@@ -32,6 +32,8 @@ fn ready_scene() -> VrmScene {
 /// 呼び出しを記録し、すべてのメソッドに既定値とは違う値を返す画面(委譲の漏れを見つける)。
 struct Probe {
     log: Rc<RefCell<Vec<String>>>,
+    /// `animating()` の値(既定は true)
+    animating: bool,
 }
 
 impl Screen for Probe {
@@ -75,7 +77,7 @@ impl Screen for Probe {
         self.log.borrow_mut().push("invalidate".into());
     }
     fn animating(&self) -> bool {
-        true
+        self.animating
     }
     fn needs_gl(&self) -> bool {
         true
@@ -102,7 +104,13 @@ impl Screen for Probe {
 
 fn probe() -> (Probe, Rc<RefCell<Vec<String>>>) {
     let log = Rc::new(RefCell::new(Vec::new()));
-    (Probe { log: log.clone() }, log)
+    (
+        Probe {
+            log: log.clone(),
+            animating: true,
+        },
+        log,
+    )
 }
 
 fn world() -> World {
@@ -166,23 +174,99 @@ fn delegates_everything_to_the_inner_screen() {
 }
 
 /// 3D に関する 5 つだけは、内側の値(ここでは Probe の 77ms・99・needs_gl)でなく装飾自身のもの。
+/// 間隔は、内側が動いていないときだけ VRM の fps(内側が動いていれば内側の間隔。次のテスト)。
 #[test]
 fn scene_methods_are_its_own() {
-    let (inner, _) = probe();
+    let (mut inner, _) = probe();
+    inner.animating = false;
     let mut s = WithScene::new(inner, ready_scene(), StageRegion::Left, 30);
     assert!(!s.needs_gl(), "装飾は GL が要る画面ではない");
     assert!(s.gl_scene().is_some());
     assert_eq!(s.gl_live_objects(), Some(0), "まだ何も作っていない");
     // 見えていないあいだは動かない(Probe は scene_animating = true だが引き継がない)
     assert!(!s.scene_animating());
-    // 見えていれば、内側の間隔でなく自分の fps
+    // 見えていて、内側が動いていなければ、内側の間隔でなく自分の fps
     s.set_presentation(true, false, true, Instant::now());
     assert!(s.scene_animating());
     let i = s.frame_interval().unwrap().as_secs_f64();
     assert!((i - 1.0 / 30.0).abs() < 1e-9, "{i}");
-    // 動いていなければ内側の間隔
+    // VRM が動いていなければ内側の間隔
     s.set_presentation(false, false, true, Instant::now());
     assert_eq!(s.frame_interval(), Some(Duration::from_millis(77)));
+}
+
+/// 内側が動いている画面(Agent 画面のカードの移動など)の間隔は、VRM が動いていても内側のもの
+/// (None = vsync)。3D が失敗しても `scene_animating` は変わらないので、その後も内側の間隔のまま。
+/// VRM だけが動いているときは VRM の fps で、失敗したら止まる。
+#[test]
+fn inner_interval_wins_while_the_inner_screen_animates() {
+    /// 動いている(`moving`)あいだ vsync(None)で描かせる画面
+    struct Mover(Rc<std::cell::Cell<bool>>);
+    impl Screen for Mover {
+        fn id(&self) -> ScreenId {
+            "mover"
+        }
+        fn title(&self) -> &'static str {
+            "MOVER"
+        }
+        fn render(&mut self, ctx: &mut RenderContext<'_>) {
+            ctx.canvas.clear(rgba(40, 80, 120, 255));
+        }
+        fn animating(&self) -> bool {
+            self.0.get()
+        }
+    }
+    let moving = Rc::new(std::cell::Cell::new(true));
+    let screens: Vec<Box<dyn Screen>> = vec![Box::new(WithScene::new(
+        Mover(moving.clone()),
+        ready_scene(),
+        StageRegion::Left,
+        30,
+    ))];
+    let mut mgr = ScreenManager::new(
+        screens,
+        "mover",
+        Box::new(DummyData::new()),
+        dummy_snapshot(0.0),
+        text_engine(""),
+        Duration::from_secs(60),
+    )
+    .with_gl_available(true);
+    let t = Instant::now();
+    mgr.tick(t);
+    mgr.tick(t + Duration::from_millis(5));
+    let mut c = miharashi_render::Canvas::new(SIZE.0, SIZE.1);
+    assert!(matches!(mgr.render_composite(&mut c), Composite::Gl(_)));
+    assert!(App::animating(&mgr));
+    assert_eq!(App::frame_interval(&mgr), None, "失敗の前: 内側の vsync");
+    mgr.report_scene_failure("試験");
+    assert!(App::animating(&mgr), "内側は動き続ける");
+    assert_eq!(App::frame_interval(&mgr), None, "失敗の後も内側の vsync");
+
+    // 内側が止まれば、VRM だけの間隔(失敗の前)。失敗したら止まる
+    let mut mgr2 = ScreenManager::new(
+        vec![Box::new(WithScene::new(
+            Mover(Rc::new(std::cell::Cell::new(false))),
+            ready_scene(),
+            StageRegion::Left,
+            30,
+        ))],
+        "mover",
+        Box::new(DummyData::new()),
+        dummy_snapshot(0.0),
+        text_engine(""),
+        Duration::from_secs(60),
+    )
+    .with_gl_available(true);
+    mgr2.tick(t);
+    mgr2.tick(t + Duration::from_millis(5));
+    assert!(App::animating(&mgr2));
+    let i = App::frame_interval(&mgr2).unwrap().as_secs_f64();
+    assert!((i - 1.0 / 30.0).abs() < 1e-9, "{i}");
+    assert!(matches!(mgr2.render_composite(&mut c), Composite::Gl(_)));
+    mgr2.report_scene_failure("試験");
+    assert!(!App::animating(&mgr2));
+    assert_eq!(App::frame_interval(&mgr2), None);
 }
 
 /// 動き続けるのは、読み込みが終わっていて、表示中かつ点灯中だけ。
@@ -413,6 +497,63 @@ fn agent_focus_aims_the_head_and_photo_does_not() {
     );
 }
 
+/// 頭の追従の時計は、表示中かつ点灯中だけ進む。向きの重みが増えている途中で見えなくなり、あとで戻っても、
+/// 休んでいた間の分は進まない(実時間で進めると、復帰の直後に重みが跳ぶ)。
+#[test]
+fn aim_clock_does_not_run_while_hidden() {
+    use super::screens::agents::AgentScreen;
+    let base = Instant::now();
+    let (initial, fresh, _) =
+        crate::agent_demo::fixture_snapshots(std::time::SystemTime::now(), base);
+    let mut world = World {
+        agents: initial,
+        ..World::default()
+    };
+    let mut s = WithScene::new(
+        AgentScreen::new((1280, 540), true, 30),
+        ready_scene(),
+        StageRegion::Left,
+        30,
+    );
+    s.on_enter(base);
+    s.set_presentation(true, false, true, base);
+    let mut text = text_engine("");
+    let mut c = miharashi_render::Canvas::new(1280, 540);
+    let mut step = |s: &mut WithScene<AgentScreen>, world: &World, ms: u64| {
+        let now = base + Duration::from_millis(ms);
+        s.tick(world, now);
+        let mut ctx = RenderContext {
+            canvas: &mut c,
+            text: &mut text,
+            world,
+            covered: false,
+            force_overlay: false,
+        };
+        let _ = s.render_composite(&mut ctx);
+        s.input().aim.map_or(0.0, |a| a.look)
+    };
+    step(&mut s, &world, 0);
+    world.agents = fresh;
+    // 重みが増え始めた(まだ小さい)ところで見えなくなる
+    let mut ms = 1000;
+    let mut look = 0.0;
+    while look <= 0.0 || look >= 0.3 {
+        ms += 20;
+        assert!(ms < 6000, "重みが増えない");
+        look = step(&mut s, &world, ms);
+    }
+    s.set_presentation(false, false, true, base + Duration::from_millis(ms));
+    // 60 秒後に戻る。復帰の 1 周期後の重みは、休む前から 1 周期分しか動かない
+    // (実時間で進めると、60 秒分の差分で 0 に跳ぶ。内側の Agent 画面のフォーカスが終わっていても、同じ 1 周期分)
+    let back = ms + 60_000;
+    s.set_presentation(true, false, true, base + Duration::from_millis(back));
+    let after = step(&mut s, &world, back + 33);
+    assert!(
+        after > 0.0 && (after - look).abs() < 0.2,
+        "休んだ間の分は進まない: {look} → {after}"
+    );
+}
+
 /// GL が使えない・3D が失敗した画面は、ScreenManager が `Composite::Gl` の下地だけにする。
 /// 元の画面だけを出したのと 1 画素も違わず、3D の分の再描画や間隔の上限を足さない。
 #[test]
@@ -638,19 +779,18 @@ mod gpu {
         }
     }
 
-    /// 写真 + VRM を、持続する Compositor で 3 フレーム描く(1 枚目は写真を渡し、2 枚目以降は GPU 側のものと
-    /// 前の重ね絵を使う)。どのフレームも写真と重ね絵が残り、領域の中に VRM が重なる。
-    #[test]
-    fn photo_and_vrm_keep_the_photo_and_overlay_across_frames() {
+    /// 写真を載せた画面を、持続する Compositor で 3 フレーム描く(1 枚目は写真を渡し、2 枚目以降は GPU 側のものと
+    /// 前の重ね絵を使う)。時計は固定するので、`scene` 以外が同じなら同じ絵になる。
+    fn photo_frames(off: &Offscreen, scene: VrmScene) -> Vec<Vec<u8>> {
+        use chrono::TimeZone;
         use miharashi_gpu::compose::Compositor;
-        let Some(off) = offscreen() else { return };
         let (dir, p) = super::super::tests::test_photo();
         let photo = PhotoScreen::new(&Config::default(), SIZE, Some(4096), Source::File(p, None));
         let feed: Box<dyn Provider> = Box::new(photo.feed_provider());
         let mut mgr = ScreenManager::new(
             vec![Box::new(WithScene::new(
                 photo,
-                ready_scene(),
+                scene,
                 StageRegion::Left,
                 30,
             ))],
@@ -661,6 +801,11 @@ mod gpu {
             Duration::from_secs(60),
         )
         .with_gl_available(true)
+        .with_fixed_clock(
+            chrono::Local
+                .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+                .unwrap(),
+        )
         .with_provider(feed);
         let end = Instant::now() + Duration::from_secs(5);
         let t0 = Instant::now();
@@ -669,7 +814,6 @@ mod gpu {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(mgr.panel_view().unwrap().photo.is_some());
-        let region = WithScene::<PhotoScreen>::region(StageRegion::Left, SIZE);
         let frames = off
             .with_target(SIZE, |gl, fbo| {
                 let mut comp = Compositor::new(gl, SIZE).unwrap();
@@ -695,6 +839,21 @@ mod gpu {
                 out
             })
             .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        frames
+    }
+
+    /// 写真 + VRM。どのフレームも写真と重ね絵が残り、領域の中だけが、同じ写真を VRM なしで描いた絵と違う。
+    #[test]
+    fn photo_and_vrm_keep_the_photo_and_overlay_across_frames() {
+        let Some(off) = offscreen() else { return };
+        let region = WithScene::<PhotoScreen>::region(StageRegion::Left, SIZE);
+        let frames = photo_frames(&off, ready_scene());
+        // 読み込めない場面(何も描かない)で、同じ写真・同じ経路・同じ時計の絵
+        let bare = photo_frames(
+            &off,
+            VrmScene::from_path("/nonexistent.vrm".into(), Rc::new(ObjectCount::default())),
+        );
         let px = |img: &[u8], x: u32, y: u32| -> [u8; 4] {
             let i = ((y * SIZE.0 + x) * 4) as usize;
             img[i..i + 4].try_into().unwrap()
@@ -703,10 +862,17 @@ mod gpu {
             // 領域の外の写真(緑)が、どのフレームでも出る
             let outside = px(img, SIZE.0 - 5, SIZE.1 / 2);
             assert_eq!(outside[3], 255, "{k} 枚目");
-            // 領域の中に VRM が重なり、写真だけの絵と変わる
+            // 領域の外は、VRM なしの絵と 1 画素も違わない
+            let in_region = |x: u32, y: u32| x < region.w && y < region.h;
+            let outside_diff = (0..SIZE.1)
+                .flat_map(|y| (0..SIZE.0).map(move |x| (x, y)))
+                .filter(|&(x, y)| !in_region(x, y) && px(img, x, y) != px(&bare[k], x, y))
+                .count();
+            assert_eq!(outside_diff, 0, "{k} 枚目: 領域の外が変わった");
+            // 領域の中には VRM が重なり、VRM なしの絵と変わる
             let inside = (0..region.h)
                 .flat_map(|y| (0..region.w).map(move |x| (x, y)))
-                .filter(|&(x, y)| px(img, x, y) != px(&frames[0], SIZE.0 - 5, 5))
+                .filter(|&(x, y)| px(img, x, y) != px(&bare[k], x, y))
                 .count();
             assert!(
                 inside > 200,
@@ -727,6 +893,5 @@ mod gpu {
                 );
             }
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

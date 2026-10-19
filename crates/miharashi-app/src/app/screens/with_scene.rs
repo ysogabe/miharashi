@@ -43,6 +43,8 @@ pub struct WithScene<S: Screen> {
     /// `demo::face` の出力の置き場(毎フレームの確保を避ける)
     face_buf: Vec<(&'static str, f32)>,
     aim: AimTracker,
+    /// 頭の追従に渡す時計の起点。`epoch + active` を渡すので、非表示・消灯の間は進まない
+    epoch: Instant,
 }
 
 impl<S: Screen> WithScene<S> {
@@ -62,6 +64,7 @@ impl<S: Screen> WithScene<S> {
             faces: None,
             face_buf: Vec::new(),
             aim: AimTracker::default(),
+            epoch: Instant::now(),
         };
         s.scene.input.framing = Framing::Bust;
         s.scene.input.gesture = true;
@@ -243,8 +246,8 @@ impl<S: Screen> Screen for WithScene<S> {
             region,
             active,
             drawn,
-            last,
             aim,
+            epoch,
             ..
         } = self;
         let base = inner.render_composite(ctx);
@@ -257,8 +260,10 @@ impl<S: Screen> Screen for WithScene<S> {
             rx as f32 + rw as f32 / 2.0,
             ry as f32 + rh as f32 * HEAD_FRACTION,
         );
+        // 頭の追従の時計も `active`(表示中かつ点灯中だけ進む)。実時間を渡すと、非表示・消灯の間の分が
+        // 復帰したときの差分に入り、復帰の直後に向きが跳ぶ
         scene.input.aim = aim.step(
-            (*last).unwrap_or_else(Instant::now),
+            *epoch + *active,
             focus_target(&base),
             head,
             size.1 as f32 * 0.5,
@@ -293,11 +298,15 @@ impl<S: Screen> Screen for WithScene<S> {
         self.running() && self.scene.state() == LoadState::Ready
     }
 
+    /// 内側の画面が動いているあいだは内側の間隔(None は vsync = 最も速い)。VRM だけが動いているときは VRM の間隔。
+    /// VRM の間隔で内側を抑えない: GL が失敗しても `scene_animating` は変わらず(ScreenManager が無視するだけ)、
+    /// ここで抑えると、失敗後も内側のカードの移動が VRM の間隔のままになる。ScreenManager 側で場面を無視する方式は、
+    /// 内側の間隔だけを取り出せないのでとらない。
     fn frame_interval(&self) -> Option<Duration> {
-        if self.scene_animating() {
-            self.interval
-        } else {
+        if self.inner.animating() || !self.scene_animating() {
             self.inner.frame_interval()
+        } else {
+            self.interval
         }
     }
 

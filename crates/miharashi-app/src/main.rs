@@ -190,6 +190,16 @@ fn run(_: Cli) -> Result<(), String> {
     Err("run は Linux 専用".into())
 }
 
+/// `png` の fixture の壁時計(いつ作っても同じ日付・時刻の絵にする)。
+#[cfg(target_os = "linux")]
+fn fixture_wall() -> chrono::DateTime<chrono::Local> {
+    use chrono::TimeZone;
+    chrono::Local
+        .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+        .single()
+        .expect("固定の壁時計")
+}
+
 fn png(cli: Cli) -> Result<(), String> {
     png_with(cli, &open_gles_checker)
 }
@@ -388,7 +398,7 @@ fn png_with(cli: Cli, open: &OpenGles) -> Result<(), String> {
     if let Some(check) = gles.as_mut() {
         scene_gles_fixtures(check, &cfg, size, &out)?;
         cube_gles_fixtures(check, size, &out)?;
-        vrm_gles_fixtures(check, &cfg, &cli, size, &out)?;
+        vrm_gles_fixtures(check, &cfg, &cli, size, &out, fixture_wall())?;
     }
     println!(
         "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,room,room-offline,room-empty,refresh-glitch,refresh-return,scene-notice,agents-overview,agents-busy,agents-new-*,agents-changed-*,agents-stale,agents-empty}}.png ({}x{})",
@@ -498,7 +508,8 @@ fn cube_gles_fixtures(
 /// (ScreenManager → `WithScene` → `Composite::Gl` → `present_scene` の本番と同じ経路)。
 /// モデルは `[vrm]` が無効なら合成モデル(fixture。いつ作っても同じ絵になる)、有効なら `vrm.model`
 /// (実際のモデルでの目視用。リポジトリには入れない)。時刻は固定で、写真は表示から 6 秒、Agent は新しいスレッドのカードが
-/// 中央に止まっているところ(3 秒余り)。
+/// 中央に止まっているところ(3 秒余り)。壁時計(写真の日付・時刻、Agent 画面の見出しの時刻と最終取得)も
+/// `wall` に固定するので、同じ入力から作った PNG は画素まで一致する。
 #[cfg(target_os = "linux")]
 fn vrm_gles_fixtures(
     check: &mut GlesCheck,
@@ -506,6 +517,7 @@ fn vrm_gles_fixtures(
     cli: &Cli,
     size: (u32, u32),
     out: &std::path::Path,
+    wall: chrono::DateTime<chrono::Local>,
 ) -> Result<(), String> {
     use crate::screen::{App, Composite, Provider, World};
     use app::screens::{agents::AgentScreen, photo::PhotoScreen, with_scene::WithScene};
@@ -550,6 +562,7 @@ fn vrm_gles_fixtures(
             Duration::from_secs(60),
         )
         .with_gl_available(true)
+        .with_fixed_clock(wall)
     };
     let region = cfg.vrm.stage_region();
     let mut save = |mgr: &mut app::manager::ScreenManager, name: &str| -> Result<(), String> {
@@ -586,11 +599,11 @@ fn vrm_gles_fixtures(
     save(&mut mgr, "photo-vrm")?;
 
     // Agent + VRM。新しいスレッドのカードが中央に拡大して止まるまで、0.1 秒ずつ進める(頭の向きの重みが出るまで)
-    let wall = SystemTime::now();
-    let (initial, fresh, _) = agent_demo::fixture_snapshots(wall, t0);
+    let wall_sys = SystemTime::from(wall);
+    let (initial, fresh, _) = agent_demo::fixture_snapshots(wall_sys, t0);
     let shared = std::rc::Rc::new(std::cell::RefCell::new(initial));
     let screen = WithScene::new(
-        AgentScreen::new(size, true, cfg.agents.stale_secs),
+        AgentScreen::new(size, true, cfg.agents.stale_secs).with_fixed_wall(wall_sys),
         scene()?,
         region,
         cfg.vrm.fps,
@@ -1022,6 +1035,40 @@ mod tests {
         let out = dir.join("gles");
         let err = png_with(cli_for(&out, &photo, "gles"), &no_gpu).unwrap_err();
         assert!(err.contains("GPU が見えない"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写真 + VRM と Agent + VRM の PNG は、壁時計が進んでも(写真の時計・Agent の見出しと最終取得)
+    /// 同じ入力から画素まで同じになる。GPU がなければ見ない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vrm_png_fixtures_do_not_depend_on_the_wall_clock() {
+        let dir = std::env::temp_dir().join(format!("miharashi-png-vrm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = dir.join("in.png");
+        image::RgbImage::from_pixel(64, 48, image::Rgb([90, 120, 200]))
+            .save(&photo)
+            .unwrap();
+        let names = ["photo-vrm-gles.png", "agents-vrm-gles.png"];
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        if png_with(cli_for(&a, &photo, "auto"), &open_gles_checker).is_err()
+            || !names.iter().all(|n| a.join(n).exists())
+        {
+            eprintln!("skip: GLES を開けない");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        // 時計の秒が必ず変わるだけ待つ
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        png_with(cli_for(&b, &photo, "auto"), &open_gles_checker).unwrap();
+        for n in names {
+            let (x, y) = (
+                std::fs::read(a.join(n)).unwrap(),
+                std::fs::read(b.join(n)).unwrap(),
+            );
+            assert!(x == y, "{n}: 時刻が変わると絵が変わる");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
