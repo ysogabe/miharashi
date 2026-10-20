@@ -190,6 +190,16 @@ fn run(_: Cli) -> Result<(), String> {
     Err("run は Linux 専用".into())
 }
 
+/// `png` の fixture の壁時計(いつ作っても同じ日付・時刻の絵にする)。
+#[cfg(target_os = "linux")]
+fn fixture_wall() -> chrono::DateTime<chrono::Local> {
+    use chrono::TimeZone;
+    chrono::Local
+        .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+        .single()
+        .expect("固定の壁時計")
+}
+
 fn png(cli: Cli) -> Result<(), String> {
     png_with(cli, &open_gles_checker)
 }
@@ -388,6 +398,7 @@ fn png_with(cli: Cli, open: &OpenGles) -> Result<(), String> {
     if let Some(check) = gles.as_mut() {
         scene_gles_fixtures(check, &cfg, size, &out)?;
         cube_gles_fixtures(check, size, &out)?;
+        vrm_gles_fixtures(check, &cfg, &cli, size, &out, fixture_wall())?;
     }
     println!(
         "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,room,room-offline,room-empty,refresh-glitch,refresh-return,scene-notice,agents-overview,agents-busy,agents-new-*,agents-changed-*,agents-stale,agents-empty}}.png ({}x{})",
@@ -397,7 +408,10 @@ fn png_with(cli: Cli, open: &OpenGles) -> Result<(), String> {
     );
     #[cfg(target_os = "linux")]
     if gles.is_some() {
-        println!("wrote {}/{{cube-gles,cube-third-gles}}.png", out.display());
+        println!(
+            "wrote {}/{{cube-gles,cube-third-gles,photo-vrm-gles,agents-vrm-gles}}.png",
+            out.display()
+        );
     }
     Ok(())
 }
@@ -488,6 +502,124 @@ fn cube_gles_fixtures(
         )?;
     }
     Ok(())
+}
+
+/// `png --renderer gles|auto`: 写真画面と Agent 画面に VRM を載せた `photo-vrm-gles.png` と `agents-vrm-gles.png`
+/// (ScreenManager → `WithScene` → `Composite::Gl` → `present_scene` の本番と同じ経路)。
+/// モデルは `[vrm]` が無効なら合成モデル(fixture。いつ作っても同じ絵になる)、有効なら `vrm.model`
+/// (実際のモデルでの目視用。リポジトリには入れない)。時刻は固定で、写真は表示から 6 秒、Agent は新しいスレッドのカードが
+/// 中央に止まっているところ(3 秒余り)。壁時計(写真の日付・時刻、Agent 画面の見出しの時刻と最終取得)も
+/// `wall` に固定するので、同じ入力から作った PNG は画素まで一致する。
+#[cfg(target_os = "linux")]
+fn vrm_gles_fixtures(
+    check: &mut GlesCheck,
+    cfg: &Config,
+    cli: &Cli,
+    size: (u32, u32),
+    out: &std::path::Path,
+    wall: chrono::DateTime<chrono::Local>,
+) -> Result<(), String> {
+    use crate::screen::{App, Composite, Provider, World};
+    use app::screens::{agents::AgentScreen, photo::PhotoScreen, with_scene::WithScene};
+    use std::time::{Duration, Instant, SystemTime};
+
+    /// Agent 画面に渡す一覧を、途中で差し替えられる Provider
+    struct Feed(std::rc::Rc<std::cell::RefCell<agents::AgentSnapshot>>);
+    impl Provider for Feed {
+        fn update(&mut self, world: &mut World) {
+            world.agents = self.0.borrow().clone();
+        }
+    }
+
+    let scene = || -> Result<miharashi_vrm::VrmScene, String> {
+        let count = std::rc::Rc::new(miharashi_glscene::ObjectCount::default());
+        if !cfg.vrm.enabled {
+            let glb = miharashi_vrm::synth::build_vrm_glb(&Default::default());
+            let model = miharashi_vrm::Model::from_glb(&glb)?;
+            return Ok(miharashi_vrm::VrmScene::from_model(model, count));
+        }
+        let mut scene = miharashi_vrm::VrmScene::from_path(cfg.vrm.model.clone().into(), count);
+        let end = Instant::now() + Duration::from_secs(60);
+        while scene.state() == miharashi_vrm::LoadState::Loading && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+            scene.poll();
+        }
+        match scene.state() {
+            miharashi_vrm::LoadState::Ready => Ok(scene),
+            _ => Err(format!(
+                "vrm.model を読めない: {}",
+                scene.error().unwrap_or("読み込みが終わらない")
+            )),
+        }
+    };
+    let manager = |screen: Box<dyn crate::screen::Screen>, id: &str| {
+        app::manager::ScreenManager::new(
+            vec![screen],
+            id,
+            Box::new(data::DummyData::new()),
+            data::dummy_snapshot(0.0),
+            app::text_engine(&cfg.ui.font),
+            Duration::from_secs(60),
+        )
+        .with_gl_available(true)
+        .with_fixed_clock(wall)
+    };
+    let region = cfg.vrm.stage_region();
+    let mut save = |mgr: &mut app::manager::ScreenManager, name: &str| -> Result<(), String> {
+        let mut c = Canvas::new(size.0, size.1);
+        let comp = mgr.render_composite(&mut c);
+        let mut parts = runtime::FrameParts::default();
+        parts.fill(&comp);
+        let Composite::Gl(g) = comp else {
+            return Err(format!("{name}: Composite::Gl を返さない"));
+        };
+        let frame = runtime::scene_frame(g, &c, &parts);
+        check(
+            &c,
+            Layers::Scene(frame),
+            &out.join(format!("{name}-gles.png")),
+        )
+    };
+
+    // 写真 + VRM。写真が届くまでは時刻を進めない(時刻は表示してからの経過で決まる)
+    let t0 = Instant::now();
+    let photo = PhotoScreen::new(cfg, size, Some(u32::MAX), source(cfg, cli));
+    let feed = photo.feed_provider();
+    let screen = WithScene::new(photo, scene()?, region, cfg.vrm.fps);
+    let mut mgr = manager(Box::new(screen), "photo").with_provider(Box::new(feed));
+    let end = Instant::now() + Duration::from_secs(10);
+    while mgr.panel_view().and_then(|v| v.photo).is_none() {
+        if Instant::now() >= end {
+            return Err("vrm: 写真が届かない".into());
+        }
+        mgr.tick(t0);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    mgr.tick(t0 + Duration::from_secs(6));
+    save(&mut mgr, "photo-vrm")?;
+
+    // Agent + VRM。新しいスレッドのカードが中央に拡大して止まるまで、0.1 秒ずつ進める(頭の向きの重みが出るまで)
+    let wall_sys = SystemTime::from(wall);
+    let (initial, fresh, _) = agent_demo::fixture_snapshots(wall_sys, t0);
+    let shared = std::rc::Rc::new(std::cell::RefCell::new(initial));
+    let screen = WithScene::new(
+        AgentScreen::new(size, true, cfg.agents.stale_secs).with_fixed_wall(wall_sys),
+        scene()?,
+        region,
+        cfg.vrm.fps,
+    );
+    let mut mgr = manager(Box::new(screen), "agents").with_provider(Box::new(Feed(shared.clone())));
+    mgr.tick(t0);
+    *shared.borrow_mut() = fresh;
+    let mut c = Canvas::new(size.0, size.1);
+    for k in 10..=32 {
+        mgr.tick(t0 + Duration::from_millis(100 * k));
+        // 頭の向きを進めるため、描画と同じ呼び出しを毎回通す
+        let _ = mgr.render_composite(&mut c);
+    }
+    // 保存は新しい Compositor で描くので、下地(背景)も描き直させる(GL の可否を切り替えると、現在の画面を invalidate する)
+    let mut mgr = mgr.with_gl_available(false).with_gl_available(true);
+    save(&mut mgr, "agents-vrm")
 }
 
 /// `png --renderer gles|auto`: 3D の画面を GLES で描いた `scene-gles.png`(3D だけ)、`scene-base-gles.png`
@@ -903,6 +1035,52 @@ mod tests {
         let out = dir.join("gles");
         let err = png_with(cli_for(&out, &photo, "gles"), &no_gpu).unwrap_err();
         assert!(err.contains("GPU が見えない"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写真 + VRM と Agent + VRM の PNG は、壁時計が進んでも(写真の時計・Agent の見出しと最終取得)
+    /// 同じ入力から画素まで同じになる。GPU がなければ見ない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vrm_png_fixtures_do_not_depend_on_the_wall_clock() {
+        let dir = std::env::temp_dir().join(format!("miharashi-png-vrm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = dir.join("in.png");
+        image::RgbImage::from_pixel(64, 48, image::Rgb([90, 120, 200]))
+            .save(&photo)
+            .unwrap();
+        let names = ["photo-vrm-gles.png", "agents-vrm-gles.png"];
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        // skip は GLES を開けないときだけ。開けたあとの描画・保存の失敗はテストの失敗にする。
+        let opened = std::rc::Rc::new(std::cell::Cell::new(false));
+        let open = {
+            let opened = opened.clone();
+            move |cfg: &Config| {
+                let r = open_gles_checker(cfg);
+                opened.set(r.is_ok());
+                r
+            }
+        };
+        png_with(cli_for(&a, &photo, "auto"), &open).unwrap();
+        if !opened.get() {
+            eprintln!("skip: GLES を開けない");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        for n in names {
+            assert!(a.join(n).exists(), "{n} がない");
+        }
+        // 時計の秒が必ず変わるだけ待つ
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        png_with(cli_for(&b, &photo, "auto"), &open_gles_checker).unwrap();
+        for n in names {
+            let (x, y) = (
+                std::fs::read(a.join(n)).unwrap(),
+                std::fs::read(b.join(n)).unwrap(),
+            );
+            assert!(x == y, "{n}: 時刻が変わると絵が変わる");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

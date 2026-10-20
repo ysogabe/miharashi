@@ -4,7 +4,7 @@
 use miharashi_vrm::demo::{self, FaceSet};
 use miharashi_vrm::synth;
 use miharashi_vrm::{
-    Framing, Level, Model, Region, Renderer, VrmLayer, attach_depth, detach_depth,
+    Framing, Level, Model, Renderer, StageRegion, VrmLayer, attach_depth, detach_depth,
 };
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -31,7 +31,7 @@ struct Args {
     synth: synth::Opts,
     /// 構図と、描く領域(`--size` の画面の中)。full / full 以外は透明な FBO に描いて重ねる
     frame: Framing,
-    region: Region,
+    region: StageRegion,
     gesture: bool,
     lipsync: bool,
     /// 計測の最初の時刻 [秒](途中の身振りや口の形の PNG を見るため)
@@ -53,7 +53,7 @@ fn parse_args() -> Result<Args, String> {
         outline_scale: 1.0,
         synth: synth::Opts::default(),
         frame: Framing::Full,
-        region: Region::Full,
+        region: StageRegion::Full,
         gesture: false,
         lipsync: false,
         start: 0.0,
@@ -81,7 +81,7 @@ fn parse_args() -> Result<Args, String> {
             "--still" => a.still = true,
             "--png" => a.png = Some(value()?.into()),
             "--frame" => a.frame = Framing::parse(&value()?)?,
-            "--region" => a.region = Region::parse(&value()?)?,
+            "--region" => a.region = StageRegion::parse(&value()?)?,
             "--gesture" => a.gesture = true,
             "--lipsync" => a.lipsync = true,
             "--start" => a.start = value()?.parse().map_err(|_| "--start が数でない")?,
@@ -161,7 +161,7 @@ fn measure(
     );
     // 描く領域。full / full 以外は、領域と同じ大きさの透明な FBO に描いて画面(この FBO)へ重ねる
     let (rx, ry, rw, rh) = a.region.rect(size);
-    let use_layer = a.region != Region::Full || a.frame != Framing::Full;
+    let use_layer = a.region != StageRegion::Full || a.frame != Framing::Full;
     let layer = if use_layer {
         use glow::HasContext;
         let target = unsafe { gl.get_parameter_framebuffer(glow::FRAMEBUFFER_BINDING) };

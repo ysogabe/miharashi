@@ -119,6 +119,8 @@ pub struct AgentScreen {
     last_snapshot: AgentSnapshot,
     last_now: Instant,
     header_due: Instant,
+    /// 壁時計を固定する(`png` の fixture 用。None なら実時刻)
+    fixed_wall: Option<SystemTime>,
 }
 
 impl AgentScreen {
@@ -159,7 +161,18 @@ impl AgentScreen {
             last_snapshot: AgentSnapshot::default(),
             last_now: Instant::now(),
             header_due: Instant::now() + Duration::from_secs(1),
+            fixed_wall: None,
         }
+    }
+
+    /// 壁時計(見出しの時刻と、通知の古さの判定)を `at` に固定する。`png` の fixture が同じ入力から同じ絵を作るため。
+    pub fn with_fixed_wall(mut self, at: SystemTime) -> Self {
+        self.fixed_wall = Some(at);
+        self
+    }
+
+    fn wall(&self) -> SystemTime {
+        self.fixed_wall.unwrap_or_else(SystemTime::now)
     }
 
     fn sync(&mut self, snap: &AgentSnapshot, now: Instant) -> bool {
@@ -502,7 +515,7 @@ impl AgentScreen {
             return false;
         }
         let mut stale = Vec::new();
-        let wall = SystemTime::now();
+        let wall = self.wall();
         for (i, e) in self.queue.iter().enumerate() {
             if self.seen.contains_key(&e.thread_id)
                 && wall.duration_since(e.observed_at).unwrap_or_default() > MAX_AGE_SECS
@@ -610,6 +623,7 @@ impl AgentScreen {
                 self.overflow_updates,
                 now,
                 self.stale_secs,
+                self.wall(),
             );
             self.background = Some(bg.pixmap);
             self.background_dirty = false;
@@ -986,6 +1000,7 @@ fn draw_background(
     overflow: usize,
     now: Instant,
     stale_secs: u64,
+    wall: SystemTime,
 ) {
     let w = canvas.width() as f32;
     let h = canvas.height() as f32;
@@ -1001,7 +1016,9 @@ fn draw_background(
     text.draw(canvas, &env, 32.0, 100.0, 24.0, [223, 231, 240, 255]);
     text.draw_right(
         canvas,
-        &chrono::Local::now().format("%Y/%m/%d %H:%M:%S").to_string(),
+        &chrono::DateTime::<chrono::Local>::from(wall)
+            .format("%Y/%m/%d %H:%M:%S")
+            .to_string(),
         w - 32.0,
         26.0,
         22.0,

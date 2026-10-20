@@ -89,6 +89,8 @@ pub struct ScreenManager {
     rotation: Option<Rotation>,
     /// GL が使えるか(`Output.gpu_max_texture.is_some()`)。起動後は変わらない(変わるのは画面ごとの失敗だけ)
     gl_available: bool,
+    /// 時計を固定する(`png` の fixture 用。None なら実時刻)
+    fixed_clock: Option<chrono::DateTime<chrono::Local>>,
     /// 3D が失敗した画面(`screens` と同じ並び)。再起動まで 3D を出さない
     scene_failed: Vec<bool>,
     /// 3D の失敗の回数(状態ログの `scene_fail=`)
@@ -144,6 +146,7 @@ impl ScreenManager {
             refreshes: 0,
             rotation: None,
             gl_available: false,
+            fixed_clock: None,
             scene_failed: vec![false; n_screens],
             scene_fails: 0,
             top: None,
@@ -161,6 +164,13 @@ impl ScreenManager {
         // 最初の tick より前の操作パネルの状態にも、Provider の初期値を出す
         p.update(&mut self.world);
         self.providers.push(p);
+        self
+    }
+
+    /// 画面の日付・時刻を `at` に固定する(`png` の fixture 用。同じ入力から同じ絵を作る)。
+    pub fn with_fixed_clock(mut self, at: chrono::DateTime<chrono::Local>) -> Self {
+        self.fixed_clock = Some(at);
+        super::set_clock_at(&mut self.world.system, at);
         self
     }
 
@@ -642,7 +652,8 @@ impl ScreenManager {
         self.update_presentation(now);
         if now >= self.next_tick {
             self.data.update(&mut self.world.system);
-            super::set_clock(&mut self.world.system);
+            let at = self.fixed_clock.unwrap_or_else(chrono::Local::now);
+            super::set_clock_at(&mut self.world.system, at);
             self.ticks += 1;
             self.next_tick += self.tick_len;
             if self.next_tick < now {

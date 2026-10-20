@@ -1,0 +1,1065 @@
+//! キャラクターを `GlScene` として画面に出す場面(Issue #71 の B、docs/DESIGN-screen-plugin-v2.md §2・§3.5)。
+//! 層(透明な FBO)に描くだけで、背景は塗らず、層を画面へ重ねるのも Compositor の仕事。
+//!
+//! CPU 側(モデルの解析結果 `Rc<Model>`)と GL 側(`Renderer` が持つバッファ・テクスチャ・プログラム)を分ける。
+//! `release` は GL 側だけを消し、解析結果は残す。次の `draw` が同じ `Rc<Model>` から転送し直す。
+//! 読み込み(`Model::from_path`)は別スレッドで走らせ、`draw` は終わるまで何も描かずに `Ok` を返す。
+//! モデルがない・壊れている・読み込みスレッドが落ちた・GPU に転送できない、のいずれも 3D なしで続ける
+//! (`draw` は `Err` にしない。`Err` は ScreenManager に 3D の失敗として扱われ、場面ごと捨てられる)。
+//! その理由は 1 回だけログに出し、`state` / `error` で外から問い合わせられる。
+use crate::gesture::Aim;
+use crate::model::Model;
+use crate::render::{Created, Framing, Level, Renderer};
+use miharashi_glscene::{GlScene, GlTarget, ObjectCount};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+
+/// 次の `draw` が使う入力(時刻と演出)。表情・口パク・身振りの組み立ては呼び出し側の仕事で、
+/// この場面は渡されたものを `Renderer` に流して描くだけ。
+#[derive(Clone, Debug)]
+pub struct SceneInput {
+    /// 待機モーション・身振りの時刻 [秒]
+    pub t: f32,
+    /// 前の `draw` からの経過 [秒](SpringBone の積分に使う)。0 なら揺れは進まない
+    pub dt: f32,
+    /// 構図
+    pub framing: Framing,
+    /// カメラをモデルのまわりで回す角度 [rad]
+    pub yaw: f32,
+    /// expression の weight。ここに挙げないものは 0 に戻る(このモデルにない名前は外し、ログに 1 回出す。
+    /// ほかの名前は適用する)
+    pub expressions: Vec<(String, f32)>,
+    /// 身振りを付けるか(humanoid の腕の骨がないモデルでは付かない)
+    pub gesture: bool,
+    /// 身振りに重ねる視線と指さし
+    pub aim: Option<Aim>,
+}
+
+impl Default for SceneInput {
+    fn default() -> Self {
+        Self {
+            t: 0.0,
+            dt: 0.0,
+            framing: Framing::Full,
+            yaw: 0.0,
+            expressions: Vec::new(),
+            gesture: false,
+            aim: None,
+        }
+    }
+}
+
+/// モデルの読み込みの状況。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadState {
+    /// まだ読み始めていない(`VrmScene::lazy`。`start` で読み始める)。`draw` は何も描かない
+    Idle,
+    /// 別スレッドで読んでいる最中。`draw` は何も描かない
+    Loading,
+    /// 解析が済んでいる(GPU への転送は最初の `draw`、`release` のあとは次の `draw`)
+    Ready,
+    /// 読めない・転送できないなどで、3D なしで続けている。理由は `VrmScene::error`
+    Failed,
+}
+
+enum Load {
+    /// 読み込みを始めていない。始めるときに使うパス
+    Idle(PathBuf),
+    Loading(Receiver<Result<Model, String>>),
+    Ready(Rc<Model>),
+    Failed(String),
+}
+
+pub struct VrmScene {
+    count: Rc<ObjectCount>,
+    load: Load,
+    level: Level,
+    /// GL 側。最初の `draw` で作り、`release` で消す。描画中も持ったままにして、途中の panic でも
+    /// `release` が見つけられるようにする
+    renderer: Option<Renderer>,
+    /// `renderer` を作っている途中の GL オブジェクトの控え。作りかけで panic しても残り、`release` が消す
+    building: Created,
+    /// 次の `draw` が使う入力
+    pub input: SceneInput,
+    /// `renderer` に反映済みの身振りの有無(`renderer` を作り直すと `None` に戻る)
+    gesture_applied: Option<bool>,
+    /// `renderer` が最後に評価した姿勢の入力(時刻・身振り・視線)。同じ入力で `dt` が 0 なら評価し直さない
+    /// (`renderer` を作り直す・消すと `None` に戻り、次の `draw` が必ず評価する)
+    animated: Option<(f32, bool, Option<Aim>)>,
+    /// 入力の不具合(未知の expression・身振りを付けられないモデル)をログに出したか
+    input_warned: bool,
+}
+
+/// `catch_unwind` の payload から文言を取り出す。
+fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic".into())
+}
+
+impl VrmScene {
+    fn with_load(count: Rc<ObjectCount>, load: Load) -> Self {
+        Self {
+            count,
+            load,
+            level: Level::Spring,
+            renderer: None,
+            building: Created::default(),
+            input: SceneInput::default(),
+            gesture_applied: None,
+            animated: None,
+            input_warned: false,
+        }
+    }
+
+    /// `path` の glb を別スレッドで読む。読み終わるまでの `draw` は何も描かない。
+    pub fn from_path(path: PathBuf, count: Rc<ObjectCount>) -> Self {
+        Self::from_loader(count, move || Model::from_path(&path))
+    }
+
+    /// `path` の glb を、`start` が呼ばれるまで読まない(スレッドも作らず、モデルを RAM に置かない)。
+    /// 画面に VRM を載せるとき、その画面が最初に出るまで読み込みを遅らせるのに使う。
+    pub fn lazy(path: PathBuf, count: Rc<ObjectCount>) -> Self {
+        Self::with_load(count, Load::Idle(path))
+    }
+
+    /// `lazy` で作った場面の読み込みを始める(始めていたら何もしない)。
+    pub fn start(&mut self) {
+        if let Load::Idle(path) = &mut self.load {
+            let path = std::mem::take(path);
+            let started = Self::from_path(path, self.count.clone());
+            self.load = started.load;
+        }
+    }
+
+    /// `load` を別スレッドで走らせる(試験で、遅い読み込みや panic を作るための入口でもある)。
+    /// `load` の panic は `Failed` として受け、スレッドを作れなかったときも `Failed` にする。
+    pub fn from_loader(
+        count: Rc<ObjectCount>,
+        load: impl FnOnce() -> Result<Model, String> + Send + 'static,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("vrm-load".into())
+            .spawn(move || {
+                let r = catch_unwind(AssertUnwindSafe(load))
+                    .unwrap_or_else(|p| Err(format!("読み込みが panic: {}", panic_message(&*p))));
+                // 受け手(場面)が先に捨てられていたら送れないが、それでよい
+                let _ = tx.send(r);
+            });
+        match spawned {
+            Ok(_) => Self::with_load(count, Load::Loading(rx)),
+            Err(e) => {
+                let mut s = Self::with_load(count, Load::Failed(String::new()));
+                s.fail(format!("読み込みスレッドを作れない: {e}"));
+                s
+            }
+        }
+    }
+
+    /// 解析済みのモデルから始める(読み込みを待たない)。
+    pub fn from_model(model: Model, count: Rc<ObjectCount>) -> Self {
+        Self::with_load(count, Load::Ready(Rc::new(model)))
+    }
+
+    /// 機能段階を選ぶ(既定は最大の `Spring`)。最初の `draw` の前に呼ぶ。
+    pub fn with_level(mut self, level: Level) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// 読み込みの状況。`Loading` から `Ready`・`Failed` への切り替えは `poll` か `draw` で起きる。
+    pub fn state(&self) -> LoadState {
+        match self.load {
+            Load::Idle(_) => LoadState::Idle,
+            Load::Loading(_) => LoadState::Loading,
+            Load::Ready(_) => LoadState::Ready,
+            Load::Failed(_) => LoadState::Failed,
+        }
+    }
+
+    /// `Failed` の理由。
+    pub fn error(&self) -> Option<&str> {
+        match &self.load {
+            Load::Failed(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// 読み込みが済んだモデル(`Ready` のときだけ)。表情に使える名前を調べるのに使う。
+    pub fn model(&self) -> Option<&Model> {
+        match &self.load {
+            Load::Ready(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// 場面が作って、まだ消していない GL オブジェクトの数(`ObjectCount::live`)。
+    pub fn gl_live_objects(&self) -> i64 {
+        self.count.live()
+    }
+
+    /// 読み込みが終わっていれば結果を取り込む(`draw` も呼ぶ)。呼び出し側の `tick` から呼べば、
+    /// `draw` が来る前に `Loading` が `Ready`・`Failed` に変わる。
+    pub fn poll(&mut self) {
+        let received = match &self.load {
+            Load::Loading(rx) => rx.try_recv(),
+            _ => return,
+        };
+        match received {
+            Ok(Ok(model)) => self.load = Load::Ready(Rc::new(model)),
+            Ok(Err(e)) => self.fail(format!("モデルを読めない: {e}")),
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.fail("読み込みスレッドが結果を返さずに終わった".into())
+            }
+        }
+    }
+
+    /// 3D なしで続ける状態にして、理由を 1 回だけログに出す(`Failed` からは出ない)。
+    fn fail(&mut self, reason: String) {
+        eprintln!("vrm: {reason}(3D なしで続ける)");
+        self.load = Load::Failed(reason);
+    }
+}
+
+/// 入力を `Renderer` に流す。身振りを付けられない・未知の expression は、ログに 1 回出して続ける。
+/// `VrmScene` の別のフィールドを借りたまま呼べるよう、メソッドにしない(`renderer` を外さずに済ませる)。
+/// 毎フレーム呼ぶので、未知の名前がないふつうの場合はアロケーションしない。
+fn apply_input(
+    r: &mut Renderer,
+    model: &Model,
+    input: &SceneInput,
+    gesture_applied: &mut Option<bool>,
+    warned: &mut bool,
+) {
+    let mut problem = None;
+    if *gesture_applied != Some(input.gesture) {
+        // 反映済みとして扱う(付けられないモデルで毎フレーム試さない)
+        *gesture_applied = Some(input.gesture);
+        if let Err(e) = r.set_gesture(input.gesture) {
+            problem = Some(e);
+        }
+    }
+    r.set_aim(input.aim);
+    // 未知の名前はこのモデルにないものとして外す(`set_expressions` は最初の未知の名前で止まり、
+    // 残りの有効な表情まで適用されなくなる)。警告の文字列は、これから警告するときだけ作る
+    let known = |n: &str| model.vrm.expression(n).is_some();
+    if !*warned && let Some((n, _)) = input.expressions.iter().find(|(n, _)| !known(n)) {
+        problem = Some(format!("expression {n} がない(ほかの表情は適用する)"));
+    }
+    let known_list = input
+        .expressions
+        .iter()
+        .filter(|(n, _)| known(n))
+        .map(|(n, w)| (n.as_str(), *w));
+    if let Err(e) = r.set_expressions_iter(known_list) {
+        problem = Some(e);
+    }
+    if let Some(e) = problem
+        && !*warned
+    {
+        *warned = true;
+        eprintln!("vrm: {e}");
+    }
+}
+
+impl GlScene for VrmScene {
+    fn draw(&mut self, gl: &glow::Context, target: &GlTarget) -> Result<(), String> {
+        self.poll();
+        let model = match &self.load {
+            Load::Ready(m) => m.clone(),
+            // 読み込み中・失敗: 透明のまま
+            _ => return Ok(()),
+        };
+        if target.size.0 == 0 || target.size.1 == 0 {
+            return Ok(());
+        }
+        if self.renderer.is_none() {
+            let built = Renderer::with_shared_tracked(
+                gl,
+                model.clone(),
+                self.level,
+                self.count.clone(),
+                &mut self.building,
+            );
+            match built {
+                Ok(mut r) => {
+                    // 層は Compositor が (0,0,0,0) で塗ってある。不透明な既定色で塗り直して潰さない
+                    r.clear_color = [0.0; 4];
+                    self.gesture_applied = None;
+                    self.animated = None;
+                    self.renderer = Some(r);
+                }
+                Err(e) => {
+                    // 転送できないモデル(関節が多すぎるなど)。作りかけは `with_shared_tracked` が消している
+                    self.fail(format!("GPU に転送できない: {e}"));
+                    return Ok(());
+                }
+            }
+        }
+        // `renderer` は外さずに使う(途中で panic しても、`release` が見つけて消せる)
+        let Some(r) = self.renderer.as_mut() else {
+            return Ok(());
+        };
+        apply_input(
+            r,
+            &model,
+            &self.input,
+            &mut self.gesture_applied,
+            &mut self.input_warned,
+        );
+        // 時間が進んでいない(dt = 0)描き直しは、前のフレームで評価した姿勢のまま描く。
+        // 初回(まだ評価していない)や、時刻・身振り・視線が変わったときは評価する
+        let key = (self.input.t, self.input.gesture, self.input.aim);
+        if self.input.dt != 0.0 || self.animated != Some(key) {
+            r.animate(self.input.t, self.input.dt);
+            self.animated = Some(key);
+        }
+        r.update(gl);
+        let (vp, eye) = r.framing_camera(self.input.framing, target.size, self.input.yaw);
+        r.render_camera(gl, target.size, &vp, eye);
+        Ok(())
+    }
+
+    fn release(&mut self, gl: &glow::Context) {
+        if let Some(r) = self.renderer.take() {
+            r.destroy(gl);
+        }
+        // 作りかけ(転送の途中で panic した)があれば、それも消す
+        std::mem::take(&mut self.building).delete(gl, &self.count);
+        self.gesture_applied = None;
+        self.animated = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::synth;
+    use glow::HasContext;
+    use miharashi_gpu::{Offscreen, render_node_for_pci};
+    use serde_json::json;
+    use std::sync::mpsc::channel;
+    use std::time::{Duration, Instant};
+
+    fn synth_model() -> Model {
+        Model::from_glb(&synth::build_vrm_glb(&synth::Opts {
+            segments: 12,
+            texture_size: 64,
+        }))
+        .unwrap()
+    }
+
+    fn offscreen() -> Option<Offscreen> {
+        match Offscreen::open(&render_node_for_pci("0000:10:00.0")) {
+            Ok(o) => Some(o),
+            Err(e) => {
+                eprintln!("GLES が使えないので skip: {e}");
+                None
+            }
+        }
+    }
+
+    /// Compositor が作る層と同じ形(色 RGBA8 のテクスチャ + 深度ステンシル)の FBO を、(0,0,0,0) で塗って返す。
+    unsafe fn make_layer(
+        gl: &glow::Context,
+        (w, h): (u32, u32),
+    ) -> (glow::Framebuffer, glow::Texture, glow::Renderbuffer) {
+        unsafe {
+            let color = gl.create_texture().unwrap();
+            gl.bind_texture(glow::TEXTURE_2D, Some(color));
+            gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, w as i32, h as i32);
+            let depth = gl.create_renderbuffer().unwrap();
+            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(depth));
+            gl.renderbuffer_storage(
+                glow::RENDERBUFFER,
+                glow::DEPTH24_STENCIL8,
+                w as i32,
+                h as i32,
+            );
+            let fbo = gl.create_framebuffer().unwrap();
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(color),
+                0,
+            );
+            gl.framebuffer_renderbuffer(
+                glow::FRAMEBUFFER,
+                glow::DEPTH_STENCIL_ATTACHMENT,
+                glow::RENDERBUFFER,
+                Some(depth),
+            );
+            assert_eq!(
+                gl.check_framebuffer_status(glow::FRAMEBUFFER),
+                glow::FRAMEBUFFER_COMPLETE
+            );
+            (fbo, color, depth)
+        }
+    }
+
+    /// 層を (0,0,0,0) で塗り、Compositor の `draw` と同じ条件で `scene.draw` を呼び、層の RGBA を読む。
+    fn draw_layer(gl: &glow::Context, scene: &mut VrmScene, size: (u32, u32)) -> Vec<u8> {
+        unsafe {
+            let (fbo, color, depth) = make_layer(gl, size);
+            gl.viewport(0, 0, size.0 as i32, size.1 as i32);
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear_depth_f32(1.0);
+            gl.clear_stencil(0);
+            gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
+            scene.draw(gl, &GlTarget { fbo, size }).unwrap();
+            assert_eq!(gl.get_error(), glow::NO_ERROR, "draw のあとの GL エラー");
+            let mut out = vec![0u8; size.0 as usize * size.1 as usize * 4];
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
+            gl.read_pixels(
+                0,
+                0,
+                size.0 as i32,
+                size.1 as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut out)),
+            );
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.delete_framebuffer(fbo);
+            gl.delete_texture(color);
+            gl.delete_renderbuffer(depth);
+            out
+        }
+    }
+
+    fn no_gl_error(gl: &glow::Context, what: &str) {
+        assert_eq!(unsafe { gl.get_error() }, glow::NO_ERROR, "{what}");
+    }
+
+    /// 透明な背景に描かれ、モデルのある所だけアルファがある(不透明な既定色で層を潰さない)。
+    #[test]
+    fn draws_on_transparent_background() {
+        let Some(off) = offscreen() else { return };
+        let size = (200u32, 300u32);
+        let count = Rc::new(ObjectCount::default());
+        let (img, _) = off
+            .with_fbo(size, |gl| {
+                let mut scene = VrmScene::from_model(synth_model(), count.clone());
+                let img = draw_layer(gl, &mut scene, size);
+                scene.release(gl);
+                img
+            })
+            .unwrap();
+        let px = img.as_chunks::<4>().0;
+        let covered = px.iter().filter(|p| p[3] > 0).count();
+        let opaque = px.iter().filter(|p| p[3] == 255).count();
+        assert!(covered > 1000, "モデルの画素が少ない: {covered}");
+        assert!(covered < px.len() * 9 / 10, "層の全面にアルファがある");
+        assert!(opaque > 500, "不透明な画素が少ない: {opaque}");
+        // 4 隅は何も描かれない(モデルは中央に収まる)。透明な画素は色も 0
+        for &(x, y) in &[(0, 0), (199, 0), (0, 299), (199, 299)] {
+            assert_eq!(px[y * 200 + x], [0, 0, 0, 0], "隅 ({x},{y}) が透明でない");
+        }
+        // premultiplied alpha: 色はアルファを超えない
+        assert!(
+            px.iter().all(|p| p[..3].iter().all(|&c| c <= p[3])),
+            "色がアルファを超える(premultiplied でない)"
+        );
+        assert_eq!(count.live(), 0);
+    }
+
+    /// release → draw の作り直しで同じ絵になる。release のあとは生きている GL オブジェクトが 0。
+    /// release は 2 回呼んでも安全。
+    #[test]
+    fn release_then_redraw_matches_and_is_idempotent() {
+        let Some(off) = offscreen() else { return };
+        let size = (160u32, 240u32);
+        let count = Rc::new(ObjectCount::default());
+        let (res, _) = off
+            .with_fbo(size, |gl| {
+                let mut scene = VrmScene::from_model(synth_model(), count.clone());
+                scene.input.gesture = true;
+                scene.input.t = 1.5;
+                let first = draw_layer(gl, &mut scene, size);
+                assert!(
+                    count.live() > 0,
+                    "描いたのに GL オブジェクトが数えられていない"
+                );
+                let created = count.created();
+                scene.release(gl);
+                assert_eq!(count.live(), 0, "release のあとにオブジェクトが残る");
+                no_gl_error(gl, "release のあと");
+                // 2 回目の release は何もしない
+                scene.release(gl);
+                assert_eq!(count.live(), 0);
+                assert_eq!(count.created(), created, "2 回目の release が何か作った");
+                no_gl_error(gl, "2 回目の release のあと");
+                // 解析結果は残っていて、次の draw で作り直せる
+                assert_eq!(scene.state(), LoadState::Ready);
+                let second = draw_layer(gl, &mut scene, size);
+                assert!(count.live() > 0);
+                assert_eq!(count.created(), created * 2, "作り直しの数が違う");
+                scene.release(gl);
+                scene.release(gl);
+                assert_eq!(count.live(), 0);
+                no_gl_error(gl, "最後");
+                (first, second)
+            })
+            .unwrap();
+        let (first, second) = res;
+        assert!(first.iter().any(|&b| b != 0), "何も描かれていない");
+        assert_eq!(first, second, "作り直したら絵が変わった");
+    }
+
+    /// 時間が進まない(dt = 0)描き直しは、何度やっても前の姿勢のまま(髪などの SpringBone が動かない)。
+    /// 時間が進めば動く。release のあとの作り直しは、dt = 0 でも 1 回は評価する。
+    #[test]
+    fn redraw_with_zero_dt_keeps_the_last_pose() {
+        let Some(off) = offscreen() else { return };
+        let size = (160u32, 240u32);
+        let count = Rc::new(ObjectCount::default());
+        // 髪の骨は関節行列に入らないモデルもあるので、ノードのワールド行列で見る
+        let joints = |s: &VrmScene| s.renderer.as_ref().unwrap().rig().world.clone();
+        let (res, _) = off
+            .with_fbo(size, |gl| {
+                let mut scene = VrmScene::from_model(synth_model(), count.clone());
+                scene.input.gesture = true;
+                // 揺れの途中まで進める
+                for k in 0..30 {
+                    scene.input.t = k as f32 / 30.0;
+                    scene.input.dt = 1.0 / 30.0;
+                    draw_layer(gl, &mut scene, size);
+                }
+                scene.input.dt = 0.0;
+                let first = draw_layer(gl, &mut scene, size);
+                let held = joints(&scene);
+                let mut same = true;
+                for _ in 0..3 {
+                    same &= draw_layer(gl, &mut scene, size) == first;
+                    same &= joints(&scene) == held;
+                }
+                // 時間が進めば動く
+                scene.input.t += 1.0 / 30.0;
+                scene.input.dt = 1.0 / 30.0;
+                draw_layer(gl, &mut scene, size);
+                let moved = joints(&scene) != held;
+                // release のあとの作り直しは、dt = 0 でも評価する(姿勢が単位行列のままにならない)
+                scene.release(gl);
+                scene.input.dt = 0.0;
+                let rebuilt = draw_layer(gl, &mut scene, size);
+                let rebuilt_joints = joints(&scene);
+                scene.release(gl);
+                (same, moved, rebuilt, rebuilt_joints, held)
+            })
+            .unwrap();
+        let (same, moved, rebuilt, rebuilt_joints, held) = res;
+        assert!(same, "dt = 0 の描き直しで絵か関節行列が変わった");
+        assert!(moved, "dt > 0 で動かない");
+        assert!(
+            rebuilt.iter().any(|&b| b != 0),
+            "作り直したあと何も描かれていない"
+        );
+        assert_eq!(rebuilt_joints.len(), held.len());
+        assert_ne!(
+            rebuilt_joints, held,
+            "作り直したあとの dt = 0 の描画が評価されていない(古い姿勢のまま)"
+        );
+    }
+
+    /// 実際の経路(`Compositor::draw_scene`)で、GL エラーや panic なしに `Drawn` で描かれ、領域の外は下地のまま、
+    /// 領域の中にモデルが重なる。release のあとの描き直しも同じ絵になる。
+    #[test]
+    fn draws_through_compositor_and_survives_release() {
+        use miharashi_gpu::{Region, SceneFrame, SceneOutcome, SceneTop, compose::Compositor};
+        let Some(off) = offscreen() else { return };
+        let size = (300u32, 200u32);
+        let region = Region {
+            x: 20,
+            y: 10,
+            w: 100,
+            h: 180,
+        };
+        let count = Rc::new(ObjectCount::default());
+        let (shots, img) = off
+            .render_with_compositor(size, |gl, comp: &mut Compositor, target| {
+                let mut scene = VrmScene::from_model(synth_model(), count.clone());
+                let mut shots = Vec::new();
+                for _ in 0..2 {
+                    let mut frame = SceneFrame {
+                        base: None,
+                        scene: &mut scene,
+                        region,
+                        top: SceneTop::Off,
+                    };
+                    let outcome = comp.draw_scene(gl, target, &mut frame).unwrap();
+                    assert_eq!(outcome, SceneOutcome::Drawn);
+                    let mut out = vec![0u8; size.0 as usize * size.1 as usize * 4];
+                    let mut scratch = Vec::new();
+                    miharashi_gpu::read_rgba_top_down(
+                        gl,
+                        target.unwrap(),
+                        size,
+                        &mut out,
+                        &mut scratch,
+                    );
+                    shots.push(out);
+                    let panics = Compositor::release_scenes(gl, size, target, &mut [&mut scene]);
+                    assert!(panics.is_empty(), "{panics:?}");
+                    assert_eq!(count.live(), 0);
+                }
+                shots
+            })
+            .unwrap();
+        drop(img);
+        assert_eq!(shots[0], shots[1], "release のあとの描き直しで絵が変わった");
+        let px = |x: u32, y: u32| &shots[0][((y * size.0 + x) * 4) as usize..][..4];
+        // 下地は黒(不透明)。領域の外はそのまま
+        for (x, y) in [(0, 0), (299, 199), (150, 100), (130, 5)] {
+            assert_eq!(px(x, y), [0, 0, 0, 255], "領域の外 ({x},{y}) が変わった");
+        }
+        let inside = (region.y..region.y + region.h)
+            .flat_map(|y| (region.x..region.x + region.w).map(move |x| (x, y)))
+            .filter(|&(x, y)| px(x, y)[..3] != [0, 0, 0])
+            .count();
+        assert!(inside > 500, "領域の中にモデルが重なっていない: {inside}");
+    }
+
+    /// 表情の入力: このモデルにない名前が混ざっても、ほかの表情は適用される。
+    #[test]
+    fn unknown_expression_does_not_block_the_others() {
+        let Some(off) = offscreen() else { return };
+        let count = Rc::new(ObjectCount::default());
+        off.with_fbo((64, 64), |gl| {
+            let mut scene = VrmScene::from_model(synth_model(), count.clone());
+            let _ = draw_layer(gl, &mut scene, (64, 64));
+            let base = scene.renderer.as_ref().unwrap().morphed_vertices(0);
+            scene.input.expressions = vec![("nothing".into(), 1.0), ("blink".into(), 1.0)];
+            let _ = draw_layer(gl, &mut scene, (64, 64));
+            let blinked = scene.renderer.as_ref().unwrap().morphed_vertices(0);
+            assert_ne!(base, blinked, "未知の名前のせいで blink が適用されない");
+            assert!(scene.input_warned, "未知の名前がログに出ていない");
+            // 空にすると 0 に戻る
+            scene.input.expressions.clear();
+            let _ = draw_layer(gl, &mut scene, (64, 64));
+            assert_eq!(base, scene.renderer.as_ref().unwrap().morphed_vertices(0));
+            scene.release(gl);
+        })
+        .unwrap();
+    }
+
+    /// 描かずに release しても安全(作っていないものは消さない)で、数えもずれない。
+    #[test]
+    fn release_before_draw_is_safe() {
+        let Some(off) = offscreen() else { return };
+        let count = Rc::new(ObjectCount::default());
+        off.with_fbo((8, 8), |gl| {
+            let mut scene = VrmScene::from_model(synth_model(), count.clone());
+            scene.release(gl);
+            scene.release(gl);
+            assert_eq!((count.created(), count.deleted()), (0, 0));
+            no_gl_error(gl, "draw の前の release");
+        })
+        .unwrap();
+    }
+
+    /// 転送できないモデル(関節が多すぎる)は、Err にせず 3D なしで続け、作りかけは消える。
+    #[test]
+    fn untransferable_model_fails_softly_without_leaks() {
+        let Some(off) = offscreen() else { return };
+        let count = Rc::new(ObjectCount::default());
+        off.with_fbo((64, 64), |gl| {
+            let mut model = synth_model();
+            // 上限(256)を超える関節を持つことにして、転送の検査で弾かせる
+            let joint = model.joint_nodes[0];
+            model.joint_nodes = vec![joint; crate::render::MAX_JOINTS + 1];
+            let mut scene = VrmScene::from_model(model, count.clone());
+            let img = draw_layer(gl, &mut scene, (64, 64));
+            assert!(img.iter().all(|&b| b == 0), "失敗したのに描かれている");
+            assert_eq!(scene.state(), LoadState::Failed);
+            assert!(scene.error().unwrap().contains("関節が多すぎる"));
+            assert_eq!(count.live(), 0, "作りかけが残る");
+            // 失敗したあとの draw / release も安全
+            let _ = draw_layer(gl, &mut scene, (64, 64));
+            scene.release(gl);
+            assert_eq!(count.live(), 0);
+        })
+        .unwrap();
+    }
+
+    /// 層の FBO を作って `scene.draw` をそのまま呼ぶ(panic や Err を呼び出し側で受けるため、unwrap しない)。
+    fn draw_raw(gl: &glow::Context, scene: &mut VrmScene, size: (u32, u32)) -> Result<(), String> {
+        unsafe {
+            let (fbo, color, depth) = make_layer(gl, size);
+            gl.viewport(0, 0, size.0 as i32, size.1 as i32);
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
+            let r = catch_unwind(AssertUnwindSafe(|| scene.draw(gl, &GlTarget { fbo, size })));
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.delete_framebuffer(fbo);
+            gl.delete_texture(color);
+            gl.delete_renderbuffer(depth);
+            r.unwrap_or_else(|p| Err(format!("panic: {}", panic_message(&*p))))
+        }
+    }
+
+    /// 転送の途中で GL エラーになる(texture の wrap が不正)と、作りかけは Renderer が消して Err を返す。
+    /// 場面は 3D なしで続け、`release` のあとも数えがずれず、同じ `count` で正しいモデルを作り直せる。
+    #[test]
+    fn gl_error_after_creating_objects_leaves_nothing() {
+        let Some(off) = offscreen() else { return };
+        let count = Rc::new(ObjectCount::default());
+        off.with_fbo((64, 64), |gl| {
+            let mut model = synth_model();
+            model.textures[0].wrap_s = 0xFFFF;
+            let mut created = Created::default();
+            let err = Renderer::with_shared_tracked(
+                gl,
+                Rc::new(model),
+                Level::Spring,
+                count.clone(),
+                &mut created,
+            )
+            .err()
+            .expect("不正な wrap が通った");
+            assert!(err.contains("GL エラー"), "{err}");
+            assert!(count.created() > 5, "失敗を作りかけのあとに起こせていない");
+            assert_eq!(count.live(), 0, "Err のあとに作りかけが残る");
+            // 控えは空に戻っている(もう一度消しても数えは変わらない)
+            let deleted = count.deleted();
+            created.delete(gl, &count);
+            assert_eq!(count.deleted(), deleted);
+
+            // 場面を通しても同じ: Err にせず Failed で続け、release のあとも 0
+            let mut bad = synth_model();
+            bad.textures[0].wrap_s = 0xFFFF;
+            let mut scene = VrmScene::from_model(bad, count.clone());
+            draw_raw(gl, &mut scene, (64, 64)).unwrap();
+            assert_eq!(scene.state(), LoadState::Failed);
+            assert_eq!(count.live(), 0);
+            scene.release(gl);
+            scene.release(gl);
+            assert_eq!(count.live(), 0);
+
+            // 同じ count で、正しいモデルは作り直せる
+            let mut ok = VrmScene::from_model(synth_model(), count.clone());
+            draw_raw(gl, &mut ok, (64, 64)).unwrap();
+            assert!(count.live() > 0);
+            ok.release(gl);
+            assert_eq!(count.live(), 0);
+        })
+        .unwrap();
+    }
+
+    /// 転送の途中で panic しても(ここでは material の番号が範囲外)、作りかけは `release` が消し、
+    /// 2 回呼んでも安全で、その後の `draw` で作り直せる。
+    #[test]
+    fn panic_while_building_is_cleaned_by_release() {
+        let Some(off) = offscreen() else { return };
+        let count = Rc::new(ObjectCount::default());
+        off.with_fbo((64, 64), |gl| {
+            let mut model = synth_model();
+            model.primitives[0].material = usize::MAX;
+            let mut scene = VrmScene::from_model(model, count.clone());
+            let r = draw_raw(gl, &mut scene, (64, 64));
+            assert!(r.unwrap_err().starts_with("panic"), "panic しなかった");
+            assert!(count.live() > 0, "作りかけの状態を作れていない");
+            scene.release(gl);
+            assert_eq!(count.live(), 0, "作りかけが漏れた");
+            scene.release(gl);
+            assert_eq!(count.live(), 0);
+            no_gl_error(gl, "panic のあとの release");
+
+            // 解析結果を正しいものに差し替えて、同じ場面で作り直せる
+            scene.load = Load::Ready(Rc::new(synth_model()));
+            let created = count.created();
+            draw_raw(gl, &mut scene, (64, 64)).unwrap();
+            let fresh = count.created() - created;
+            assert!(count.live() > 0 && scene.renderer.is_some());
+            scene.release(gl);
+            assert_eq!(count.live(), 0);
+
+            let probe = Rc::new(ObjectCount::default());
+            let mut other = VrmScene::from_model(synth_model(), probe.clone());
+            draw_raw(gl, &mut other, (64, 64)).unwrap();
+            assert_eq!(fresh, probe.created(), "作り直しの数が違う");
+            other.release(gl);
+        })
+        .unwrap();
+    }
+
+    /// 描画の途中で panic しても Renderer を失わず、`release` で GL オブジェクトが 0 に戻る。
+    #[test]
+    fn panic_while_rendering_still_releases_renderer() {
+        let Some(off) = offscreen() else { return };
+        let count = Rc::new(ObjectCount::default());
+        off.with_fbo((64, 64), |gl| {
+            let mut scene = VrmScene::from_model(synth_model(), count.clone());
+            draw_raw(gl, &mut scene, (64, 64)).unwrap();
+            scene.renderer.as_mut().unwrap().break_render_for_test();
+            let r = draw_raw(gl, &mut scene, (64, 64));
+            assert!(r.unwrap_err().starts_with("panic"), "panic しなかった");
+            assert!(scene.renderer.is_some(), "panic で Renderer を失った");
+            assert!(count.live() > 0);
+            scene.release(gl);
+            assert_eq!(count.live(), 0, "描画中の panic で漏れた");
+            scene.release(gl);
+            assert_eq!(count.live(), 0);
+            // 作り直せる
+            draw_raw(gl, &mut scene, (64, 64)).unwrap();
+            assert!(count.live() > 0);
+            scene.release(gl);
+            assert_eq!(count.live(), 0);
+        })
+        .unwrap();
+    }
+
+    /// 半透明の素材(BLEND・alpha 0.5)でも出力は premultiplied(色 <= アルファ)で、半透明の画素が実際にある。
+    #[test]
+    fn translucent_material_output_is_premultiplied() {
+        let Some(off) = offscreen() else { return };
+        let size = (200u32, 300u32);
+        let count = Rc::new(ObjectCount::default());
+        let (img, _) = off
+            .with_fbo(size, |gl| {
+                let mut model = synth_model();
+                for m in &mut model.materials {
+                    m.alpha_mode = crate::AlphaMode::Blend;
+                    m.base_color[3] = 0.5;
+                }
+                let mut scene = VrmScene::from_model(model, count.clone());
+                let img = draw_layer(gl, &mut scene, size);
+                scene.release(gl);
+                img
+            })
+            .unwrap();
+        let px = img.as_chunks::<4>().0;
+        let translucent = px.iter().filter(|p| p[3] > 0 && p[3] < 255).count();
+        assert!(translucent > 500, "半透明の画素が少ない: {translucent}");
+        assert!(
+            px.iter().all(|p| p[..3].iter().all(|&c| c <= p[3])),
+            "色がアルファを超える(premultiplied でない)"
+        );
+        assert!(
+            px.iter().any(|p| p[..3].iter().any(|&c| c > 0)),
+            "色が全部 0"
+        );
+        assert_eq!(count.live(), 0);
+    }
+
+    /// 読み込みが終わるまで何も描かず Ok を返し、終わったあとの draw で描かれる。
+    #[test]
+    fn loads_on_another_thread_then_draws() {
+        let Some(off) = offscreen() else { return };
+        let size = (160u32, 240u32);
+        let count = Rc::new(ObjectCount::default());
+        let (gate_tx, gate_rx) = channel::<()>();
+        let glb = synth::build_vrm_glb(&synth::Opts {
+            segments: 12,
+            texture_size: 64,
+        });
+        off.with_fbo(size, |gl| {
+            let mut scene = VrmScene::from_loader(count.clone(), move || {
+                // 合図が来るまで読み込みを終えない(draw が待たされないことの確認)
+                gate_rx.recv().map_err(|e| e.to_string())?;
+                Model::from_glb(&glb)
+            });
+            assert_eq!(scene.state(), LoadState::Loading);
+            let t0 = Instant::now();
+            let loading = draw_layer(gl, &mut scene, size);
+            assert!(
+                t0.elapsed() < Duration::from_secs(2),
+                "draw が読み込みを待った"
+            );
+            assert!(loading.iter().all(|&b| b == 0), "読み込み中に描かれている");
+            assert_eq!(scene.state(), LoadState::Loading);
+            assert_eq!(count.created(), 0);
+            gate_tx.send(()).unwrap();
+            // 読み込みが終わるのを待つ(poll は tick から呼ぶ想定)
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while scene.state() == LoadState::Loading {
+                assert!(Instant::now() < deadline, "読み込みが終わらない");
+                std::thread::sleep(Duration::from_millis(5));
+                scene.poll();
+            }
+            assert_eq!(scene.state(), LoadState::Ready);
+            let img = draw_layer(gl, &mut scene, size);
+            assert!(
+                img.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count() > 1000,
+                "読み込み後に描かれていない"
+            );
+            scene.release(gl);
+            assert_eq!(count.live(), 0);
+        })
+        .unwrap();
+    }
+
+    /// 存在しないパス・壊れた glb・panic する読み込みでも、draw は Ok を返し続け、描かれず、GL を作らない。
+    #[test]
+    fn broken_models_never_fail_draw() {
+        let Some(off) = offscreen() else { return };
+        let dir = std::env::temp_dir().join(format!("vrm-scene-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = synth::build_vrm_glb(&synth::Opts {
+            segments: 12,
+            texture_size: 64,
+        });
+        let write = |name: &str, bytes: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+        // sparse の values の byteStride が要素(VEC3 の float = 12 バイト)より小さい glb
+        let (mut doc, bin) = synth::build_vrm_doc(&synth::Opts {
+            segments: 12,
+            texture_size: 64,
+        });
+        let t = doc["meshes"][0]["primitives"][0]["targets"][0]["POSITION"]
+            .as_u64()
+            .unwrap() as usize;
+        let views = doc["bufferViews"].as_array_mut().unwrap();
+        views.push(json!({"buffer": 0, "byteOffset": 0, "byteLength": 4}));
+        views.push(json!({"buffer": 0, "byteOffset": 0, "byteLength": 24, "byteStride": 4}));
+        let (iv, vv) = (views.len() - 2, views.len() - 1);
+        doc["accessors"][t]["sparse"] = json!({
+            "count": 2,
+            "indices": {"bufferView": iv, "componentType": 5123},
+            "values": {"bufferView": vv},
+        });
+        let sparse = write("sparse.glb", &synth::pack_glb(&doc, &bin));
+        let cases: Vec<(&str, VrmScene)> = vec![
+            (
+                "存在しないパス",
+                VrmScene::from_path(dir.join("nothing.glb"), Rc::new(ObjectCount::default())),
+            ),
+            (
+                "切り詰めた glb",
+                VrmScene::from_path(
+                    write("truncated.glb", &good[..good.len() / 2]),
+                    Rc::new(ObjectCount::default()),
+                ),
+            ),
+            (
+                "sparse の stride が要素より小さい",
+                VrmScene::from_path(sparse, Rc::new(ObjectCount::default())),
+            ),
+            (
+                "glb ではない",
+                VrmScene::from_path(
+                    write("text.glb", b"not a glb at all"),
+                    Rc::new(ObjectCount::default()),
+                ),
+            ),
+            (
+                "読み込みが panic",
+                VrmScene::from_loader(Rc::new(ObjectCount::default()), || {
+                    panic!("読み込みの途中で落ちた")
+                }),
+            ),
+        ];
+        for (what, mut scene) in cases {
+            off.with_fbo((32, 32), |gl| {
+                // 読み込みが終わるまで draw を回す。どの draw も Ok(draw_layer が unwrap する)
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while scene.state() == LoadState::Loading {
+                    assert!(Instant::now() < deadline, "{what}: 読み込みが終わらない");
+                    let img = draw_layer(gl, &mut scene, (32, 32));
+                    assert!(img.iter().all(|&b| b == 0), "{what}: 描かれている");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                assert_eq!(scene.state(), LoadState::Failed, "{what}");
+                assert!(scene.error().is_some(), "{what}");
+                for _ in 0..3 {
+                    let img = draw_layer(gl, &mut scene, (32, 32));
+                    assert!(img.iter().all(|&b| b == 0), "{what}: 失敗後に描かれている");
+                }
+                assert_eq!(scene.gl_live_objects(), 0, "{what}");
+                scene.release(gl);
+                scene.release(gl);
+            })
+            .unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `lazy` は `start` まで何も読まない(存在しないパスでも失敗しない)。`start` で読み始め、2 回呼んでも読み直さない。
+    #[test]
+    fn lazy_scene_reads_nothing_until_started() {
+        let wait = |scene: &mut VrmScene| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while scene.state() == LoadState::Loading {
+                assert!(Instant::now() < deadline, "読み込みが終わらない");
+                std::thread::sleep(Duration::from_millis(2));
+                scene.poll();
+            }
+        };
+        let mut missing = VrmScene::lazy(
+            "/nonexistent/vrm/lazy.glb".into(),
+            Rc::new(ObjectCount::default()),
+        );
+        for _ in 0..3 {
+            missing.poll();
+            assert_eq!(missing.state(), LoadState::Idle);
+            assert!(missing.error().is_none() && missing.model().is_none());
+        }
+        missing.start();
+        assert_eq!(missing.state(), LoadState::Loading);
+        wait(&mut missing);
+        assert_eq!(missing.state(), LoadState::Failed);
+        assert!(missing.error().unwrap().contains("lazy.glb"));
+        // 失敗のあとの start は何もしない
+        missing.start();
+        assert_eq!(missing.state(), LoadState::Failed);
+
+        let dir = std::env::temp_dir().join(format!("vrm-lazy-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ok.glb");
+        std::fs::write(
+            &path,
+            synth::build_vrm_glb(&synth::Opts {
+                segments: 12,
+                texture_size: 64,
+            }),
+        )
+        .unwrap();
+        let mut ok = VrmScene::lazy(path, Rc::new(ObjectCount::default()));
+        assert_eq!(ok.state(), LoadState::Idle);
+        ok.start();
+        ok.start();
+        wait(&mut ok);
+        assert_eq!(ok.state(), LoadState::Ready);
+        assert!(ok.model().is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// GPU が無くても動く確認: 失敗の理由は 1 つに定まり、スレッドの panic は文言に残る。
+    #[test]
+    fn failure_reasons_are_recorded() {
+        let mut scene = VrmScene::from_loader(Rc::new(ObjectCount::default()), || {
+            panic!("読み込みの途中で落ちた")
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while scene.state() == LoadState::Loading {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+            scene.poll();
+        }
+        assert_eq!(scene.state(), LoadState::Failed);
+        let e = scene.error().unwrap();
+        assert!(
+            e.contains("panic") && e.contains("読み込みの途中で落ちた"),
+            "{e}"
+        );
+
+        let mut scene = VrmScene::from_path(
+            "/nonexistent/vrm/model.glb".into(),
+            Rc::new(ObjectCount::default()),
+        );
+        while scene.state() == LoadState::Loading {
+            std::thread::sleep(Duration::from_millis(2));
+            scene.poll();
+        }
+        assert!(scene.error().unwrap().contains("model.glb"));
+    }
+}

@@ -20,7 +20,7 @@ use miharashi_vrm::demo::FaceSet;
 use miharashi_vrm::photo_stage::{self, Slideshow};
 use miharashi_vrm::record::{self, Codec};
 use miharashi_vrm::synth;
-use miharashi_vrm::{Framing, Level, Model, Region, Renderer, VrmLayer, demo};
+use miharashi_vrm::{Framing, Level, Model, Renderer, StageRegion, VrmLayer, demo};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,7 +49,7 @@ struct Args {
     level: Level,
     outline_scale: f32,
     frame: Framing,
-    region: Region,
+    region: StageRegion,
     gesture: bool,
     lipsync: bool,
     /// 背景に写真を描く。`synthetic` か、JPEG の入ったディレクトリ(なければ合成写真)
@@ -100,7 +100,7 @@ fn parse_args() -> Result<Args, String> {
         level: Level::Spring,
         outline_scale: 1.0,
         frame: Framing::Full,
-        region: Region::Full,
+        region: StageRegion::Full,
         gesture: false,
         lipsync: false,
         photos: None,
@@ -135,7 +135,7 @@ fn parse_args() -> Result<Args, String> {
                 a.outline_scale = value()?.parse().map_err(|_| "--outline-scale が数でない")?
             }
             "--frame" => a.frame = Framing::parse(&value()?)?,
-            "--region" => a.region = Region::parse(&value()?)?,
+            "--region" => a.region = StageRegion::parse(&value()?)?,
             "--gesture" => a.gesture = true,
             "--lipsync" => a.lipsync = true,
             "--photos" => a.photos = Some(value()?),
@@ -573,7 +573,7 @@ fn run(a: &Args) -> Result<(), String> {
 
 /// 構図から決まる、領域と視線・指さしの起点。
 struct Geom {
-    /// キャラクターの領域(画素。左下原点の `Region::rect`)
+    /// キャラクターの領域(画素。左下原点の `StageRegion::rect`)
     rect: (u32, u32, u32, u32),
     /// 視線と指さしの起点(頭の画面上の位置)
     head: (f32, f32),
@@ -594,7 +594,7 @@ fn geom(a: &Args, size: (u32, u32), backdrop: &Backdrop) -> Geom {
         ),
         depth: size.1 as f32 * 0.5,
         sway: a.frame == Framing::Full
-            && a.region == Region::Full
+            && a.region == StageRegion::Full
             && !a.gesture
             && matches!(backdrop, Backdrop::None),
     }

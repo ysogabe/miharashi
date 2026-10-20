@@ -9,6 +9,7 @@ pub mod screens {
     pub mod photo;
     pub mod room;
     pub mod status;
+    pub mod with_scene;
 }
 
 use crate::config::Config;
@@ -22,6 +23,7 @@ use screens::gl_check::{Dirt, DirtyScreen};
 use screens::photo::PhotoScreen;
 use screens::room::{RoomFeeds, RoomScreen};
 use screens::status::StatusScreen;
+use screens::with_scene::WithScene;
 use std::time::Duration;
 
 /// データ収集(実測値)の抽象。実行ループも画面も具体的な収集方法を知らない。
@@ -42,12 +44,40 @@ pub fn text_engine(font: &str) -> TextEngine {
 }
 
 pub fn set_clock(s: &mut Snapshot) {
+    set_clock_at(s, chrono::Local::now());
+}
+
+/// 日付・時刻を `now` にする(`png` の fixture が、実時刻に依らない絵を作るため)。
+pub fn set_clock_at(s: &mut Snapshot, now: chrono::DateTime<chrono::Local>) {
     use chrono::Datelike;
-    let now = chrono::Local::now();
     let wd =
         ["月", "火", "水", "木", "金", "土", "日"][now.weekday().num_days_from_monday() as usize];
     s.date = format!("{} ({wd})", now.format("%Y/%m/%d"));
     s.time = now.format("%H:%M:%S").to_string();
+}
+
+/// `[vrm]` の設定どおり、画面 `screen`(id = `id`)に VRM を載せる。載せないときはそのまま返す。
+/// 載せるのは、有効で、その画面が `vrm.screens` にあり、GL が使えるときだけ(`gl` は `gpu_max.is_some()`)。
+/// `renderer = cpu` や `auto` で GLES を開けなかったときに包んでも、ScreenManager が 3D を外して元の画面を出すが、
+/// 読み込みの別スレッドを起こしてモデルを RAM に置いてしまう。包まなければ、無効のときと同じ動きになる。
+/// 読み込みは画面が最初に出るまで始めない(`VrmScene::lazy`)ので、巡回に出ない画面の分のモデルは読まない。
+fn decorated<S: crate::screen::Screen + 'static>(
+    cfg: &Config,
+    gl: bool,
+    id: &str,
+    screen: S,
+) -> Box<dyn crate::screen::Screen> {
+    let v = &cfg.vrm;
+    if !(v.enabled && gl && v.screens.iter().any(|s| s == id)) {
+        return Box::new(screen);
+    }
+    let count = std::rc::Rc::new(miharashi_glscene::ObjectCount::default());
+    Box::new(WithScene::new(
+        screen,
+        miharashi_vrm::VrmScene::lazy(v.model.clone().into(), count),
+        v.stage_region(),
+        v.fps,
+    ))
 }
 
 /// キオスクの画面を登録する。並び順が切り替わる順になる(docs/DESIGN-screens.md §2)。
@@ -66,8 +96,11 @@ pub fn kiosk(
 ) -> ScreenManager {
     let photo = PhotoScreen::new(cfg, size, gpu_max, source);
     let feed = photo.feed_provider();
-    let mut screens: Vec<Box<dyn crate::screen::Screen>> =
-        vec![Box::new(StatusScreen::new()), Box::new(photo)];
+    let gl = gpu_max.is_some();
+    let mut screens: Vec<Box<dyn crate::screen::Screen>> = vec![
+        Box::new(StatusScreen::new()),
+        decorated(cfg, gl, "photo", photo),
+    ];
     if let Some(feeds) = room {
         screens.push(Box::new(RoomScreen::new(cfg.room.tiles.clone(), feeds)));
     }
@@ -79,11 +112,12 @@ pub fn kiosk(
         .enabled
         .then(|| crate::agents::start(&cfg.agents));
     if cfg.agents.enabled {
-        screens.push(Box::new(AgentScreen::new(
-            size,
-            gpu_max.is_some(),
-            cfg.agents.stale_secs,
-        )));
+        screens.push(decorated(
+            cfg,
+            gl,
+            "agents",
+            AgentScreen::new(size, gl, cfg.agents.stale_secs),
+        ));
     }
     // 3D の画面(既定は無効。GL が使えないときは案内を出し、自動巡回では飛ばす)
     if cfg.cube.enabled {
@@ -135,6 +169,8 @@ use screens::agents::AgentScreen;
 mod cube_tests;
 #[cfg(test)]
 mod scene_tests;
+#[cfg(test)]
+mod with_scene_tests;
 
 #[cfg(test)]
 mod tests {

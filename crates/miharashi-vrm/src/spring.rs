@@ -3,7 +3,7 @@
 use crate::anim::Rig;
 use crate::math::{self, Quat};
 use crate::model::Model;
-use crate::vrm::{ColliderShape, SPRING_LIMIT};
+use crate::vrm::{ColliderShape, NO_NODE, SPRING_LIMIT};
 
 type V3 = [f32; 3];
 
@@ -59,6 +59,14 @@ pub fn push_out_capsule(p: V3, a: V3, b: V3, r: f32) -> V3 {
     push_out_sphere(p, math::vec_add(a, math::vec_scale(ab, t)), r)
 }
 
+/// 1 フレームに計算する「関節 × コライダー」の組の数の上限(全 spring の合計)。
+/// 読み込みの上限(関節 1024 × コライダー 1024)のままだと最悪 100 万組を毎フレーム計算し、
+/// 30fps の予算を食いつぶす。組 1 つは数十 ns なので、16384 組なら 1ms 前後に収まる。
+/// ニケちゃんは髪 55 本・計 110 関節・コライダー 31 で、最悪(全関節が全コライダーに当たる)でも
+/// 3410 組(上限の約 1/5)なので、実モデルは引っかからない。
+/// 超えた spring は、その spring のコライダーを外して(衝突なしで揺らして)落ちないようにする。
+pub const MAX_COLLISION_PAIRS: usize = 16384;
+
 struct SJoint {
     node: usize,
     /// 子ノード(なければ仮の尾)
@@ -81,12 +89,15 @@ pub struct SpringSim {
     springs: Vec<(std::ops::Range<usize>, Vec<usize>)>,
     joints: Vec<SJoint>,
     initialized: bool,
+    /// `MAX_COLLISION_PAIRS` を超えて、コライダーを外した spring の数
+    collision_disabled: usize,
 }
 
 impl SpringSim {
     pub fn new(model: &Model, _rig: &Rig) -> Self {
         let sb = &model.vrm.spring;
         let (mut springs, mut joints) = (Vec::new(), Vec::new());
+        let (mut pairs, mut collision_disabled) = (0usize, 0usize);
         for sp in &sb.springs {
             let start = joints.len();
             for (k, j) in sp.joints.iter().enumerate() {
@@ -132,14 +143,32 @@ impl SpringSim {
                         }
                     }
                 }
+                let n = (joints.len() - start).saturating_mul(cols.len());
+                if pairs.saturating_add(n) > MAX_COLLISION_PAIRS {
+                    cols.clear();
+                    collision_disabled += 1;
+                } else {
+                    pairs += n;
+                }
                 springs.push((start..joints.len(), cols));
             }
+        }
+        if collision_disabled > 0 {
+            eprintln!(
+                "SpringBone: 関節 × コライダーが上限({MAX_COLLISION_PAIRS})を超えるので、\
+                 {collision_disabled} 本の spring の衝突を無効にする"
+            );
         }
         Self {
             springs,
             joints,
             initialized: false,
+            collision_disabled,
         }
+    }
+
+    pub fn collision_disabled_springs(&self) -> usize {
+        self.collision_disabled
     }
 
     pub fn joint_count(&self) -> usize {
@@ -150,6 +179,9 @@ impl SpringSim {
     /// 揺れる骨の `override_rot` を設定し、その骨と子のワールドを更新する。
     pub fn step(&mut self, model: &Model, rig: &mut Rig, dt: f32) {
         let dt = dt.clamp(0.0, 1.0 / 20.0);
+        // 時間が進んでいない(dt = 0)ときは揺れを進めない。慣性の項は dt に依存しないので、
+        // そのまま積分すると、同じ時刻の描き直しのたびに毛先が動いてしまう
+        let frozen = dt == 0.0;
         let sb = &model.vrm.spring;
         let pos = |w: &math::Mat4| [w[3][0], w[3][1], w[3][2]];
         if !self.initialized {
@@ -174,19 +206,24 @@ impl SpringSim {
                 let head = pos(&rig.world[j.node]);
                 let rest_world_rot = math::quat_mul(parent_rot, j.rest_rot);
                 let axis_w = math::quat_rotate(rest_world_rot, j.bone_axis);
-                let mut next = verlet(
-                    j.prev_tail,
-                    j.curr_tail,
-                    axis_w,
-                    j.stiffness,
-                    j.drag,
-                    j.gravity,
-                    dt,
-                );
+                let mut next = if frozen {
+                    j.curr_tail
+                } else {
+                    verlet(
+                        j.prev_tail,
+                        j.curr_tail,
+                        axis_w,
+                        j.stiffness,
+                        j.drag,
+                        j.gravity,
+                        dt,
+                    )
+                };
                 next = keep_length(head, next, j.bone_length);
                 for &ci in cols {
                     let c = &sb.colliders[ci];
-                    if c.node >= rig.world.len() {
+                    // node のないコライダー(NO_NODE)や範囲外は無視する
+                    if c.node == NO_NODE || c.node >= rig.world.len() {
                         continue;
                     }
                     let m = &rig.world[c.node];
@@ -209,8 +246,10 @@ impl SpringSim {
                     };
                     next = keep_length(head, next, j.bone_length);
                 }
-                j.prev_tail = j.curr_tail;
-                j.curr_tail = next;
+                if !frozen {
+                    j.prev_tail = j.curr_tail;
+                    j.curr_tail = next;
+                }
                 // 回転: 初期の骨の向き → 次の尾の向き(骨の初期ローカル系で見たもの)
                 let to_local =
                     math::quat_rotate(math::quat_conj(rest_world_rot), math::vec_sub(next, head));

@@ -13,7 +13,6 @@
 //!
 //! 含めないもの: 新しいスレッドが右から入る動き、画面が消えている間の一時停止、T3 との通信(中身は全て架空)。
 use crate::agent_layout::{self as layout, CardMode};
-use crate::gesture::Aim;
 use miharashi_gpu::{AgentGpuCard, Frame};
 use miharashi_render::agents::{self as draw, AgentCardContent, AgentCardSurface, AgentPose};
 use miharashi_render::{Canvas, Pixmap, TextEngine};
@@ -892,69 +891,7 @@ impl AgentStage {
     }
 }
 
-/// キャラクターが向く目標(フォーカス中のカード)。
-#[derive(Clone, Copy, Debug)]
-pub struct AimTarget {
-    /// 画面の px(左上が原点)
-    pub center: (f32, f32),
-    /// 腕を伸ばして指さしてよいか(カードが中央で止まっている間)
-    pub pointing: bool,
-}
-
-/// フォーカスの移りに合わせて、視線と指さしの重みを滑らかに出し入れする(`--follow-cards`)。
-#[derive(Default)]
-pub struct AimTracker {
-    look: f32,
-    point: f32,
-    dir: [f32; 3],
-    last: Option<Instant>,
-}
-
-/// 視線・指さしが 0 → 1 になるまでの時間 [秒]
-const AIM_RAMP: f32 = 0.5;
-/// 向きが目標に追いつく時定数 [秒]
-const AIM_TAU: f32 = 0.12;
-
-impl AimTracker {
-    /// `head` はキャラクターの頭の画面上の位置(px、左上が原点)、`depth` はキャラクターから
-    /// 画面の面までの仮想の距離(px)。向きは「頭 → カードの中心」。
-    pub fn step(
-        &mut self,
-        now: Instant,
-        target: Option<AimTarget>,
-        head: (f32, f32),
-        depth: f32,
-    ) -> Option<Aim> {
-        let dt = self
-            .last
-            .map_or(0.0, |l| now.saturating_duration_since(l).as_secs_f32());
-        self.last = Some(now);
-        let up = |v: f32, on: bool| {
-            let step = dt / AIM_RAMP;
-            (if on { v + step } else { v - step }).clamp(0.0, 1.0)
-        };
-        self.look = up(self.look, target.is_some());
-        self.point = up(self.point, target.is_some_and(|t| t.pointing));
-        if let Some(t) = target {
-            let raw = crate::math::normalize([t.center.0 - head.0, head.1 - t.center.1, depth]);
-            self.dir = if self.dir == [0.0; 3] || self.look <= dt / AIM_RAMP + 1e-6 {
-                raw
-            } else {
-                let k = 1.0 - (-dt / AIM_TAU).exp();
-                crate::math::normalize([
-                    lerp(self.dir[0], raw[0], k),
-                    lerp(self.dir[1], raw[1], k),
-                    lerp(self.dir[2], raw[2], k),
-                ])
-            };
-        }
-        (self.look > 0.0).then_some(Aim {
-            dir: self.dir,
-            look: smooth(self.look),
-            point: smooth(self.point),
-        })
-    }
-}
+pub use crate::gesture::{AimTarget, AimTracker};
 
 #[cfg(test)]
 mod tests {
@@ -1081,7 +1018,7 @@ mod tests {
         off: &miharashi_gpu::Offscreen,
         size: (u32, u32),
         model_path: Option<&str>,
-        region: crate::Region,
+        region: crate::StageRegion,
         frame: crate::Framing,
         follow: bool,
         secs: f32,
@@ -1150,7 +1087,7 @@ mod tests {
 
     #[test]
     fn vrm_layer_overlays_agent_frame_offscreen() {
-        use crate::{Framing, Region};
+        use crate::{Framing, StageRegion};
         let Ok(off) = miharashi_gpu::Offscreen::open(std::path::Path::new("/dev/dri/renderD128"))
         else {
             eprintln!("GLES が使えないので skip");
@@ -1162,23 +1099,29 @@ mod tests {
             let dir = std::path::Path::new(&dir);
             std::fs::create_dir_all(dir).unwrap();
             // (名前, 時刻, 領域, 構図, 連動)。カードの変化は 3 秒ごと、最初のフォーカスは 3.0〜9.5 秒
-            let shots: &[(&str, f32, Region, Framing, bool)] = &[
-                ("a-before-right", 2.0, Region::Right, Framing::Bust, true),
-                ("b-in-right", 3.4, Region::Right, Framing::Bust, true),
-                ("c-hold-right", 6.0, Region::Right, Framing::Bust, true),
-                ("d-out-right", 9.1, Region::Right, Framing::Bust, true),
-                ("e-hold-left", 6.0, Region::Left, Framing::Bust, true),
+            let shots: &[(&str, f32, StageRegion, Framing, bool)] = &[
+                (
+                    "a-before-right",
+                    2.0,
+                    StageRegion::Right,
+                    Framing::Bust,
+                    true,
+                ),
+                ("b-in-right", 3.4, StageRegion::Right, Framing::Bust, true),
+                ("c-hold-right", 6.0, StageRegion::Right, Framing::Bust, true),
+                ("d-out-right", 9.1, StageRegion::Right, Framing::Bust, true),
+                ("e-hold-left", 6.0, StageRegion::Left, Framing::Bust, true),
                 (
                     "f-hold-right-nofollow",
                     6.0,
-                    Region::Right,
+                    StageRegion::Right,
                     Framing::Bust,
                     false,
                 ),
                 (
                     "g-hold-right-waist",
                     6.0,
-                    Region::Right,
+                    StageRegion::Right,
                     Framing::Waist,
                     true,
                 ),
@@ -1202,9 +1145,25 @@ mod tests {
         }
         // 合成モデルで: 領域の中にモデルが描かれ、領域の外はカードのまま。フォーカス中は scrim で暗くなる
         let size = (1280u32, 540u32);
-        let (rx, _, rw, _) = Region::Right.rect(size);
-        let before = render_at(&off, size, None, Region::Right, Framing::Full, false, 1.0);
-        let hold = render_at(&off, size, None, Region::Right, Framing::Full, false, 6.0);
+        let (rx, _, rw, _) = StageRegion::Right.rect(size);
+        let before = render_at(
+            &off,
+            size,
+            None,
+            StageRegion::Right,
+            Framing::Full,
+            false,
+            1.0,
+        );
+        let hold = render_at(
+            &off,
+            size,
+            None,
+            StageRegion::Right,
+            Framing::Full,
+            false,
+            6.0,
+        );
         let px = |img: &[u8], x: u32, y: u32| -> [u8; 4] {
             img[((y * size.0 + x) * 4) as usize..][..4]
                 .try_into()

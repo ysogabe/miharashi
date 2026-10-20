@@ -16,6 +16,7 @@ pub mod photo_stage;
 #[cfg(feature = "view")]
 pub mod record;
 pub mod render;
+pub mod scene;
 pub mod spring;
 pub mod synth;
 pub mod vrm;
@@ -23,5 +24,6 @@ pub mod vrm;
 pub use layer::VrmLayer;
 pub use model::{AlphaMode, Model, Stats};
 pub use render::{
-    Framing, Level, Region, Renderer, UpdateTimes, attach_depth, detach_depth, view_proj,
+    Framing, Level, Renderer, StageRegion, UpdateTimes, attach_depth, detach_depth, view_proj,
 };
+pub use scene::{LoadState, SceneInput, VrmScene};

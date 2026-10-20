@@ -6,7 +6,9 @@ use crate::math;
 use crate::model::{AlphaMode, FLOATS_PER_VERTEX, Model};
 use crate::vrm::OutlineMode;
 use glow::HasContext;
+use miharashi_glscene::ObjectCount;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::time::Instant;
 
 /// 描き方の機能段階(後ろのものは前のものを含む)。
@@ -293,9 +295,11 @@ struct Prog {
     locs: Locs,
 }
 
-/// `Renderer::new` の途中で作った GL オブジェクトの控え。失敗したときにまとめて消す。
+/// `Renderer` の転送の途中で作った GL オブジェクトの控え。失敗したときにまとめて消す。
+/// 呼び出し側が持つ(`Renderer::with_shared_tracked`)と、転送の途中で panic しても控えが残るので、
+/// 呼び出し側が `delete` で作りかけを消せる(Drop では GL の Context を使えない)。
 #[derive(Default)]
-struct Created {
+pub struct Created {
     programs: Vec<glow::Program>,
     vaos: Vec<glow::VertexArray>,
     buffers: Vec<glow::Buffer>,
@@ -303,26 +307,28 @@ struct Created {
 }
 
 impl Created {
-    unsafe fn delete(self, gl: &glow::Context) {
-        unsafe {
-            for v in self.vaos {
-                gl.delete_vertex_array(v);
-            }
-            for b in self.buffers {
-                gl.delete_buffer(b);
-            }
-            for t in self.textures {
-                gl.delete_texture(t);
-            }
-            for p in self.programs {
-                gl.delete_program(p);
-            }
+    /// 控えにあるものをすべて消す(空なら何もしない)。
+    pub fn delete(self, gl: &glow::Context, count: &ObjectCount) {
+        for v in self.vaos {
+            count.delete_vertex_array(gl, v);
+        }
+        for b in self.buffers {
+            count.delete_buffer(gl, b);
+        }
+        for t in self.textures {
+            count.delete_texture(gl, t);
+        }
+        for p in self.programs {
+            count.delete_program(gl, p);
         }
     }
 }
 
 pub struct Renderer {
-    model: Model,
+    /// 解析結果。`VrmScene` が `release` のあとも持ち続けるので共有する(GL のオブジェクトとは別の寿命)
+    model: Rc<Model>,
+    /// GL オブジェクトの作成・削除の数え方(§3.3)。`new` では自分だけが持つ
+    count: Rc<ObjectCount>,
     level: Level,
     lambert: Prog,
     mtoon: Prog,
@@ -360,18 +366,23 @@ fn as_bytes<T>(v: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), std::mem::size_of_val(v)) }
 }
 
-unsafe fn compile(gl: &glow::Context, vs: &str, fs: &str) -> Result<glow::Program, String> {
+unsafe fn compile(
+    gl: &glow::Context,
+    count: &ObjectCount,
+    vs: &str,
+    fs: &str,
+) -> Result<glow::Program, String> {
     unsafe {
-        let program = gl.create_program()?;
+        let program = count.create_program(gl)?;
         let mut shaders = Vec::new();
         for (kind, src) in [(glow::VERTEX_SHADER, vs), (glow::FRAGMENT_SHADER, fs)] {
-            let s = match gl.create_shader(kind) {
+            let s = match count.create_shader(gl, kind) {
                 Ok(s) => s,
                 Err(e) => {
                     for s in shaders {
-                        gl.delete_shader(s);
+                        count.delete_shader(gl, s);
                     }
-                    gl.delete_program(program);
+                    count.delete_program(gl, program);
                     return Err(e);
                 }
             };
@@ -381,9 +392,9 @@ unsafe fn compile(gl: &glow::Context, vs: &str, fs: &str) -> Result<glow::Progra
             if !gl.get_shader_compile_status(s) {
                 let log = gl.get_shader_info_log(s);
                 for s in shaders {
-                    gl.delete_shader(s);
+                    count.delete_shader(gl, s);
                 }
-                gl.delete_program(program);
+                count.delete_program(gl, program);
                 return Err(format!("シェーダ: {log}"));
             }
             gl.attach_shader(program, s);
@@ -392,11 +403,11 @@ unsafe fn compile(gl: &glow::Context, vs: &str, fs: &str) -> Result<glow::Progra
         let ok = gl.get_program_link_status(program);
         for s in shaders {
             gl.detach_shader(program, s);
-            gl.delete_shader(s);
+            count.delete_shader(gl, s);
         }
         if !ok {
             let log = gl.get_program_info_log(program);
-            gl.delete_program(program);
+            count.delete_program(gl, program);
             return Err(format!("リンク: {log}"));
         }
         Ok(program)
@@ -409,18 +420,19 @@ pub(crate) fn compile_program(
     vs: &str,
     fs: &str,
 ) -> Result<glow::Program, String> {
-    unsafe { compile(gl, vs, fs) }
+    unsafe { compile(gl, &ObjectCount::default(), vs, fs) }
 }
 
 /// 3 つのプログラムを作り、関節行列の UBO(binding 0)につなぐ。
 unsafe fn make_prog(
     gl: &glow::Context,
+    count: &ObjectCount,
     created: &mut Created,
     vs: &str,
     fs: &str,
 ) -> Result<Prog, String> {
     unsafe {
-        let program = compile(gl, vs, fs)?;
+        let program = compile(gl, count, vs, fs)?;
         created.programs.push(program);
         if let Some(i) = gl.get_uniform_block_index(program, "Joints") {
             gl.uniform_block_binding(program, i, 0);
@@ -440,12 +452,39 @@ impl Renderer {
 
     /// 機能段階を指定して転送する。失敗したときは、それまでに作った GL オブジェクトを消して返る。
     pub fn with_level(gl: &glow::Context, model: Model, level: Level) -> Result<Self, String> {
-        let mut created = Created::default();
+        Self::with_shared(gl, Rc::new(model), level, Rc::new(ObjectCount::default()))
+    }
+
+    /// 解析結果を共有し(失敗しても、`release` したあとも呼び出し側に残る)、GL オブジェクトの作成・削除を
+    /// `count` で数えて転送する。`with_level` と同じく、失敗したときは作りかけを消して返る。
+    /// 転送の途中で panic すると作りかけが残る。それを回収したいときは `with_shared_tracked` を使う。
+    pub fn with_shared(
+        gl: &glow::Context,
+        model: Rc<Model>,
+        level: Level,
+        count: Rc<ObjectCount>,
+    ) -> Result<Self, String> {
+        Self::with_shared_tracked(gl, model, level, count, &mut Created::default())
+    }
+
+    /// `with_shared` と同じだが、作ったものの控えを呼び出し側の `created` に付ける。
+    /// 失敗(Err)では控えを消して空に戻す。成功すると控えは空に戻り、以後の所有は `Renderer` が持つ(`destroy` で消す)。
+    /// 転送の途中で panic した場合は、作りかけが `created` に残る。呼び出し側がその `delete` で回収する。
+    pub fn with_shared_tracked(
+        gl: &glow::Context,
+        model: Rc<Model>,
+        level: Level,
+        count: Rc<ObjectCount>,
+        created: &mut Created,
+    ) -> Result<Self, String> {
         unsafe {
-            match Self::build(gl, model, level, &mut created) {
-                Ok(r) => Ok(r),
+            match Self::build(gl, model, level, count.clone(), created) {
+                Ok(r) => {
+                    *created = Created::default();
+                    Ok(r)
+                }
                 Err(e) => {
-                    created.delete(gl);
+                    std::mem::take(created).delete(gl, &count);
                     // 途中で立った GL エラーを呼び出し側に残さない
                     for _ in 0..32 {
                         if gl.get_error() == glow::NO_ERROR {
@@ -460,8 +499,9 @@ impl Renderer {
 
     unsafe fn build(
         gl: &glow::Context,
-        model: Model,
+        model: Rc<Model>,
         level: Level,
+        count: Rc<ObjectCount>,
         created: &mut Created,
     ) -> Result<Self, String> {
         let mut uploaded = 0u64;
@@ -476,11 +516,11 @@ impl Renderer {
             }
             let vs_body = format!("{VS_HEAD}{VS_BODY}");
             let vs_outline = format!("{VS_HEAD}{VS_OUTLINE}");
-            let lambert = make_prog(gl, created, &vs_body, FS_LAMBERT)?;
-            let mtoon = make_prog(gl, created, &vs_body, FS_MTOON)?;
-            let outline = make_prog(gl, created, &vs_outline, FS_OUTLINE)?;
+            let lambert = make_prog(gl, &count, created, &vs_body, FS_LAMBERT)?;
+            let mtoon = make_prog(gl, &count, created, &vs_body, FS_MTOON)?;
+            let outline = make_prog(gl, &count, created, &vs_outline, FS_OUTLINE)?;
 
-            let joint_ubo = gl.create_buffer()?;
+            let joint_ubo = count.create_buffer(gl)?;
             created.buffers.push(joint_ubo);
             gl.bind_buffer(glow::UNIFORM_BUFFER, Some(joint_ubo));
             gl.buffer_data_size(
@@ -492,10 +532,10 @@ impl Renderer {
 
             let mut prims = Vec::new();
             for (pi, p) in model.primitives.iter().enumerate() {
-                let vao = gl.create_vertex_array()?;
+                let vao = count.create_vertex_array(gl)?;
                 created.vaos.push(vao);
                 gl.bind_vertex_array(Some(vao));
-                let vbo = gl.create_buffer()?;
+                let vbo = count.create_buffer(gl)?;
                 created.buffers.push(vbo);
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                 let usage = if p.targets.is_empty() || level == Level::Bake {
@@ -515,7 +555,7 @@ impl Renderer {
                     gl.vertex_attrib_pointer_f32(loc, comps, glow::FLOAT, false, stride, offset);
                 }
                 // 関節番号(u16 × 4)と重み(f32 × 4)。morph で書き換える頂点とは別のバッファ
-                let skin_vbo = gl.create_buffer()?;
+                let skin_vbo = count.create_buffer(gl)?;
                 created.buffers.push(skin_vbo);
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(skin_vbo));
                 let mut skin_data = Vec::with_capacity(p.joints.len() * 24);
@@ -532,7 +572,7 @@ impl Renderer {
                 gl.vertex_attrib_pointer_i32(3, 4, glow::UNSIGNED_SHORT, 24, 0);
                 gl.enable_vertex_attrib_array(4);
                 gl.vertex_attrib_pointer_f32(4, 4, glow::FLOAT, false, 24, 8);
-                let ebo = gl.create_buffer()?;
+                let ebo = count.create_buffer(gl)?;
                 created.buffers.push(ebo);
                 gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
                 gl.buffer_data_u8_slice(
@@ -557,6 +597,7 @@ impl Renderer {
                 let img = &model.images[t.image];
                 let tex = upload_texture(
                     gl,
+                    &count,
                     img.width,
                     img.height,
                     &img.rgba,
@@ -579,6 +620,7 @@ impl Renderer {
                         let img = &model.images[t.image];
                         let tex = upload_texture(
                             gl,
+                            &count,
                             img.width,
                             img.height,
                             &img.rgba,
@@ -591,7 +633,15 @@ impl Renderer {
                     }
                 }
             }
-            let white = upload_texture(gl, 1, 1, &[255; 4], (glow::REPEAT, glow::REPEAT), true)?;
+            let white = upload_texture(
+                gl,
+                &count,
+                1,
+                1,
+                &[255; 4],
+                (glow::REPEAT, glow::REPEAT),
+                true,
+            )?;
             created.textures.push(white);
 
             let blend = |i: usize| {
@@ -638,6 +688,7 @@ impl Renderer {
                 (level >= Level::Spring).then(|| crate::spring::SpringSim::new(&model, &rig));
             Ok(Self {
                 model,
+                count,
                 level,
                 lambert,
                 mtoon,
@@ -725,10 +776,18 @@ impl Renderer {
     /// expression の weight(0..1)を与える。ここに挙げないものは 0 に戻る。
     /// 実際の頂点の更新は `update` で行う。
     pub fn set_expressions(&mut self, list: &[(&str, f32)]) -> Result<(), String> {
+        self.set_expressions_iter(list.iter().copied())
+    }
+
+    /// `set_expressions` の、スライスを作らずに渡せる版(毎フレーム呼ぶ側がアロケーションを避けるため)。
+    pub fn set_expressions_iter<'a>(
+        &mut self,
+        list: impl IntoIterator<Item = (&'a str, f32)>,
+    ) -> Result<(), String> {
         for w in self.weights.values_mut() {
             w.fill(0.0);
         }
-        for &(name, value) in list {
+        for (name, value) in list {
             let e = self
                 .model
                 .vrm
@@ -767,15 +826,16 @@ impl Renderer {
             if wt == 0.0 {
                 continue;
             }
-            for (i, v) in out
-                .as_chunks_mut::<FLOATS_PER_VERTEX>()
-                .0
-                .iter_mut()
-                .enumerate()
-            {
+            // 空の側は差分なし(zip が止まる)
+            let verts = out.as_chunks_mut::<FLOATS_PER_VERTEX>().0;
+            for (v, d) in verts.iter_mut().zip(&t.positions) {
                 for k in 0..3 {
-                    v[k] += wt * t.positions[i][k];
-                    v[3 + k] += wt * t.normals[i][k];
+                    v[k] += wt * d[k];
+                }
+            }
+            for (v, d) in verts.iter_mut().zip(&t.normals) {
+                for k in 0..3 {
+                    v[3 + k] += wt * d[k];
                 }
             }
         }
@@ -1025,26 +1085,32 @@ impl Renderer {
         }
     }
 
+    /// 試験用: 描画の途中で panic させる(`order_solid` に存在しないプリミティブ番号を足す)。
+    /// 持っている GL オブジェクトは変えないので、`destroy` の結果は変わらない。
+    #[cfg(test)]
+    pub(crate) fn break_render_for_test(&mut self) {
+        self.order_solid.push(usize::MAX);
+    }
+
     /// GPU リソースをすべて解放する。
     pub fn destroy(self, gl: &glow::Context) {
-        unsafe {
-            for p in &self.prims {
-                gl.delete_vertex_array(p.vao);
-                gl.delete_buffer(p.vbo);
-                gl.delete_buffer(p.skin_vbo);
-                gl.delete_buffer(p.ebo);
-            }
-            for &t in &self.textures {
-                gl.delete_texture(t);
-            }
-            for &t in self.linear_textures.values() {
-                gl.delete_texture(t);
-            }
-            gl.delete_texture(self.white);
-            gl.delete_buffer(self.joint_ubo);
-            for p in [&self.lambert, &self.mtoon, &self.outline] {
-                gl.delete_program(p.program);
-            }
+        let count = &self.count;
+        for p in &self.prims {
+            count.delete_vertex_array(gl, p.vao);
+            count.delete_buffer(gl, p.vbo);
+            count.delete_buffer(gl, p.skin_vbo);
+            count.delete_buffer(gl, p.ebo);
+        }
+        for &t in &self.textures {
+            count.delete_texture(gl, t);
+        }
+        for &t in self.linear_textures.values() {
+            count.delete_texture(gl, t);
+        }
+        count.delete_texture(gl, self.white);
+        count.delete_buffer(gl, self.joint_ubo);
+        for p in [&self.lambert, &self.mtoon, &self.outline] {
+            count.delete_program(gl, p.program);
         }
     }
 }
@@ -1055,6 +1121,7 @@ fn as_bytes_f32(m: &math::Mat4) -> &[f32] {
 
 unsafe fn upload_texture(
     gl: &glow::Context,
+    count: &ObjectCount,
     w: u32,
     h: u32,
     rgba: &[u8],
@@ -1062,7 +1129,7 @@ unsafe fn upload_texture(
     srgb: bool,
 ) -> Result<glow::Texture, String> {
     unsafe {
-        let tex = gl.create_texture()?;
+        let tex = count.create_texture(gl)?;
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
         gl.tex_image_2d(
@@ -1124,7 +1191,7 @@ impl Framing {
 
 /// キャラクターを描く画面上の領域。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Region {
+pub enum StageRegion {
     /// 画面の左 1/3
     Left,
     /// 画面の中央 1/3
@@ -1135,31 +1202,36 @@ pub enum Region {
     Full,
 }
 
-impl Region {
+impl StageRegion {
     pub fn name(self) -> &'static str {
         match self {
-            Region::Left => "left",
-            Region::Center => "center",
-            Region::Right => "right",
-            Region::Full => "full",
+            StageRegion::Left => "left",
+            StageRegion::Center => "center",
+            StageRegion::Right => "right",
+            StageRegion::Full => "full",
         }
     }
 
     pub fn parse(s: &str) -> Result<Self, String> {
-        [Region::Left, Region::Center, Region::Right, Region::Full]
-            .into_iter()
-            .find(|r| r.name() == s)
-            .ok_or_else(|| format!("--region は left / center / right / full: {s}"))
+        [
+            StageRegion::Left,
+            StageRegion::Center,
+            StageRegion::Right,
+            StageRegion::Full,
+        ]
+        .into_iter()
+        .find(|r| r.name() == s)
+        .ok_or_else(|| format!("--region は left / center / right / full: {s}"))
     }
 
     /// 画面 `(w, h)` の中の領域 `(x, y, 幅, 高さ)`。GL の座標(左下が原点)。高さは画面いっぱい。
     pub fn rect(self, (w, h): (u32, u32)) -> (u32, u32, u32, u32) {
         let third = (w / 3).max(1);
         match self {
-            Region::Left => (0, 0, third, h),
-            Region::Center => ((w - third) / 2, 0, third, h),
-            Region::Right => (w - third, 0, third, h),
-            Region::Full => (0, 0, w, h),
+            StageRegion::Left => (0, 0, third, h),
+            StageRegion::Center => ((w - third) / 2, 0, third, h),
+            StageRegion::Right => (w - third, 0, third, h),
+            StageRegion::Full => (0, 0, w, h),
         }
     }
 }
@@ -1192,6 +1264,8 @@ const BUST_BELOW_CHEST: f32 = 0.10;
 const WAIST_BELOW_HIPS: f32 = 0.0;
 /// 領域の半幅に最低限入れたい量 = 肩幅の半分 × この値 + 腕の長さ × `REACH_FRAC`
 const SHOULDER_FIT: f32 = 0.9;
+/// 腕を幅に入れる割合。0.0 のまま: ニケちゃんでは 0.3 まで構図が変わらず(高さで決まる)、0.4 で手が収まるが
+/// 顔が約 1 割小さくなり、バストアップに腰が入る(人の比率の試験モデルでも腰が入る)。0.8 は顔が小さすぎる。
 const REACH_FRAC: f32 = 0.0;
 
 impl Anchors {
@@ -1382,7 +1456,7 @@ mod camera_tests {
             shoulder_half: 0.15,
             arm_reach: 0.55,
         };
-        let size = Region::Left.rect((2560, 1080));
+        let size = StageRegion::Left.rect((2560, 1080));
         assert_eq!(size, (0, 0, 853, 1080));
         let ndc = |f: Framing, p: [f32; 3]| {
             let vp = a.camera(f, (size.2, size.3), 0.0).0;
