@@ -819,9 +819,12 @@ fn without_gl_the_manager_shows_only_the_inner_screen() {
         )
         .with_gl_available(gl)
     };
-    let t = Instant::now();
     let mut plain = new_mgr(false, false);
     let mut wrapped = new_mgr(true, false);
+    // フォント初期化にかかった実時間で 2 つの周期の起点がずれないようにする。
+    let t = Instant::now();
+    plain.restart_at(t);
+    wrapped.restart_at(t);
     plain.tick(t);
     wrapped.tick(t);
     assert!(wrapped.tick(t + Duration::from_millis(5)) == plain.tick(t + Duration::from_millis(5)));
@@ -844,6 +847,7 @@ fn without_gl_the_manager_shows_only_the_inner_screen() {
 
     // GL があれば、同じ画面が Gl で包まれ、動き続ける。3D が失敗したら元の画面だけに戻り、動かない
     let mut gl = new_mgr(true, true);
+    gl.restart_at(t);
     gl.tick(t);
     assert!(App::animating(&gl));
     assert!(

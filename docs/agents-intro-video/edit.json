@@ -1,0 +1,48 @@
+{
+  "fps": 30,
+  "size": [1920, 1080],
+  "text": {
+    "badge": "T3 AGENTS / 仮データ",
+    "diagram_title": "エージェントの今を、そばの画面へ。",
+    "source_title": "T3 Code",
+    "source_subtitle": "Codex / Claude",
+    "source_lines": ["いつもの開発環境で", "プロジェクトと作業を進める"],
+    "state_title": "プロジェクト / スレッド",
+    "state_subtitle": "状態を読み取る",
+    "state_lines": ["実行中　・　待機", "応答完了などの変化"],
+    "display_title": "Miharashi",
+    "display_subtitle": "一覧 / 中央通知",
+    "display_lines": ["プロジェクトごとに見渡す", "新着や状態の変化に気づく"],
+    "read_only": "読み取り専用。会話本文は取得しません。",
+    "demo_note": "実装済みの画面に公開用の仮データを表示しています。音声はありません。",
+    "outro_title": "作業の変化を、眺めて分かる。",
+    "outro_lines": ["T3 Code 連携は、設定で有効に。", "読み取り専用 / 会話本文は取得しません。"],
+    "url": "ysogabe.github.io/miharashi/"
+  },
+  "versions": {
+    "15": {
+      "diagram_seconds": 3,
+      "demo_seconds": 10,
+      "outro_seconds": 2,
+      "new_at": 0.3,
+      "done_at": 5.0,
+      "captions": [
+        {"at": 0, "title": "新着 → 一覧 → 応答完了。変化を中央に。"}
+      ]
+    },
+    "30": {
+      "diagram_seconds": 6,
+      "demo_seconds": 20,
+      "outro_seconds": 4,
+      "new_at": 3,
+      "done_at": 10,
+      "captions": [
+        {"at": 0, "title": "複数プロジェクトの状態を、ひと目で。"},
+        {"at": 3, "title": "新しいスレッドを、中央にお知らせ。"},
+        {"at": 7.5, "title": "通知のあとは、プロジェクトの一覧へ。"},
+        {"at": 10, "title": "同じスレッドの応答完了も、お知らせ。"},
+        {"at": 14.5, "title": "完了したスレッドは、一覧にも反映。"}
+      ]
+    }
+  }
+}
