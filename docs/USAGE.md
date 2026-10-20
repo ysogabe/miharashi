@@ -50,7 +50,7 @@ ffmpeg -framerate 15 -i work/agents-demo/frame-%06d.png -pix_fmt yuv420p work/ag
 
 ### 見本の動画(`demo-video` / `intro-video`)
 
-どちらも設定ファイルを探さず、通信もしません。各画面の描画処理(CPU)に仮データを渡し、フレームごとに進める仮想の時刻(壁時計は 2026-10-16 14:35:00 から)で描いて、`ffmpeg`(libx264)に流します。`ffmpeg` が PATH に要ります。同じ引数なら、毎回同じ動画になります。
+どちらも設定ファイルを探さず、通信もしません。各画面の描画処理(CPU)に仮データを渡し、フレームごとに進める仮想の時刻(壁時計は 2026-10-16 14:35:00 から)で描いて、`ffmpeg`(libx264)に流します。`ffmpeg` が PATH に要ります。同じ環境(OS、フォント、ffmpeg のビルド)で同じ引数なら、毎回同じ動画(バイト列)になります。文字は Noto Sans CJK JP(日本語)と Noto Sans Mono(英数字の等幅)をシステムから読むので、どちらも入れておいてください(再配布はしません)。
 
 ```sh
 # 1 画面の見本。--screen は status / photo / trip(旅の地図カード)/ room / aircraft / agents

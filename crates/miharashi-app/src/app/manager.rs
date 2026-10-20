@@ -666,11 +666,11 @@ impl ScreenManager {
             redraw = true;
         }
         self.update_presentation(now);
-        // 壁時計は毎周期更新する(画面は Local::now を読まず、ここから受け取る)。日付・時刻の文字は 1 秒ごと
-        let at = self.fixed_clock.unwrap_or_else(chrono::Local::now);
-        self.world.wall = Some(at);
         if now >= self.next_tick {
             self.data.update(&mut self.world.system);
+            // 画面は Local::now を読まず、ここ(1 秒ごと)で書く壁時計を受け取る
+            let at = self.fixed_clock.unwrap_or_else(chrono::Local::now);
+            self.world.wall = Some(at);
             super::set_clock_at(&mut self.world.system, at);
             self.ticks += 1;
             self.next_tick += self.tick_len;

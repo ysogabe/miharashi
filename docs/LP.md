@@ -116,10 +116,10 @@ cargo build --release
 # LP 用(30 秒版)。2.3 MB。ポスターは同じ動画の 1.8 秒の 1 コマ
 ffmpeg -i work/intro/miharashi-30s.mp4 -an -c:v libx264 -preset slow -crf 22 -pix_fmt yuv420p \
   -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv \
-  -movflags +faststart -map_metadata -1 site/videos/miharashi-30s.mp4
+  -movflags +faststart -fflags +bitexact -flags:v +bitexact -map_metadata -1 site/videos/miharashi-30s.mp4
 ffmpeg -ss 1.8 -i work/intro/miharashi-30s.mp4 -frames:v 1 -vf scale=1280:720 -q:v 4 site/videos/miharashi-30s-poster.jpg
 ```
 
-- 長さはフレーム単位(300 / 900 / 1800)で合わせる。同じ引数なら毎回同じバイト列になる。
+- 長さはフレーム単位(300 / 900 / 1800)で合わせる。同じ環境(OS、Noto Sans CJK JP と Noto Sans Mono のフォント、ffmpeg / libx264 のビルド)で同じ引数なら、毎回同じバイト列になる。環境が違うと、フォントと ffmpeg の違いでバイト列は変わりうる。
 - 映像の中の値(使用率、予報、機体、作業名、写真)はすべて仮データで、写真はプログラムで作った架空の風景。右上のバッジは「仮データ」。
 - 旧版(Mac でスマホから実モニターを撮影)は、画質が悪く自宅周辺の地名が映っていたため、この仕組みに置き換えた。

@@ -318,7 +318,7 @@ fn hero_text(c: &mut Canvas, f: &mut Fonts, t: &Text, y0: f32) {
 }
 
 struct Stills {
-    map: BTreeMap<&'static str, Pixmap>,
+    map: BTreeMap<(&'static str, u32), Pixmap>,
     fps: u32,
 }
 
@@ -329,7 +329,7 @@ impl Stills {
             .iter()
             .find(|(_, d)| *d == screen)
             .map_or("", |(n, _)| *n);
-        if !self.map.contains_key(name) {
+        if !self.map.contains_key(&(name, frame)) {
             let mut run = DemoRun::new(
                 screen,
                 (2560, 1080),
@@ -340,9 +340,10 @@ impl Stills {
             for i in 0..frame {
                 run.frame(i);
             }
-            self.map.insert(name, run.frame(frame).pixmap.clone());
+            self.map
+                .insert((name, frame), run.frame(frame).pixmap.clone());
         }
-        Ok(&self.map[name])
+        Ok(&self.map[&(name, frame)])
     }
 }
 
