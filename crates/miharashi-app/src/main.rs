@@ -437,7 +437,8 @@ fn demo_video(cli: Cli) -> Result<(), String> {
     let size = cli.size.unwrap_or((2560, 1080));
     let fps = cli.fps.unwrap_or(30);
     let seconds = u32::try_from(cli.seconds.unwrap_or(10)).map_err(|_| "--seconds が大きすぎる")?;
-    let frames = video::demo::write(screen, size, fps, seconds, &out, cli.overwrite)?;
+    let stop = video::stop_flag()?;
+    let frames = video::demo::write(screen, size, fps, seconds, &out, cli.overwrite, &stop)?;
     println!(
         "wrote {} ({frames} frames, {}x{}, {fps} fps, {seconds}s)",
         out.display(),
@@ -454,7 +455,8 @@ fn intro_video(cli: Cli) -> Result<(), String> {
         return Err("--version は 10 / 30 / 60 / all".into());
     }
     let out_dir = cli.out_dir.ok_or("--out-dir <dir> が要る")?;
-    video::intro::write(version, &out_dir, cli.edit.as_deref(), cli.overwrite)?;
+    let stop = video::stop_flag()?;
+    video::intro::write(version, &out_dir, cli.edit.as_deref(), cli.overwrite, &stop)?;
     Ok(())
 }
 

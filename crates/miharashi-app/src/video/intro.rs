@@ -7,6 +7,7 @@ use miharashi_render::{Canvas, Pixmap, TextEngine};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 /// 編集の原本(リポジトリの `docs/intro-video/edit.json`)。`--edit` で別のファイルも使える。
 const EDIT_JSON: &str = include_str!("../../../../docs/intro-video/edit.json");
@@ -619,7 +620,13 @@ fn compose(
 }
 
 /// 1 つの版(`10` / `30` / `60`)を書き出す。戻り値: フレーム数。
-fn write_version(edit: &Edit, name: &str, out_path: &Path, overwrite: bool) -> Result<u32, String> {
+fn write_version(
+    edit: &Edit,
+    name: &str,
+    out_path: &Path,
+    overwrite: bool,
+    stop: &AtomicBool,
+) -> Result<u32, String> {
     let scenes = edit
         .versions
         .get(name)
@@ -635,7 +642,7 @@ fn write_version(edit: &Edit, name: &str, out_path: &Path, overwrite: bool) -> R
         ));
     }
     let settings = super::record_settings(out_path, edit.size, fps, overwrite);
-    miharashi_vrm::record::check_output(out_path, overwrite)?;
+    miharashi_vrm::record::check_output(out_path, overwrite, "--overwrite")?;
     let mut fonts = Fonts::new();
     let mut stills = Stills {
         map: BTreeMap::new(),
@@ -645,8 +652,10 @@ fn write_version(edit: &Edit, name: &str, out_path: &Path, overwrite: bool) -> R
     let mut out = Canvas::new(edit.size.0, edit.size.1);
     let mut prev: Option<Canvas> = None;
     for (def, (start, end)) in scenes.iter().zip(&ranges) {
+        super::check_stop(stop)?;
         let mut rt = start_scene(def, *start, edit, &mut fonts, &mut stills)?;
         for g in *start..*end {
+            super::check_stop(stop)?;
             compose(&mut rt, g - start, g, total, edit, prev.as_ref(), &mut out);
             sink.write_frame(out.pixmap.data())?;
         }
@@ -664,6 +673,7 @@ pub fn write(
     out_dir: &Path,
     edit_file: Option<&Path>,
     overwrite: bool,
+    stop: &AtomicBool,
 ) -> Result<Vec<(String, u32)>, String> {
     let json = match edit_file {
         Some(p) => std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?,
@@ -678,10 +688,13 @@ pub fn write(
     } else {
         vec![version.to_string()]
     };
+    // 新しい checkout でも書き出せるよう、出力先のディレクトリは作る
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| format!("{} を作れない: {e}", out_dir.display()))?;
     let mut done = Vec::new();
     for n in names {
         let path = out_dir.join(format!("miharashi-{n}s.mp4"));
-        let frames = write_version(&edit, &n, &path, overwrite)?;
+        let frames = write_version(&edit, &n, &path, overwrite, stop)?;
         println!("wrote {} ({frames} frames)", path.display());
         done.push((n, frames));
     }

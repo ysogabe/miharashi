@@ -8,18 +8,18 @@ use crate::app::screens::{
     status::StatusScreen,
 };
 use crate::config::Config;
-use crate::data;
 use crate::photos::{Catalog, Feed, Fixed, Grouping, Source};
 use crate::screen::{Provider, Screen, World};
 use miharashi_render::Canvas;
 use miharashi_render::screens::Snapshot;
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-/// 仮想時刻の 1 秒あたり、状況画面の見本の波形を進める量(本番は 1 周期で 1 つ。動画では動きが見えるよう速める)
-const STATUS_PHASE_STEP: f32 = 3.0;
+/// 状況画面の見本の秒番号の起点(履歴が負の秒にならないよう、十分先から始める)
+const STATUS_SECOND0: i64 = 600;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DemoScreen {
@@ -73,15 +73,15 @@ impl Default for AgentScript {
     }
 }
 
-/// 状況画面の見本。`DummyData` と同じ波形を、速めに進める。
+/// 状況画面の見本。仮想時刻の 1 周期(1 秒)ごとに 1 サンプル進む(`video::status_data`)。
 struct VideoData {
-    phase: f32,
+    second: i64,
 }
 
 impl crate::app::DataSource for VideoData {
     fn update(&mut self, snap: &mut Snapshot) {
-        self.phase += STATUS_PHASE_STEP;
-        *snap = data::dummy_snapshot(self.phase);
+        *snap = super::status_data::snapshot(self.second);
+        self.second += 1;
     }
 }
 
@@ -208,8 +208,10 @@ impl DemoRun {
         let mut mgr = ScreenManager::new(
             vec![screen_box],
             id,
-            Box::new(VideoData { phase: 0.0 }),
-            data::dummy_snapshot(0.0),
+            Box::new(VideoData {
+                second: STATUS_SECOND0 + wall_offset.as_secs() as i64,
+            }),
+            super::status_data::snapshot(STATUS_SECOND0 + wall_offset.as_secs() as i64),
             text,
             alert_len,
         );
@@ -289,16 +291,19 @@ pub fn write(
     seconds: u32,
     out: &std::path::Path,
     overwrite: bool,
+    stop: &AtomicBool,
 ) -> Result<u32, String> {
     if !(1..=3600).contains(&seconds) {
         return Err("--seconds は 1〜3600".into());
     }
     let frames = seconds * fps;
     let settings = super::record_settings(out, size, fps, overwrite);
-    miharashi_vrm::record::check_output(out, overwrite)?;
+    super::ensure_parent(out)?;
+    miharashi_vrm::record::check_output(out, overwrite, "--overwrite")?;
     let mut run = DemoRun::new(screen, size, fps, AgentScript::default(), Duration::ZERO)?;
     let mut sink = miharashi_vrm::record::Sink::spawn(&settings)?;
     for i in 0..frames {
+        super::check_stop(stop)?;
         let canvas = run.frame(i);
         sink.write_frame(DemoRun::rgba(canvas))?;
     }
@@ -310,28 +315,58 @@ pub fn write(
 mod tests {
     use super::*;
 
-    fn frames(screen: DemoScreen, n: u32) -> Vec<Vec<u8>> {
-        // 生成の速さで絵が変わらないことを見るため、2 回目の前に少し待つ
-        let mut run = DemoRun::new(
-            screen,
-            (320, 135),
-            30,
-            AgentScript::default(),
-            Duration::ZERO,
-        )
-        .unwrap();
+    const SMALL: (u32, u32) = (320, 135);
+    /// Agents の中央表示と配置領域が画面内に収まる大きさ(小さい画面では領域が画面の外になる)
+    const AGENTS_SIZE: (u32, u32) = (960, 405);
+
+    fn run(screen: DemoScreen, size: (u32, u32), fps: u32, offset: Duration) -> DemoRun {
+        DemoRun::new(screen, size, fps, AgentScript::default(), offset).unwrap()
+    }
+
+    fn frames(screen: DemoScreen, size: (u32, u32), n: u32) -> Vec<Vec<u8>> {
+        let mut run = run(screen, size, 30, Duration::ZERO);
         (0..n)
             .map(|i| DemoRun::rgba(run.frame(i)).to_vec())
             .collect()
+    }
+
+    /// 直前のフレームから絵が変わったフレームの番号(0 は含めない)。画素は保持せず、前の 1 枚とだけ比べる。
+    fn change_points(
+        screen: DemoScreen,
+        size: (u32, u32),
+        fps: u32,
+        offset: Duration,
+        n: u32,
+    ) -> Vec<u32> {
+        let mut run = run(screen, size, fps, offset);
+        let mut prev = DemoRun::rgba(run.frame(0)).to_vec();
+        let mut points = Vec::new();
+        for i in 1..n {
+            let cur = DemoRun::rgba(run.frame(i));
+            if cur != prev.as_slice() {
+                points.push(i);
+                prev = cur.to_vec();
+            }
+        }
+        points
+    }
+
+    fn size_of(screen: DemoScreen) -> (u32, u32) {
+        if screen == DemoScreen::Agents {
+            AGENTS_SIZE
+        } else {
+            SMALL
+        }
     }
 
     /// どの画面も、同じ引数なら全フレームの画素まで同じ(実時計・乱数・スレッドの速さに依らない)。
     #[test]
     fn every_screen_is_deterministic() {
         for (name, screen) in DemoScreen::ALL {
-            let a = frames(screen, 200);
+            let a = frames(screen, size_of(screen), 200);
+            // 生成の速さで絵が変わらないことを見るため、2 回目の前に少し待つ
             std::thread::sleep(Duration::from_millis(40));
-            let b = frames(screen, 200);
+            let b = frames(screen, size_of(screen), 200);
             assert!(a == b, "{name}: 2 回の絵が違う");
         }
     }
@@ -340,7 +375,7 @@ mod tests {
     #[test]
     fn screens_move_with_virtual_time() {
         let changed = |screen, a: usize, b: usize| {
-            let f = frames(screen, 200);
+            let f = frames(screen, size_of(screen), 200);
             f[a] != f[b]
         };
         assert!(changed(DemoScreen::Photo, 30, 150), "写真が替わる");
@@ -352,5 +387,106 @@ mod tests {
             !changed(DemoScreen::Trip, 5, 100),
             "地図カードは止まっている"
         );
+    }
+
+    /// 壁時計とデータは仮想時刻の 1 秒ごとに進む(同じ秒のあいだ、状況画面は動かない)。
+    #[test]
+    fn status_advances_once_per_virtual_second() {
+        let p = change_points(DemoScreen::Status, SMALL, 30, Duration::ZERO, 100);
+        assert_eq!(p, vec![30, 60, 90]);
+        // fps が違っても、変わるのは秒の境界
+        let p = change_points(DemoScreen::Status, SMALL, 25, Duration::ZERO, 80);
+        assert_eq!(p, vec![25, 50, 75]);
+    }
+
+    /// 写真は fps に依らず、ちょうど 3 秒ごとに切り替わる(1 フレームずつ遅れて積み上がらない)。
+    /// 切り替わりのフレームで新しい写真を適用し、フェード(800ms)が終わると動かなくなる。
+    #[test]
+    fn photo_changes_every_three_seconds_and_fade_ends() {
+        for fps in [24, 25, 30, 60] {
+            let p = change_points(DemoScreen::Photo, SMALL, fps, Duration::ZERO, fps * 10);
+            let fade_frames = (0.8 * f64::from(fps)).ceil() as u32;
+            for k in 1..=3 {
+                let at = k * 3 * fps;
+                if at >= fps * 10 {
+                    break;
+                }
+                assert!(p.contains(&at), "fps {fps}: {at} で切り替わる({p:?})");
+                assert!(!p.contains(&(at - 1)), "fps {fps}: 切り替え前は動かない");
+                // フェード(800ms)のあいだは毎フレーム動き、終わったら次の秒の境界まで止まる
+                for f in at + 1..at + fade_frames {
+                    assert!(p.contains(&f), "fps {fps}: フェード中の {f}({p:?})");
+                }
+                assert!(
+                    !p.iter().any(|&f| f >= at + fade_frames && f < at + fps),
+                    "fps {fps}: フェードが終わったら止まる({p:?})"
+                );
+            }
+        }
+    }
+
+    /// room は分が替わる瞬間にだけ描き直す(14:35:58 から始めると 2 秒後の 14:36:00)。
+    #[test]
+    fn room_redraws_at_the_minute_boundary() {
+        let p = change_points(DemoScreen::Room, SMALL, 30, Duration::from_secs(58), 120);
+        assert_eq!(p, vec![60]);
+        let p = change_points(DemoScreen::Room, SMALL, 30, Duration::ZERO, 120);
+        assert!(p.is_empty(), "分の途中では動かない: {p:?}");
+    }
+
+    /// 航空機の見本は 5 秒ごとに取得し直すので、30 秒を過ぎても古い結果(受信機の応答なし)にならない。
+    #[test]
+    fn aircraft_feed_never_goes_stale() {
+        let mut run = run(DemoScreen::Aircraft, SMALL, 10, Duration::ZERO);
+        let (base, stale) = (run.base, Duration::from_secs(30));
+        for i in 0..800u32 {
+            run.frame(i);
+            let at = run
+                .aircraft
+                .as_ref()
+                .unwrap()
+                .shared
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .0;
+            let age = (base + Duration::from_millis(u64::from(i) * 100)) - at;
+            assert!(
+                age < Duration::from_secs(5) && age < stale,
+                "{i}: 取得から {age:?}"
+            );
+        }
+    }
+
+    /// 出力先の親ディレクトリは自動で作る。中断(終了フラグ)では出力先も一時ファイルも残さない。
+    #[test]
+    fn write_creates_the_parent_and_leaves_nothing_when_interrupted() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("ffmpeg が無いので skip");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("miharashi-demo-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("new/dir/a.mp4");
+        let go = AtomicBool::new(false);
+        let frames = write(DemoScreen::Status, (320, 136), 5, 1, &out, false, &go).unwrap();
+        assert_eq!(frames, 5);
+        assert!(out.metadata().unwrap().len() > 0);
+
+        let stop = AtomicBool::new(true);
+        let out2 = dir.join("new/dir/b.mp4");
+        let err = write(DemoScreen::Status, (320, 136), 5, 1, &out2, false, &stop).unwrap_err();
+        assert!(err.contains("中断"), "{err}");
+        let left: Vec<_> = std::fs::read_dir(dir.join("new/dir"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("a.mp4")]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

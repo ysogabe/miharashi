@@ -1411,6 +1411,18 @@ mod tests {
             ..Default::default()
         }
     }
+    /// `with_fixed_wall` は World の壁時計より優先する(`png` の fixture が同じ絵になる)。どちらも無ければ実時刻。
+    #[test]
+    fn fixed_wall_beats_the_world_wall() {
+        let at = |s| UNIX_EPOCH + Duration::from_secs(s);
+        let mut s = AgentScreen::new((1920, 1080), false, 30);
+        assert!(s.wall() > at(1_000_000_000), "どちらも無ければ実時刻");
+        s.world_wall = Some(at(2_000));
+        assert_eq!(s.wall(), at(2_000));
+        let s = s.with_fixed_wall(at(1_000));
+        assert_eq!(s.wall(), at(1_000));
+    }
+
     #[test]
     fn homes_stay_stable_when_entries_arrive_and_drop() {
         let now = Instant::now();

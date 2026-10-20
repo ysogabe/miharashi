@@ -739,6 +739,11 @@ impl Feed {
         }
     }
 
+    /// 別スレッドを使わない `Feed` か(`next` / `prev` の結果が、呼んだ直後に `try_recv` で取れる)。
+    pub fn is_inline(&self) -> bool {
+        self.inline.is_some()
+    }
+
     fn step(&self, delta: isize, cmd: Cmd) {
         match &self.inline {
             Some(i) => {

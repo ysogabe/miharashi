@@ -492,7 +492,7 @@ fn run(a: &Args) -> Result<(), String> {
 
     // 録画の出力先は、重いモデルの読み込みの前に確かめる(既存ファイルなどはすぐ分かるように)
     if let Some(out) = &a.record {
-        record::check_output(out, a.record_overwrite)?;
+        record::check_output(out, a.record_overwrite, "--record-overwrite")?;
     }
     // モデルと写真は画面を取る前に読む(読めなければキオスクの画面を触らずに終わる)
     let assets = load_assets(a)?;
@@ -842,6 +842,7 @@ fn record_run(a: &Args, assets: Assets, term: &AtomicBool) -> Result<(), String>
         fps,
         codec: a.record_codec,
         overwrite: a.record_overwrite,
+        overwrite_flag: "--record-overwrite".into(),
         vaapi_device: node,
         extra_args: Vec::new(),
     };

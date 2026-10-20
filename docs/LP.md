@@ -25,7 +25,7 @@ Miharashi が何をするものかを、**実装済みの画面**で伝える。
 | 順序 | セクション | 役割 |
 |---|---|---|
 | 1 | ヘッダー | 名称、画面・機能・操作パネル・仕組み・FAQ への導線、「実機で毎日稼働中」 |
-| 2 | ヒーロー | 「サーバーの今を、ひとつの画面に。」と用途、特徴 3 つ |
+| 2 | ヒーロー | 「サーバーの今を、ひとつの画面に。」と用途、特徴 3 つ。注記で「下の静止画のうち状況と写真は実機から出力、ほかの 3 画面と紹介動画は仮データ」と対象を区別する |
 | 3 | 紹介動画 | 30 秒の紹介動画(仮データ。音声なし、自動再生しない)。キャプションに仮データであることを明記 |
 | 4 | 01 画面 | STATUS(OVERVIEW / DETAILS)・PHOTO FRAME の実機画像と、ROOM & WEATHER・AIRCRAFT・T3 AGENTS の仮データ画像 |
 | 5 | 02 機能 | アラート、写真、航空機、室内環境と天気、T3 Agent、自動巡回、モニターの電源、操作パネル、GPU 描画、焼き付き対策の 10 枚と、連携を有効にする条件 |
@@ -47,7 +47,7 @@ Miharashi が何をするものかを、**実装済みの画面**で伝える。
 | `site/images/room-demo.png` | 室内環境と天気(仮データ) | `png` の `room.png`(2560×1080) |
 | `site/images/aircraft-demo.png` | 航空機(仮データ) | `png` の `aircraft.png`(2560×1080) |
 | `site/images/agents-demo.png` | T3 Agent(仮データ) | `png` の `agents-overview.png`(2560×1080) |
-| `site/videos/miharashi-30s.mp4` | 紹介動画 30 秒版(1920×1080、約 2.3 MB、音声なし)。仮データ | `miharashi intro-video`(§7) |
+| `site/videos/miharashi-30s.mp4` | 紹介動画 30 秒版(1920×1080、約 2.2 MB、音声なし)。仮データ | `miharashi intro-video`(§7) |
 | `site/videos/miharashi-30s-poster.jpg` | 動画のポスター(1280×720) | 同じ動画の 1.8 秒の 1 コマ |
 | `site/images/panel.png` | Echo Show 5 の操作パネル | `adb exec-out screencap -p`(960×480 のまま) |
 
@@ -108,18 +108,18 @@ cp work/lp-fixtures/agents-overview.png site/images/agents-demo.png
 
 ## 7. 紹介動画の再生成
 
-動画は `miharashi intro-video` が、各画面の見本を仮想の時刻で描いて合成する(実機も、通信も、撮影素材も使わない)。構成・長さ・見出し・補足文は [docs/intro-video/edit.json](intro-video/edit.json)。10 秒版と 60 秒版はリポジトリに置かず、必要なときに作る。`ffmpeg`(libx264)が要る。
+動画は `miharashi intro-video` が、各画面の見本を仮想の時刻で描いて合成する(実機も、通信も、撮影素材も使わない)。構成・長さ・見出し・補足文は [docs/intro-video/edit.json](intro-video/edit.json)。10 秒版と 60 秒版はリポジトリに置かず、必要なときに作る。`ffmpeg`(libx264)が要る。`--out-dir`(`demo-video` なら `--out` の親)は、無ければ作る。途中で止めた(Ctrl-C、SIGTERM)ときは、書き出し中の動画を残さない。
 
 ```sh
 cargo build --release
 ./target/release/miharashi intro-video --version all --out-dir work/intro --overwrite   # 10 / 30 / 60 秒版
-# LP 用(30 秒版)。2.3 MB。ポスターは同じ動画の 1.8 秒の 1 コマ
-ffmpeg -i work/intro/miharashi-30s.mp4 -an -c:v libx264 -preset slow -crf 22 -pix_fmt yuv420p \
+# LP 用(30 秒版)。ポスターは同じ動画の 1.8 秒の 1 コマ
+ffmpeg -y -i work/intro/miharashi-30s.mp4 -an -c:v libx264 -preset slow -crf 22 -pix_fmt yuv420p \
   -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv \
   -movflags +faststart -fflags +bitexact -flags:v +bitexact -map_metadata -1 site/videos/miharashi-30s.mp4
-ffmpeg -ss 1.8 -i work/intro/miharashi-30s.mp4 -frames:v 1 -vf scale=1280:720 -q:v 4 site/videos/miharashi-30s-poster.jpg
+ffmpeg -y -ss 1.8 -i work/intro/miharashi-30s.mp4 -frames:v 1 -vf scale=1280:720 -q:v 4 site/videos/miharashi-30s-poster.jpg
 ```
 
 - 長さはフレーム単位(300 / 900 / 1800)で合わせる。同じ環境(OS、Noto Sans CJK JP と Noto Sans Mono のフォント、ffmpeg / libx264 のビルド)で同じ引数なら、毎回同じバイト列になる。環境が違うと、フォントと ffmpeg の違いでバイト列は変わりうる。
-- 映像の中の値(使用率、予報、機体、作業名、写真)はすべて仮データで、写真はプログラムで作った架空の風景。右上のバッジは「仮データ」。
+- 映像の中の値(使用率、予報、機体、作業名、写真)はすべて仮データで(状況画面は 1 秒に 1 サンプル進む、決定的な疑似乱数の緩やかな変動。`video/status_data.rs`)、写真はプログラムで作った架空の風景。右上のバッジは「仮データ」。
 - 旧版(Mac でスマホから実モニターを撮影)は、画質が悪く自宅周辺の地名が映っていたため、この仕組みに置き換えた。

@@ -111,37 +111,8 @@ impl PhotoScreen {
         }
     }
 
-    /// フェードの進み具合(新フレームの不透明度 0〜1)。
-    fn fade_alpha(&self, t0: Instant) -> f32 {
-        (self.last_now.saturating_duration_since(t0).as_secs_f32() / self.fade_len.as_secs_f32())
-            .min(1.0)
-    }
-}
-
-impl Screen for PhotoScreen {
-    fn id(&self) -> ScreenId {
-        "photo"
-    }
-
-    fn title(&self) -> &'static str {
-        "PHOTO FRAME"
-    }
-
-    fn on_enter(&mut self, _now: Instant) {
-        self.visible = true;
-        self.overlay_dirty = true;
-    }
-
-    fn on_leave(&mut self, _now: Instant) {
-        self.visible = false;
-    }
-
-    fn invalidate(&mut self) {
-        self.overlay_dirty = true;
-    }
-
-    fn tick(&mut self, _world: &World, now: Instant) -> bool {
-        self.last_now = now;
+    /// フィードから届いたものを全部適用する。描き直しが要るか。
+    fn drain_feed(&mut self, now: Instant) -> bool {
         let mut redraw = false;
         while let Some(ev) = self.feed.try_recv() {
             match ev {
@@ -174,14 +145,56 @@ impl Screen for PhotoScreen {
                 }
             }
         }
+        redraw
+    }
+
+    /// フェードの進み具合(新フレームの不透明度 0〜1)。
+    fn fade_alpha(&self, t0: Instant) -> f32 {
+        (self.last_now.saturating_duration_since(t0).as_secs_f32() / self.fade_len.as_secs_f32())
+            .min(1.0)
+    }
+}
+
+impl Screen for PhotoScreen {
+    fn id(&self) -> ScreenId {
+        "photo"
+    }
+
+    fn title(&self) -> &'static str {
+        "PHOTO FRAME"
+    }
+
+    fn on_enter(&mut self, _now: Instant) {
+        self.visible = true;
+        self.overlay_dirty = true;
+    }
+
+    fn on_leave(&mut self, _now: Instant) {
+        self.visible = false;
+    }
+
+    fn invalidate(&mut self) {
+        self.overlay_dirty = true;
+    }
+
+    fn tick(&mut self, _world: &World, now: Instant) -> bool {
+        self.last_now = now;
+        let mut redraw = self.drain_feed(now);
         let dwell = if self.card.is_some() {
             self.card_len
         } else {
             self.photo_interval
         };
         if self.visible && now.duration_since(self.last_photo_change) >= dwell {
+            let due = self.last_photo_change + dwell;
             self.feed.next();
             self.last_photo_change = now;
+            // 別スレッドでない Feed は、次の 1 枚がもう届いている。同じ時刻に適用し、次の期限は予定の時刻から進める
+            // (そうしないと、切り替わりの間隔が「待ち時間 + 1 フレーム」になり、動画では fps に依る)
+            if self.feed.is_inline() {
+                redraw |= self.drain_feed(now);
+                self.last_photo_change = due;
+            }
         }
         if self
             .fade
