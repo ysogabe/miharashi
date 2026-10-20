@@ -8,6 +8,8 @@
 .shot-note{margin:18px 0 0;font-size:11px;color:#8ea4b0}
 .screen-samples{margin-top:22px}
 .hero-shot{margin-top:6px}
+.video-section{padding:0 0 10px}
+.shot-video video{display:block;width:100%;height:auto;aspect-ratio:16/9;border:1px solid var(--line);border-radius:8px;background:#07131c}
 
 .feature-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
 .feature{padding:22px 22px 20px;border:1px solid var(--line);border-radius:8px;background:linear-gradient(145deg,#13272e80,#0b182260)}
