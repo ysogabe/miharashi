@@ -21,6 +21,7 @@ mod runtime;
 mod scene_check;
 mod screen;
 mod screen_power;
+mod video;
 mod weather;
 
 use config::Config;
@@ -51,6 +52,11 @@ struct Cli {
     lines: Option<String>,
     video: Option<PathBuf>,
     detections: Option<usize>,
+    // demo-video / intro-video
+    overwrite: bool,
+    version: Option<String>,
+    out_dir: Option<PathBuf>,
+    edit: Option<PathBuf>,
 }
 
 fn parse_cli(argv: Vec<String>) -> Result<Cli, String> {
@@ -77,6 +83,10 @@ fn parse_cli(argv: Vec<String>) -> Result<Cli, String> {
             "--video" => c.video = Some(v()?.into()),
             "--detections" => c.detections = Some(v()?.parse().map_err(|_| "bad --detections")?),
             "--live" => c.live = true,
+            "--overwrite" => c.overwrite = true,
+            "--version" => c.version = Some(v()?),
+            "--out-dir" => c.out_dir = Some(v()?.into()),
+            "--edit" => c.edit = Some(v()?.into()),
             "--size" => {
                 let s = v()?;
                 let (w, h) = s.split_once('x').ok_or("--size WxH")?;
@@ -231,7 +241,7 @@ fn png_with(cli: Cli, open: &OpenGles) -> Result<(), String> {
                 radius_km: cfg.geoframe.home_radius_km,
             }
             .resolve(),
-            Source::File(..) => None,
+            Source::File(..) | Source::Demo { .. } => None,
         },
         radius_km: cfg.geoframe.home_radius_km,
     };
@@ -413,6 +423,38 @@ fn png_with(cli: Cli, open: &OpenGles) -> Result<(), String> {
             out.display()
         );
     }
+    Ok(())
+}
+
+/// `demo-video`: 1 画面の見本(仮データ)を、固定刻みの仮想時刻で動画に書き出す。
+fn demo_video(cli: Cli) -> Result<(), String> {
+    let screen = video::demo::DemoScreen::parse(
+        cli.screen
+            .as_deref()
+            .ok_or("--screen が要る(status / photo / trip / room / aircraft / agents)")?,
+    )?;
+    let out = cli.out.ok_or("--out <file.mp4> が要る")?;
+    let size = cli.size.unwrap_or((2560, 1080));
+    let fps = cli.fps.unwrap_or(30);
+    let seconds = u32::try_from(cli.seconds.unwrap_or(10)).map_err(|_| "--seconds が大きすぎる")?;
+    let frames = video::demo::write(screen, size, fps, seconds, &out, cli.overwrite)?;
+    println!(
+        "wrote {} ({frames} frames, {}x{}, {fps} fps, {seconds}s)",
+        out.display(),
+        size.0,
+        size.1
+    );
+    Ok(())
+}
+
+/// `intro-video`: 10 / 30 / 60 秒の紹介動画を、各画面の見本から合成して書き出す。
+fn intro_video(cli: Cli) -> Result<(), String> {
+    let version = cli.version.as_deref().unwrap_or("all");
+    if !matches!(version, "10" | "30" | "60" | "all") {
+        return Err("--version は 10 / 30 / 60 / all".into());
+    }
+    let out_dir = cli.out_dir.ok_or("--out-dir <dir> が要る")?;
+    video::intro::write(version, &out_dir, cli.edit.as_deref(), cli.overwrite)?;
     Ok(())
 }
 
@@ -978,6 +1020,8 @@ fn main() -> Result<(), String> {
         "run" => run(cli),
         "png" => png(cli),
         "agents-demo" => agents_demo(cli),
+        "demo-video" => demo_video(cli),
+        "intro-video" => intro_video(cli),
         "bench" => bench(cli),
         "bench-gpu" => bench_gpu(cli),
         "bench-scene" => bench_scene(cli),
@@ -985,7 +1029,7 @@ fn main() -> Result<(), String> {
         "kms-info" => kms_info(cli),
         "check-config" => load_config(&cli).map(|_| println!("OK")),
         other => Err(format!(
-            "unknown command {other}(run / png / agents-demo / bench / bench-gpu / bench-scene / bench-metrics / kms-info / check-config)"
+            "unknown command {other}(run / png / agents-demo / demo-video / intro-video / bench / bench-gpu / bench-scene / bench-metrics / kms-info / check-config)"
         )),
     }
 }

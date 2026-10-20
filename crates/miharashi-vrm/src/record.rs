@@ -38,6 +38,8 @@ pub struct Settings {
     pub overwrite: bool,
     /// VAAPI で使う render node
     pub vaapi_device: PathBuf,
+    /// `-c:v` の前に足す出力オプション(例: 色空間のタグ、`-fflags +bitexact`)。vrm-view は空
+    pub extra_args: Vec<String>,
 }
 
 /// ffmpeg に渡す引数(`ffmpeg` 自身は含まない)。`target` は実際に書く一時ファイル(`Sink::spawn` が先に作る)。
@@ -72,6 +74,7 @@ pub fn ffmpeg_args(s: &Settings, target: &Path) -> Vec<String> {
         ]
         .map(String::from),
     );
+    a.extend(s.extra_args.iter().cloned());
     match s.codec {
         Codec::X264 => a.extend(
             [
@@ -272,6 +275,7 @@ mod tests {
             codec,
             overwrite,
             vaapi_device: PathBuf::from("/dev/dri/renderD128"),
+            extra_args: Vec::new(),
         }
     }
 

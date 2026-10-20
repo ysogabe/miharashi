@@ -843,6 +843,7 @@ fn record_run(a: &Args, assets: Assets, term: &AtomicBool) -> Result<(), String>
         codec: a.record_codec,
         overwrite: a.record_overwrite,
         vaapi_device: node,
+        extra_args: Vec::new(),
     };
     let Assets {
         model,

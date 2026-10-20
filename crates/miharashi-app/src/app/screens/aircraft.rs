@@ -17,6 +17,10 @@ pub struct AircraftScreen {
     visible: bool,
     /// 表示を始めた時刻(回る線の角度の起点)
     entered: Instant,
+    /// 直近の tick の時刻(機体の古さと回る線の角度を決める。実時計を直接読まず、仮想時刻でも動くように)
+    last_now: Instant,
+    /// CPU 経路でも回る線を進める(動画の書き出し用。既定は止めて描く = `STILL_SWEEP`)
+    spinning: bool,
     /// 注目する機体の hex。None ならいちばん近い機体
     focus: Option<String>,
     /// GPU 経路(GLES)か。回る線を毎フレーム描く
@@ -35,12 +39,20 @@ impl AircraftScreen {
             shared,
             visible: false,
             entered: Instant::now(),
+            last_now: Instant::now(),
+            spinning: false,
             focus: None,
             gpu,
             drawn: None,
             radar_bg: None,
             radar_base: None,
         }
+    }
+
+    /// CPU 経路でも、回る線を時刻から進めて描く(動画の書き出し用。本番の CPU 経路は CPU 負荷のため止めて描く)。
+    pub fn with_spinning_sweep(mut self) -> Self {
+        self.spinning = true;
+        self
     }
 
     /// 今出す内容。位置は取得からの秒数(1 秒きざみ)だけ進め、注目する機体を決める。
@@ -72,10 +84,21 @@ impl AircraftScreen {
             .lock()
             .ok()
             .and_then(|g| {
-                g.as_ref()
-                    .map(|(at, v)| (at.elapsed() < STALE) as usize * v.planes.len())
+                g.as_ref().map(|(at, v)| {
+                    (self.last_now.saturating_duration_since(*at) < STALE) as usize * v.planes.len()
+                })
             })
             .unwrap_or(0)
+    }
+
+    /// 回る線の角度 [rad](北 0、時計回り)。表示を始めてからの時間で決める。
+    fn sweep_angle(&self) -> f32 {
+        let turns = self
+            .last_now
+            .saturating_duration_since(self.entered)
+            .as_secs_f32()
+            / aircraft::SWEEP_PERIOD_SECS;
+        turns.fract() * std::f32::consts::TAU
     }
 }
 
@@ -91,6 +114,7 @@ impl Screen for AircraftScreen {
     fn on_enter(&mut self, now: Instant) {
         self.visible = true;
         self.entered = now;
+        self.last_now = now;
         self.drawn = None;
         self.radar_bg = None;
     }
@@ -100,8 +124,10 @@ impl Screen for AircraftScreen {
     }
 
     fn tick(&mut self, _world: &World, now: Instant) -> bool {
+        self.last_now = now;
         // GPU 経路は回る線を毎フレーム描く。CPU 経路は内容(1 秒ごとに進める位置)が変わったときだけ
-        self.visible && (self.gpu || self.drawn.as_ref() != Some(&self.view(now)))
+        // (回る線を進める設定なら毎フレーム)
+        self.visible && (self.gpu || self.spinning || self.drawn.as_ref() != Some(&self.view(now)))
     }
 
     fn handle_action(&mut self, action: ScreenAction, now: Instant) -> Outcome {
@@ -132,10 +158,15 @@ impl Screen for AircraftScreen {
 
     /// CPU で完成画面を描く。回る線は止めて描く。下地(地図)は取っておいて、毎回は作り直さない。
     fn render(&mut self, ctx: &mut RenderContext<'_>) {
-        let v = self.view(Instant::now());
+        let v = self.view(self.last_now);
         aircraft::aircraft_background_cached(ctx.canvas, ctx.text, &v, &mut self.radar_base);
         let g = aircraft::radar_geometry(&v, (ctx.canvas.width(), ctx.canvas.height()));
-        aircraft::sweep_cpu(ctx.canvas, &g, aircraft::STILL_SWEEP, aircraft::TRAIL);
+        let sweep = if self.spinning {
+            self.sweep_angle()
+        } else {
+            aircraft::STILL_SWEEP
+        };
+        aircraft::sweep_cpu(ctx.canvas, &g, sweep, aircraft::TRAIL);
         self.drawn = Some(v);
     }
 
@@ -147,18 +178,17 @@ impl Screen for AircraftScreen {
             self.render(ctx);
             return Composite::Canvas;
         }
-        let v = self.view(Instant::now());
+        let v = self.view(self.last_now);
         let changed = self.radar_bg.as_ref() != Some(&v);
         if changed {
             aircraft::aircraft_background_cached(ctx.canvas, ctx.text, &v, &mut self.radar_base);
         }
         let geom = aircraft::radar_geometry(&v, (ctx.canvas.width(), ctx.canvas.height()));
         self.radar_bg = Some(v);
-        let turns = self.entered.elapsed().as_secs_f32() / aircraft::SWEEP_PERIOD_SECS;
         Composite::Radar {
             background_changed: changed,
             geom,
-            sweep: turns.fract() * std::f32::consts::TAU,
+            sweep: self.sweep_angle(),
         }
     }
 

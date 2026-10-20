@@ -15,11 +15,27 @@ pub enum Source {
     Geoframe(String),
     /// (ファイル, 表示名)。表示名がなければファイル名を使う。
     File(PathBuf, Option<String>),
+    /// 動画の見本。実在のアルバムでもファイルでもなく、プログラムで作った合成の風景(`video::photos`)を決まった順に巡回する。
+    /// `card_first` なら、先頭に旅の区切りの地図カード(`album::demo_card`)を置く。
+    Demo {
+        card_first: bool,
+    },
 }
 
 enum Origin {
     Url(String),
     File(PathBuf),
+    /// `video::photos::scene` の番号
+    Synthetic(usize),
+}
+
+/// 時刻と乱数を実時刻・実乱数に頼らず固定する(動画の書き出しで、同じ引数から同じ結果にする)。
+#[derive(Debug, Clone, Copy)]
+pub struct Fixed {
+    /// 「今」(撮影日からの経過と、旅・季節の並べ方に使う)
+    pub now: chrono::NaiveDateTime,
+    /// 並べ方の乱数の種
+    pub seed: u64,
 }
 
 struct Entry {
@@ -99,6 +115,8 @@ pub struct Catalog {
     slot: usize,
     /// GPU 経路なら、GPU で扱える写真の最大の幅と高さ。None なら CPU で完成フレームまで作る
     pub gpu_max: Option<u32>,
+    /// 時刻と乱数の固定(None なら実時刻・実乱数)
+    fixed: Option<Fixed>,
 }
 
 /// 次に見せるもの。
@@ -162,6 +180,10 @@ fn taken_labels(raw: &str, today: NaiveDate) -> (String, String) {
     (taken, relative_age(date, today))
 }
 
+fn decode(bytes: &[u8]) -> Result<DynamicImage, String> {
+    image::load_from_memory(bytes).map_err(|e| e.to_string())
+}
+
 fn read_all(req: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>, String> {
     let mut req = req;
     req.body_mut()
@@ -173,6 +195,30 @@ fn read_all(req: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>, String> {
 
 impl Catalog {
     pub fn open(source: &Source, size: (u32, u32), grouping: &Grouping) -> Result<Self, String> {
+        Self::open_with(source, size, grouping, None)
+    }
+
+    /// 時刻と乱数を `fixed` に固定して開く(動画の書き出し)。
+    pub fn open_fixed(
+        source: &Source,
+        size: (u32, u32),
+        grouping: &Grouping,
+        fixed: Fixed,
+    ) -> Result<Self, String> {
+        Self::open_with(source, size, grouping, Some(fixed))
+    }
+
+    fn now(&self) -> chrono::NaiveDateTime {
+        self.fixed
+            .map_or_else(|| chrono::Local::now().naive_local(), |f| f.now)
+    }
+
+    fn open_with(
+        source: &Source,
+        size: (u32, u32),
+        grouping: &Grouping,
+        fixed: Option<Fixed>,
+    ) -> Result<Self, String> {
         let (entries, metas) = match source {
             Source::File(p, caption) => {
                 let name = p
@@ -185,6 +231,18 @@ impl Catalog {
                 };
                 (vec![e], Vec::new())
             }
+            Source::Demo { .. } => (
+                crate::video::photos::SCENES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| Entry {
+                        origin: Origin::Synthetic(i),
+                        place: s.caption.into(),
+                        taken: s.taken.into(),
+                    })
+                    .collect(),
+                Vec::new(),
+            ),
             Source::Geoframe(base) => Self::list_geoframe(base)?,
         };
         if entries.is_empty() {
@@ -202,6 +260,7 @@ impl Catalog {
             size,
             slot: 0,
             gpu_max: None,
+            fixed,
         };
         if cat.metas.is_empty() {
             let n = cat.entries.len();
@@ -212,6 +271,14 @@ impl Catalog {
                     n,
                 })
                 .collect();
+            if matches!(source, Source::Demo { card_first: true }) {
+                cat.groups.push(Group {
+                    everyday: false,
+                    members: Vec::new(),
+                    card: album::demo_card(),
+                });
+                cat.queue.insert(0, Slot::Card(0));
+            }
             return Ok(cat);
         }
         // 海外の写真は地名が空なので、国と都市を引いて写真の説明にも使う
@@ -234,9 +301,12 @@ impl Catalog {
                 "不明(GEOFRAME の旅番号を使う)"
             }
         );
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0x9e3779b97f4a7c15, |d| d.as_nanos() as u64);
+        let seed = match cat.fixed {
+            Some(f) => f.seed,
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0x9e3779b97f4a7c15, |d| d.as_nanos() as u64),
+        };
         let mut sched = Scheduler::new(seed);
         cat.state = std::env::var_os("STATE_DIRECTORY").map(|d| PathBuf::from(d).join("play.json"));
         if let Some(path) = &cat.state
@@ -248,7 +318,7 @@ impl Catalog {
                 eprintln!("photos: 表示履歴を読めない(最初から): {}", path.display());
             }
         }
-        cat.queue = sched.next_round(&cat.groups, &cat.metas, chrono::Local::now().naive_local());
+        cat.queue = sched.next_round(&cat.groups, &cat.metas, cat.now());
         cat.sched = Some(sched);
         Ok(cat)
     }
@@ -328,11 +398,10 @@ impl Catalog {
         }
         self.pos = next as usize;
         if self.pos >= self.queue.len() {
-            let round = sched.next_round(
-                &self.groups,
-                &self.metas,
-                chrono::Local::now().naive_local(),
-            );
+            let now = self
+                .fixed
+                .map_or_else(|| chrono::Local::now().naive_local(), |f| f.now);
+            let round = sched.next_round(&self.groups, &self.metas, now);
             self.queue.extend(round);
             self.save_state();
         }
@@ -364,18 +433,22 @@ impl Catalog {
             }
         }
         let e = &self.entries[index];
-        let bytes = match &e.origin {
-            Origin::Url(u) => read_all(ureq::get(u).call().map_err(|err| format!("{u}: {err}"))?)?,
-            Origin::File(p) => std::fs::read(p).map_err(|err| format!("{}: {err}", p.display()))?,
-        };
-        let (taken, age) = taken_labels(&e.taken, chrono::Local::now().date_naive());
+        let (taken, age) = taken_labels(&e.taken, self.now().date());
         let info = PhotoInfo {
             place: e.place.clone(),
             taken,
             age,
             position: (k, n),
         };
-        let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+        let img = match &e.origin {
+            Origin::Synthetic(i) => crate::video::photos::scene(*i),
+            Origin::Url(u) => decode(&read_all(
+                ureq::get(u).call().map_err(|err| format!("{u}: {err}"))?,
+            )?)?,
+            Origin::File(p) => {
+                decode(&std::fs::read(p).map_err(|err| format!("{}: {err}", p.display()))?)?
+            }
+        };
         let (w, h) = self.size;
         let layout = photo_layout::plan(&mut self.slot, w, h, img.width(), img.height());
         let pixels = match self.gpu_max {
@@ -523,6 +596,23 @@ impl HomeLookup {
 pub struct Feed {
     tx: Sender<Cmd>,
     rx: Receiver<FeedEvent>,
+    /// 別スレッドを使わず、`next` / `prev` のその場で次を読む(動画の書き出し。届く時刻を実時間に依存させない)
+    inline: Option<std::cell::RefCell<Inline>>,
+}
+
+struct Inline {
+    catalog: Catalog,
+    pending: std::collections::VecDeque<FeedEvent>,
+}
+
+impl Inline {
+    fn push_current(&mut self) {
+        match self.catalog.current() {
+            Ok(Shown::Photo(p)) => self.pending.push_back(FeedEvent::Photo(p)),
+            Ok(Shown::Card(c)) => self.pending.push_back(FeedEvent::Card(c)),
+            Err(e) => eprintln!("photo: {e}"),
+        }
+    }
 }
 
 impl Feed {
@@ -626,18 +716,54 @@ impl Feed {
         if let Err(e) = spawned {
             eprintln!("photos: スレッドを起動できない: {e}");
         }
-        Self { tx, rx }
+        Self {
+            tx,
+            rx,
+            inline: None,
+        }
+    }
+
+    /// 別スレッドを使わない `Feed`。最初の 1 枚(か 1 枚目のカード)はすぐ届き、`next` / `prev` も呼んだ時点で次が届く。
+    pub fn inline(catalog: Catalog) -> Self {
+        let (tx, _) = channel::<Cmd>();
+        let (_, rx) = channel();
+        let mut inline = Inline {
+            catalog,
+            pending: Default::default(),
+        };
+        inline.push_current();
+        Self {
+            tx,
+            rx,
+            inline: Some(std::cell::RefCell::new(inline)),
+        }
+    }
+
+    fn step(&self, delta: isize, cmd: Cmd) {
+        match &self.inline {
+            Some(i) => {
+                let mut i = i.borrow_mut();
+                i.catalog.advance(delta);
+                i.push_current();
+            }
+            None => {
+                let _ = self.tx.send(cmd);
+            }
+        }
     }
 
     pub fn next(&self) {
-        let _ = self.tx.send(Cmd::Next);
+        self.step(1, Cmd::Next);
     }
 
     pub fn prev(&self) {
-        let _ = self.tx.send(Cmd::Prev);
+        self.step(-1, Cmd::Prev);
     }
 
     pub fn try_recv(&self) -> Option<FeedEvent> {
+        if let Some(i) = &self.inline {
+            return i.borrow_mut().pending.pop_front();
+        }
         self.rx.try_recv().ok()
     }
 }
@@ -753,6 +879,7 @@ mod tests {
             size: (32, 18),
             slot: 0,
             gpu_max: None,
+            fixed: None,
         };
         let red = |c: &mut Catalog| c.current_photo().unwrap().frame().unwrap().data()[0];
         assert_eq!(

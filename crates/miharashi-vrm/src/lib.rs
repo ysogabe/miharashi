@@ -13,7 +13,7 @@ pub mod math;
 pub mod model;
 #[cfg(feature = "view")]
 pub mod photo_stage;
-#[cfg(feature = "view")]
+// std だけに依存する(GL も view の feature も要らない)。vrm-view と、app の動画の書き出しが使う
 pub mod record;
 pub mod render;
 pub mod scene;

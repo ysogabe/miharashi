@@ -1,0 +1,241 @@
+{
+  "fps": 30,
+  "size": [
+    1920,
+    1080
+  ],
+  "screen_size": [
+    1728,
+    729
+  ],
+  "text": {
+    "title": "Miharashi",
+    "tagline": [
+      "サーバーの今を、",
+      "ひとつの画面に。"
+    ],
+    "description": [
+      "Linux マシンのそばに置く",
+      "キオスク・ダッシュボード。"
+    ],
+    "badge_intro": "Linux キオスク・ダッシュボード",
+    "badge_sample": "仮データ",
+    "tags": "RUST / DRM·KMS / 5 SCREENS",
+    "thumbs_label": "SAMPLE SCREENS · 仮データ",
+    "thumbs_caption": "家とサーバーを、5 つの画面で見渡す。",
+    "tabs": [
+      "STATUS",
+      "PHOTOS",
+      "ROOM & WEATHER",
+      "AIRCRAFT",
+      "T3 AGENTS"
+    ],
+    "controls_guide": "CONTROL GUIDE",
+    "keys": [
+      {
+        "keys": [
+          "4",
+          "6"
+        ],
+        "label": "画面を切り替える"
+      },
+      {
+        "keys": [
+          "8",
+          "2",
+          "5"
+        ],
+        "label": "画面の中を操作する"
+      },
+      {
+        "keys": [
+          "0"
+        ],
+        "label": "メニューを開く"
+      }
+    ],
+    "outro_lead": "詳しくは紹介ページへ",
+    "outro_url": "ysogabe.github.io/miharashi/",
+    "outro_repo": "github.com/ysogabe/miharashi",
+    "outro_footer": "連携先や表示内容は、自分の環境に合わせて設定。"
+  },
+  "versions": {
+    "10": [
+      {
+        "kind": "intro",
+        "duration": 1.5
+      },
+      {
+        "kind": "feature",
+        "shot": "status",
+        "duration": 1.25,
+        "index": 0,
+        "title": "サーバーの状態",
+        "subtitle": ""
+      },
+      {
+        "kind": "feature",
+        "shot": "photo",
+        "duration": 1.25,
+        "index": 1,
+        "title": "旅の写真",
+        "subtitle": ""
+      },
+      {
+        "kind": "feature",
+        "shot": "room",
+        "duration": 1.25,
+        "index": 2,
+        "title": "空気と天気",
+        "subtitle": ""
+      },
+      {
+        "kind": "feature",
+        "shot": "aircraft",
+        "duration": 1.25,
+        "index": 3,
+        "title": "上空の航空機",
+        "subtitle": ""
+      },
+      {
+        "kind": "feature",
+        "shot": "agents",
+        "duration": 1.5,
+        "index": 4,
+        "title": "AI の動き",
+        "subtitle": "",
+        "agents": {
+          "new_at": 0.4,
+          "done_at": null
+        }
+      },
+      {
+        "kind": "outro",
+        "duration": 2
+      }
+    ],
+    "30": [
+      {
+        "kind": "intro",
+        "duration": 2.5
+      },
+      {
+        "kind": "feature",
+        "shot": "status",
+        "duration": 4.5,
+        "index": 0,
+        "title": "サーバーの状態を、一目で。",
+        "subtitle": "CPU・GPU・メモリ。温度も電力も、グラフで。"
+      },
+      {
+        "kind": "feature",
+        "shot": "photo",
+        "duration": 4.5,
+        "index": 1,
+        "title": "サーバーのそばに、旅の写真。",
+        "subtitle": "写真と大きな時計で、いつもの場所をフォトフレームに。"
+      },
+      {
+        "kind": "feature",
+        "shot": "room",
+        "duration": 4.5,
+        "index": 2,
+        "title": "部屋の空気と、これからの天気。",
+        "subtitle": "温度・湿度・CO₂ の推移と、今日からの予報。"
+      },
+      {
+        "kind": "feature",
+        "shot": "aircraft",
+        "duration": 4.5,
+        "index": 3,
+        "title": "いま、上空を飛ぶ機体は？",
+        "subtitle": "近くの航空機をレーダーに。機種・高度・経路も。"
+      },
+      {
+        "kind": "feature",
+        "shot": "agents",
+        "duration": 5.5,
+        "index": 4,
+        "title": "AI エージェントの動きも。",
+        "subtitle": "T3 Code の作業状況を一覧に。状態の変化は中央へ。",
+        "agents": {
+          "new_at": 0.8,
+          "done_at": null
+        }
+      },
+      {
+        "kind": "outro",
+        "duration": 4
+      }
+    ],
+    "60": [
+      {
+        "kind": "intro",
+        "duration": 4
+      },
+      {
+        "kind": "feature",
+        "shot": "status",
+        "duration": 8,
+        "index": 0,
+        "title": "サーバーの状態を、一目で。",
+        "subtitle": "CPU・GPU・メモリ。温度・電力と、その推移まで。"
+      },
+      {
+        "kind": "feature",
+        "shot": "photo",
+        "duration": 8,
+        "index": 1,
+        "title": "写真を眺める時間も、ここに。",
+        "subtitle": "旅や季節の写真を、大きな時計といっしょに。"
+      },
+      {
+        "kind": "feature",
+        "shot": "travel",
+        "duration": 6,
+        "index": 1,
+        "title": "旅の区切りには、地図のカード。",
+        "subtitle": "行き先と日付から、思い出をたどる。"
+      },
+      {
+        "kind": "feature",
+        "shot": "room",
+        "duration": 8,
+        "index": 2,
+        "title": "部屋の空気と、これからの天気。",
+        "subtitle": "Home Assistant の室内センサーと、気象庁の予報をひとつに。"
+      },
+      {
+        "kind": "feature",
+        "shot": "aircraft",
+        "duration": 8,
+        "index": 3,
+        "title": "上空の動きまで、見渡せる。",
+        "subtitle": "ADS-B 受信機と連携。近くの機体の位置・高度・経路を表示。"
+      },
+      {
+        "kind": "feature",
+        "shot": "agents",
+        "duration": 10,
+        "index": 4,
+        "title": "AI の作業が動いたら、画面の中央へ。",
+        "subtitle": "T3 Code のプロジェクトとスレッドを、状態ごとに一覧。",
+        "agents": {
+          "new_at": 0.4,
+          "done_at": 5.2
+        }
+      },
+      {
+        "kind": "controls",
+        "shot": "status",
+        "duration": 4,
+        "title": "画面の切り替えは、テンキーで。",
+        "subtitle": "手元の Echo Show 5 の操作パネルにも対応。"
+      },
+      {
+        "kind": "outro",
+        "duration": 4
+      }
+    ]
+  }
+}
