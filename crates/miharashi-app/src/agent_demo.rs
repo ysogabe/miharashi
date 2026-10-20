@@ -118,6 +118,104 @@ fn changed_snapshot(base: &AgentSnapshot, wall: SystemTime, mono: Instant) -> Ag
     snapshot
 }
 
+/// 新しく検出した作業が、実行中から応答完了になったところ。
+fn completed_snapshot(base: &AgentSnapshot, wall: SystemTime, mono: Instant) -> AgentSnapshot {
+    let mut snapshot = base.clone();
+    let mut entries = snapshot.entries.to_vec();
+    let Some(done) = entries.iter_mut().find(|e| e.thread_id == "demo-new") else {
+        return snapshot;
+    };
+    done.state = AgentState::Completed;
+    let title = done.title.clone();
+    snapshot.entries = entries.into();
+    snapshot.change_cursor = 2;
+    snapshot.last_success = Some(wall);
+    snapshot.last_success_mono = Some(mono);
+    snapshot.changes = vec![AgentChange {
+        id: 2,
+        thread_id: "demo-new".into(),
+        kind: AgentChangeKind::State,
+        before_state: Some(AgentState::Running),
+        after_state: Some(AgentState::Completed),
+        before_goal: None,
+        after_goal: None,
+        before_title: Some(title.clone()),
+        after_title: Some(title),
+        observed_at: wall,
+    }]
+    .into();
+    snapshot
+}
+
+/// 2 つ目の出来事。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Second {
+    /// 承認待ちになる(`agents-demo`)
+    Approval,
+    /// 実行中から応答完了になる(紹介動画)
+    Completed,
+}
+
+/// 時間が進むにつれて、一覧 → 新着 → 2 つ目の出来事、と変わる筋書き。仮想の時刻(`wall0`・`base` からの経過)だけで決まり、
+/// 実時計を読まない。5 秒ごとの取得成功も真似る(取得の鮮度だけが進む)。
+pub struct Scenario {
+    wall0: SystemTime,
+    base: Instant,
+    initial: AgentSnapshot,
+    fresh: AgentSnapshot,
+    second: AgentSnapshot,
+    new_at: Duration,
+    second_at: Option<Duration>,
+}
+
+impl Scenario {
+    pub fn new(
+        wall0: SystemTime,
+        base: Instant,
+        new_at: Duration,
+        second: Second,
+        second_at: Option<Duration>,
+    ) -> Self {
+        let initial = initial_snapshot(wall0, base);
+        let fresh = new_thread_snapshot(&initial, wall0 + new_at, base + new_at);
+        let at = second_at.unwrap_or(new_at);
+        let second = match second {
+            Second::Approval => changed_snapshot(&fresh, wall0 + at, base + at),
+            Second::Completed => completed_snapshot(&fresh, wall0 + at, base + at),
+        };
+        Self {
+            wall0,
+            base,
+            initial,
+            fresh,
+            second,
+            new_at,
+            second_at,
+        }
+    }
+
+    /// 開始から `elapsed` 後の一覧。
+    pub fn at(&self, elapsed: Duration) -> AgentSnapshot {
+        let mut snapshot = if self.second_at.is_some_and(|t| elapsed >= t) {
+            self.second.clone()
+        } else if elapsed >= self.new_at {
+            self.fresh.clone()
+        } else {
+            self.initial.clone()
+        };
+        // 取得は 5 秒ごとに成功する。鮮度だけが進み、活動の経過は変わらない。
+        let poll = Duration::from_secs((elapsed.as_secs() / 5) * 5);
+        snapshot.last_success = Some(self.wall0 + poll);
+        snapshot.last_success_mono = Some(self.base + poll);
+        snapshot
+    }
+}
+
+/// `agents-demo` と紹介動画の、仮想の壁時計の開始(いつ作っても同じ日時にする)。
+pub fn demo_wall() -> chrono::DateTime<chrono::Local> {
+    crate::video::wall_start()
+}
+
 /// Many threads in a few projects, to review stacking without a live server.
 fn busy_snapshot(base: &AgentSnapshot) -> AgentSnapshot {
     let mut entries = Vec::new();
@@ -338,18 +436,21 @@ pub fn render_sequence(
     }
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
 
-    let wall = SystemTime::now();
-    let base = Instant::now();
-    let (initial, mut new_snapshot, mut changed_snapshot) = fixture_snapshots(wall, base);
-    let new_at = Duration::from_secs(1);
-    let changed_at = Duration::from_secs(7);
+    let wall = demo_wall();
+    // 仮想の Instant の起点。画面の生成時に実時刻で取った時刻より後にそろえ、生成の速さで絵が変わらないようにする
+    let base = Instant::now() + Duration::from_secs(3600);
+    let scenario = Scenario::new(
+        SystemTime::from(wall),
+        base,
+        Duration::from_secs(1),
+        Second::Approval,
+        Some(Duration::from_secs(7)),
+    );
 
     let mut world = World::default();
     let mut screen = AgentScreen::new(size, false, cfg.agents.stale_secs);
     screen.on_enter(base);
     let mut text = crate::app::text_engine(&cfg.ui.font);
-    let mut new_observed_at_injected = false;
-    let mut changed_observed_at_injected = false;
     let frames = usize::try_from(seconds)
         .ok()
         .and_then(|s| s.checked_mul(fps as usize))
@@ -357,37 +458,8 @@ pub fn render_sequence(
     for index in 0..frames {
         let elapsed = Duration::from_secs_f64(index as f64 / f64::from(fps));
         let now = base + elapsed;
-        // AgentScreen ages notices against SystemTime::now(), while this demo advances only a
-        // virtual Instant timeline. Stamp each change when it first enters the simulation so
-        // slow 1080p rendering does not make a synthetic event appear already stale.
-        if elapsed >= new_at && !new_observed_at_injected {
-            if !new_snapshot.changes.is_empty() {
-                let mut changes = new_snapshot.changes.to_vec();
-                changes[0].observed_at = SystemTime::now();
-                new_snapshot.changes = changes.into();
-            }
-            new_observed_at_injected = true;
-        }
-        if elapsed >= changed_at && !changed_observed_at_injected {
-            if !changed_snapshot.changes.is_empty() {
-                let mut changes = changed_snapshot.changes.to_vec();
-                changes[0].observed_at = SystemTime::now();
-                changed_snapshot.changes = changes.into();
-            }
-            changed_observed_at_injected = true;
-        }
-        let mut snapshot = if elapsed >= changed_at {
-            changed_snapshot.clone()
-        } else if elapsed >= new_at {
-            new_snapshot.clone()
-        } else {
-            initial.clone()
-        };
-        // Model successful 5-second polls. This advances freshness without resetting activity ages.
-        let last_poll_secs = (elapsed.as_secs() / 5) * 5;
-        snapshot.last_success = Some(wall + Duration::from_secs(last_poll_secs));
-        snapshot.last_success_mono = Some(base + Duration::from_secs(last_poll_secs));
-        world.agents = snapshot;
+        world.wall = Some(wall + chrono::Duration::from_std(elapsed).unwrap_or_default());
+        world.agents = scenario.at(elapsed);
         screen.tick(&world, now);
         let mut canvas = Canvas::new(size.0, size.1);
         let mut context = RenderContext {

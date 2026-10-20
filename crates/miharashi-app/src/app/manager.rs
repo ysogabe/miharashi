@@ -169,9 +169,25 @@ impl ScreenManager {
 
     /// 画面の日付・時刻を `at` に固定する(`png` の fixture 用。同じ入力から同じ絵を作る)。
     pub fn with_fixed_clock(mut self, at: chrono::DateTime<chrono::Local>) -> Self {
-        self.fixed_clock = Some(at);
-        super::set_clock_at(&mut self.world.system, at);
+        self.set_clock(at);
         self
+    }
+
+    /// 壁時計を `at` にして、画面の日付・時刻にもすぐ写す。動画の書き出しが、フレームごとに仮想の時刻を進めるのに使う。
+    /// 各画面は `World::wall` からこの時刻を読む(実時計を直接読まない)。
+    pub fn set_clock(&mut self, at: chrono::DateTime<chrono::Local>) {
+        self.fixed_clock = Some(at);
+        self.world.wall = Some(at);
+        super::set_clock_at(&mut self.world.system, at);
+    }
+
+    /// 動画の書き出しの始まり。仮想時刻 `now` を起点にそろえる(生成時に実時刻で取った時刻を使わない)。
+    /// 最初の周期で必ずデータを進め、表示中の画面を `now` で表示し直す。
+    pub fn restart_at(&mut self, now: Instant) {
+        self.next_tick = now;
+        self.refresh_due = now;
+        self.screens[self.current].on_enter(now);
+        self.force_overlay = true;
     }
 
     /// GL が使えるか(`Output.gpu_max_texture.is_some()`)。既定は使えない。`with_rotation` より前に渡すこと
@@ -652,7 +668,9 @@ impl ScreenManager {
         self.update_presentation(now);
         if now >= self.next_tick {
             self.data.update(&mut self.world.system);
+            // 画面は Local::now を読まず、ここ(1 秒ごと)で書く壁時計を受け取る
             let at = self.fixed_clock.unwrap_or_else(chrono::Local::now);
+            self.world.wall = Some(at);
             super::set_clock_at(&mut self.world.system, at);
             self.ticks += 1;
             self.next_tick += self.tick_len;

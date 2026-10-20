@@ -119,8 +119,10 @@ pub struct AgentScreen {
     last_snapshot: AgentSnapshot,
     last_now: Instant,
     header_due: Instant,
-    /// 壁時計を固定する(`png` の fixture 用。None なら実時刻)
+    /// 壁時計を固定する(`png` の fixture 用。None なら `World::wall`)
     fixed_wall: Option<SystemTime>,
+    /// 直近の tick で `World::wall` から受け取った壁時計(まだ受け取っていなければ実時刻)
+    world_wall: Option<SystemTime>,
 }
 
 impl AgentScreen {
@@ -162,6 +164,7 @@ impl AgentScreen {
             last_now: Instant::now(),
             header_due: Instant::now() + Duration::from_secs(1),
             fixed_wall: None,
+            world_wall: None,
         }
     }
 
@@ -172,7 +175,9 @@ impl AgentScreen {
     }
 
     fn wall(&self) -> SystemTime {
-        self.fixed_wall.unwrap_or_else(SystemTime::now)
+        self.fixed_wall
+            .or(self.world_wall)
+            .unwrap_or_else(SystemTime::now)
     }
 
     fn sync(&mut self, snap: &AgentSnapshot, now: Instant) -> bool {
@@ -913,6 +918,7 @@ impl Screen for AgentScreen {
     }
     fn tick(&mut self, world: &crate::screen::World, now: Instant) -> bool {
         self.last_now = now;
+        self.world_wall = world.wall.map(SystemTime::from);
         let mut redraw = self.sync(&world.agents, now);
         redraw |= self.advance(now);
         // Land each finished move on an exact frame, and keep drawing while any card moves.
@@ -1405,6 +1411,18 @@ mod tests {
             ..Default::default()
         }
     }
+    /// `with_fixed_wall` は World の壁時計より優先する(`png` の fixture が同じ絵になる)。どちらも無ければ実時刻。
+    #[test]
+    fn fixed_wall_beats_the_world_wall() {
+        let at = |s| UNIX_EPOCH + Duration::from_secs(s);
+        let mut s = AgentScreen::new((1920, 1080), false, 30);
+        assert!(s.wall() > at(1_000_000_000), "どちらも無ければ実時刻");
+        s.world_wall = Some(at(2_000));
+        assert_eq!(s.wall(), at(2_000));
+        let s = s.with_fixed_wall(at(1_000));
+        assert_eq!(s.wall(), at(1_000));
+    }
+
     #[test]
     fn homes_stay_stable_when_entries_arrive_and_drop() {
         let now = Instant::now();

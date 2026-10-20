@@ -31,8 +31,18 @@
         <div class="note-item"><span class="note-index">01</span><div><strong>専用の全画面表示</strong><p>X11 も Wayland も使わず、DRM/KMS へ直接描く</p></div></div>
         <div class="note-item"><span class="note-index">02</span><div><strong>テンキーか、手元のパネルで</strong><p>4 / 6 で画面切替、8 / 2 / 5 で画面内を操作</p></div></div>
         <div class="note-item"><span class="note-index">03</span><div><strong>留守のあいだは消える</strong><p>Home Assistant の在宅判定でモニターを消灯</p></div></div>
-        <p class="note-disclaimer">状況と写真は実機から出力。ほかの 3 画面は仮データの見本です。表示先と解像度は設定で選べます。</p>
+        <p class="note-disclaimer">下の静止画のうち、状況と写真は実機から出力。ほかの 3 画面と紹介動画は仮データの見本です。表示先と解像度は設定で選べます。</p>
       </aside>
+    </section>
+
+    <section class="shell video-section" id="video" aria-label="紹介動画">
+      <figure class="shot shot-video">
+        <video controls muted loop playsinline preload="metadata" width="1920" height="1080" poster="videos/miharashi-30s-poster.jpg" aria-label="Miharashi の紹介動画(30 秒)。状況・写真・室内環境と天気・航空機・T3 Agents の 5 画面を順に紹介する。音声はありません。">
+          <source src="videos/miharashi-30s.mp4" type="video/mp4">
+          <a href="videos/miharashi-30s.mp4">紹介動画(30 秒、MP4)をダウンロード</a>
+        </video>
+        <figcaption><span><strong>紹介動画 / 30 秒</strong> 5 つの画面を順に紹介します。実装済みの描画処理に仮データを渡して書き出した映像で、実際の観測値・作業状況ではありません。音声はありません。</span><span>仮データ</span></figcaption>
+      </figure>
     </section>
 
     <section class="shell section-block" id="screens" aria-labelledby="screens-title">

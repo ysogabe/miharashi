@@ -36,8 +36,12 @@ pub struct Settings {
     pub codec: Codec,
     /// 既存のファイルを上書きする(既定は、あればエラー)
     pub overwrite: bool,
+    /// 上書きを指示するオプション名(既にあるときのエラーの案内に使う。例: `--record-overwrite`)
+    pub overwrite_flag: String,
     /// VAAPI で使う render node
     pub vaapi_device: PathBuf,
+    /// `-c:v` の前に足す出力オプション(例: 色空間のタグ、`-fflags +bitexact`)。vrm-view は空
+    pub extra_args: Vec<String>,
 }
 
 /// ffmpeg に渡す引数(`ffmpeg` 自身は含まない)。`target` は実際に書く一時ファイル(`Sink::spawn` が先に作る)。
@@ -72,6 +76,7 @@ pub fn ffmpeg_args(s: &Settings, target: &Path) -> Vec<String> {
         ]
         .map(String::from),
     );
+    a.extend(s.extra_args.iter().cloned());
     match s.codec {
         Codec::X264 => a.extend(
             [
@@ -97,13 +102,14 @@ pub fn ffmpeg_args(s: &Settings, target: &Path) -> Vec<String> {
 }
 
 /// 出力先を使えるか(既存ファイルの確認と、親ディレクトリの有無)。描画の前に呼ぶ。
-pub fn check_output(out: &Path, overwrite: bool) -> Result<(), String> {
+/// `overwrite_flag` は、既にあるときのエラーで案内する上書きのオプション名。
+pub fn check_output(out: &Path, overwrite: bool, overwrite_flag: &str) -> Result<(), String> {
     if out.is_dir() {
         return Err(format!("{} はディレクトリ", out.display()));
     }
     if out.exists() && !overwrite {
         return Err(format!(
-            "{} が既にある(上書きするなら --record-overwrite)",
+            "{} が既にある(上書きするなら {overwrite_flag})",
             out.display()
         ));
     }
@@ -140,13 +146,14 @@ pub struct Sink {
     part: PathBuf,
     out: PathBuf,
     overwrite: bool,
+    overwrite_flag: String,
     /// 一時ファイルを出力先へ移した(Drop で消さない)
     committed: bool,
 }
 
 impl Sink {
     pub fn spawn(s: &Settings) -> Result<Self, String> {
-        check_output(&s.out, s.overwrite)?;
+        check_output(&s.out, s.overwrite, &s.overwrite_flag)?;
         let part = part_path(&s.out)?;
         // 一時ファイルを先に作って名前を押さえる(既にあれば失敗させ、他人のファイルを上書きしない)
         std::fs::OpenOptions::new()
@@ -181,6 +188,7 @@ impl Sink {
             part,
             out: s.out.clone(),
             overwrite: s.overwrite,
+            overwrite_flag: s.overwrite_flag.clone(),
             committed: false,
         })
     }
@@ -232,8 +240,9 @@ impl Sink {
             std::fs::hard_link(&self.part, &self.out).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::AlreadyExists {
                     format!(
-                        "{} が録画中に作られた(上書きしない。--record-overwrite で上書き)",
-                        self.out.display()
+                        "{} が録画中に作られた(上書きしない。{} で上書き)",
+                        self.out.display(),
+                        self.overwrite_flag
                     )
                 } else {
                     format!("{} へ移せない: {e}", self.out.display())
@@ -271,7 +280,9 @@ mod tests {
             fps: 30.0,
             codec,
             overwrite,
+            overwrite_flag: "--record-overwrite".into(),
             vaapi_device: PathBuf::from("/dev/dri/renderD128"),
+            extra_args: Vec::new(),
         }
     }
 
@@ -314,16 +325,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("miharashi-rec-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a.mp4");
-        assert!(check_output(&f, false).is_ok());
+        assert!(check_output(&f, false, "--record-overwrite").is_ok());
         std::fs::write(&f, b"x").unwrap();
         assert!(
-            check_output(&f, false)
+            check_output(&f, false, "--record-overwrite")
                 .unwrap_err()
                 .contains("--record-overwrite")
         );
-        assert!(check_output(&f, true).is_ok());
-        assert!(check_output(&dir, true).is_err());
-        assert!(check_output(&dir.join("no/such/b.mp4"), false).is_err());
+        assert!(
+            check_output(&f, false, "--overwrite")
+                .unwrap_err()
+                .contains("--overwrite)")
+        );
+        assert!(check_output(&f, true, "--record-overwrite").is_ok());
+        assert!(check_output(&dir, true, "--record-overwrite").is_err());
+        assert!(check_output(&dir.join("no/such/b.mp4"), false, "--record-overwrite").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

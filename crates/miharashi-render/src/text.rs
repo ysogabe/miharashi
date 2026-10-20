@@ -1,11 +1,12 @@
 use crate::Canvas;
 use cosmic_text::fontdb;
-use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache};
+use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 
 pub struct TextEngine {
     fonts: FontSystem,
     swash: SwashCache,
     family: String,
+    weight: u16,
 }
 
 impl TextEngine {
@@ -15,7 +16,14 @@ impl TextEngine {
             fonts: FontSystem::new(),
             swash: SwashCache::new(),
             family: family.to_string(),
+            weight: Weight::NORMAL.0,
         }
+    }
+
+    /// 字の太さ(400 = 標準、700 = 太字)。既定は標準。
+    pub fn with_weight(mut self, weight: u16) -> Self {
+        self.weight = weight;
+        self
     }
 
     /// フォントファイルをヒープへ読み込んで使う。システムフォント(mmap)には依存しないので、
@@ -27,13 +35,16 @@ impl TextEngine {
             fonts: FontSystem::new_with_locale_and_db("ja-JP".to_string(), db),
             swash: SwashCache::new(),
             family: family.to_string(),
+            weight: Weight::NORMAL.0,
         })
     }
 
     fn buffer(&mut self, text: &str, size: f32) -> Buffer {
         let mut buf = Buffer::new(&mut self.fonts, Metrics::new(size, size * 1.3));
         buf.set_size(None, None);
-        let attrs = Attrs::new().family(Family::Name(&self.family));
+        let attrs = Attrs::new()
+            .family(Family::Name(&self.family))
+            .weight(Weight(self.weight));
         buf.set_text(text, &attrs, Shaping::Advanced, None);
         buf.shape_until_scroll(&mut self.fonts, false);
         buf

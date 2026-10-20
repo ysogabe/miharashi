@@ -16,3 +16,5 @@
 
 # vrm-view --record の出力(デモ動画。リポジトリには置かない)
 *.mp4
+# LP に載せる紹介動画(30 秒版)だけは置く(docs/LP.md §3)
+!site/videos/*.mp4

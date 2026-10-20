@@ -53,6 +53,16 @@ pub struct World {
     pub photo_feed: FeedState,
     /// T3 Agent 一覧。AgentProvider が更新し、画面は読むだけ。
     pub agents: crate::agents::AgentSnapshot,
+    /// 今の壁時計。ScreenManager が毎周期書く(`png` の fixture と動画の書き出しでは固定・仮想の時刻)。
+    /// 画面は `Local::now()` を直接読まず、これを読む(None は ScreenManager を通さない試験だけ)。
+    pub wall: Option<chrono::DateTime<chrono::Local>>,
+}
+
+impl World {
+    /// 壁時計。ScreenManager が書いていなければ実時刻。
+    pub fn wall(&self) -> chrono::DateTime<chrono::Local> {
+        self.wall.unwrap_or_else(chrono::Local::now)
+    }
 }
 
 /// 取得した値を `World` に写す。毎周期呼ぶので、ブロックしない。

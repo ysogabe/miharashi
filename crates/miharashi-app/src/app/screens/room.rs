@@ -29,6 +29,8 @@ pub struct RoomScreen {
     feeds: RoomFeeds,
     visible: bool,
     drawn: Option<Key>,
+    /// 取得せずに、この見本を出す(動画の書き出し。時計だけは壁時計から作る)
+    demo: Option<RoomView>,
 }
 
 const WEEKDAYS: [&str; 7] = ["月", "火", "水", "木", "金", "土", "日"];
@@ -231,7 +233,14 @@ impl RoomScreen {
             feeds,
             visible: false,
             drawn: None,
+            demo: None,
         }
+    }
+
+    /// 取得せずに `view` の見本を出す(時計だけは壁時計から作る)。
+    pub fn with_demo(mut self, view: RoomView) -> Self {
+        self.demo = Some(view);
+        self
     }
 
     fn key(&self, now: &DateTime<Local>) -> Key {
@@ -252,8 +261,12 @@ impl RoomScreen {
     pub fn view(&self, now: &DateTime<Local>) -> RoomView {
         let today = now.date_naive();
         let wd = WEEKDAYS[now.weekday().num_days_from_monday() as usize];
+        let clock = format!("{} ({wd})  {}", now.format("%Y/%m/%d"), now.format("%H:%M"));
+        if let Some(d) = &self.demo {
+            return RoomView { clock, ..d.clone() };
+        }
         let mut v = RoomView {
-            clock: format!("{} ({wd})  {}", now.format("%Y/%m/%d"), now.format("%H:%M")),
+            clock,
             ..RoomView::default()
         };
         // 室内
@@ -326,12 +339,12 @@ impl Screen for RoomScreen {
         self.visible = false;
     }
 
-    fn tick(&mut self, _world: &World, _now: Instant) -> bool {
-        self.visible && self.drawn.as_ref() != Some(&self.key(&Local::now()))
+    fn tick(&mut self, world: &World, _now: Instant) -> bool {
+        self.visible && self.drawn.as_ref() != Some(&self.key(&world.wall()))
     }
 
     fn render(&mut self, ctx: &mut RenderContext<'_>) {
-        let now = Local::now();
+        let now = ctx.world.wall();
         // 先に版を取る(描いている間に届いた更新は、次の周期で描き直す)
         let key = self.key(&now);
         room::room_screen(ctx.canvas, ctx.text, &self.view(&now));
@@ -371,6 +384,27 @@ pub fn offline_demo(v: &RoomView) -> RoomView {
         warn_feed: feed_of(&s, "気象庁", Some("08:00 発表".into())),
         ..v.clone()
     }
+}
+
+/// 動画の見本。`room::demo_view()` の日付・曜日・取得時刻を、壁時計 `now` に合わせて作り直したもの。
+pub fn demo_for(now: &DateTime<Local>) -> RoomView {
+    let today = now.date_naive();
+    let mut v = room::demo_view();
+    if let Some(w) = v.weather.as_mut() {
+        for (i, d) in w.days.iter_mut().enumerate() {
+            if let Some(date) = today.checked_add_days(chrono::Days::new(i as u64)) {
+                d.label = day_label(date, today);
+            }
+        }
+        for (i, d) in w.week.iter_mut().enumerate() {
+            if let Some(date) = today.checked_add_days(chrono::Days::new(i as u64 + 1)) {
+                d.day = date.day().to_string();
+                d.weekday = date.weekday().num_days_from_monday() as usize;
+            }
+        }
+    }
+    v.env.text = format!("HA {} 取得", hm(now));
+    v
 }
 
 /// 起動してまだ何も取れていないところ(`png` の画像)。
