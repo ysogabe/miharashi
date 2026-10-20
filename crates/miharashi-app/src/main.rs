@@ -52,7 +52,7 @@ struct Cli {
     lines: Option<String>,
     video: Option<PathBuf>,
     detections: Option<usize>,
-    // demo-video / intro-video
+    // demo-video / intro-video / agents-intro-video
     overwrite: bool,
     version: Option<String>,
     out_dir: Option<PathBuf>,
@@ -457,6 +457,15 @@ fn intro_video(cli: Cli) -> Result<(), String> {
     let out_dir = cli.out_dir.ok_or("--out-dir <dir> が要る")?;
     let stop = video::stop_flag()?;
     video::intro::write(version, &out_dir, cli.edit.as_deref(), cli.overwrite, &stop)?;
+    Ok(())
+}
+
+/// Agent 専用紹介動画。設定探索・実接続は行わない。
+fn agents_intro_video(cli: Cli) -> Result<(), String> {
+    let version = cli.version.as_deref().unwrap_or("all");
+    let out_dir = cli.out_dir.ok_or("--out-dir <dir> が要る")?;
+    let stop = video::stop_flag()?;
+    video::agents_intro::write(version, &out_dir, cli.edit.as_deref(), cli.overwrite, &stop)?;
     Ok(())
 }
 
@@ -1024,6 +1033,7 @@ fn main() -> Result<(), String> {
         "agents-demo" => agents_demo(cli),
         "demo-video" => demo_video(cli),
         "intro-video" => intro_video(cli),
+        "agents-intro-video" => agents_intro_video(cli),
         "bench" => bench(cli),
         "bench-gpu" => bench_gpu(cli),
         "bench-scene" => bench_scene(cli),
@@ -1031,7 +1041,7 @@ fn main() -> Result<(), String> {
         "kms-info" => kms_info(cli),
         "check-config" => load_config(&cli).map(|_| println!("OK")),
         other => Err(format!(
-            "unknown command {other}(run / png / agents-demo / demo-video / intro-video / bench / bench-gpu / bench-scene / bench-metrics / kms-info / check-config)"
+            "unknown command {other}(run / png / agents-demo / demo-video / intro-video / agents-intro-video / bench / bench-gpu / bench-scene / bench-metrics / kms-info / check-config)"
         )),
     }
 }

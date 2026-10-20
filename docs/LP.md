@@ -1,12 +1,14 @@
 # Miharashi — LP 構成書
 
-版: 0.7 / 更新日: 2026-10-20(0.6: 2026-10-16、0.3: 2026-10-14、0.2: 2026-10-11)
+版: 0.8 / 更新日: 2026-10-20(0.6: 2026-10-16、0.3: 2026-10-14、0.2: 2026-10-11)
 公開先: https://ysogabe.github.io/miharashi/
 実物: [site/index.html](../site/index.html)
 
 ## 1. LP の目的
 
 Miharashi が何をするものかを、**実装済みの画面**で伝える。実測画像と仮データの見本は明記して区別する。訪問者が「何が映るか」「どう操作するか」「どこまでできていて、次に何をするか」を短時間で理解できるページにする。
+
+0.8 では、画面紹介の T3 AGENTS 静止画の直後に Agent 専用の 30 秒版と 15 秒短縮版を追加した。連携の概念図と、通知から一覧へ戻る動きを伝える(§8)。
 
 0.7 では、ヒーローの直後に紹介動画(30 秒版)を置いた。映像は本体の描画処理に仮データを渡して書き出したもの(§3、§7)。
 
@@ -27,7 +29,7 @@ Miharashi が何をするものかを、**実装済みの画面**で伝える。
 | 1 | ヘッダー | 名称、画面・機能・操作パネル・仕組み・FAQ への導線、「実機で毎日稼働中」 |
 | 2 | ヒーロー | 「サーバーの今を、ひとつの画面に。」と用途、特徴 3 つ。注記で「下の静止画のうち状況と写真は実機から出力、ほかの 3 画面と紹介動画は仮データ」と対象を区別する |
 | 3 | 紹介動画 | 30 秒の紹介動画(仮データ。音声なし、自動再生しない)。キャプションに仮データであることを明記 |
-| 4 | 01 画面 | STATUS(OVERVIEW / DETAILS)・PHOTO FRAME の実機画像と、ROOM & WEATHER・AIRCRAFT・T3 AGENTS の仮データ画像 |
+| 4 | 01 画面 | STATUS(OVERVIEW / DETAILS)・PHOTO FRAME の実機画像と、ROOM & WEATHER・AIRCRAFT・T3 AGENTS の仮データ画像。直後に Agent 専用動画(主動画 30 秒・折りたたみ内の 15 秒版) |
 | 5 | 02 機能 | アラート、写真、航空機、室内環境と天気、T3 Agent、自動巡回、モニターの電源、操作パネル、GPU 描画、焼き付き対策の 10 枚と、連携を有効にする条件 |
 | 6 | 03 操作パネル | Echo Show 5 のスクリーンショットと、パネルアプリのソースへの導線 |
 | 7 | 04 仕組み | 共通の描画面 → DRM/KMS・PNG、表示と監視の GPU の役割、seat と systemd |
@@ -49,6 +51,9 @@ Miharashi が何をするものかを、**実装済みの画面**で伝える。
 | `site/images/agents-demo.png` | T3 Agent(仮データ) | `png` の `agents-overview.png`(2560×1080) |
 | `site/videos/miharashi-30s.mp4` | 紹介動画 30 秒版(1920×1080、約 2.2 MB、音声なし)。仮データ | `miharashi intro-video`(§7) |
 | `site/videos/miharashi-30s-poster.jpg` | 動画のポスター(1280×720) | 同じ動画の 1.8 秒の 1 コマ |
+| `site/videos/miharashi-agents-30s.mp4` | Agent 専用 30 秒版(1920×1080、約 1.35 MB、音声なし)。仮データ | `miharashi agents-intro-video`(§8) |
+| `site/videos/miharashi-agents-15s.mp4` | Agent 専用 15 秒短縮版(1920×1080、約 1.04 MB、音声なし)。仮データ | 同上 |
+| `site/videos/miharashi-agents-{15,30}s-poster.jpg` | 各版と同じ映像の連携図(1280×720) | 15 秒版の 1.5 秒 / 30 秒版の 2 秒 |
 | `site/images/panel.png` | Echo Show 5 の操作パネル | `adb exec-out screencap -p`(960×480 のまま) |
 
 ### 載せないもの(プライバシー)
@@ -123,3 +128,62 @@ ffmpeg -y -ss 1.8 -i work/intro/miharashi-30s.mp4 -frames:v 1 -vf scale=1280:720
 - 長さはフレーム単位(300 / 900 / 1800)で合わせる。同じ環境(OS、Noto Sans CJK JP と Noto Sans Mono のフォント、ffmpeg / libx264 のビルド)で同じ引数なら、毎回同じバイト列になる。環境が違うと、フォントと ffmpeg の違いでバイト列は変わりうる。
 - 映像の中の値(使用率、予報、機体、作業名、写真)はすべて仮データで(状況画面は 1 秒に 1 サンプル進む、決定的な疑似乱数の緩やかな変動。`video/status_data.rs`)、写真はプログラムで作った架空の風景。右上のバッジは「仮データ」。
 - 旧版(Mac でスマホから実モニターを撮影)は、画質が悪く自宅周辺の地名が映っていたため、この仕組みに置き換えた。
+
+## 8. Agent 専用紹介動画の再生成
+
+### 構成と掲載位置
+
+Mac の旧 `video-creator` の編集原本(`agents-edit.json`)は、この作業環境の一時フォルダーから削除済みで、今回 Mac 側の原本は参照していない。履歴で確認できた構成要素(15 秒: 連携概念図・Agent 一覧・状態変更通知、30 秒: 連携と読み取り専用の説明・長めの一覧と通知)から、現行の配色・フォントで再構成した。旧版の秒割りや文言の完全復元ではなく、旧動画素材も使わない。
+
+編集原本は [docs/agents-intro-video/edit.json](agents-intro-video/edit.json)。`text` が文言、`versions.15` / `versions.30` が区間の長さ・通知時刻・見出し切替。CLI の既定値はビルド時に埋め込んだ同じ原本で、`--edit` を指定すれば再ビルドせず別の編集ファイルを読める。`intro-video` の 10 / 30 / 60 秒版やその原本とは独立している。
+
+- **15 秒版**: 概念図 3 秒 → 実画面 10 秒 → 案内 2 秒(450 フレーム)。実画面の 0.3 秒で新着、5.0 秒で同じスレッドが応答完了。初期一覧は短く、通知の動きを手早く見せる。新着の復帰は 4.8 秒、完了の復帰は 9.5 秒で、最後の完了一覧を 0.5 秒残す。
+- **30 秒版**: 概念図 6 秒 → 実画面 20 秒 → 案内 4 秒(900 フレーム)。実画面の 3 秒で新着、10 秒で応答完了。新着の復帰 7.5 秒から完了通知まで 2.5 秒、完了の復帰 14.5 秒から締めまで 5.5 秒、一覧を読みやすく保持する。
+- 実画面は既存の `DemoRun` / `agent_demo::Scenario` が公開用の仮データを実 `AgentScreen` に渡す。1 本の連続した仮想時刻で動かし、見出しを替えるために時計・スレッド・通知をリセットしない。中央通知は通常の 700ms 導入 + 3 秒保持 + 800ms 復帰を使う。通常のアプリ挙動は変えない。
+- 概念図は Rust の Canvas で描く。T3 Code(Codex / Claude) → プロジェクト / スレッドの状態 → Miharashi の一覧 / 中央通知という情報の方向だけに矢印と動く点を置く。読み取り専用・会話本文を取得しないことを図と実画面の補足に明記する。
+
+掲載先は `#screens` の T3 AGENTS 静止画直後、`shot-grid` の外に置く全幅の `#agents-video`。静止画が示す「何が並ぶか」に続けて、動画で「変化がどう届くか」を説明でき、通知の中央表示も大きく見せられるため。ヒーロー直後の総合 30 秒動画は製品全体を知る役割を保つ。Agent 専用の主動画は一覧を読む時間がある 30 秒版とし、15 秒版は同じブロック内の標準 HTML `details`「15秒版を見る」に収める。両版とも `controls muted loop playsinline preload="none"`、自動再生なし、説明と MP4 リンク付き。JavaScript は追加しない。
+
+### 正確な生成・軽量化・ポスターのコマンド
+
+中間 PNG 連番は作らず、既存の `Sink` に RGBA フレームを流す。完成仕様は両版とも 1920×1080・30fps・無音 H.264 / yuv420p / BT.709 / faststart。深紺 `#07131c`、白 `#e7f0f4`、ミント `#72e2c5`、Noto Sans CJK JP と Noto Sans Mono、区間境界の 6 フレームのフェードを使う。
+
+```sh
+cargo build --release -p miharashi-app
+TZ=Asia/Tokyo ./target/release/miharashi agents-intro-video --version all \
+  --out-dir work/agents-intro --edit docs/agents-intro-video/edit.json --overwrite
+# 個別生成なら --version 15 または --version 30
+
+# LP 用の軽量化。bitexact でも SPS に BT.709 の三属性を確実に残す。
+for seconds in 15 30; do
+  ffmpeg -y -i "work/agents-intro/miharashi-agents-${seconds}s.mp4" \
+    -an -c:v libx264 -preset slow -crf 22 -pix_fmt yuv420p \
+    -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv \
+    -bsf:v h264_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1 \
+    -movflags +faststart -fflags +bitexact -flags:v +bitexact -map_metadata -1 \
+    "site/videos/miharashi-agents-${seconds}s.mp4"
+done
+# 各版と同じ完成映像から連携図を取り出す
+ffmpeg -y -ss 1.5 -i site/videos/miharashi-agents-15s.mp4 -frames:v 1 \
+  -vf scale=1280:720 -q:v 4 site/videos/miharashi-agents-15s-poster.jpg
+ffmpeg -y -ss 2 -i site/videos/miharashi-agents-30s.mp4 -frames:v 1 \
+  -vf scale=1280:720 -q:v 4 site/videos/miharashi-agents-30s-poster.jpg
+```
+
+生成結果(2026-10-20): 15 秒版 **1,036,416 bytes**(約 1.04 MB)、30 秒版 **1,353,050 bytes**(約 1.35 MB)。ポスターは順に 54,603 / 54,616 bytes。`ffprobe -count_frames` で 450 / 900 フレーム、15.000000 / 30.000000 秒、1920×1080・30/1fps・映像ストリーム 1 本(音声なし)、yuv420p、色空間・原色・伝達特性がすべて bt709 と確認。MP4 の `moov` が `mdat` より前にあることも確認した。
+
+### 再現条件と確認
+
+同じ OS・フォントファイル・描画ライブラリ・タイムゾーン・ffmpeg / libx264 のビルドと同じ JSON を使う。今回の生成環境は Linux、`TZ=Asia/Tokyo`、ffmpeg 7.1.5-0+deb13u1、NotoSansCJK-Regular.ttc / Bold、NotoSansMono-Regular.ttf。実 API・既存画面・個人設定は探さず、外部通信もしない。壁時計は 2026-10-16 14:35:00 を動画全体の起点にする。環境が違えばフォントやエンコーダの差でバイト列が変わりうる。
+
+```sh
+cargo test --release -p miharashi-app video::
+# 同じ 52 フレーム(概念図の動く点・フェード・新着通知)を 2 回生成し、MP4 のバイト一致を確認
+TZ=Asia/Tokyo cargo test --release -p miharashi-app encoded_excerpt_is_byte_identical -- --ignored
+for seconds in 15 30; do
+  ffprobe -v error -count_frames -show_streams -show_format -of json \
+    "site/videos/miharashi-agents-${seconds}s.mp4"
+done
+```
+
+代表コマは完成 MP4 から `work/agent-video-review/{15,30}s-01.png` ～ `07.png` に保存した(作業成果物、git 管理外)。順に概念図・初期一覧・新着中央・一覧復帰・完了中央・完了一覧・締め。15 秒版のフレーム番号は 45 / 96 / 135 / 236 / 285 / 381 / 420、30 秒版は 60 / 240 / 330 / 435 / 525 / 660 / 840(先頭 0)。`{15,30}s-contact.png` は同じコマの一覧。映像の時計が進み続け、復帰後の一覧と中央通知の状態・同じ作業名が一致することを確認した。ブラウザーで両版を再生し、幅 320 / 375px・折りたたみの開閉時にも横溢れがないことを確認した。

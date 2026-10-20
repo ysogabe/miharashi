@@ -1,6 +1,7 @@
 //! 各画面の見本(仮データ)を、固定刻みの仮想時刻で動画に書き出す(`demo-video`)と、
 //! それをつなぐ紹介動画(`intro-video`)。本番のキオスクは使わない。
 //! 時刻は `Instant`(単調時刻)も壁時計も、フレーム番号から決める仮想のもの。実時計は読まない。
+pub mod agents_intro;
 pub mod demo;
 pub mod intro;
 pub mod photos;

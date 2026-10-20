@@ -19,6 +19,7 @@ cargo test
 ./target/release/miharashi agents-demo --size 1920x1080 --seconds 15 --fps 15 --out work/agents-demo # T3画面のオフライン連番
 ./target/release/miharashi demo-video --screen status --seconds 10 --out work/status.mp4   # 画面の見本を動画に(仮データ)
 ./target/release/miharashi intro-video --version 30 --out-dir work/intro                  # 紹介動画(10 / 30 / 60 / all)
+./target/release/miharashi agents-intro-video --version all --out-dir work/agents-intro   # Agent 専用(15 / 30 / all)
 ./target/release/miharashi kms-info                            # DRM カード・コネクターの一覧と、設定で選ばれる表示先
 ./target/release/miharashi run --config config/example.toml    # 実機表示(直接オープンは video・input グループが必要)
 ./target/release/miharashi bench                               # CPU 描画のベースライン(PoC-005)
@@ -48,9 +49,9 @@ T3 Agent 画面の静止 PNG fixture は `png` コマンドから出力できま
 ffmpeg -framerate 15 -i work/agents-demo/frame-%06d.png -pix_fmt yuv420p work/agents-demo.mp4
 ```
 
-### 見本の動画(`demo-video` / `intro-video`)
+### 見本の動画(`demo-video` / `intro-video` / `agents-intro-video`)
 
-どちらも設定ファイルを探さず、通信もしません。各画面の描画処理(CPU)に仮データを渡し、フレームごとに進める仮想の時刻(壁時計は 2026-10-16 14:35:00 から)で描いて、`ffmpeg`(libx264)に流します。`ffmpeg` が PATH に要ります。同じ環境(OS、フォント、ffmpeg のビルド)で同じ引数なら、毎回同じ動画(バイト列)になります。文字は Noto Sans CJK JP(日本語)と Noto Sans Mono(英数字の等幅)をシステムから読むので、どちらも入れておいてください(再配布はしません)。出力先のディレクトリは無ければ作ります。途中で止めた(Ctrl-C、SIGTERM)ときは、書き出し中の動画を残さず、エラーで終わります。
+いずれも設定ファイルを探さず、通信もしません。各画面の描画処理(CPU)に仮データを渡し、フレームごとに進める仮想の時刻(壁時計は 2026-10-16 14:35:00 から)で描いて、`ffmpeg`(libx264)に流します。`ffmpeg` が PATH に要ります。同じ環境(OS、フォント、ffmpeg のビルド)で同じ引数なら、毎回同じ動画(バイト列)になります。文字は Noto Sans CJK JP(日本語)と Noto Sans Mono(英数字の等幅)をシステムから読むので、どちらも入れておいてください(再配布はしません)。出力先のディレクトリは無ければ作ります。途中で止めた(Ctrl-C、SIGTERM)ときは、書き出し中の動画を残さず、エラーで終わります。
 
 ```sh
 # 1 画面の見本。--screen は status / photo / trip(旅の地図カード)/ room / aircraft / agents
@@ -58,15 +59,22 @@ ffmpeg -framerate 15 -i work/agents-demo/frame-%06d.png -pix_fmt yuv420p work/ag
 
 # 紹介動画。構成と文言は docs/intro-video/edit.json(--edit <file> で別のファイルも使える)
 ./target/release/miharashi intro-video --version all --out-dir work/intro [--overwrite]   # miharashi-{10,30,60}s.mp4
+
+# Agent 専用。独立した編集原本で、連携図 → 連続する AgentScreen → 案内を合成
+TZ=Asia/Tokyo ./target/release/miharashi agents-intro-video --version all --out-dir work/agents-intro \
+  --edit docs/agents-intro-video/edit.json [--overwrite]  # miharashi-agents-{15,30}s.mp4
 ```
 
 | オプション | 内容 |
 |---|---|
 | `--screen` | `demo-video` の画面。写真は合成した風景を 3 秒ごとに替え、Agents は新しく検出 → 実行中から応答完了の筋書き |
-| `--seconds` `--fps` `--size` | 長さ(秒)、フレームレート(既定 30)、大きさ(既定 2560x1080) |
-| `--out` / `--out-dir` | 出力ファイル(`demo-video`)/ 出力先ディレクトリ(`intro-video`)。出力は一時ファイルに書き、成功したときだけ移す |
-| `--version` | `intro-video` の版。10 / 30 / 60 / all(既定)。1920x1080、300 / 900 / 1800 フレーム、音声なし |
+| `--seconds` `--fps` `--size` | `demo-video` の長さ(秒)、フレームレート(既定 30)、大きさ(既定 2560x1080) |
+| `--out` / `--out-dir` | 出力ファイル(`demo-video`)/ 出力先ディレクトリ(`intro-video` / `agents-intro-video`)。出力は一時ファイルに書き、成功したときだけ移す |
+| `--version` | `intro-video`: 10 / 30 / 60 / all(既定)、300 / 900 / 1800 フレーム。`agents-intro-video`: 15 / 30 / all(既定)、450 / 900 フレーム。いずれも 1920x1080・30fps・音声なし |
+| `--edit` | 紹介動画の編集 JSON。Agent 専用は `docs/agents-intro-video/edit.json`。省略時はビルドに埋め込んだ原本。構成・文言・通知時刻・見出し切替を編集できる |
 | `--overwrite` | 既にあるファイルを上書きする |
+
+Agent 専用動画は読み取りの連携図と、公開用の仮データによる一覧・新着通知・同じスレッドの応答完了を描きます。見出しが替わっても実画面の時計・状態をリセットしません。LP 掲載用の軽量化、ポスター、再現条件は [LP 構成書 §8](LP.md#8-agent-専用紹介動画の再生成)を参照してください。
 
 写真は、プログラムで作った架空の風景(家族の写真や実在の写真は使いません)、場所は東京駅のあたりの見本です。映像の数値・予報・機体・作業名はすべて仮データです。
 

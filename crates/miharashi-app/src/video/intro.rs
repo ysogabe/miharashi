@@ -156,7 +156,7 @@ fn background(size: (u32, u32)) -> Canvas {
 }
 
 /// 面積平均で縮小する(文字をつぶさない)。`src` は不透明。
-fn resample(src: &Pixmap, dw: u32, dh: u32) -> Pixmap {
+pub(super) fn resample(src: &Pixmap, dw: u32, dh: u32) -> Pixmap {
     let (sw, sh) = (src.width() as usize, src.height() as usize);
     let (dw, dh) = (dw as usize, dh as usize);
     let s = src.data();
