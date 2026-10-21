@@ -93,6 +93,10 @@ pub struct AgentEntry {
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
     pub error_summary: Option<String>,
+    /// `lineage.relationshipToParent` が `subagent` のときの親スレッド ID。fork や不明な関係は親子として扱わない。
+    pub parent_thread_id: Option<String>,
+    /// 親スレッドのタイトル。親が一覧の対象外(片付け済み・古い・アーカイブ)でも、shell にあれば残す。
+    pub parent_title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -523,6 +527,8 @@ fn parse_shell_recent(
     }
     let mut entries = Vec::with_capacity(threads.len());
     let mut seen_ids = std::collections::HashSet::with_capacity(threads.len());
+    // 除外した親のタイトルも子の見出しに使うので、対象かどうかの前に集める。
+    let mut titles: HashMap<String, String> = HashMap::with_capacity(threads.len());
     for thread in threads {
         validate_thread(thread)?;
         let id = field_str(thread, "id").ok_or("thread id がありません")?;
@@ -547,6 +553,13 @@ fn parse_shell_recent(
             request.and_then(|r| field_str(r, "kind")),
             plan,
             background_tasks > 0,
+        );
+        titles.insert(
+            sanitize(id, 256),
+            field_str(thread, "title").map_or_else(
+                || "無題".into(),
+                |v| nonempty(sanitize(v, ENTRY_TEXT_LIMIT), "無題"),
+            ),
         );
         let archived = thread.get("archivedAt").is_some_and(|v| !v.is_null());
         // T3 のサーバー・client と同じく、settledOverride だけで片付け済みかを決める。
@@ -594,7 +607,15 @@ fn parse_shell_recent(
             started_at: field_str(thread, "latestRunStartedAt").map(|s| sanitize(s, 64)),
             completed_at: field_str(thread, "latestRunCompletedAt").map(|s| sanitize(s, 64)),
             error_summary: error_summary(thread),
+            parent_thread_id: subagent_parent(thread),
+            parent_title: None,
         });
+    }
+    for entry in &mut entries {
+        entry.parent_title = entry
+            .parent_thread_id
+            .as_ref()
+            .and_then(|parent| titles.get(parent).cloned());
     }
     entries.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
     Ok(RemoteSnapshot {
@@ -623,6 +644,17 @@ fn provider_label(instance_id: &str) -> String {
 }
 
 /// 利用上限で止まった run は、いつ再開できるかを添える。
+/// `lineage` が `subagent` の子なら親スレッドの ID。`fork`・null・未知の関係は独立したスレッドとして None。
+fn subagent_parent(thread: &Value) -> Option<String> {
+    let lineage = thread.get("lineage").filter(|v| v.is_object())?;
+    if field_str(lineage, "relationshipToParent") != Some("subagent") {
+        return None;
+    }
+    field_str(lineage, "parentThreadId")
+        .filter(|id| !id.is_empty())
+        .map(|id| sanitize(id, 256))
+}
+
 fn error_summary(thread: &Value) -> Option<String> {
     if field_str(thread, "lastErrorClass") == Some("usage_limit") {
         return Some(match field_str(thread, "usageLimitResetAt") {
@@ -712,7 +744,7 @@ fn validate_thread(thread: &Value) -> Result<(), String> {
     {
         return Err("thread.hasActionableProposedPlan が boolean ではありません".into());
     }
-    for key in ["modelSelection", "pendingRuntimeRequest", "goal"] {
+    for key in ["modelSelection", "pendingRuntimeRequest", "goal", "lineage"] {
         if let Some(value) = thread.get(key)
             && !value.is_null()
             && !value.is_object()
@@ -724,6 +756,10 @@ fn validate_thread(thread: &Value) -> Result<(), String> {
         ("modelSelection", &["instanceId", "model"][..]),
         ("pendingRuntimeRequest", &["kind"][..]),
         ("goal", &["objective", "status"][..]),
+        (
+            "lineage",
+            &["parentThreadId", "relationshipToParent", "rootThreadId"][..],
+        ),
     ] {
         let Some(value) = thread.get(parent).filter(|v| v.is_object()) else {
             continue;
@@ -1003,6 +1039,7 @@ mod tests {
             "lastError":null, "lastErrorClass":null, "usageLimitResetAt":null,
             "pendingRuntimeRequest":null, "hasActionableProposedPlan":false,
             "pendingBackgroundTasks":[], "goal":null,
+            "lineage":null,
             "archivedAt":null, "settledOverride":null, "settledAt":null
         })
     }
@@ -1259,6 +1296,105 @@ mod tests {
             ids,
             ["failed-old", "failed-reopened", "idle-recent", "running"]
         );
+    }
+
+    fn lineage(parent: &str, relationship: &str) -> Value {
+        serde_json::json!({
+            "parentThreadId": parent,
+            "relationshipToParent": relationship,
+            "rootThreadId": "root",
+        })
+    }
+
+    #[test]
+    fn subagent_lineage_gives_the_parent_and_its_title() {
+        let mut parent = mock_thread("parent", "running", "today");
+        parent["title"] = Value::String("親のスレッド".into());
+        let mut child = mock_thread("child", "completed", "today");
+        child["lineage"] = lineage("parent", "subagent");
+        let mut solo = mock_thread("solo", "idle", "today");
+        solo["lineage"] = serde_json::json!({
+            "parentThreadId": null, "relationshipToParent": null, "rootThreadId": "solo"
+        });
+        let parsed = parse_shell(&shell(vec![parent, child, solo], 1)).unwrap();
+        let by_id = |id: &str| parsed.entries.iter().find(|e| e.thread_id == id).unwrap();
+        assert_eq!(by_id("child").parent_thread_id.as_deref(), Some("parent"));
+        assert_eq!(by_id("child").parent_title.as_deref(), Some("親のスレッド"));
+        // lineage が null(または無い)スレッドと、親を持たない lineage は独立したスレッド。
+        assert_eq!(by_id("parent").parent_thread_id, None);
+        assert_eq!(by_id("solo").parent_thread_id, None);
+        assert_eq!(by_id("solo").parent_title, None);
+    }
+
+    #[test]
+    fn fork_and_unknown_relationships_stay_independent() {
+        for relationship in ["fork", "something-new", ""] {
+            let mut child = mock_thread("child", "running", "today");
+            child["lineage"] = lineage("parent", relationship);
+            let parsed = parse_shell(&shell(vec![child], 1)).unwrap();
+            assert_eq!(parsed.entries[0].parent_thread_id, None, "{relationship}");
+            assert_eq!(parsed.entries[0].parent_title, None, "{relationship}");
+        }
+        let mut no_lineage = mock_thread("child", "running", "today");
+        no_lineage.as_object_mut().unwrap().remove("lineage");
+        assert_eq!(
+            parse_shell(&shell(vec![no_lineage], 1)).unwrap().entries[0].parent_thread_id,
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_lineage_is_rejected_like_other_fields() {
+        let mut not_object = mock_thread("t", "running", "today");
+        not_object["lineage"] = Value::String("parent".into());
+        assert!(parse_shell(&shell(vec![not_object], 1)).is_err());
+        for key in ["parentThreadId", "relationshipToParent", "rootThreadId"] {
+            let mut bad = mock_thread("t", "running", "today");
+            bad["lineage"] = lineage("parent", "subagent");
+            bad["lineage"][key] = serde_json::json!(5);
+            assert!(parse_shell(&shell(vec![bad], 1)).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn an_excluded_parent_still_names_its_children() {
+        let now = SystemTime::now();
+        let recent = DateTime::<Utc>::from(now).to_rfc3339();
+        let old = DateTime::<Utc>::from(now - Duration::from_secs(48 * 3600)).to_rfc3339();
+        let mut old_parent = mock_thread("old-parent", "idle", &old);
+        old_parent["title"] = Value::String("古い親".into());
+        let mut archived_parent = mock_thread("archived-parent", "running", &recent);
+        archived_parent["title"] = Value::String("片付けた親".into());
+        archived_parent["archivedAt"] = Value::String(recent.clone());
+        let mut a = mock_thread("a", "running", &recent);
+        a["lineage"] = lineage("old-parent", "subagent");
+        let mut b = mock_thread("b", "running", &recent);
+        b["lineage"] = lineage("archived-parent", "subagent");
+        let mut c = mock_thread("c", "running", &recent);
+        c["lineage"] = lineage("missing-parent", "subagent");
+        let parsed = parse_shell_recent(
+            &shell(vec![old_parent, archived_parent, a, b, c], 1),
+            24,
+            now,
+        )
+        .unwrap();
+        let ids: Vec<_> = parsed
+            .entries
+            .iter()
+            .map(|e| e.thread_id.as_str())
+            .collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+        assert_eq!(parsed.entries[0].parent_title.as_deref(), Some("古い親"));
+        assert_eq!(
+            parsed.entries[1].parent_title.as_deref(),
+            Some("片付けた親")
+        );
+        // 親が shell に無ければタイトルは None(親 ID は残る)。
+        assert_eq!(
+            parsed.entries[2].parent_thread_id.as_deref(),
+            Some("missing-parent")
+        );
+        assert_eq!(parsed.entries[2].parent_title, None);
     }
 
     #[test]
