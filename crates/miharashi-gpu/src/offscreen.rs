@@ -759,6 +759,60 @@ mod tests {
     }
 
     #[test]
+    fn offscreen_agent_popup_is_drawn_after_hundreds_of_frame_and_link_layers() {
+        use crate::compose::{AgentGpuCard, Compositor, Frame};
+        let Ok(off) = Offscreen::open(Path::new("/dev/dri/renderD128")) else {
+            eprintln!("GLES が使えないので skip");
+            return;
+        };
+        let size = (12u32, 8u32);
+        let bg = [8u8, 12, 20, 255].repeat((size.0 * size.1) as usize);
+        let solids = [[10u8, 20, 30, 255], [40, 50, 60, 255], [70, 80, 90, 255]];
+        let popup = [255u8, 0, 0, 255].repeat(4);
+        let ((), got) = off
+            .with_fbo(size, |gl| {
+                let mut comp = Compositor::new(gl, size).unwrap();
+                // 枠・線の面(同じ色は同じ id と同じテクスチャ)を何百枚も積み、最後にカードとポップアップ。
+                let mut cards: Vec<AgentGpuCard<'_>> = (0..600u64)
+                    .map(|i| AgentGpuCard {
+                        id: 1 + i % 3,
+                        revision: 1,
+                        pixels: &solids[(i % 3) as usize],
+                        size: (1, 1),
+                        rect: (0.0, 0.0, 1.0, 1.0),
+                        alpha: 1.0,
+                    })
+                    .collect();
+                cards.push(AgentGpuCard {
+                    id: 999,
+                    revision: 1,
+                    pixels: &popup,
+                    size: (2, 2),
+                    rect: (5.0, 3.0, 2.0, 2.0),
+                    alpha: 1.0,
+                });
+                comp.draw(
+                    gl,
+                    &Frame::Agents {
+                        background: Some(&bg),
+                        cards: &cards,
+                        scrim_alpha: 0.4,
+                        focus_card_id: Some(999),
+                    },
+                )
+                .unwrap();
+                comp.destroy(gl);
+            })
+            .unwrap();
+        let px = |x: usize, y: usize| {
+            let at = (y * size.0 as usize + x) * 4;
+            [got[at], got[at + 1], got[at + 2], got[at + 3]]
+        };
+        assert_eq!(px(5, 3), [255, 0, 0, 255], "ポップアップは暗幕の前に出る");
+        assert_eq!(px(6, 4), [255, 0, 0, 255]);
+    }
+
+    #[test]
     fn offscreen_agent_alpha_scale_and_scrim_match_cpu_scene() {
         use crate::compose::{AgentGpuCard, Frame};
         use miharashi_render::agents::{AgentCardSurface, AgentPose, AgentScene, render_scene_cpu};

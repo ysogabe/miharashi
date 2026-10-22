@@ -2,6 +2,8 @@
 //!
 //! ボードは 1 枚だけ。プロジェクトは横に並ぶ枠になり、件数の多い枠には列を足す。
 //! 列が足りないときは 1〜数件の枠を 1 列に縦に積み、それでも入らない列ではカードを重ねる。
+pub mod family;
+
 use std::collections::HashMap;
 
 // 1920x1080 を 1.0 とした寸法。
@@ -30,6 +32,8 @@ pub enum CardMode {
     Full,
     /// 他のカードの後ろにあり、上端の 1 行だけが見える。
     Strip,
+    /// 親子グループの静かな子。1 行だけの低いカード(状態の点・題名・経過時間)。
+    Row,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -38,6 +42,8 @@ pub struct CardSlot {
     pub mode: CardMode,
     /// 同じ列の中での重なり順。大きいほど手前。
     pub z: u32,
+    /// 親子グループの中での字下げの段(親 0、子 1、孫以降 2)。
+    pub depth: u8,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -49,12 +55,36 @@ pub struct Lane {
     pub head: Rect,
     /// 入りきらずに隠したカード。左上と件数。
     pub more: Vec<(f32, f32, usize)>,
+    /// 親子グループの配置で、同じプロジェクトが次の列へ続いた 2 つ目以降の枠。
+    pub cont: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Layout {
     pub lanes: Vec<Lane>,
     pub cards: HashMap<String, CardSlot>,
+    /// 親子グループの枠(`family::plan_board` が作る。単独スレッドだけの配置では空)。
+    pub families: Vec<family::FamilyShape>,
+}
+
+impl Layout {
+    /// カードの置き場。カードが無い(「ほか N 件」にまとめた)スレッドは、親のカード、
+    /// 親も無ければグループの見出しの位置を返す。ポップアップの元位置と戻り先に使う。
+    pub fn anchor(&self, id: &str) -> Option<Rect> {
+        if let Some(card) = self.cards.get(id) {
+            return Some(card.rect);
+        }
+        let shape = self
+            .families
+            .iter()
+            .find(|f| f.hidden_ids.iter().any(|h| h == id))?;
+        shape
+            .root
+            .as_deref()
+            .and_then(|root| self.cards.get(root))
+            .map(|c| c.rect)
+            .or(Some(shape.head))
+    }
 }
 
 /// `groups` は表示順に並んだプロジェクトごとのスレッド ID。各グループの中は重要な順。
@@ -180,6 +210,7 @@ pub fn layout(area: Rect, scale: f32, groups: &[Vec<String>]) -> Layout {
                     h: head - 16.0 * s,
                 },
                 more: Vec::new(),
+                cont: false,
             };
             let per = ids.len().div_ceil(c);
             for (ci, chunk) in ids.chunks(per.max(1)).enumerate() {
@@ -213,6 +244,7 @@ pub fn layout(area: Rect, scale: f32, groups: &[Vec<String>]) -> Layout {
                         h: head - 16.0 * s,
                     },
                     more: Vec::new(),
+                    cont: false,
                 });
                 place_column(
                     &mut out.cards,
@@ -270,6 +302,7 @@ fn place_column(
                     },
                     mode: CardMode::Full,
                     z: 0,
+                    depth: 0,
                 },
             );
         }
@@ -308,6 +341,7 @@ fn place_column(
                 },
                 mode: CardMode::Strip,
                 z: i as u32,
+                depth: 0,
             },
         );
     }
@@ -319,6 +353,7 @@ fn place_column(
                 rect: Rect { x, y, w, h: card_h },
                 mode: CardMode::Full,
                 z: 1000 + j as u32,
+                depth: 0,
             },
         );
         y += card_h + gap;
