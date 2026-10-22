@@ -134,6 +134,9 @@ pub struct AgentScreen {
     labels: HashMap<String, Label>,
     pages: Vec<layout::Layout>,
     pages_dirty: bool,
+    /// 配置(`plan_board`)を作り直した回数。テストで、変わっていないときに作り直さないことを確かめる。
+    #[cfg(test)]
+    replans: usize,
     page: usize,
     /// 表示中のページを出し始めた時刻。ページが 1 枚のとき、まだ表示していないときは None。
     page_since: Option<Instant>,
@@ -186,6 +189,8 @@ impl AgentScreen {
             labels: HashMap::new(),
             pages: Vec::new(),
             pages_dirty: true,
+            #[cfg(test)]
+            replans: 0,
             page: 0,
             page_since: None,
             goal_notified: HashMap::new(),
@@ -581,13 +586,27 @@ impl AgentScreen {
         }
     }
 
-    /// 取得結果が変わったときだけ、親子グループとページごとの配置を作り直す。
+    /// 取得結果が変わったときに、親子グループを組み直す。ページごとの配置(`plan_board`)を作り直すのは、
+    /// 配置に関わる値(スレッドの ID・親・状態の段・重要な順・プロジェクト)が変わったときだけ。
+    /// ポップアップを出している間は、対象のカードと戻り先を動かさないよう、作り直しを終わるまで待つ。
     fn ensure_pages(&mut self) {
         if !self.pages_dirty && !self.pages.is_empty() {
             return;
         }
+        if self.focus.is_some() && !self.pages.is_empty() {
+            return;
+        }
         self.pages_dirty = false;
-        self.arrangement = self.arrange();
+        let arrangement = self.arrange();
+        let same_plan = !self.pages.is_empty() && arrangement.families == self.arrangement.families;
+        self.arrangement = arrangement;
+        if same_plan {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.replans += 1;
+        }
         self.pages =
             family::plan_board(self.board_area(), self.scale(), &self.arrangement.families);
         self.page = self.page.min(self.pages.len().saturating_sub(1));
@@ -753,7 +772,8 @@ impl AgentScreen {
         let snap = self.last_snapshot.clone();
         let now = self.last_now;
         self.ensure_pages();
-        let groups = self.arrangement.groups.clone();
+        // 毎フレーム全スレッドを複製しないよう、描いている間だけ借りる。
+        let groups = std::mem::take(&mut self.arrangement.groups);
         if self.background_dirty || self.background.is_none() {
             let mut bg = Canvas::new(self.size.0, self.size.1);
             draw_background(
@@ -795,6 +815,12 @@ impl AgentScreen {
                 },
                 None => continue,
             };
+            // 画面の外に置かれたカードには面を作らない。
+            let (sw, sh) = (self.size.0 as f32, self.size.1 as f32);
+            let r = slot.rect;
+            if !is_focus && (r.x >= sw || r.y >= sh || r.x + r.w <= 0.0 || r.y + r.h <= 0.0) {
+                continue;
+            }
             if self.pending_new.contains(&entry.thread_id) && !is_focus {
                 continue;
             }
@@ -915,6 +941,7 @@ impl AgentScreen {
             });
         }
         self.id_map.retain(|id, _| self.seen.contains_key(id));
+        self.arrangement.groups = groups;
         let scene = draw::AgentScene {
             size: self.size,
             background: Some(self.background.as_ref().unwrap().data()),
@@ -957,7 +984,7 @@ impl AgentScreen {
                         .filter_map(|m| by_id.get(m.id.as_str()).copied()),
                 );
                 (
-                    format!("{}:{}:{}", shape.project, shape.family, shape.continued),
+                    format!("{}:{}:{}", shape.project, shape.family, shape.piece),
                     layout::family::decor(shape, s, &pose),
                     family_heading(fam, shape, &by_id),
                     badge,
@@ -1688,15 +1715,13 @@ fn family_heading(
             .unwrap_or("無題")
     };
     if shape.orphan {
+        // 親情報なしの組の根(親が一覧に無い子)だけから親のタイトルを取る。孫の parent_title は子のタイトル。
         let parent_title = f
             .members
             .iter()
-            .find_map(|m| {
-                entries
-                    .get(m.id.as_str())
-                    .and_then(|e| e.parent_title.as_deref())
-            })
-            .filter(|t| !t.is_empty());
+            .filter_map(|m| entries.get(m.id.as_str()))
+            .filter(|e| e.parent_thread_id.as_deref() == f.orphan_of.as_deref())
+            .find_map(|e| e.parent_title.as_deref().filter(|t| !t.is_empty()));
         return match (parent_title, shape.continued) {
             (Some(t), false) => format!("{t}の子"),
             (Some(t), true) => format!("{t}の子・続き"),
@@ -2617,12 +2642,15 @@ mod tests {
             parent_title: None,
             ..child("nameless", "gone2", AgentState::Running)
         };
+        // 孫の parent_title は「子」のタイトル。親情報なしの見出しには使わない。
+        let grandchild = child("deep", "nameless", AgentState::Idle);
         s.sync(
             &snapshot_of(vec![
                 entry("boss", AgentState::Running),
                 child("k", "boss", AgentState::Idle),
                 lost,
                 nameless,
+                grandchild,
             ]),
             now,
         );
@@ -2802,5 +2830,142 @@ mod tests {
         s.pending_new.insert("nobody".into());
         assert!(!s.activate_event(now));
         assert!(s.queue.is_empty() && !s.pending_new.contains("nobody"));
+    }
+
+    /// 5 組以上の親子グループで、別のページのスレッドをポップアップ中に別の組が要確認になって順位が変わっても、
+    /// 対象のカードと戻り先は今のページにあり、配置の差し替えはポップアップが終わってから反映される。
+    #[test]
+    fn a_popup_keeps_its_target_and_return_place_when_other_groups_reorder() {
+        let now = Instant::now();
+        let mut s = AgentScreen::new((1920, 1080), false, 30);
+        let entries = nine_families();
+        let world = |entries: Vec<AgentEntry>| crate::screen::World {
+            agents: snapshot_of(entries),
+            ..Default::default()
+        };
+        s.tick(&world(entries.clone()), now);
+        assert!(s.pages.len() > 1);
+        let last = s.pages.len() - 1;
+        let target = s.pages[last]
+            .cards
+            .keys()
+            .find(|id| id.starts_with('g') && id.contains('c'))
+            .unwrap()
+            .clone();
+        s.enqueue(change_event(&target, EventKind::Changed));
+        assert!(s.activate_event(now));
+        assert_eq!(s.page, last);
+        let replans = s.replans;
+        // 別の組の子が要確認になる。組は最初のページへ上がり、ほかのページの組も順位が動く。
+        let mut moved = entries;
+        moved
+            .iter_mut()
+            .find(|e| e.thread_id == "g0c0")
+            .unwrap()
+            .state = AgentState::Approval;
+        let t = now + Duration::from_secs(1);
+        s.tick(&world(moved.clone()), t);
+        let mid = render_for_test(&mut s, &snapshot_of(moved.clone()), t);
+        assert!(s.focus.is_some());
+        assert_eq!(s.replans, replans, "ポップアップの間は作り直さない");
+        assert!(s.board.anchor(&target).is_some());
+        assert!(s.pages[s.page].anchor(&target).is_some());
+        assert_eq!(s.board, s.pages[s.page]);
+        assert!(mid.iter().any(|c| c.id == s.id_map[&target]));
+        // 終わったあとに反映される: 要確認の組が最初のページに来る。
+        let later = now + Duration::from_secs(8);
+        s.tick(&world(moved), later);
+        assert!(s.focus.is_none());
+        assert_eq!(s.replans, replans + 1);
+        assert!(s.pages[0].cards.contains_key("g0c0"));
+    }
+
+    #[test]
+    fn the_layout_is_rebuilt_only_when_what_it_depends_on_changes() {
+        let now = Instant::now();
+        let mut s = AgentScreen::new((1920, 1080), false, 30);
+        s.sync(&snapshot_of(nine_families()), now);
+        s.ensure_pages();
+        assert_eq!(s.replans, 1);
+        // 中身が同じ(Arc だけ新しい)取得では作り直さない。
+        s.sync(&snapshot_of(nine_families()), now + Duration::from_secs(1));
+        s.ensure_pages();
+        assert_eq!(s.replans, 1);
+        // 題名が変わっても配置は変わらない。表示用のスレッドの中身は新しくなる。
+        let mut renamed = nine_families();
+        renamed[1].title = "新しい題名".into();
+        s.sync(&snapshot_of(renamed), now + Duration::from_secs(2));
+        s.ensure_pages();
+        assert_eq!(s.replans, 1);
+        assert!(
+            s.arrangement
+                .groups
+                .iter()
+                .flat_map(|g| &g.entries)
+                .any(|e| e.title == "新しい題名")
+        );
+        // 状態の段が変わると作り直す。
+        let mut moved = nine_families();
+        moved[1].state = AgentState::Approval;
+        s.sync(&snapshot_of(moved), now + Duration::from_secs(3));
+        s.ensure_pages();
+        assert_eq!(s.replans, 2);
+    }
+
+    #[test]
+    fn frames_of_a_family_spread_over_many_columns_have_distinct_heading_ids() {
+        let now = Instant::now();
+        let mut s = AgentScreen::new((1920, 1080), false, 30);
+        let mut entries = vec![entry("boss", AgentState::Running)];
+        entries.extend((0..14).map(|i| child(&format!("c{i}"), "boss", AgentState::Running)));
+        let snap = snapshot_of(entries);
+        s.sync(&snap, now);
+        render_for_test(&mut s, &snap, now);
+        let frames = s.board.families.len();
+        assert!(frames >= 3, "{frames}");
+        let heads = s.labels.keys().filter(|k| k.ends_with(":head")).count();
+        assert_eq!(heads, frames);
+    }
+
+    #[test]
+    fn no_surface_is_made_for_a_card_placed_outside_the_screen() {
+        let now = Instant::now();
+        let mut s = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(big_family(1));
+        s.sync(&snap, now);
+        s.ensure_pages();
+        s.board.cards.get_mut("run").unwrap().rect.x = 5000.0;
+        let cards = render_for_test(&mut s, &snap, now);
+        assert!(cards.iter().all(|c| c.id != s.id_map["run"]));
+        assert!(!s.surfaces.contains_key("run"));
+        assert!(s.surfaces.contains_key("boss"));
+    }
+
+    /// 件数の多い取得を画面が取り込む時間(組み立て + 配置 + 描画の準備)。
+    /// `cargo test --release -p miharashi-app agent_screen_scale -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn agent_screen_scale_bench() {
+        for n in [250usize, 1000, 2047] {
+            let now = Instant::now();
+            let mut s = AgentScreen::new((1920, 1080), false, 30);
+            let entries = big_family(n - 1);
+            let snap = snapshot_of(entries.clone());
+            let started = std::time::Instant::now();
+            s.sync(&snap, now);
+            s.ensure_pages();
+            let first = started.elapsed();
+            let started = std::time::Instant::now();
+            s.sync(&snapshot_of(entries), now + Duration::from_secs(5));
+            s.ensure_pages();
+            let same = started.elapsed();
+            let started = std::time::Instant::now();
+            render_for_test(&mut s, &snap, now + Duration::from_secs(6));
+            eprintln!(
+                "bench screen threads={n}: first={first:?} next poll (same layout)={same:?} render={:?} replans={}",
+                started.elapsed(),
+                s.replans
+            );
+        }
     }
 }

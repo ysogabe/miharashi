@@ -265,6 +265,14 @@ impl Ctx {
     fn foot(&self) -> f32 {
         LANE_FOOT * self.s
     }
+    /// 空の列に置ける高さ(列の見出しと下端を除く)。
+    fn fresh(&self) -> f32 {
+        self.area.h - self.head() - self.foot()
+    }
+    /// 枠 1 つの余白と見出しの高さ。
+    fn overhead(&self) -> f32 {
+        (FAM_PAD * 2.0 + FAM_HEAD) * self.s
+    }
     fn entry_h(&self, f: &Family, e: &Entry) -> f32 {
         self.s
             * match e {
@@ -322,6 +330,7 @@ struct Seg {
 struct Packed {
     segs: Vec<Seg>,
     cols: usize,
+    over: bool,
 }
 
 struct Packer<'a> {
@@ -331,6 +340,9 @@ struct Packer<'a> {
     col: usize,
     y: f32,
     open: Option<usize>,
+    /// 使える列の数。これを超える列が要るとわかった時点で打ち切る。
+    limit: usize,
+    over: bool,
 }
 
 impl<'a> Packer<'a> {
@@ -364,6 +376,10 @@ impl<'a> Packer<'a> {
         self.end_seg();
         self.col += 1;
         self.y = 0.0;
+        if self.col >= self.limit {
+            self.over = true;
+            return;
+        }
         self.begin(project);
     }
 
@@ -382,27 +398,51 @@ impl<'a> Packer<'a> {
         self.y += h + self.c.gap();
     }
 
+    /// 組を置く。収まらなければ次の列へ続ける。高さは前から 1 回なめて足すだけで決める。
     fn place(&mut self, project: usize, fam: usize) {
         let f = self.fams[fam].f;
         let framed = f.framed();
-        let mut entries = entries_of(f, &self.fams[fam].states);
+        let entries = entries_of(f, &self.fams[fam].states);
+        let n = entries.len();
+        if n == 0 {
+            return;
+        }
+        let c = self.c;
+        // pre[i] = 先頭 i 件の高さの和。a..b 番目を 1 枠にしたときの高さが O(1) で出る。
+        let mut pre = Vec::with_capacity(n + 1);
+        pre.push(0.0f32);
+        for e in &entries {
+            pre.push(pre[pre.len() - 1] + c.entry_h(f, e));
+        }
+        let child_gap = CHILD_GAP * c.s;
+        let height = |a: usize, b: usize| {
+            let sum = pre[b] - pre[a];
+            if framed {
+                sum + (b - a - 1) as f32 * child_gap + c.overhead()
+            } else {
+                sum
+            }
+        };
+        let mut start = 0;
         let mut continued = false;
         loop {
+            if self.over {
+                return;
+            }
             let i = self.open.expect("open segment");
-            let remaining = self.c.area.h - self.y - self.c.foot();
-            let whole = self.c.piece_h(f, framed, &entries);
+            let remaining = c.area.h - self.y - c.foot();
+            let whole = height(start, n);
             if whole <= remaining + 0.5 {
-                self.push_piece(fam, entries, framed, continued);
+                self.push_piece(fam, entries[start..].to_vec(), framed, continued);
                 return;
             }
             let can_gain = !self.segs[i].pieces.is_empty() || self.segs[i].top > 0.0;
-            let fresh = self.c.area.h - self.c.head() - self.c.foot();
-            if can_gain && (whole <= fresh + 0.5 || !framed) {
+            if can_gain && (whole <= c.fresh() + 0.5 || !framed) {
                 self.next_col(project);
                 continue;
             }
             if !framed {
-                self.push_piece(fam, entries, framed, continued);
+                self.push_piece(fam, entries[start..].to_vec(), framed, continued);
                 return;
             }
             let kmin = (if continued || f.orphan_of.is_some() {
@@ -410,23 +450,26 @@ impl<'a> Packer<'a> {
             } else {
                 2
             })
-            .min(entries.len());
-            let k = (kmin..=entries.len())
-                .rev()
-                .find(|&k| self.c.piece_h(f, true, &entries[..k]) <= remaining + 0.5);
-            let k = match k {
-                Some(k) => k,
-                None if can_gain => {
+            .min(n - start);
+            // 入る最大の件数。高さは件数に対して増える一方なので、入らなくなったところで止める。
+            let mut k = 0;
+            for take in kmin..=n - start {
+                if height(start, start + take) > remaining + 0.5 {
+                    break;
+                }
+                k = take;
+            }
+            if k == 0 {
+                if can_gain {
                     self.next_col(project);
                     continue;
                 }
-                None => kmin,
-            };
-            let rest = entries.split_off(k);
-            self.push_piece(fam, entries, true, continued);
+                k = kmin;
+            }
+            self.push_piece(fam, entries[start..start + k].to_vec(), true, continued);
             continued = true;
-            entries = rest;
-            if entries.is_empty() {
+            start += k;
+            if start >= n {
                 return;
             }
             self.next_col(project);
@@ -442,7 +485,8 @@ struct PageFam<'a> {
     states: Vec<UnitState>,
 }
 
-fn pack(c: &Ctx, fams: &[PageFam<'_>], fresh_columns: bool) -> Packed {
+/// `limit` 列を超える配置になりそうなら、そこで打ち切って `over` を立てる。
+fn pack(c: &Ctx, fams: &[PageFam<'_>], fresh_columns: bool, limit: usize) -> Packed {
     let mut p = Packer {
         c,
         fams,
@@ -450,112 +494,217 @@ fn pack(c: &Ctx, fams: &[PageFam<'_>], fresh_columns: bool) -> Packed {
         col: 0,
         y: 0.0,
         open: None,
+        limit,
+        over: false,
     };
     let mut projects: Vec<usize> = fams.iter().map(|f| f.project).collect();
     projects.dedup();
-    for project in projects {
+    'projects: for project in projects {
         if fresh_columns && p.y > 0.0 {
             p.col += 1;
             p.y = 0.0;
+            if p.col >= p.limit {
+                p.over = true;
+                break;
+            }
         }
         p.begin(project);
         for fi in (0..fams.len()).filter(|&fi| fams[fi].project == project) {
             p.place(project, fi);
+            if p.over {
+                break 'projects;
+            }
         }
         p.end_seg();
     }
     p.end_seg();
     let cols = p.segs.iter().map(|s| s.col + 1).max().unwrap_or(0);
-    Packed { segs: p.segs, cols }
+    Packed {
+        segs: p.segs,
+        cols,
+        over: p.over,
+    }
 }
 
-/// 1 列に収まるまで、静かな単位を後ろから 1 行表示にする。
-fn natural_states(c: &Ctx, f: &Family) -> Vec<UnitState> {
+fn try_pack(c: &Ctx, fams: &[PageFam<'_>]) -> Option<Packed> {
+    [true, false]
+        .into_iter()
+        .map(|fresh| pack(c, fams, fresh, c.max_cols))
+        .find(|packed| !packed.over)
+}
+
+/// 単位ごとの、含まれるスレッドの数。
+fn unit_sizes(f: &Family) -> Vec<usize> {
+    let mut sizes = vec![0; f.units];
+    for u in f.members.iter().filter_map(|m| m.unit) {
+        sizes[u] += 1;
+    }
+    sizes
+}
+
+/// 組の最初の表示。1 列に収まるまで静かな単位を後ろから 1 行表示にする。
+/// 全部を 1 行にしても画面全体(`max_cols` 列)に入らない分は、先に「ほか N 件」にまとめる
+/// (並べられる行数には画面の広さという上限があり、件数が多くても配置の計算量を抑えられる)。
+fn base_states(c: &Ctx, f: &Family) -> Vec<UnitState> {
     let mut states = vec![UnitState::Card; f.units];
-    let avail = c.area.h - c.head() - c.foot();
-    while c.piece_h(f, f.framed(), &entries_of(f, &states)) > avail {
-        let Some(u) = states.iter().rposition(|s| *s == UnitState::Card) else {
+    if f.units == 0 {
+        return states;
+    }
+    let sizes = unit_sizes(f);
+    let s = c.s;
+    let mut h = c.piece_h(f, f.framed(), &entries_of(f, &states));
+    for u in (0..f.units).rev() {
+        if h <= c.fresh() {
             break;
-        };
+        }
         states[u] = UnitState::Row;
+        h -= sizes[u] as f32 * (CHILD_H - ROW_H) * s;
+    }
+    let gap = CHILD_GAP * s;
+    let mut total: f32 = f
+        .members
+        .iter()
+        .map(|m| {
+            gap + s * match (m.unit, m.depth) {
+                (Some(_), _) => ROW_H,
+                (None, 0) => CARD_H,
+                (None, _) => CHILD_H,
+            }
+        })
+        .sum();
+    let capacity = c.max_cols as f32 * (c.fresh() - c.overhead() + gap);
+    let mut counted = false;
+    for u in (0..f.units).rev() {
+        if total <= capacity {
+            break;
+        }
+        total -= sizes[u] as f32 * (ROW_H * s + gap);
+        if !counted {
+            total += MORE_LINE * s + gap;
+            counted = true;
+        }
+        states[u] = UnitState::Hidden;
     }
     states
 }
 
-/// 1 ページ分(`items` は (プロジェクト, そのプロジェクトの組の位置))を詰める。
-/// 入らなければ、全部を 1 行表示 → 静かな単位を後ろから 1 つずつ隠す、の順に縮める。
-fn build_page(
-    c: &Ctx,
-    projects: &[Vec<Family>],
-    items: &[(usize, usize)],
-    force: bool,
-) -> Option<Layout> {
-    let mut items = items.to_vec();
-    items.sort_unstable();
-    let mut fams: Vec<PageFam<'_>> = items
+/// 隠す順(組, 単位)。隠せる単位が最も多い組から、後ろの単位を 1 つずつ。
+fn hide_order(fams: &[PageFam<'_>]) -> Vec<(usize, usize)> {
+    let mut heap: std::collections::BinaryHeap<(usize, usize)> = fams
         .iter()
-        .map(|&(project, idx)| {
-            let f = &projects[project][idx];
-            PageFam {
-                f,
-                project,
-                idx,
-                states: natural_states(c, f),
-            }
+        .enumerate()
+        .filter_map(|(i, fam)| {
+            let left = fam
+                .states
+                .iter()
+                .filter(|s| **s != UnitState::Hidden)
+                .count();
+            (left > 0).then_some((left, i))
         })
         .collect();
-    let mut all_rows = false;
-    loop {
-        for fresh in [true, false] {
-            let packed = pack(c, &fams, fresh);
-            if packed.cols <= c.max_cols {
-                return Some(finish(c, &fams, packed));
-            }
+    let mut order = Vec::new();
+    while let Some((left, i)) = heap.pop() {
+        order.push((i, left - 1));
+        if left > 1 {
+            heap.push((left - 1, i));
         }
-        if !all_rows {
-            all_rows = true;
-            let mut changed = false;
-            for fam in &mut fams {
-                for s in &mut fam.states {
-                    if *s == UnitState::Card {
-                        *s = UnitState::Row;
-                        changed = true;
-                    }
-                }
-            }
-            if changed {
-                continue;
-            }
-        }
-        // 隠せる静かな単位が最も多い組から、いちばん静かな 1 つを隠す。
-        let target = fams
-            .iter()
-            .enumerate()
-            .filter_map(|(i, fam)| {
-                let left = fam
-                    .states
-                    .iter()
-                    .filter(|s| **s != UnitState::Hidden)
-                    .count();
-                (left > 0).then_some((left, i))
-            })
-            .max();
-        match target {
-            Some((_, i)) => {
-                if let Some(u) = fams[i].states.iter().rposition(|s| *s != UnitState::Hidden) {
-                    fams[i].states[u] = UnitState::Hidden;
-                }
-            }
-            None => {
-                if !force {
-                    return None;
-                }
-                // どうしても入らない(要確認が何十件もある)ときは、右端の外へはみ出して並べる。
-                let packed = pack(c, &fams, false);
-                return Some(finish(c, &fams, packed));
+    }
+    order
+}
+
+/// 1 ページ分(`items` は (プロジェクト, そのプロジェクトの組の位置))を詰める。
+/// 入らなければ、全部を 1 行表示 → 静かな単位を隠していく(隠す数は二分探索で決める)、の順に縮める。
+/// 隠せる静かな単位を全部隠しても入らないときは、縮めきった組を返す(要確認の子は縮めない)。
+fn fit_page<'a>(
+    c: &Ctx,
+    projects: &'a [Vec<Family>],
+    bases: &[Vec<Vec<UnitState>>],
+    items: &[(usize, usize)],
+) -> Result<Layout, Vec<PageFam<'a>>> {
+    let mut items = items.to_vec();
+    items.sort_unstable();
+    let mut fams: Vec<PageFam<'a>> = items
+        .iter()
+        .map(|&(project, idx)| PageFam {
+            f: &projects[project][idx],
+            project,
+            idx,
+            states: bases[project][idx].clone(),
+        })
+        .collect();
+    if let Some(packed) = try_pack(c, &fams) {
+        return Ok(finish(c, &fams, packed));
+    }
+    let mut changed = false;
+    for fam in &mut fams {
+        for s in &mut fam.states {
+            if *s == UnitState::Card {
+                *s = UnitState::Row;
+                changed = true;
             }
         }
     }
+    if changed && let Some(packed) = try_pack(c, &fams) {
+        return Ok(finish(c, &fams, packed));
+    }
+    let order = hide_order(&fams);
+    let rows: Vec<Vec<UnitState>> = fams.iter().map(|f| f.states.clone()).collect();
+    let hide = |fams: &mut Vec<PageFam<'a>>, k: usize| {
+        for (fam, base) in fams.iter_mut().zip(&rows) {
+            fam.states.clone_from(base);
+        }
+        for &(i, u) in &order[..k] {
+            fams[i].states[u] = UnitState::Hidden;
+        }
+    };
+    hide(&mut fams, order.len());
+    let Some(mut best) = try_pack(c, &fams) else {
+        return Err(fams);
+    };
+    // 隠す数が増えるほど入りやすい。入る最小の数を二分探索する。
+    let (mut lo, mut hi) = (1, order.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        hide(&mut fams, mid);
+        match try_pack(c, &fams) {
+            Some(packed) => {
+                hi = mid;
+                best = packed;
+            }
+            None => lo = mid + 1,
+        }
+    }
+    hide(&mut fams, hi);
+    Ok(finish(c, &fams, best))
+}
+
+/// 1 画面に入らない組を、列の数ごとのページに分ける(2 ページ目以降の最初の枠は「続き」)。
+fn split_pages(c: &Ctx, fams: &[PageFam<'_>]) -> Vec<Layout> {
+    let packed = pack(c, fams, false, usize::MAX);
+    let per = c.max_cols;
+    let mut buckets: Vec<Vec<Seg>> = (0..packed.cols.div_ceil(per).max(1))
+        .map(|_| Vec::new())
+        .collect();
+    for mut seg in packed.segs {
+        let page = seg.col / per;
+        seg.col %= per;
+        buckets[page].push(seg);
+    }
+    buckets
+        .into_iter()
+        .map(|segs| {
+            let cols = segs.iter().map(|s| s.col + 1).max().unwrap_or(0);
+            finish(
+                c,
+                fams,
+                Packed {
+                    segs,
+                    cols,
+                    over: false,
+                },
+            )
+        })
+        .collect()
 }
 
 /// 詰めた結果を座標にする。
@@ -571,6 +720,8 @@ fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed) -> Layout {
     let x0 = c.area.x + (c.area.w - used) / 2.0;
     let pad = LANE_PAD * s;
     let (fpad, fhead) = (FAM_PAD * s, FAM_HEAD * s);
+    // 同じ組の何枠目か(列をまたぐ組の見出しを区別する)。
+    let mut pieces_of: HashMap<(usize, usize), usize> = HashMap::new();
     for (si, seg) in packed.segs.iter().enumerate() {
         let x = x0 + seg.col as f32 * (cw + lane_gap);
         let last_in_col = !packed.segs[si + 1..].iter().any(|o| o.col == seg.col);
@@ -620,9 +771,13 @@ fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed) -> Layout {
                 );
                 continue;
             }
+            let nth = pieces_of.entry((fam.project, fam.idx)).or_insert(0);
+            let piece_no = *nth;
+            *nth += 1;
             let mut shape = FamilyShape {
                 project: fam.project,
                 family: fam.idx,
+                piece: piece_no,
                 continued: piece.continued,
                 orphan: f.orphan_of.is_some(),
                 root: f.root_id().map(str::to_string),
@@ -643,6 +798,7 @@ fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed) -> Layout {
                 hidden_ids: Vec::new(),
             };
             let mut y = top + fpad + fhead;
+            let mut placed_at: Vec<usize> = Vec::new();
             for e in &piece.entries {
                 let h = c.entry_h(f, e);
                 match *e {
@@ -664,6 +820,7 @@ fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed) -> Layout {
                                 depth: mem.depth,
                             },
                         );
+                        placed_at.push(m);
                         shape.members.push(ShapeMember {
                             id: mem.id.clone(),
                             parent: None,
@@ -686,16 +843,11 @@ fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed) -> Layout {
                 y += h + CHILD_GAP * s;
             }
             // 親は、この枠に置いたメンバーの中にいるときだけ線の起点にする。
-            let placed: Vec<String> = shape.members.iter().map(|m| m.id.clone()).collect();
-            for sm in &mut shape.members {
-                let parent = f
-                    .members
-                    .iter()
-                    .find(|m| m.id == sm.id)
-                    .and_then(|m| m.parent)
-                    .map(|p| f.members[p].id.clone())
-                    .filter(|p| placed.contains(p));
-                sm.parent = parent;
+            for (sm, &m) in shape.members.iter_mut().zip(&placed_at) {
+                sm.parent = f.members[m]
+                    .parent
+                    .filter(|p| placed_at.contains(p))
+                    .map(|p| f.members[p].id.clone());
             }
             if shape.more.is_some() {
                 shape.hidden_ids = f
@@ -725,6 +877,8 @@ pub struct FamilyShape {
     /// `plan_board` に渡したプロジェクトの位置と、その中の組の位置。
     pub project: usize,
     pub family: usize,
+    /// 同じ組の何枠目か(0 から。ページが分かれても、そのページの中で数える)。
+    pub piece: usize,
     /// 次の列へ続いた 2 つ目以降の枠(親のカードは無い)。
     pub continued: bool,
     pub orphan: bool,
@@ -754,25 +908,61 @@ pub struct Decor {
 /// `pose` が各カードの現在位置を返す(無ければ配置した位置)。
 pub fn decor(shape: &FamilyShape, s: f32, pose: &dyn Fn(&str) -> Option<Rect>) -> Decor {
     let cur = |m: &ShapeMember| pose(&m.id).unwrap_or(m.rect);
-    let (dx, dy) = shape.members.first().map_or((0.0, 0.0), |m| {
-        let c = cur(m);
-        (c.x - m.rect.x, c.y - m.rect.y)
-    });
-    let shift = |r: Rect| Rect {
-        x: r.x + dx,
-        y: r.y + dy,
-        ..r
-    };
     let pad = FAM_PAD * s;
-    let mut frame = shift(shape.rect);
-    let head = shift(shape.head);
-    let more = shape.more.map(|(r, _)| shift(r));
-    for m in &shape.members {
-        frame.h = frame.h.max(cur(m).y + cur(m).h + pad - frame.y);
+    // 枠は、全メンバー(と「ほか N 件」)の現在位置を含む大きさにする。止まっているときは配置した枠そのもの。
+    // 左右は各メンバーが配置の枠からどれだけ動いたかの最大・最小で、上下は現在位置の上端・下端に余白を足して決める。
+    // 「ほか N 件」の行は面を持たないので、直前のメンバーの動きに付いていく。
+    let more = shape.more.map(|(r, _)| {
+        shape.members.last().map_or(r, |m| {
+            let now = cur(m);
+            Rect {
+                x: r.x + now.x - m.rect.x,
+                y: r.y + now.y - m.rect.y,
+                ..r
+            }
+        })
+    });
+    let mut tracked: Vec<(Rect, Rect)> = shape.members.iter().map(|m| (m.rect, cur(m))).collect();
+    if let (Some((rest, _)), Some(now)) = (shape.more, more) {
+        tracked.push((rest, now));
     }
-    if let Some(m) = more {
-        frame.h = frame.h.max(m.y + m.h + pad - frame.y);
-    }
+    let moved = tracked.iter().any(|(rest, now)| rest != now);
+    let (frame, head) = if !moved {
+        (shape.rect, shape.head)
+    } else {
+        let left = tracked
+            .iter()
+            .map(|(rest, now)| now.x - rest.x)
+            .fold(f32::INFINITY, f32::min);
+        let right = tracked
+            .iter()
+            .map(|(rest, now)| now.x + now.w - (rest.x + rest.w))
+            .fold(f32::NEG_INFINITY, f32::max);
+        let top = tracked
+            .iter()
+            .map(|(_, now)| now.y)
+            .fold(f32::INFINITY, f32::min)
+            - pad
+            - FAM_HEAD * s;
+        let bottom = tracked
+            .iter()
+            .map(|(_, now)| now.y + now.h)
+            .fold(f32::NEG_INFINITY, f32::max)
+            + pad;
+        let x = shape.rect.x + left;
+        let frame = Rect {
+            x,
+            y: top,
+            w: (shape.rect.x + shape.rect.w + right - x).max(1.0),
+            h: bottom - top,
+        };
+        let head = Rect {
+            x: frame.x + pad,
+            y: frame.y + pad,
+            ..shape.head
+        };
+        (frame, head)
+    };
     let lw = LINK_W * s;
     let mut links = Vec::new();
     let mut link = |from: Rect, to: Rect, from_bottom: f32| {
@@ -847,6 +1037,10 @@ pub fn plan_board(area: Rect, scale: f32, projects: &[Vec<Family>]) -> Vec<Layou
     }
     let max_cols = (((area.w + LANE_GAP * s) / (MIN_W * s + LANE_GAP * s)).floor() as usize).max(1);
     let c = Ctx { s, area, max_cols };
+    let bases: Vec<Vec<Vec<UnitState>>> = projects
+        .iter()
+        .map(|fams| fams.iter().map(|f| base_states(&c, f)).collect())
+        .collect();
     let mut order: Vec<(usize, usize)> = projects
         .iter()
         .enumerate()
@@ -856,29 +1050,37 @@ pub fn plan_board(area: Rect, scale: f32, projects: &[Vec<Family>]) -> Vec<Layou
         let f = &projects[p][i];
         (!f.has_attention(), f.best(), p, i)
     });
-    let mut pages: Vec<Vec<(usize, usize)>> = Vec::new();
+    // 組を重要な順に足していき、入らなくなったら次のページへ。
+    let mut pages: Vec<Layout> = Vec::new();
     let mut cur: Vec<(usize, usize)> = Vec::new();
+    let mut cur_layout: Option<Layout> = None;
     for item in order {
         cur.push(item);
-        if build_page(&c, projects, &cur, false).is_some() {
+        let failed = match fit_page(&c, projects, &bases, &cur) {
+            Ok(layout) => {
+                cur_layout = Some(layout);
+                continue;
+            }
+            Err(fams) => fams,
+        };
+        let alone = cur.len() == 1;
+        cur.clear();
+        pages.extend(cur_layout.take());
+        if alone {
+            // 1 組だけで画面に入らない。列の数ごとのページに分けて巡回する。
+            pages.extend(split_pages(&c, &failed));
             continue;
         }
-        cur.pop();
-        if !cur.is_empty() {
-            pages.push(std::mem::take(&mut cur));
-        }
-        cur.push(item);
-        if build_page(&c, projects, &cur, false).is_none() {
-            pages.push(std::mem::take(&mut cur));
+        match fit_page(&c, projects, &bases, &[item]) {
+            Ok(layout) => {
+                cur.push(item);
+                cur_layout = Some(layout);
+            }
+            Err(fams) => pages.extend(split_pages(&c, &fams)),
         }
     }
-    if !cur.is_empty() {
-        pages.push(cur);
-    }
+    pages.extend(cur_layout);
     pages
-        .iter()
-        .filter_map(|items| build_page(&c, projects, items, true))
-        .collect()
 }
 
 #[cfg(test)]
@@ -1206,14 +1408,163 @@ mod tests {
         }
     }
 
+    /// どのカードも表示領域の中にある。
+    fn assert_inside(l: &Layout, area: Rect) {
+        for (id, c) in &l.cards {
+            assert!(
+                c.rect.x >= area.x - 0.5
+                    && c.rect.x + c.rect.w <= area.x + area.w + 0.5
+                    && c.rect.y >= area.y - 0.5
+                    && c.rect.y + c.rect.h <= area.y + area.h + 0.5,
+                "{id} {:?} is outside {area:?}",
+                c.rect
+            );
+        }
+    }
+
     #[test]
-    fn a_family_larger_than_the_screen_still_gets_a_bounded_page() {
+    fn a_family_larger_than_the_screen_continues_on_more_pages_with_every_card_inside() {
         let area = Rect { w: 400.0, ..AREA };
         let mut nodes = vec![node("p", None, Tier::Running)];
         nodes.extend((0..40).map(|i| node(&format!("c{i}"), Some("p"), Tier::Attention)));
         let pages = plan_board(area, 1.0, &[fams(&nodes)]);
+        assert!(pages.len() > 1, "{}", pages.len());
+        let mut seen: Vec<&String> = pages.iter().flat_map(|l| l.cards.keys()).collect();
+        seen.sort();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(before, seen.len(), "同じカードが 2 回出ない");
+        assert_eq!(seen.len(), 41, "全カードがどこかのページに出る");
+        for l in &pages {
+            assert_inside(l, area);
+            assert!(l.cards.values().all(|c| c.mode == CardMode::Full));
+        }
+        // 親は最初のページ、2 ページ目以降の最初の枠は「続き」。
+        assert!(pages[0].cards.contains_key("p"));
+        assert!(pages[1..].iter().all(|l| !l.cards.contains_key("p")));
+        assert!(pages[1..].iter().all(|l| l.families[0].continued));
+    }
+
+    #[test]
+    fn twenty_attention_children_of_one_parent_are_all_reachable_at_1920() {
+        // 1920x1080 相当(領域 1856x788)。親 1 + 承認待ちの子 20。
+        let area = Rect { w: 1856.0, ..AREA };
+        let mut nodes = vec![node("p", None, Tier::Running)];
+        nodes.extend((0..20).map(|i| node(&format!("c{i}"), Some("p"), Tier::Attention)));
+        let pages = plan_board(area, 1.0, &[fams(&nodes)]);
+        let mut seen: Vec<&String> = pages.iter().flat_map(|l| l.cards.keys()).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 21);
+        for l in &pages {
+            assert_inside(l, area);
+        }
+    }
+
+    #[test]
+    fn quiet_children_beyond_the_screen_are_counted_not_laid_out() {
+        // 静かな子が 1 組に何千件あっても、並べるのは画面に入る分だけ。
+        let mut nodes = vec![node("p", None, Tier::Running)];
+        nodes.extend((0..2047).map(|i| node(&format!("q{i}"), Some("p"), Tier::Quiet)));
+        let pages = plan_board(AREA, 1.0, &[fams(&nodes)]);
         assert_eq!(pages.len(), 1);
-        assert_eq!(pages[0].cards.len(), 41);
+        let l = &pages[0];
+        assert_inside(l, AREA);
+        let hidden: usize = l.families.iter().map(|f| f.hidden_ids.len()).sum();
+        assert_eq!(l.cards.len() + hidden, 2048);
+        assert!(l.cards.len() < 200, "{}", l.cards.len());
+        // 静かな子の中では重要な順(先頭)から残る。
+        assert!(l.cards.contains_key("q0"));
+        assert!(!l.cards.contains_key("q2046"));
+        assert_eq!(l.anchor("q2046"), Some(l.cards["p"].rect));
+    }
+
+    /// 件数に対する配置計算の時間を測る。
+    /// `cargo test --release -p miharashi-app family_scale -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn family_scale_bench() {
+        let time = |name: &str, projects: &[Vec<Family>]| {
+            let started = std::time::Instant::now();
+            let pages = plan_board(AREA, 1.0, projects);
+            eprintln!(
+                "bench {name}: {:?} pages={} cards(p1)={}",
+                started.elapsed(),
+                pages.len(),
+                pages[0].cards.len()
+            );
+        };
+        for n in [250usize, 500, 1000, 2047] {
+            let mut nodes = vec![node("p", None, Tier::Running)];
+            nodes.extend((0..n).map(|i| node(&format!("q{i}"), Some("p"), Tier::Quiet)));
+            time(&format!("quiet children={n}"), &[fams(&nodes)]);
+        }
+        let mut nodes = vec![node("p", None, Tier::Running)];
+        nodes.extend((0..2047).map(|i| node(&format!("a{i}"), Some("p"), Tier::Attention)));
+        time("attention children=2047", &[fams(&nodes)]);
+        // 親 1 + 子 1 の小さな組が 1000。
+        let mut nodes = Vec::new();
+        for g in 0..1000 {
+            let p = format!("g{g}");
+            nodes.push(node(&p, None, Tier::Running));
+            nodes.push(node(&format!("{p}c"), Some(&p), Tier::Quiet));
+        }
+        time("families=1000 (2 threads each)", &[fams(&nodes)]);
+        let mut projects = Vec::new();
+        for g in 0..64 {
+            let mut nodes = Vec::new();
+            for f in 0..16 {
+                let p = format!("g{g}f{f}");
+                nodes.push(node(&p, None, Tier::Running));
+                nodes.extend((0..1).map(|i| node(&format!("{p}q{i}"), Some(&p), Tier::Quiet)));
+            }
+            projects.push(fams(&nodes));
+        }
+        time("projects=64 x families=16", &projects);
+        // 親 1 + 静かな子 20 の組が 100(1 ページ内の「ほか N 件」の割り振りが重い形)。
+        let mut nodes = Vec::new();
+        for g in 0..100 {
+            let p = format!("g{g}");
+            nodes.push(node(&p, None, Tier::Running));
+            nodes.extend((0..20).map(|i| node(&format!("{p}q{i}"), Some(&p), Tier::Quiet)));
+        }
+        time("families=100 x quiet children=20", &[fams(&nodes)]);
+    }
+
+    #[test]
+    fn frame_follows_every_member_when_children_swap_places() {
+        let nodes = family_with(1, "");
+        let pages = plan_board(AREA, 1.0, &[fams(&nodes)]);
+        let l = &pages[0];
+        let shape = &l.families[0];
+        // 先頭の子(a)と末尾の子(q0)が入れ替わる途中: a は q0 の位置、q0 は a の位置にいる。
+        let (a, q) = (l.cards["a"].rect, l.cards["q0"].rect);
+        let pose = |id: &str| match id {
+            "a" => Some(Rect {
+                x: a.x - 300.0,
+                ..q
+            }),
+            "q0" => Some(a),
+            _ => None,
+        };
+        let d = decor(shape, 1.0, &pose);
+        for id in ["p", "a", "r", "q0"] {
+            let c = pose(id).unwrap_or(l.cards[id].rect);
+            assert!(c.x >= d.frame.x - 0.01 && c.y >= d.frame.y - 0.01, "{id}");
+            assert!(
+                c.x + c.w <= d.frame.x + d.frame.w + 0.01
+                    && c.y + c.h <= d.frame.y + d.frame.h + 0.01,
+                "{id}"
+            );
+        }
+        // 枠はメンバーの外へ無駄に広がらない: 上は親カードの上、見出しは枠の上端にある。
+        let p = l.cards["p"].rect;
+        assert!((d.frame.y - shape.rect.y).abs() < 0.01 && d.frame.y < p.y);
+        assert!((d.head.y - (d.frame.y + FAM_PAD)).abs() < 0.01);
+        assert!(d.frame.x < a.x - 300.0 - FAM_PAD + 0.01);
+        // 止まっているときは配置した枠そのもの。
+        let rest = decor(shape, 1.0, &|_| None);
+        assert_eq!((rest.frame, rest.head), (shape.rect, shape.head));
     }
 
     #[test]
