@@ -1,6 +1,6 @@
 //! 各画面の見本を、フレーム番号から決まる仮想時刻で描く(`DemoRun`)。1 画面だけの `ScreenManager` に仮データを渡し、
 //! フレームごとに壁時計と `Instant` を進めて `tick` → `render`(CPU)する。`demo-video` と `intro-video` が共有する。
-use crate::agent_demo::{Scenario, Second};
+use crate::agent_demo::Scenario;
 use crate::aircraft::{self, Shared};
 use crate::app::manager::ScreenManager;
 use crate::app::screens::{
@@ -186,11 +186,10 @@ impl DemoRun {
             }
             DemoScreen::Agents => {
                 let secs = |s: f64| Duration::from_secs_f64(s);
-                let scenario = Scenario::new(
+                let scenario = Scenario::family_video(
                     SystemTime::from(wall0),
                     base,
                     secs(script.new_at),
-                    Second::Completed,
                     script.done_at.map(secs),
                 );
                 let elapsed = Rc::new(Cell::new(0));

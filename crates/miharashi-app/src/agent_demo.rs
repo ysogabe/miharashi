@@ -169,6 +169,33 @@ pub struct Scenario {
 }
 
 impl Scenario {
+    /// 動画専用。既存の親子の見本に子が増え、同じ子が応答完了になる。
+    /// 静止画や agents-demo の筋書きは変えない。
+    pub fn family_video(
+        wall0: SystemTime,
+        base: Instant,
+        new_at: Duration,
+        second_at: Option<Duration>,
+    ) -> Self {
+        let mut scenario = Self::new(wall0, base, new_at, Second::Completed, second_at);
+        scenario.initial = family_snapshot(&scenario.initial);
+        let mut fresh = new_thread_snapshot(&scenario.initial, wall0 + new_at, base + new_at);
+        let mut entries = fresh.entries.to_vec();
+        let child = entries
+            .iter_mut()
+            .find(|e| e.thread_id == "demo-new")
+            .unwrap();
+        child.project_id = "demo-agents".into();
+        child.project_title = "仮データ / agents".into();
+        child.parent_thread_id = Some("fam-parent".into());
+        child.parent_title = Some("エージェント画面の改善".into());
+        fresh.entries = entries.into();
+        let at = second_at.unwrap_or(new_at);
+        scenario.second = completed_snapshot(&fresh, wall0 + at, base + at);
+        scenario.fresh = fresh;
+        scenario
+    }
+
     pub fn new(
         wall0: SystemTime,
         base: Instant,

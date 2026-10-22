@@ -37,7 +37,7 @@
 
     <section class="shell video-section" id="video" aria-label="紹介動画">
       <figure class="shot shot-video">
-        <video controls muted loop playsinline preload="metadata" width="1920" height="1080" poster="videos/miharashi-30s-poster.jpg" aria-label="Miharashi の紹介動画(30 秒)。状況・写真・室内環境と天気・航空機・T3 Agents の 5 画面を順に紹介する。音声はありません。">
+        <video controls muted loop playsinline preload="metadata" width="1920" height="1080" poster="videos/miharashi-30s-poster.jpg" aria-label="Miharashi の紹介動画(30 秒)。状況・写真・室内環境と天気・航空機・T3 Agents(親子グループ表示を含む)の 5 画面を順に紹介する。音声はありません。">
           <source src="videos/miharashi-30s.mp4" type="video/mp4">
           <a href="videos/miharashi-30s.mp4">紹介動画(30 秒、MP4)をダウンロード</a>
         </video>
@@ -72,20 +72,20 @@
           <figcaption><span><strong>AIRCRAFT</strong> 近くを飛ぶ機体の位置と詳細。8 / 2 で注目する機体を選択。</span><span>仮データ</span></figcaption>
         </figure>
         <figure class="shot">
-          <img src="images/agents-demo.png" width="2560" height="1080" loading="lazy" alt="仮データの T3 AGENTS。4 つのプロジェクトごとに、実行中・待機・応答完了のスレッドを並べたカードボード">
-          <figcaption><span><strong>T3 AGENTS</strong> プロジェクトごとのスレッドと状態を一覧に。新着や変更を中央に表示。</span><span>仮データ</span></figcaption>
+          <img src="images/agents-demo.png" width="2560" height="1080" loading="lazy" alt="仮データの T3 AGENTS。プロジェクトごとに実行中・待機・応答完了のスレッドを並べ、親の下に子を線でつないだカードボード。承認待ちの子がある組は枠をアンバーにしている">
+          <figcaption><span><strong>T3 AGENTS</strong> プロジェクトごとのスレッドと状態を一覧に。サブエージェントは親の下にまとめ、承認待ちの組は枠で目立たせます。新着や変更は中央に表示。</span><span>仮データ</span></figcaption>
         </figure>
       </div>
       <section class="agents-video" id="agents-video" aria-labelledby="agents-video-title">
         <p class="eyebrow">T3 Agents / In motion</p>
         <h3 id="agents-video-title">新着から応答完了まで、動きで見る。</h3>
-        <p class="agents-video-lead" id="agents-video-description">30 秒版では、T3 Code との連携の仕組みと、複数プロジェクトの一覧 → 新着の中央通知 → 一覧への復帰 → 同じスレッドの応答完了を紹介します。T3 Code 連携は設定で有効にする読み取り専用の機能で、会話本文は取得しません。</p>
+        <p class="agents-video-lead" id="agents-video-description">30 秒版では、T3 Code との連携の仕組みと、親子でまとまった一覧 → 新着の中央通知 → 一覧への復帰 → 同じスレッドの応答完了を紹介します。子は親の下に線でつなぎ、承認待ちの子がある組は枠をアンバーにします。T3 Code 連携は設定で有効にする読み取り専用の機能で、会話本文は取得しません。</p>
         <figure class="shot shot-video">
-          <video controls muted loop playsinline preload="none" width="1920" height="1080" poster="videos/miharashi-agents-30s-poster.jpg" aria-label="T3 Agent 専用紹介動画、30 秒版。連携図と、実装済みの Agent 画面で新着・応答完了・一覧への復帰を紹介。仮データ、音声なし。" aria-describedby="agents-video-description agents-video-note">
+          <video controls muted loop playsinline preload="none" width="1920" height="1080" poster="videos/miharashi-agents-30s-poster.jpg" aria-label="T3 Agent 専用紹介動画、30 秒版。連携図と、親子グループ表示の Agent 画面で新着・応答完了・一覧への復帰を紹介。仮データ、音声なし。" aria-describedby="agents-video-description agents-video-note">
             <source src="videos/miharashi-agents-30s.mp4" type="video/mp4">
             <a href="videos/miharashi-agents-30s.mp4">Agent 紹介動画(30 秒、MP4)</a>
           </video>
-          <figcaption><span><strong>T3 AGENTS / 30 秒</strong> 連携と通知の流れを、一覧を読みながら確認できます。</span><span><a href="videos/miharashi-agents-30s.mp4">MP4 を開く</a></span></figcaption>
+          <figcaption><span><strong>T3 AGENTS / 30 秒</strong> 連携と通知の流れを、親子の組を読みながら確認できます。</span><span><a href="videos/miharashi-agents-30s.mp4">MP4 を開く</a></span></figcaption>
         </figure>
         <p class="shot-note" id="agents-video-note">両版とも公開用の仮データです。実際の作業状況ではありません。音声なし・自動再生なし。再生ボタンで開始できます。</p>
         <details class="agents-video-short">
@@ -109,7 +109,7 @@
         <article class="feature"><span class="micro-label">PHOTOS</span><h3>旅ごと、季節ごとに写真を流す</h3><p>写真の撮影地から、自宅を離れた「旅」と、いつもの暮らしの「季節」に分けて巡回します。区切りには、行き先の地図と日付のカードを挟みます。</p></article>
         <article class="feature"><span class="micro-label">AIRCRAFT</span><h3>上空を飛ぶ航空機</h3><p>ADS-B 受信機(readsb)の情報から、近くを飛ぶ機体を近い順に並べ、機種・登録記号・運航会社・経路を表示します。独立したレーダー画面で表示し、8 / 2 で注目する機体を選べます。</p></article>
         <article class="feature"><span class="micro-label">ROOM &amp; WEATHER</span><h3>部屋の空気と、これからの天気</h3><p>Home Assistant の温度・湿度・CO₂ などと過去 24 時間の推移を表示。気象庁の今日・明日・週間の予報と、自宅の市町村の警報・注意報をまとめます。</p></article>
-        <article class="feature"><span class="micro-label">T3 AGENTS</span><h3>AI エージェントの動きを眺める</h3><p>T3 Code のプロジェクトとスレッドをカードで並べ、状態の変わったものを中央に表示します。会話本文は取得せず、読み取りだけで動きます。連携は設定で有効にします。</p></article>
+        <article class="feature"><span class="micro-label">T3 AGENTS</span><h3>AI エージェントの動きを眺める</h3><p>T3 Code のプロジェクトとスレッドをカードで並べ、状態の変わったものを中央に表示します。サブエージェントは親の下に線でつないで並べ、承認待ちがあれば枠で知らせます。会話本文は取得せず、読み取りだけで動きます。連携は設定で有効にします。</p></article>
         <article class="feature"><span class="micro-label">ROTATION</span><h3>触らなければ、画面が巡回</h3><p>設定した順番と時間で画面を切り替えます。操作すると既定で 5 分休み、そのあと巡回に戻ります。API から巡回を止めたままにすることも、再開することもできます。</p></article>
         <article class="feature"><span class="micro-label">SCREEN POWER</span><h3>留守ならモニターを消す</h3><p>Home Assistant の在宅判定で、不在が続けば消灯し、帰れば点灯します。アラートは消灯中でも点けて見せます。手動の「常に点灯 / 常に消灯」も切り替えられます。</p></article>
         <article class="feature"><span class="micro-label">REMOTE</span><h3>手元の Echo Show 5 から操作</h3><p>Android 化した Echo Show 5 が、専用の操作盤になります。画面内の操作やメニューからの直接選択、モニターの消灯・点灯・自動に対応。操作ラベルと、今の画面や巡回の状態も手元で分かります。</p></article>
