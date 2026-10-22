@@ -1,12 +1,14 @@
 # Miharashi — LP 構成書
 
-版: 0.8 / 更新日: 2026-10-20(0.6: 2026-10-16、0.3: 2026-10-14、0.2: 2026-10-11)
+版: 0.9 / 更新日: 2026-10-23(0.8: 2026-10-20、0.6: 2026-10-16、0.3: 2026-10-14、0.2: 2026-10-11)
 公開先: https://ysogabe.github.io/miharashi/
 実物: [site/index.html](../site/index.html)
 
 ## 1. LP の目的
 
 Miharashi が何をするものかを、**実装済みの画面**で伝える。実測画像と仮データの見本は明記して区別する。訪問者が「何が映るか」「どう操作するか」「どこまでできていて、次に何をするか」を短時間で理解できるページにする。
+
+0.9 では、T3 Agent の見本を親子グループ表示に差し替えた。サブエージェントの子は親の下に線でつなぎ、承認待ちの子がある組は枠をアンバーにする。収まらないときは静かな子を 1 行にまとめ、次の列に「続き」として出す。静止画は `agents-family.png` から取り直し、Agent 専用の 30 秒版と 15 秒版、紹介動画 30 秒版も同じ見た目で作り直した。機能紹介の T3 Agent のカードにも親子表示の説明を足した(§3、§7、§8)。
 
 0.8 では、画面紹介の T3 AGENTS 静止画の直後に Agent 専用の 30 秒版と 15 秒短縮版を追加した。連携の概念図と、通知から一覧へ戻る動きを伝える(§8)。
 
@@ -48,11 +50,11 @@ Miharashi が何をするものかを、**実装済みの画面**で伝える。
 | `site/images/photo.jpg` | フォトフレーム | 同上に `--photo <生成した風景画像> --caption "夕暮れの湖"` |
 | `site/images/room-demo.png` | 室内環境と天気(仮データ) | `png` の `room.png`(2560×1080) |
 | `site/images/aircraft-demo.png` | 航空機(仮データ) | `png` の `aircraft.png`(2560×1080) |
-| `site/images/agents-demo.png` | T3 Agent(仮データ) | `png` の `agents-overview.png`(2560×1080) |
-| `site/videos/miharashi-30s.mp4` | 紹介動画 30 秒版(1920×1080、約 2.2 MB、音声なし)。仮データ | `miharashi intro-video`(§7) |
+| `site/images/agents-demo.png` | T3 Agent の親子グループ表示(仮データ、約 248 KB) | `png` の `agents-family.png`(2560×1080) |
+| `site/videos/miharashi-30s.mp4` | 紹介動画 30 秒版(1920×1080、2,288,370 bytes、約 2.3 MB、音声なし)。仮データ | `miharashi intro-video`(§7) |
 | `site/videos/miharashi-30s-poster.jpg` | 動画のポスター(1280×720) | 同じ動画の 1.8 秒の 1 コマ |
-| `site/videos/miharashi-agents-30s.mp4` | Agent 専用 30 秒版(1920×1080、約 1.35 MB、音声なし)。仮データ | `miharashi agents-intro-video`(§8) |
-| `site/videos/miharashi-agents-15s.mp4` | Agent 専用 15 秒短縮版(1920×1080、約 1.04 MB、音声なし)。仮データ | 同上 |
+| `site/videos/miharashi-agents-30s.mp4` | Agent 専用 30 秒版(1920×1080、1,496,341 bytes、約 1.5 MB、音声なし)。親子グループ表示の仮データ | `miharashi agents-intro-video`(§8) |
+| `site/videos/miharashi-agents-15s.mp4` | Agent 専用 15 秒短縮版(1920×1080、1,143,290 bytes、約 1.1 MB、音声なし)。仮データ | 同上 |
 | `site/videos/miharashi-agents-{15,30}s-poster.jpg` | 各版と同じ映像の連携図(1280×720) | 15 秒版の 1.5 秒 / 30 秒版の 2 秒 |
 | `site/images/panel.png` | Echo Show 5 の操作パネル | `adb exec-out screencap -p`(960×480 のまま) |
 
@@ -108,7 +110,7 @@ cargo build --release
   --photo site/images/photo.jpg --size 2560x1080 --out work/lp-fixtures
 cp work/lp-fixtures/room.png site/images/room-demo.png
 cp work/lp-fixtures/aircraft.png site/images/aircraft-demo.png
-cp work/lp-fixtures/agents-overview.png site/images/agents-demo.png
+cp work/lp-fixtures/agents-family.png site/images/agents-demo.png
 ```
 
 ## 7. 紹介動画の再生成
@@ -138,7 +140,7 @@ Mac の旧 `video-creator` の編集原本(`agents-edit.json`)は、この作業
 編集原本は [docs/agents-intro-video/edit.json](agents-intro-video/edit.json)。`text` が文言、`versions.15` / `versions.30` が区間の長さ・通知時刻・見出し切替。CLI の既定値はビルド時に埋め込んだ同じ原本で、`--edit` を指定すれば再ビルドせず別の編集ファイルを読める。`intro-video` の 10 / 30 / 60 秒版やその原本とは独立している。
 
 - **15 秒版**: 概念図 3 秒 → 実画面 10 秒 → 案内 2 秒(450 フレーム)。実画面の 0.3 秒で新着、5.0 秒で同じスレッドが応答完了。初期一覧は短く、通知の動きを手早く見せる。新着の復帰は 4.8 秒、完了の復帰は 9.5 秒で、最後の完了一覧を 0.5 秒残す。
-- **30 秒版**: 概念図 6 秒 → 実画面 20 秒 → 案内 4 秒(900 フレーム)。実画面の 3 秒で新着、10 秒で応答完了。新着の復帰 7.5 秒から完了通知まで 2.5 秒、完了の復帰 14.5 秒から締めまで 5.5 秒、一覧を読みやすく保持する。
+- **30 秒版**: 連携図 0–6 秒 → 親子一覧 6–9 秒 → 新着通知 9–13.5 秒 → 子が増えた一覧 13.5–16 秒 → 完了通知 16–20.5 秒 → 完了一覧 20.5–26 秒 → 案内 26–30 秒。親子の組は親の下に子を線でつなぎ、承認待ちの子がある組はアンバー枠で示す。新着の復帰から完了通知まで、完了の復帰から締めまでの間は一覧を読めるように保持する。
 - 実画面は既存の `DemoRun` / `agent_demo::Scenario` が公開用の仮データを実 `AgentScreen` に渡す。1 本の連続した仮想時刻で動かし、見出しを替えるために時計・スレッド・通知をリセットしない。中央通知は通常の 700ms 導入 + 3 秒保持 + 800ms 復帰を使う。通常のアプリ挙動は変えない。
 - 概念図は Rust の Canvas で描く。T3 Code(Codex / Claude) → プロジェクト / スレッドの状態 → Miharashi の一覧 / 中央通知という情報の方向だけに矢印と動く点を置く。読み取り専用・会話本文を取得しないことを図と実画面の補足に明記する。
 
