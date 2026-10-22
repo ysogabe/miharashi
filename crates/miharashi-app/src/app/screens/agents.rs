@@ -50,6 +50,22 @@ enum FocusStage {
     Out,
 }
 
+/// 文字を描いた面。文字か大きさが変わったときだけ描き直す。
+struct Label {
+    id: u64,
+    key: String,
+    revision: u64,
+    surface: Arc<Pixmap>,
+}
+
+/// 親子グループの枠と見出しの色。
+const FRAME_FILL: [u8; 4] = [18, 28, 42, 255];
+const FRAME_EDGE: [u8; 4] = [52, 70, 92, 255];
+const FRAME_EDGE_ALERT: [u8; 4] = [150, 108, 60, 255];
+const LINK_COLOR: [u8; 4] = [78, 100, 124, 255];
+const MUTED: [u8; 4] = [143, 163, 183, 255];
+const AMBER: [u8; 4] = [255, 188, 102, 255];
+
 /// 並び替えや件数の変化で配置が変わったとき、カードを新しい位置へ滑らせる。
 #[derive(Clone, Copy, Debug)]
 struct PoseTween {
@@ -110,6 +126,10 @@ pub struct AgentScreen {
     /// いま表示しているページの配置。
     board: layout::Layout,
     arrangement: Arrangement,
+    /// 親子グループの枠・接続線に使う単色の面(色ごとに 1 枚を使い回す)。
+    solids: HashMap<[u8; 4], (u64, Arc<Pixmap>)>,
+    /// 親子グループの見出し・「ほか N 件」の文字の面。
+    labels: HashMap<String, Label>,
     pages: Vec<layout::Layout>,
     pages_dirty: bool,
     page: usize,
@@ -158,6 +178,8 @@ impl AgentScreen {
             poses: HashMap::new(),
             board: layout::Layout::default(),
             arrangement: Arrangement::default(),
+            solids: HashMap::new(),
+            labels: HashMap::new(),
             pages: Vec::new(),
             pages_dirty: true,
             page: 0,
@@ -695,13 +717,25 @@ impl AgentScreen {
         let scale = self.scale();
         let mut shown = HashSet::new();
         let mut cards = Vec::new();
+        let mut homes: HashMap<String, layout::Rect> = HashMap::new();
         for entry in groups.iter().flat_map(|g| &g.entries) {
-            let Some(slot) = self.board.cards.get(&entry.thread_id).copied() else {
-                continue;
-            };
             let is_focus = focus
                 .as_ref()
                 .is_some_and(|f| f.event.thread_id == entry.thread_id);
+            let slot = match self.board.cards.get(&entry.thread_id).copied() {
+                Some(slot) => slot,
+                // 「ほか N 件」にまとめた子の変更は、親のカード(親も見えなければ見出し)を元位置にして出す。
+                None if is_focus => match self.board.anchor(&entry.thread_id) {
+                    Some(rect) => layout::CardSlot {
+                        rect,
+                        mode: layout::CardMode::Full,
+                        z: 0,
+                        depth: 0,
+                    },
+                    None => continue,
+                },
+                None => continue,
+            };
             if self.pending_new.contains(&entry.thread_id) && !is_focus {
                 continue;
             }
@@ -714,6 +748,15 @@ impl AgentScreen {
                 alpha: if self.stale { 0.65 } else { 1.0 },
             };
             let home = self.tween_pose(&entry.thread_id, target, now);
+            homes.insert(
+                entry.thread_id.clone(),
+                layout::Rect {
+                    x: home.x,
+                    y: home.y,
+                    w: home.width,
+                    h: home.height,
+                },
+            );
             let mut pose = home;
             if let Some(f) = focus.as_ref().filter(|_| is_focus) {
                 let elapsed = now.saturating_duration_since(f.started).as_secs_f32();
@@ -776,7 +819,8 @@ impl AgentScreen {
                 self.ensure_surface(&entry.thread_id, &content, (focus_w, focus_h), ctx.text);
             } else {
                 let compact = slot.mode == layout::CardMode::Strip;
-                let content = self.content(entry, now, None, compact, false);
+                let mut content = self.content(entry, now, None, compact, false);
+                content.one_line = slot.mode == layout::CardMode::Row;
                 self.ensure_surface(
                     &entry.thread_id,
                     &content,
@@ -799,9 +843,9 @@ impl AgentScreen {
             self.scrim_alpha = 0.0;
             self.focus_card_id = None;
         }
-        // Strips first, then the full cards in front of them, then the focus.
+        // Group frames and links first, then strips, then the full cards in front of them, then the focus.
         cards.sort_by_key(|(_, _, _, order)| *order);
-        self.scene_cards.clear();
+        self.scene_cards = self.decor_layers(&homes, ctx.text);
         for (id, stable, pose, _) in cards {
             let surface = self.surfaces.get(&id).expect("surface prepared").clone();
             self.scene_cards.push(draw::AgentCardSurface {
@@ -823,6 +867,131 @@ impl AgentScreen {
             ctx.canvas.pixmap.data_mut().copy_from_slice(frame.data());
         }
         self.text_dirty = false;
+    }
+
+    /// 親子グループの枠・見出し・接続線の面。カードの現在位置(動いている途中の位置)から毎フレーム作り、
+    /// 背景には焼かない。カードより先(下)に描く。
+    fn decor_layers(
+        &mut self,
+        homes: &HashMap<String, layout::Rect>,
+        text: &mut miharashi_render::TextEngine,
+    ) -> Vec<draw::AgentCardSurface> {
+        let s = self.scale();
+        let alpha = if self.stale { 0.65 } else { 1.0 };
+        let by_id: HashMap<&str, &AgentEntry> = self
+            .entries
+            .iter()
+            .map(|e| (e.thread_id.as_str(), e))
+            .collect();
+        let pose = |id: &str| homes.get(id).copied();
+        let views: Vec<_> = self
+            .board
+            .families
+            .iter()
+            .map(|shape| {
+                let fam = &self.arrangement.families[shape.project][shape.family];
+                let badge = child_attention_label(
+                    shape
+                        .members
+                        .iter()
+                        .filter(|m| Some(m.id.as_str()) != shape.root.as_deref())
+                        .filter_map(|m| by_id.get(m.id.as_str()).copied()),
+                );
+                (
+                    format!("{}:{}:{}", shape.project, shape.family, shape.continued),
+                    layout::family::decor(shape, s, &pose),
+                    family_heading(fam, shape, &by_id),
+                    badge,
+                    shape.more.map_or(0, |(_, n)| n),
+                )
+            })
+            .collect();
+        let mut out = Vec::new();
+        let mut used = HashSet::new();
+        let edge_w = 2.0 * s;
+        for (key, d, heading, badge, hidden) in views {
+            let edge = if badge.is_some() {
+                FRAME_EDGE_ALERT
+            } else {
+                FRAME_EDGE
+            };
+            let f = d.frame;
+            solid_layer(&mut self.solids, &mut out, f, FRAME_FILL, alpha);
+            for r in [
+                layout::Rect { h: edge_w, ..f },
+                layout::Rect {
+                    y: f.y + f.h - edge_w,
+                    h: edge_w,
+                    ..f
+                },
+                layout::Rect { w: edge_w, ..f },
+                layout::Rect {
+                    x: f.x + f.w - edge_w,
+                    w: edge_w,
+                    ..f
+                },
+            ] {
+                solid_layer(&mut self.solids, &mut out, r, edge, alpha);
+            }
+            for r in &d.links {
+                solid_layer(&mut self.solids, &mut out, *r, LINK_COLOR, alpha);
+            }
+            let font = 17.0 * s;
+            let h = d.head;
+            let badge_w = if badge.is_some() { h.w * 0.4 } else { 0.0 };
+            let mut label = |name: &str, label: &str, r: layout::Rect, color, align| {
+                let id = format!("{key}:{name}");
+                used.insert(id.clone());
+                label_layer(
+                    &mut self.labels,
+                    &mut out,
+                    text,
+                    &id,
+                    label,
+                    r,
+                    (font, color, align),
+                    alpha,
+                );
+            };
+            label(
+                "head",
+                &heading,
+                layout::Rect {
+                    w: h.w - badge_w,
+                    ..h
+                },
+                MUTED,
+                draw::LabelAlign::Left,
+            );
+            if let Some(badge) = &badge {
+                label(
+                    "badge",
+                    badge,
+                    layout::Rect {
+                        x: h.x + h.w - badge_w,
+                        w: badge_w,
+                        ..h
+                    },
+                    AMBER,
+                    draw::LabelAlign::Right,
+                );
+            }
+            if let Some(m) = d.more {
+                label(
+                    "more",
+                    &format!("ほか {hidden} 件"),
+                    layout::Rect {
+                        x: m.x + 8.0 * s,
+                        w: m.w - 8.0 * s,
+                        ..m
+                    },
+                    MUTED,
+                    draw::LabelAlign::Left,
+                );
+            }
+        }
+        self.labels.retain(|id, _| used.contains(id));
+        out
     }
 
     fn tween_pose(&mut self, id: &str, target: draw::AgentPose, now: Instant) -> draw::AgentPose {
@@ -934,6 +1103,7 @@ impl AgentScreen {
             progress: None,
             badge: None,
             compact,
+            one_line: false,
         }
     }
 }
@@ -1238,6 +1408,28 @@ fn draw_background(
         let head = lane.head;
         let name_size = 28.0 * scale;
         let count_size = 23.0 * scale;
+        if lane.cont {
+            // 同じプロジェクトが次の列へ続いた枠。名前だけを控えめに出す。
+            let name = fit_header_label(&group.label, (head.w - 90.0 * scale).max(40.0), name_size);
+            text.draw(
+                canvas,
+                &name,
+                head.x,
+                head.y,
+                name_size,
+                [143, 163, 183, 255],
+            );
+            let x = head.x + text.measure(&name, name_size) + 10.0 * scale;
+            text.draw(
+                canvas,
+                "続き",
+                x,
+                head.y + 4.0 * scale,
+                count_size,
+                [143, 163, 183, 255],
+            );
+            continue;
+        }
         let count = group.entries.len().to_string();
         let count_w = text.measure(&count, count_size);
         let name = fit_header_label(
@@ -1312,6 +1504,144 @@ fn draw_background(
         1.0,
         miharashi_render::canvas::rgba(48, 67, 87, 255),
     );
+}
+
+/// 単色の面を長方形に伸ばして 1 枚足す。
+fn solid_layer(
+    solids: &mut HashMap<[u8; 4], (u64, Arc<Pixmap>)>,
+    out: &mut Vec<draw::AgentCardSurface>,
+    r: layout::Rect,
+    color: [u8; 4],
+    alpha: f32,
+) {
+    if r.w <= 0.0 || r.h <= 0.0 {
+        return;
+    }
+    let (id, surface) = solids
+        .entry(color)
+        .or_insert_with(|| {
+            (
+                stable_id(&format!("solid:{color:?}")),
+                Arc::new(draw::solid_surface(color)),
+            )
+        })
+        .clone();
+    out.push(draw::AgentCardSurface {
+        id,
+        revision: 1,
+        surface,
+        pose: draw::AgentPose {
+            x: r.x,
+            y: r.y,
+            width: r.w,
+            height: r.h,
+            alpha,
+        },
+    });
+}
+
+/// 文字の面を長方形に 1 枚足す。文字・大きさ・色が変わったときだけ描き直す。
+#[allow(clippy::too_many_arguments)]
+fn label_layer(
+    labels: &mut HashMap<String, Label>,
+    out: &mut Vec<draw::AgentCardSurface>,
+    text: &mut miharashi_render::TextEngine,
+    id: &str,
+    label: &str,
+    r: layout::Rect,
+    (font, color, align): (f32, [u8; 4], draw::LabelAlign),
+    alpha: f32,
+) {
+    if r.w < 4.0 || r.h < 4.0 {
+        return;
+    }
+    let size = (r.w.round().max(1.0) as u32, r.h.round().max(1.0) as u32);
+    let key = format!("{label}|{size:?}|{font}|{color:?}|{align:?}");
+    let entry = labels.entry(id.to_string()).or_insert_with(|| Label {
+        id: stable_id(&format!("label:{id}")),
+        key: String::new(),
+        revision: 0,
+        surface: Arc::new(Pixmap::new(1, 1).expect("1x1 pixmap")),
+    });
+    if entry.key != key {
+        entry.key = key;
+        entry.revision += 1;
+        entry.surface = Arc::new(draw::render_label(label, size, font, color, align, text));
+    }
+    out.push(draw::AgentCardSurface {
+        id: entry.id,
+        revision: entry.revision,
+        surface: entry.surface.clone(),
+        pose: draw::AgentPose {
+            x: r.x,
+            y: r.y,
+            width: size.0 as f32,
+            height: size.1 as f32,
+            alpha,
+        },
+    });
+}
+
+/// 子の要確認の件数。種類が 1 つなら「子に承認待ち 1」、混ざっていれば「子に要確認 N」。
+fn child_attention_label<'a>(children: impl Iterator<Item = &'a AgentEntry>) -> Option<String> {
+    let mut counts = [0usize; 3];
+    for e in children.filter(|e| attention(e)) {
+        let kind = if e.has_pending_approvals || e.state == crate::agents::AgentState::Approval {
+            0
+        } else if e.state == crate::agents::AgentState::Error {
+            2
+        } else {
+            1
+        };
+        counts[kind] += 1;
+    }
+    let total: usize = counts.iter().sum();
+    let kinds = counts.iter().filter(|c| **c > 0).count();
+    match (total, kinds) {
+        (0, _) => None,
+        (n, 1) => {
+            let name = ["承認待ち", "入力待ち", "異常"][counts.iter().position(|c| *c > 0)?];
+            Some(format!("子に{name} {n}"))
+        }
+        (n, _) => Some(format!("子に要確認 {n}")),
+    }
+}
+
+/// 親子グループの枠の見出し。親が一覧に無い子は「親のタイトルの子」、タイトルも無ければ「親情報なし」。
+fn family_heading(
+    f: &family::Family,
+    shape: &layout::family::FamilyShape,
+    entries: &HashMap<&str, &AgentEntry>,
+) -> String {
+    let title_of = |id: &str| {
+        entries
+            .get(id)
+            .map(|e| e.title.as_str())
+            .filter(|t| !t.is_empty())
+            .unwrap_or("無題")
+    };
+    if shape.orphan {
+        let parent_title = f
+            .members
+            .iter()
+            .find_map(|m| {
+                entries
+                    .get(m.id.as_str())
+                    .and_then(|e| e.parent_title.as_deref())
+            })
+            .filter(|t| !t.is_empty());
+        return match (parent_title, shape.continued) {
+            (Some(t), false) => format!("{t}の子"),
+            (Some(t), true) => format!("{t}の子・続き"),
+            (None, false) => "親情報なし".into(),
+            (None, true) => "親情報なし・続き".into(),
+        };
+    }
+    if shape.continued {
+        let root = f.members.first().map_or("親", |m| title_of(&m.id));
+        return format!("{root}の子・続き");
+    }
+    format!("親子グループ · 子 {}", f.members.len().saturating_sub(1))
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -1433,10 +1763,11 @@ fn describe_change(
 }
 fn content_key(e: &AgentEntry) -> String {
     format!(
-        "{:?}|{}|{}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{}{}{}",
+        "{:?}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{}{}{}",
         e.state,
         e.project_title,
         e.title,
+        (&e.parent_thread_id, &e.parent_title),
         e.goal,
         e.background_tasks,
         e.provider,
@@ -1450,7 +1781,7 @@ fn content_key(e: &AgentEntry) -> String {
 }
 fn content_key_from_display(c: &draw::AgentCardContent) -> String {
     format!(
-        "{:?}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}",
+        "{:?}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}{}",
         c.state,
         c.project,
         c.title,
@@ -1459,7 +1790,8 @@ fn content_key_from_display(c: &draw::AgentCardContent) -> String {
         c.age,
         c.progress,
         c.badge,
-        c.compact
+        c.compact,
+        c.one_line
     )
 }
 

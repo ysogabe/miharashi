@@ -15,6 +15,8 @@ use tiny_skia::{
 pub const BASE_CARD_WIDTH: f32 = 440.0;
 pub const BASE_CARD_HEIGHT: f32 = 210.0;
 const MAX_TEXT_SCALE: f32 = 1.6;
+/// Height at which a one-line row has text scale 1.0.
+pub const ROW_BASE_HEIGHT: f32 = 38.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentState {
@@ -80,6 +82,10 @@ pub struct AgentCardContent {
     /// A card behind others in a stack: only its top row is visible, so the
     /// state, title, and age share that row.
     pub compact: bool,
+    /// A quiet child in a parent/child group, drawn as one low row: state dot,
+    /// title, and age. The surface height is the row height (`ROW_BASE_HEIGHT`
+    /// at text scale 1.0), so the caller chooses it by sizing the surface.
+    pub one_line: bool,
 }
 
 /// Destination bounds in screen pixels. The center is kept stable by the
@@ -121,6 +127,9 @@ pub fn render_card(content: &AgentCardContent, size: (u32, u32), text: &mut Text
     let (w, h) = (size.0.max(32), size.1.max(32));
     let mut pix = Pixmap::new(w, h).expect("invalid agent card dimensions");
     let (wf, hf) = (w as f32, h as f32);
+    if content.one_line {
+        return render_row(content, pix, text);
+    }
     let s = (wf / BASE_CARD_WIDTH)
         .min(if content.compact {
             f32::MAX
@@ -266,6 +275,116 @@ pub fn render_card(content: &AgentCardContent, size: (u32, u32), text: &mut Text
     canvas.pixmap
 }
 
+/// A one-line row: an accent bar, a state dot, the title, and the age on the right.
+fn render_row(content: &AgentCardContent, mut pix: Pixmap, text: &mut TextEngine) -> Pixmap {
+    let (wf, hf) = (pix.width() as f32, pix.height() as f32);
+    let s = (hf / ROW_BASE_HEIGHT).clamp(0.6, MAX_TEXT_SCALE);
+    let radius = (9.0 * s).min(hf / 2.0);
+    let [tr, tg, tb] = content.state.tint();
+    let [cr, cg, cb] = content.state.color();
+    let mut fill = Paint::default();
+    fill.set_color(Color::from_rgba8(tr, tg, tb, 248));
+    fill.anti_alias = true;
+    let mut path = PathBuilder::new();
+    path.move_to(radius, 0.0);
+    path.line_to(wf - radius, 0.0);
+    path.quad_to(wf, 0.0, wf, radius);
+    path.line_to(wf, hf - radius);
+    path.quad_to(wf, hf, wf - radius, hf);
+    path.line_to(radius, hf);
+    path.quad_to(0.0, hf, 0.0, hf - radius);
+    path.line_to(0.0, radius);
+    path.quad_to(0.0, 0.0, radius, 0.0);
+    path.close();
+    if let Some(path) = path.finish() {
+        pix.fill_path(&path, &fill, FillRule::Winding, Transform::identity(), None);
+        let mut edge = Paint::default();
+        edge.set_color(Color::from_rgba8(cr, cg, cb, 150));
+        edge.anti_alias = true;
+        pix.stroke_path(
+            &path,
+            &edge,
+            &tiny_skia::Stroke {
+                width: 1.5,
+                ..Default::default()
+            },
+            Transform::identity(),
+            None,
+        );
+    }
+    let mut canvas = Canvas { pixmap: pix };
+    let muted = [143, 163, 183, 255];
+    let bright = [223, 231, 240, 255];
+    let size = 21.0 * s;
+    let top = (hf - size * 1.3) / 2.0;
+    let left = 14.0 * s;
+    let right = wf - 14.0 * s;
+    canvas.fill_circle(
+        left + 5.0 * s,
+        hf / 2.0,
+        5.0 * s,
+        Color::from_rgba8(cr, cg, cb, 255),
+    );
+    let age = content.age.as_deref().unwrap_or("");
+    let age_w = if age.is_empty() {
+        0.0
+    } else {
+        let w = text.measure(age, size * 0.9);
+        text.draw_right(&mut canvas, age, right, top, size * 0.9, muted);
+        w
+    };
+    let start = left + 20.0 * s;
+    let room = right - age_w - 12.0 * s - start;
+    if room > 24.0 {
+        let title = fit_text(text, &content.title, size, room);
+        text.draw(&mut canvas, &title, start, top, size, bright);
+    }
+    canvas.pixmap
+}
+
+/// A 1x1 premultiplied pixel. Scaled to any rectangle, it is a flat fill, so the
+/// group frames and connector lines ride the same GPU/CPU card path as the cards
+/// and follow a card's tweened pose frame by frame.
+pub fn solid_surface(rgba: [u8; 4]) -> Pixmap {
+    let mut pix = Pixmap::new(1, 1).expect("1x1 pixmap");
+    pix.fill(Color::from_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]));
+    pix
+}
+
+/// Horizontal alignment of a text label inside its surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LabelAlign {
+    Left,
+    Right,
+}
+
+/// A transparent surface holding one line of text, ellipsized to fit `size`.
+pub fn render_label(
+    label: &str,
+    size: (u32, u32),
+    font: f32,
+    color: [u8; 4],
+    align: LabelAlign,
+    text: &mut TextEngine,
+) -> Pixmap {
+    let (w, h) = (size.0.max(1), size.1.max(1));
+    let mut canvas = Canvas {
+        pixmap: Pixmap::new(w, h).expect("invalid label dimensions"),
+    };
+    let shown = fit_text(text, label, font, w as f32);
+    let top = (h as f32 - font * 1.3) / 2.0;
+    match align {
+        LabelAlign::Left => text.draw(&mut canvas, &shown, 0.0, top, font, color),
+        LabelAlign::Right => text.draw_right(&mut canvas, &shown, w as f32, top, font, color),
+    }
+    canvas.pixmap
+}
+
+/// Ellipsize `value` to `max_width` at `size` with the real font metrics.
+pub fn fit_label_text(text: &mut TextEngine, value: &str, size: f32, max_width: f32) -> String {
+    fit_text(text, value, size, max_width)
+}
+
 fn fit_text(text: &mut TextEngine, value: &str, size: f32, max_width: f32) -> String {
     if text.measure(value, size) <= max_width {
         return value.to_string();
@@ -391,6 +510,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn solid_and_label_surfaces_follow_the_card_path() {
+        let mut text = TextEngine::new("Noto Sans CJK JP");
+        let solid = Arc::new(solid_surface([52, 70, 92, 255]));
+        let label = Arc::new(render_label(
+            "エージェント画面の改善の子・続き",
+            (160, 28),
+            17.0,
+            [143, 163, 183, 255],
+            LabelAlign::Left,
+            &mut text,
+        ));
+        assert_eq!((label.width(), label.height()), (160, 28));
+        let bg = [8u8, 12, 20, 255].repeat(200 * 100);
+        let layer = |id, surface: &Arc<Pixmap>, x, y, w, h| AgentCardSurface {
+            id,
+            revision: 1,
+            surface: surface.clone(),
+            pose: AgentPose {
+                x,
+                y,
+                width: w,
+                height: h,
+                alpha: 1.0,
+            },
+        };
+        let cards = [
+            layer(1, &solid, 10.0, 10.0, 100.0, 2.0),
+            layer(2, &solid, 10.0, 10.0, 2.0, 60.0),
+            layer(3, &label, 20.0, 30.0, 160.0, 28.0),
+        ];
+        let frame = render_scene_cpu(&AgentScene {
+            size: (200, 100),
+            background: Some(&bg),
+            cards: &cards,
+            scrim_alpha: 0.0,
+            focus_card_id: None,
+        })
+        .unwrap();
+        let px = |x: usize, y: usize| frame.data()[(y * 200 + x) * 4..][..3].to_vec();
+        assert_eq!(px(50, 10), [52, 70, 92]);
+        assert_eq!(px(10, 50), [52, 70, 92]);
+        assert_eq!(px(150, 90), [8, 12, 20]);
+        let lit = (30..58)
+            .flat_map(|y| (20..180).map(move |x| (x, y)))
+            .filter(|&(x, y)| px(x, y)[0] > 60)
+            .count();
+        assert!(lit > 20, "the label text is composed: {lit}");
+    }
+
+    #[test]
     fn japanese_cards_compose_at_full_hd_and_ultrawide() {
         let mut text = TextEngine::new("Noto Sans CJK JP");
         let content = AgentCardContent {
@@ -403,6 +572,7 @@ mod tests {
             progress: Some(0.5),
             badge: Some("状態が変わりました".into()),
             compact: false,
+            one_line: false,
         };
         let card = Arc::new(render_card(&content, (600, 300), &mut text));
         let tall = render_card(&content, (480, 700), &mut text);
@@ -417,6 +587,23 @@ mod tests {
             &mut text,
         );
         assert_eq!((strip.width(), strip.height()), (480, 210));
+        let row = render_card(
+            &AgentCardContent {
+                one_line: true,
+                project: String::new(),
+                ..content.clone()
+            },
+            (480, ROW_BASE_HEIGHT as u32),
+            &mut text,
+        );
+        assert_eq!((row.width(), row.height()), (480, ROW_BASE_HEIGHT as u32));
+        // 状態の点と題名が、1 行の高さの中に描かれる(余白だけではない)。
+        let inked = row
+            .data()
+            .chunks(4)
+            .filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150)
+            .count();
+        assert!(inked > 100, "the title text is drawn: {inked}");
         for (width, name) in [
             (1920, "agents-1920x1080.png"),
             (2560, "agents-2560x1080.png"),

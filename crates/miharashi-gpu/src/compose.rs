@@ -93,7 +93,9 @@ pub struct AgentGpuCard<'a> {
     pub alpha: f32,
 }
 
-const AGENT_CACHE: usize = 64;
+/// 1 フレームに描く Agent の面の数の上限。親子グループの枠・接続線・見出しも面として数える
+/// (同じ色の線は 1 枚のテクスチャを使い回すので、テクスチャの数はこれより少ない)。
+const AGENT_CACHE: usize = 256;
 struct AgentTexture {
     id: u64,
     revision: u64,

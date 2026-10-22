@@ -502,6 +502,7 @@ impl AgentStage {
             progress: None,
             badge: None,
             compact,
+            one_line: false,
         }
     }
 
