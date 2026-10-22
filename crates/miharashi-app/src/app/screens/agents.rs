@@ -774,6 +774,11 @@ impl AgentScreen {
         self.ensure_pages();
         // 毎フレーム全スレッドを複製しないよう、描いている間だけ借りる。
         let groups = std::mem::take(&mut self.arrangement.groups);
+        // ポップアップの間は配置(対象のカードと戻り先)を前のまま保つので、`groups` は古いことがある。
+        // 描く中身は今の一覧から ID で引き直し、一覧から消えたスレッドは描く対象から外す。
+        let entries = std::mem::take(&mut self.entries);
+        let current: HashMap<&str, &AgentEntry> =
+            entries.iter().map(|e| (e.thread_id.as_str(), e)).collect();
         if self.background_dirty || self.background.is_none() {
             let mut bg = Canvas::new(self.size.0, self.size.1);
             draw_background(
@@ -797,7 +802,13 @@ impl AgentScreen {
         let mut shown = HashSet::new();
         let mut cards = Vec::new();
         let mut homes: HashMap<String, layout::Rect> = HashMap::new();
-        for entry in groups.iter().flat_map(|g| &g.entries) {
+        for placed_entry in groups.iter().flat_map(|g| &g.entries) {
+            let Some(&entry) = current.get(placed_entry.thread_id.as_str()) else {
+                continue;
+            };
+            let Some(&stable) = self.id_map.get(&entry.thread_id) else {
+                continue;
+            };
             let is_focus = focus
                 .as_ref()
                 .is_some_and(|f| f.event.thread_id == entry.thread_id);
@@ -893,8 +904,7 @@ impl AgentScreen {
                     pose.alpha = 1.0;
                     self.scrim_alpha = 0.46 * (1.0 - p);
                 }
-                let id = self.id_map[&entry.thread_id];
-                self.focus_card_id = Some(id);
+                self.focus_card_id = Some(stable);
                 let summary = if f.event.kind == EventKind::New {
                     format!("新しく検出 · {}", state_label(entry.state))
                 } else {
@@ -913,13 +923,10 @@ impl AgentScreen {
                     ctx.text,
                 );
             }
-            cards.push((
-                entry.thread_id.clone(),
-                self.id_map[&entry.thread_id],
-                pose,
-                (is_focus, slot.z),
-            ));
+            cards.push((entry.thread_id.clone(), stable, pose, (is_focus, slot.z)));
         }
+        drop(current);
+        self.entries = entries;
         self.surfaces.retain(|id, _| shown.contains(id));
         self.content_keys.retain(|id, _| shown.contains(id));
         let placed = &self.board.cards;
@@ -2878,6 +2885,107 @@ mod tests {
         assert!(s.focus.is_none());
         assert_eq!(s.replans, replans + 1);
         assert!(s.pages[0].cards.contains_key("g0c0"));
+    }
+
+    /// ポップアップの間は配置(対象のカードと戻り先)を前のまま保つので、その間に別のスレッドが一覧から消えても、
+    /// 消えたスレッドを描こうとして落ちない。ポップアップは最後まで出て、終わったあとの配置に消えたスレッドは無い。
+    #[test]
+    fn a_thread_vanishing_during_a_popup_neither_panics_nor_stops_it() {
+        let now = Instant::now();
+        let mut s = AgentScreen::new((1920, 1080), false, 30);
+        let entries = nine_families();
+        let world = |entries: Vec<AgentEntry>| crate::screen::World {
+            agents: snapshot_of(entries),
+            ..Default::default()
+        };
+        s.tick(&world(entries.clone()), now);
+        assert!(s.pages.len() > 1);
+        let last = s.pages.len() - 1;
+        let target = s.pages[last]
+            .cards
+            .keys()
+            .find(|id| id.starts_with('g') && id.contains('c'))
+            .unwrap()
+            .clone();
+        s.enqueue(change_event(&target, EventKind::Changed));
+        assert!(s.activate_event(now));
+        assert_eq!(s.page, last);
+        // 今のページにある、対象でない子が一覧から消える(アーカイブ・片付け・時間切れなど)。
+        let gone = s
+            .board
+            .cards
+            .keys()
+            .find(|id| id.contains('c') && **id != target)
+            .unwrap()
+            .clone();
+        let gone_card = s.id_map[&gone];
+        let remaining: Vec<AgentEntry> = entries
+            .iter()
+            .filter(|e| e.thread_id != gone)
+            .cloned()
+            .collect();
+        let t = now + Duration::from_secs(1);
+        s.tick(&world(remaining.clone()), t);
+        assert!(!s.id_map.contains_key(&gone));
+        assert!(s.focus.is_some());
+        for step in [1u64, 2, 3] {
+            let at = now + Duration::from_secs(step);
+            let cards = render_for_test(&mut s, &snapshot_of(remaining.clone()), at);
+            assert!(cards.iter().any(|c| c.id == s.id_map[&target]), "{step}");
+            assert!(cards.iter().all(|c| c.id != gone_card), "{step}");
+        }
+        // 終わったあとに作り直され、消えたスレッドはどのページにも無い。
+        let later = now + Duration::from_secs(8);
+        s.tick(&world(remaining.clone()), later);
+        assert!(s.focus.is_none());
+        let cards = render_for_test(&mut s, &snapshot_of(remaining), later);
+        assert!(cards.iter().all(|c| c.id != gone_card));
+        assert!(s.pages.iter().all(|p| p.anchor(&gone).is_none()));
+        assert!(
+            s.arrangement
+                .groups
+                .iter()
+                .flat_map(|g| &g.entries)
+                .all(|e| e.thread_id != gone)
+        );
+    }
+
+    /// ポップアップの対象自身が消えたときは、ポップアップをやめて、待っていた次のイベントへ進む。
+    #[test]
+    fn the_popup_target_vanishing_ends_the_popup_and_the_queue_moves_on() {
+        let now = Instant::now();
+        let mut s = AgentScreen::new((1920, 1080), false, 30);
+        let entries = nine_families();
+        let world = |entries: Vec<AgentEntry>| crate::screen::World {
+            agents: snapshot_of(entries),
+            ..Default::default()
+        };
+        s.tick(&world(entries.clone()), now);
+        s.enqueue(change_event("g0c1", EventKind::Changed));
+        s.enqueue(change_event("g1c1", EventKind::Changed));
+        assert!(s.activate_event(now));
+        assert_eq!(s.focus.as_ref().unwrap().event.thread_id, "g0c1");
+        let gone_card = s.id_map["g0c1"];
+        let remaining: Vec<AgentEntry> = entries
+            .iter()
+            .filter(|e| e.thread_id != "g0c1")
+            .cloned()
+            .collect();
+        let t = now + Duration::from_secs(1);
+        s.tick(&world(remaining.clone()), t);
+        assert_eq!(s.focus.as_ref().unwrap().event.thread_id, "g1c1");
+        let cards = render_for_test(&mut s, &snapshot_of(remaining.clone()), t);
+        assert!(cards.iter().any(|c| c.id == s.id_map["g1c1"]));
+        assert!(cards.iter().all(|c| c.id != gone_card));
+        assert!(s.pages.iter().all(|p| p.anchor("g0c1").is_none()));
+        // 最後のイベントの対象が消えても、キューは空になるだけで落ちない。
+        let remaining: Vec<AgentEntry> = remaining
+            .into_iter()
+            .filter(|e| e.thread_id != "g1c1")
+            .collect();
+        s.tick(&world(remaining.clone()), t + Duration::from_secs(1));
+        assert!(s.focus.is_none() && s.queue.is_empty());
+        render_for_test(&mut s, &snapshot_of(remaining), t + Duration::from_secs(1));
     }
 
     #[test]

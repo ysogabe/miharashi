@@ -649,24 +649,51 @@ fn fit_page<'a>(
     }
     let order = hide_order(&fams);
     let rows: Vec<Vec<UnitState>> = fams.iter().map(|f| f.states.clone()).collect();
-    let hide = |fams: &mut Vec<PageFam<'a>>, k: usize| {
-        for (fam, base) in fams.iter_mut().zip(&rows) {
-            fam.states.clone_from(base);
+    match min_hidden(c, &mut fams, &rows, &order) {
+        Some((k, packed)) => {
+            hide(&mut fams, &rows, &order, k);
+            Ok(finish(c, &fams, packed))
         }
-        for &(i, u) in &order[..k] {
-            fams[i].states[u] = UnitState::Hidden;
-        }
-    };
-    hide(&mut fams, order.len());
-    let Some(mut best) = try_pack(c, &fams) else {
-        return Err(fams);
-    };
-    // 隠す数が増えるほど入りやすい。入る最小の数を二分探索する。
+        None => Err(fams),
+    }
+}
+
+/// `rows`(全部 1 行表示)から、`order` の先頭 `k` 件の単位を隠した状態にする。
+fn hide(fams: &mut [PageFam<'_>], rows: &[Vec<UnitState>], order: &[(usize, usize)], k: usize) {
+    for (fam, base) in fams.iter_mut().zip(rows) {
+        fam.states.clone_from(base);
+    }
+    for &(i, u) in &order[..k] {
+        fams[i].states[u] = UnitState::Hidden;
+    }
+}
+
+/// 二分探索で見つけた数より下を、1 つずつ確かめる回数の上限(これを超えるときは見つけた数のまま)。
+const HIDE_SCAN_MAX: usize = 256;
+
+/// 入る最小の隠す数(と、そのときの配置)。全部隠しても入らなければ None。
+/// 隠す数が多いほど入りやすいのが普通だが、「組ごと次の列へ送る」判定のせいで、隠す数を増やすと
+/// 入ったり入らなかったりすることがある(10 で入り、11 で入らず、12 で入る、など)。二分探索だけでは
+/// 余分に隠してしまうので、次のようにする。
+/// 1. 二分探索で、入る数 `hi` を見つける(入る数が見つかれば、これ以上隠す必要は無い)。
+/// 2. 面積から決まる下限(列の数 × 列の高さに、残るカードの高さと枠の余白の和が入る最小の数)`lb` を求める。
+///    これは隠す数に対して単調で、`lb` より少ない数では入らない。
+/// 3. `lb` から `hi` の手前まで、小さい方から 1 つずつ確かめ、最初に入った数を採る。
+///
+/// 確かめるのは最大 `HIDE_SCAN_MAX` 回なので、計算量は O((log n + HIDE_SCAN_MAX) · 1 回の詰め)。
+fn min_hidden(
+    c: &Ctx,
+    fams: &mut Vec<PageFam<'_>>,
+    rows: &[Vec<UnitState>],
+    order: &[(usize, usize)],
+) -> Option<(usize, Packed)> {
+    hide(fams, rows, order, order.len());
+    let mut best = try_pack(c, fams)?;
     let (mut lo, mut hi) = (1, order.len());
     while lo < hi {
         let mid = (lo + hi) / 2;
-        hide(&mut fams, mid);
-        match try_pack(c, &fams) {
+        hide(fams, rows, order, mid);
+        match try_pack(c, fams) {
             Some(packed) => {
                 hi = mid;
                 best = packed;
@@ -674,8 +701,42 @@ fn fit_page<'a>(
             None => lo = mid + 1,
         }
     }
-    hide(&mut fams, hi);
-    Ok(finish(c, &fams, best))
+    // 面積の下限。1 組は少なくとも枠 1 つ分の余白と、カード同士の隙間を持つ。隠す単位が 1 つ減るたびに、
+    // その単位のスレッドの数 × (行の高さ + 隙間)が減る(「ほか N 件」の行は数えない)。
+    let child_gap = CHILD_GAP * c.s;
+    let sizes: Vec<Vec<usize>> = fams.iter().map(|fam| unit_sizes(fam.f)).collect();
+    let mut left: f32 = fams
+        .iter()
+        .zip(rows)
+        .map(|(fam, states)| {
+            let shown: Vec<Entry> = entries_of(fam.f, states)
+                .into_iter()
+                .filter(|e| !matches!(e, Entry::More(_)))
+                .collect();
+            let sum: f32 = shown.iter().map(|e| c.entry_h(fam.f, e)).sum();
+            if fam.f.framed() {
+                sum + shown.len().saturating_sub(1) as f32 * child_gap + c.overhead()
+            } else {
+                sum
+            }
+        })
+        .sum();
+    let capacity = c.max_cols as f32 * c.fresh() + 0.5;
+    let mut lb = 0;
+    while left > capacity && lb < order.len() {
+        let (i, u) = order[lb];
+        let gap = if fams[i].f.framed() { child_gap } else { 0.0 };
+        left -= sizes[i][u] as f32 * (ROW_H * c.s + gap);
+        lb += 1;
+    }
+    let from = lb.max(1);
+    for k in from..hi.min(from + HIDE_SCAN_MAX) {
+        hide(fams, rows, order, k);
+        if let Some(packed) = try_pack(c, fams) {
+            return Some((k, packed));
+        }
+    }
+    Some((hi, best))
 }
 
 /// 1 画面に入らない組を、列の数ごとのページに分ける(2 ページ目以降の最初の枠は「続き」)。
@@ -1477,6 +1538,115 @@ mod tests {
         assert!(l.cards.contains_key("q0"));
         assert!(!l.cards.contains_key("q2046"));
         assert_eq!(l.anchor("q2046"), Some(l.cards["p"].rect));
+    }
+
+    /// 親 `{prefix}p` に実行中の子 `running` 件と静かな子 `quiet` 件の組。
+    fn project_with(prefix: &str, running: usize, quiet: usize) -> Vec<Family> {
+        let p = format!("{prefix}p");
+        let mut v = vec![node(&p, None, Tier::Running)];
+        for i in 0..running {
+            v.push(node(&format!("{prefix}r{i}"), Some(&p), Tier::Running));
+        }
+        for i in 0..quiet {
+            v.push(node(&format!("{prefix}q{i}"), Some(&p), Tier::Quiet));
+        }
+        fams(&v)
+    }
+
+    fn ctx_for(area: Rect) -> Ctx {
+        Ctx {
+            s: 1.0,
+            area,
+            max_cols: (((area.w + LANE_GAP) / (MIN_W + LANE_GAP)).floor() as usize).max(1),
+        }
+    }
+
+    /// 全部を 1 行表示にしてから、隠す数を 1 から順に確かめて、入る最小の数を求める(遅いが確実な基準)。
+    fn brute_min_hidden(c: &Ctx, projects: &[Vec<Family>]) -> Option<usize> {
+        let mut fams: Vec<PageFam> = Vec::new();
+        for (project, list) in projects.iter().enumerate() {
+            for (idx, f) in list.iter().enumerate() {
+                fams.push(PageFam {
+                    f,
+                    project,
+                    idx,
+                    states: base_states(c, f)
+                        .into_iter()
+                        .map(|s| {
+                            if s == UnitState::Card {
+                                UnitState::Row
+                            } else {
+                                s
+                            }
+                        })
+                        .collect(),
+                });
+            }
+        }
+        // 隠さなくても入るなら、fit_page は隠す段まで来ない。
+        if try_pack(c, &fams).is_some() {
+            return None;
+        }
+        let order = hide_order(&fams);
+        let rows: Vec<Vec<UnitState>> = fams.iter().map(|f| f.states.clone()).collect();
+        let found = min_hidden(c, &mut fams, &rows, &order).map(|(k, _)| k);
+        let brute = (1..=order.len()).find(|&k| {
+            hide(&mut fams, &rows, &order, k);
+            try_pack(c, &fams).is_some()
+        });
+        assert_eq!(found, brute, "二分探索の結果が最小の数と違う");
+        brute
+    }
+
+    #[test]
+    fn hiding_stops_at_the_smallest_count_that_fits_even_when_fitting_is_not_monotone() {
+        // 1920x1080 の盤面に、静かな子の多い 3 つのプロジェクト。隠す数が 10 で入り、11 で入らず、12 で入る形。
+        let area = Rect {
+            x: 32.0,
+            y: 212.0,
+            w: 1856.0,
+            h: 788.0,
+        };
+        let projects = vec![
+            project_with("a", 0, 12),
+            project_with("b", 0, 18),
+            project_with("c", 2, 4),
+        ];
+        let c = ctx_for(area);
+        let brute = brute_min_hidden(&c, &projects).expect("隠せば入る");
+        let pages = plan_board(area, 1.0, &projects);
+        assert_eq!(pages.len(), 1);
+        let hidden: usize = pages[0].families.iter().map(|f| f.hidden_ids.len()).sum();
+        let total: usize = projects.iter().flatten().map(|f| f.members.len()).sum();
+        assert_eq!(pages[0].cards.len() + hidden, total);
+        // 静かな子は 1 件ずつが単位なので、隠したスレッドの数は隠した単位の数と同じ。
+        assert_eq!(hidden, brute);
+    }
+
+    #[test]
+    fn hiding_matches_the_brute_force_minimum_on_varied_boards() {
+        let mut seed = 12345u64;
+        let mut rnd = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let mut checked = 0;
+        for w in [1856.0f32, 2496.0, 900.0, 400.0] {
+            let area = Rect { w, ..AREA };
+            let c = ctx_for(area);
+            for _ in 0..300 {
+                let projects: Vec<Vec<Family>> = (0..1 + rnd(8))
+                    .map(|i| project_with(&format!("p{i}"), rnd(6) as usize, rnd(100) as usize))
+                    .collect();
+                // brute_min_hidden の中で、探索の結果が 1 つずつ確かめた最小の数と同じか確かめる。
+                if brute_min_hidden(&c, &projects).is_some() {
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 200, "{checked}");
     }
 
     /// 件数に対する配置計算の時間を測る。
