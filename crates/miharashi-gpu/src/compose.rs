@@ -93,9 +93,26 @@ pub struct AgentGpuCard<'a> {
     pub alpha: f32,
 }
 
-/// 1 フレームに描く Agent の面の数の上限。親子グループの枠・接続線・見出しも面として数える
-/// (同じ色の線は 1 枚のテクスチャを使い回すので、テクスチャの数はこれより少ない)。
-const AGENT_CACHE: usize = 256;
+/// 1 フレームに描く Agent の面の数の上限。親子グループの枠・接続線・見出しも 1 回の描画として数える。
+/// 同じ色の枠・線は 1 枚のテクスチャを使い回すので、描画の数はテクスチャの数よりずっと多くなる。
+const AGENT_DRAWS: usize = 2048;
+/// 1 フレームに使う Agent のテクスチャ(面の id の種類)の上限。使っていないテクスチャは毎フレーム捨てる。
+const AGENT_TEXTURES: usize = 512;
+
+/// `ids`(描く順の面の id)のうち、描く範囲の先頭の位置を返す。上限を超えるときは描く順の前
+/// (親子グループの枠・線)から捨て、カード、ポップアップの順に残す。
+fn agent_draw_start(ids: &[u64]) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    let mut start = ids.len();
+    for (i, id) in ids.iter().enumerate().rev() {
+        if ids.len() - i > AGENT_DRAWS || (!seen.contains(id) && seen.len() >= AGENT_TEXTURES) {
+            break;
+        }
+        seen.insert(*id);
+        start = i;
+    }
+    start
+}
 struct AgentTexture {
     id: u64,
     revision: u64,
@@ -481,8 +498,9 @@ impl Compositor {
                 gl.disable(glow::BLEND);
             }
         }
-        let live: std::collections::HashSet<u64> =
-            cards.iter().take(AGENT_CACHE).map(|c| c.id).collect();
+        let ids: Vec<u64> = cards.iter().map(|c| c.id).collect();
+        let cards = &cards[agent_draw_start(&ids)..];
+        let live: std::collections::HashSet<u64> = cards.iter().map(|c| c.id).collect();
         let mut index = 0;
         while index < self.agent_cards.len() {
             if !live.contains(&self.agent_cards[index].id) {
@@ -493,7 +511,7 @@ impl Compositor {
                 index += 1;
             }
         }
-        for card in cards.iter().take(AGENT_CACHE) {
+        for card in cards {
             if card.size.0 == 0
                 || card.size.1 == 0
                 || card.pixels.len() != card.size.0 as usize * card.size.1 as usize * 4
@@ -652,5 +670,39 @@ impl Compositor {
         }
         self.scene.destroy(gl);
         self.builder.destroy(gl);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn many_decorations_do_not_push_out_cards_or_the_popup() {
+        // 枠・線 288 面(同じ色は同じ id)→ カード 40 枚 → ポップアップ。全部描く。
+        let mut ids: Vec<u64> = (0..288).map(|i| 1 + i % 3).collect();
+        ids.extend(100..140);
+        ids.push(999);
+        assert_eq!(agent_draw_start(&ids), 0);
+    }
+
+    #[test]
+    fn over_the_draw_limit_decorations_go_first() {
+        let mut ids: Vec<u64> = (0..AGENT_DRAWS as u64 * 2).map(|i| 1 + i % 3).collect();
+        ids.extend(100..140);
+        ids.push(999);
+        let start = agent_draw_start(&ids);
+        assert_eq!(ids.len() - start, AGENT_DRAWS);
+        assert_eq!(*ids[start..].last().unwrap(), 999);
+        assert!((100..140).all(|id| ids[start..].contains(&id)));
+    }
+
+    #[test]
+    fn over_the_texture_limit_the_earliest_surfaces_go_first() {
+        let ids: Vec<u64> = (1..=AGENT_TEXTURES as u64 + 100).collect();
+        let start = agent_draw_start(&ids);
+        assert_eq!(start, 100);
+        assert_eq!(ids.len() - start, AGENT_TEXTURES);
+        assert_eq!(agent_draw_start(&[]), 0);
     }
 }
