@@ -216,6 +216,201 @@ pub fn demo_wall() -> chrono::DateTime<chrono::Local> {
     crate::video::wall_start()
 }
 
+/// 子のスレッド。`parent` は (親のスレッド ID, 親のタイトル)。
+fn child_entry(
+    project: &str,
+    id: &str,
+    title: &str,
+    state: AgentState,
+    parent: (&str, &str),
+) -> AgentEntry {
+    let mut e = project_entry(project, id, title, state);
+    e.parent_thread_id = Some(parent.0.into());
+    e.parent_title = Some(parent.1.into());
+    e.provider = Some("Claude".into());
+    e.model = Some("Sonnet".into());
+    e.has_pending_approvals = state == AgentState::Approval;
+    e.has_pending_user_input = state == AgentState::Input;
+    e
+}
+
+/// 親 1・子 6(承認待ち 1、実行中 1、応答完了 4)・孫 1 の親子グループと、単独スレッド、「親情報なし」の子 1。
+fn family_snapshot(base: &AgentSnapshot) -> AgentSnapshot {
+    const PARENT: (&str, &str) = ("fam-parent", "エージェント画面の改善");
+    let mut entries = vec![project_entry(
+        "agents",
+        PARENT.0,
+        PARENT.1,
+        AgentState::Running,
+    )];
+    for (id, title, state) in [
+        ("fam-c-impl", "親子カードの配置", AgentState::Approval),
+        ("fam-c-review", "描画と表示件数の確認", AgentState::Running),
+        ("fam-c-r1", "親子関係の取得を調査", AgentState::Completed),
+        ("fam-c-r2", "既存のレイアウトを調査", AgentState::Completed),
+        ("fam-c-v1", "画像の比較", AgentState::Completed),
+        ("fam-c-v2", "小さい画面での確認", AgentState::Completed),
+    ] {
+        entries.push(child_entry("agents", id, title, state, PARENT));
+    }
+    entries.push(child_entry(
+        "agents",
+        "fam-g-color",
+        "色のコントラストを確認",
+        AgentState::Running,
+        ("fam-c-review", "描画と表示件数の確認"),
+    ));
+    entries.push(project_entry(
+        "photos",
+        "fam-solo-1",
+        "写真の並べ替え",
+        AgentState::Running,
+    ));
+    entries.push(project_entry(
+        "photos",
+        "fam-solo-2",
+        "画像の取得処理を確認",
+        AgentState::Completed,
+    ));
+    entries.push(project_entry(
+        "photos",
+        "fam-solo-3",
+        "説明文の更新",
+        AgentState::Idle,
+    ));
+    entries.push(child_entry(
+        "docs",
+        "fam-orphan",
+        "月次の集計表を作る",
+        AgentState::Running,
+        ("fam-gone", "月次レポートの整理"),
+    ));
+    AgentSnapshot {
+        entries: entries.into(),
+        changes: Vec::new().into(),
+        ..base.clone()
+    }
+}
+
+/// 子が多すぎて「ほか N 件」と巡回が起きる場面。
+fn family_many_snapshot(base: &AgentSnapshot) -> AgentSnapshot {
+    const POOL: [&str; 12] = [
+        "設定の確認",
+        "ログの整理",
+        "型の見直し",
+        "テストの追加",
+        "文言の修正",
+        "画像の差し替え",
+        "依存の更新",
+        "計測の再実行",
+        "配線図の更新",
+        "色の調整",
+        "一覧の並び順",
+        "軌跡の長さ",
+    ];
+    let mut entries = Vec::new();
+    // (プロジェクト, 親の題名, 承認待ちの子, 実行中の子, 静かな子)
+    let parents = [
+        ("agents", "エージェント画面の改善", 1, 2, 14),
+        ("agents", "設定画面の作り直し", 0, 1, 12),
+        ("photos", "写真の取り込みを速くする", 0, 2, 9),
+        ("photos", "アルバムの並びを直す", 0, 0, 11),
+        ("device", "センサーの値を滑らかにする", 0, 1, 7),
+        ("device", "配線図と実機の突き合わせ", 1, 0, 8),
+        ("docs", "使い方の文章を見直す", 0, 0, 6),
+        ("docs", "紹介動画の差し替え", 0, 1, 5),
+    ];
+    for (n, (project, title, ask, run, quiet)) in parents.into_iter().enumerate() {
+        let pid = format!("many-{n}");
+        entries.push(project_entry(project, &pid, title, AgentState::Running));
+        let parent = (pid.as_str(), title);
+        for i in 0..ask {
+            entries.push(child_entry(
+                project,
+                &format!("{pid}-a{i}"),
+                POOL[i % POOL.len()],
+                AgentState::Approval,
+                parent,
+            ));
+        }
+        for i in 0..run {
+            entries.push(child_entry(
+                project,
+                &format!("{pid}-r{i}"),
+                POOL[(i + 3) % POOL.len()],
+                AgentState::Running,
+                parent,
+            ));
+        }
+        for i in 0..quiet {
+            entries.push(child_entry(
+                project,
+                &format!("{pid}-q{i}"),
+                POOL[(i + n) % POOL.len()],
+                if i % 5 == 4 {
+                    AgentState::Idle
+                } else {
+                    AgentState::Completed
+                },
+                parent,
+            ));
+        }
+    }
+    for i in 0..6 {
+        entries.push(project_entry(
+            "tools",
+            &format!("many-solo-{i}"),
+            POOL[(i * 2) % POOL.len()],
+            if i == 0 {
+                AgentState::Running
+            } else {
+                AgentState::Idle
+            },
+        ));
+    }
+    AgentSnapshot {
+        entries: entries.into(),
+        changes: Vec::new().into(),
+        ..base.clone()
+    }
+}
+
+/// 「ほか N 件」にまとめられた子が、応答完了から待機に変わったところ(静かなままなのでまとめられたまま)。
+fn collapsed_child_snapshot(
+    base: &AgentSnapshot,
+    id: &str,
+    wall: SystemTime,
+    mono: Instant,
+) -> AgentSnapshot {
+    let at = Duration::from_secs(60);
+    let mut entries = base.entries.to_vec();
+    let mut title = String::new();
+    if let Some(e) = entries.iter_mut().find(|e| e.thread_id == id) {
+        e.state = AgentState::Idle;
+        title = e.title.clone();
+    }
+    AgentSnapshot {
+        entries: entries.into(),
+        change_cursor: base.change_cursor + 1,
+        last_success: Some(wall + at),
+        last_success_mono: Some(mono + at),
+        changes: vec![AgentChange {
+            id: base.change_cursor + 1,
+            thread_id: id.into(),
+            kind: AgentChangeKind::State,
+            before_state: Some(AgentState::Completed),
+            after_state: Some(AgentState::Idle),
+            before_goal: None,
+            after_goal: None,
+            before_title: Some(title.clone()),
+            after_title: Some(title),
+            observed_at: wall + at,
+        }]
+        .into(),
+        ..base.clone()
+    }
+}
+
 /// Many threads in a few projects, to review stacking without a live server.
 fn busy_snapshot(base: &AgentSnapshot) -> AgentSnapshot {
     let mut entries = Vec::new();
@@ -385,6 +580,70 @@ pub fn write_fixtures(
         text,
         size,
     )?;
+
+    let mut family_screen = AgentScreen::new(size, false, stale_secs);
+    family_screen.on_enter(changed_at);
+    let family_world = World {
+        agents: family_snapshot(&changed),
+        ..World::default()
+    };
+    save(
+        &mut family_screen,
+        &family_world,
+        changed_at,
+        "agents-family",
+        out,
+        text,
+        size,
+    )?;
+
+    // 子が多すぎる場面: 「ほか N 件」と、15 秒ごとの自動巡回(要確認の組が最初のページ)。
+    let mut many_screen = AgentScreen::new(size, false, stale_secs);
+    many_screen.on_enter(changed_at);
+    let many = family_many_snapshot(&changed);
+    let mut many_world = World {
+        agents: many.clone(),
+        ..World::default()
+    };
+    save(
+        &mut many_screen,
+        &many_world,
+        changed_at,
+        "agents-family-many",
+        out,
+        text,
+        size,
+    )?;
+    for page in 2..=3 {
+        let at = changed_at + Duration::from_secs(16 * (page - 1));
+        many_world.agents.last_success = Some(wall + Duration::from_secs(7 + 16 * (page - 1)));
+        many_world.agents.last_success_mono = Some(at);
+        save(
+            &mut many_screen,
+            &many_world,
+            at,
+            &format!("agents-family-many-p{page}"),
+            out,
+            text,
+            size,
+        )?;
+    }
+    // 「ほか N 件」にまとめた子の変更は、親のカードを元位置にしてポップアップする。
+    let hidden_id = "many-0-q13";
+    many_world.agents = collapsed_child_snapshot(&many, hidden_id, wall, changed_at);
+    many_screen.on_enter(changed_at + Duration::from_secs(60));
+    let pop_at = changed_at + Duration::from_secs(60);
+    for (i, seconds) in [0.0f32, 0.35, 2.0].iter().enumerate() {
+        save(
+            &mut many_screen,
+            &many_world,
+            pop_at + Duration::from_secs_f32(*seconds),
+            &format!("agents-family-hidden-{i:02}"),
+            out,
+            text,
+            size,
+        )?;
+    }
 
     let mut stale = changed.clone();
     stale.connection = AgentConnection::Retrying;
