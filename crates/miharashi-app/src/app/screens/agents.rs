@@ -1,6 +1,7 @@
 //! 操作不要の T3 Agent カードボード。ボードは 1 枚で、スレッドはプロジェクトごとの枠にまとめる。
 mod layout;
 
+use self::layout::family::{self, Node, Tier};
 use crate::agents::{AgentChangeKind, AgentConnection, AgentEntry, AgentSnapshot};
 use crate::screen::{Composite, Outcome, RenderContext, Screen, ScreenAction, ScreenId};
 use miharashi_render::agents as draw;
@@ -77,9 +78,19 @@ impl PoseTween {
 }
 
 /// 1 つのプロジェクトのスレッド。重要な順に並ぶ。
+#[derive(Clone)]
 struct Group {
     label: String,
     entries: Vec<AgentEntry>,
+}
+
+/// 表示するスレッドを、プロジェクトごとの親子グループにまとめたもの。
+/// 子は親のプロジェクトの枠に入る(子の projectId が違っても)。
+#[derive(Clone, Default)]
+struct Arrangement {
+    groups: Vec<Group>,
+    /// `groups` と同じ順のプロジェクトごとに、親子グループ(重要な順)。
+    families: Vec<Vec<family::Family>>,
 }
 
 pub struct AgentScreen {
@@ -96,7 +107,12 @@ pub struct AgentScreen {
     next_seen: u64,
     last_activity: HashMap<String, Instant>,
     poses: HashMap<String, PoseTween>,
+    /// いま表示しているページの配置。
     board: layout::Layout,
+    arrangement: Arrangement,
+    pages: Vec<layout::Layout>,
+    pages_dirty: bool,
+    page: usize,
     goal_notified: HashMap<String, Instant>,
     stale: bool,
     overflow_updates: usize,
@@ -141,6 +157,10 @@ impl AgentScreen {
             last_activity: HashMap::new(),
             poses: HashMap::new(),
             board: layout::Layout::default(),
+            arrangement: Arrangement::default(),
+            pages: Vec::new(),
+            pages_dirty: true,
+            page: 0,
             goal_notified: HashMap::new(),
             stale: false,
             overflow_updates: 0,
@@ -377,6 +397,7 @@ impl AgentScreen {
             self.change_cursor = self.change_cursor.max(snap.change_cursor);
         }
         self.entries = entries;
+        self.pages_dirty = true;
         self.last_snapshot = snap.clone();
         if redraw {
             self.background_dirty = true;
@@ -465,54 +486,94 @@ impl AgentScreen {
             })
     }
 
-    /// プロジェクトを初めて見た順に並べ、各枠の中を重要な順に並べる。
-    fn groups(&self) -> Vec<Group> {
-        let mut groups: Vec<(u64, &str, Group)> = Vec::new();
-        for e in &self.entries {
-            if let Some((_, _, g)) = groups.iter_mut().find(|(_, id, _)| *id == e.project_id) {
-                g.entries.push(e.clone());
-            } else {
-                let label = if e.project_title.is_empty() {
-                    short(&e.project_id)
-                } else {
-                    e.project_title.clone()
-                };
-                groups.push((
+    /// 親子グループにまとめ、プロジェクトを初めて見た順に並べる。各枠の中は重要な順。
+    /// 子は親のプロジェクトの枠に入り、親が一覧に無い子は親ごとの「親情報なし」の組になる。
+    fn arrange(&self) -> Arrangement {
+        let mut sorted: Vec<&AgentEntry> = self.entries.iter().collect();
+        sorted.sort_by(|a, b| self.rank(a, b));
+        let nodes: Vec<Node> = sorted
+            .iter()
+            .map(|e| Node {
+                id: e.thread_id.clone(),
+                parent: e.parent_thread_id.clone(),
+                tier: tier_of(e),
+            })
+            .collect();
+        let mut projects: Vec<(u64, &str, Vec<family::Family>)> = Vec::new();
+        for f in family::build_families(&nodes) {
+            let lead = sorted[f.lead];
+            match projects
+                .iter_mut()
+                .find(|(_, id, _)| *id == lead.project_id)
+            {
+                Some((_, _, v)) => v.push(f),
+                None => projects.push((
                     self.project_seen
-                        .get(&e.project_id)
+                        .get(&lead.project_id)
                         .copied()
                         .unwrap_or(u64::MAX),
-                    &e.project_id,
-                    Group {
-                        label,
-                        entries: vec![e.clone()],
-                    },
-                ));
+                    &lead.project_id,
+                    vec![f],
+                )),
             }
         }
-        groups.sort_by_key(|(seq, _, _)| *seq);
-        groups
-            .into_iter()
-            .map(|(_, _, mut g)| {
-                g.entries.sort_by(|a, b| self.rank(a, b));
-                g
-            })
-            .collect()
+        projects.sort_by_key(|(seq, _, _)| *seq);
+        let mut out = Arrangement::default();
+        for (_, id, families) in projects {
+            let mut ranks: Vec<usize> = families
+                .iter()
+                .flat_map(|f| f.members.iter().map(|m| m.rank))
+                .collect();
+            ranks.sort_unstable();
+            let first = sorted.iter().find(|e| e.project_id == id);
+            let label = match first {
+                Some(e) if !e.project_title.is_empty() => e.project_title.clone(),
+                _ => short(id),
+            };
+            out.groups.push(Group {
+                label,
+                entries: ranks.into_iter().map(|r| sorted[r].clone()).collect(),
+            });
+            out.families.push(families);
+        }
+        out
     }
 
-    fn layout(&self, groups: &[Group]) -> layout::Layout {
+    #[cfg(test)]
+    fn groups(&self) -> Vec<Group> {
+        self.arrange().groups
+    }
+
+    fn board_area(&self) -> layout::Rect {
         let (w, h) = (self.size.0 as f32, self.size.1 as f32);
-        let area = layout::Rect {
+        layout::Rect {
             x: 32.0,
             y: BOARD_TOP,
             w: w - 64.0,
             h: h - BOARD_TOP - BOARD_BOTTOM_MARGIN,
-        };
-        let ids = groups
-            .iter()
-            .map(|g| g.entries.iter().map(|e| e.thread_id.clone()).collect())
-            .collect::<Vec<Vec<String>>>();
-        layout::layout(area, self.scale(), &ids)
+        }
+    }
+
+    /// 取得結果が変わったときだけ、親子グループとページごとの配置を作り直す。
+    fn ensure_pages(&mut self) {
+        if !self.pages_dirty && !self.pages.is_empty() {
+            return;
+        }
+        self.pages_dirty = false;
+        self.arrangement = self.arrange();
+        self.pages =
+            family::plan_board(self.board_area(), self.scale(), &self.arrangement.families);
+        self.page = self.page.min(self.pages.len().saturating_sub(1));
+        let board = self.pages[self.page].clone();
+        if board != self.board {
+            self.board = board;
+            self.background_dirty = true;
+        }
+    }
+
+    #[cfg(test)]
+    fn layout(&self, arrangement: &Arrangement) -> Vec<layout::Layout> {
+        family::plan_board(self.board_area(), self.scale(), &arrangement.families)
     }
 
     fn activate_event(&mut self, now: Instant) -> bool {
@@ -548,7 +609,8 @@ impl AgentScreen {
                 .saturating_add(count.saturating_sub(1));
             self.background_dirty = true;
         }
-        let board = self.layout(&self.groups());
+        self.ensure_pages();
+        let board = &self.board;
         let pos = self
             .queue
             .iter()
@@ -610,12 +672,8 @@ impl AgentScreen {
     fn render_scene(&mut self, ctx: &mut RenderContext<'_>, composite_cpu: bool) {
         let snap = self.last_snapshot.clone();
         let now = self.last_now;
-        let groups = self.groups();
-        let board = self.layout(&groups);
-        if board != self.board {
-            self.board = board;
-            self.background_dirty = true;
-        }
+        self.ensure_pages();
+        let groups = self.arrangement.groups.clone();
         if self.background_dirty || self.background.is_none() {
             let mut bg = Canvas::new(self.size.0, self.size.1);
             draw_background(
@@ -1302,6 +1360,15 @@ fn fit_header_label(value: &str, max_width: f32, font_size: f32) -> String {
     result.push('…');
     result
 }
+fn tier_of(e: &AgentEntry) -> Tier {
+    if attention(e) {
+        Tier::Attention
+    } else if running(e) {
+        Tier::Running
+    } else {
+        Tier::Quiet
+    }
+}
 fn attention(e: &AgentEntry) -> bool {
     e.has_pending_approvals
         || e.has_pending_user_input
@@ -1595,7 +1662,7 @@ mod tests {
         let groups = s.groups();
         assert_eq!(groups.len(), 3);
         assert_eq!(groups.iter().map(|g| g.entries.len()).sum::<usize>(), 13);
-        let board = s.layout(&groups);
+        let board = s.layout(&s.arrange()).remove(0);
         assert_eq!(board.cards.len(), 13);
         let lane_of = |id: &str| {
             let x = board.cards[id].rect.x;
@@ -1619,7 +1686,7 @@ mod tests {
         s.sync(&snap, now);
         assert_eq!(s.seen.len(), 13);
         assert!((0..6).all(|i| !s.seen.contains_key(&format!("a{i}"))));
-        assert_eq!(s.layout(&s.groups()).cards.len(), 13);
+        assert_eq!(s.layout(&s.arrange())[0].cards.len(), 13);
     }
     #[test]
     fn attention_comes_first_in_its_project_then_running_then_recent() {
