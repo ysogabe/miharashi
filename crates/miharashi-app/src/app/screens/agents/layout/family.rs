@@ -11,7 +11,10 @@
 //!    下限 `SHRINK_FLOOR`)。小さい scale では最小幅も小さくなり、列が増える。
 //! 5. 下限の scale でも入らないとき(要確認の子が非常に多いなど)の最後の手段は、列を縦に仮想的に伸ばして
 //!    詰め、できた列を画面の高さに縮めること(`overlap_fit`)。カードは高さを保ったまま重なり、要確認は
-//!    手前に出る。ページには分けず、要確認のカードを画面の外に置くことも、欠落させることもしない。
+//!    手前に出る。縮めるのはカードが連なる間隔だけで、見出しと「ほか N 件」の行は縮めない。
+//!    ページには分けず、要確認のカードを画面の外に置くことも、欠落させることもしない。
+//! 6. ただし GLES の合成の上限(面・テクスチャ)を超える枚数は 1 枚に出せないので、配置が上限を超えるときは
+//!    重要でない方(その他 → 実行中 → 要確認)から「ほか N 件」にまとめてやり直す(`plan_board`、`cut_order`)。
 use super::{
     CARD_H, CardMode, CardSlot, GAP, LANE_FOOT, LANE_GAP, LANE_HEAD, LANE_PAD, Lane, Layout, MAX_W,
     MIN_W, Rect, layout,
@@ -73,12 +76,17 @@ pub struct Family {
     pub lead: usize,
     /// 1 行表示・集約の単位の数。
     pub units: usize,
+    /// 表示の予算(`SurfaceBudget`)のために「ほか N 件」へ回したスレッドの ID。`build_families` は空で作り、
+    /// `plan_board` が配置のためにだけ詰める。
+    pub cut_ids: Vec<String>,
+    /// `cut_ids` のうち、要確認のスレッドの数。
+    pub cut_attention: usize,
 }
 
 impl Family {
     /// 枠と接続線を付ける組か。
     pub fn framed(&self) -> bool {
-        self.members.len() > 1 || self.orphan_of.is_some()
+        self.members.len() > 1 || self.orphan_of.is_some() || !self.cut_ids.is_empty()
     }
     /// 組の中で最も重要なスレッドの位置。
     pub fn best(&self) -> usize {
@@ -203,27 +211,7 @@ fn make_family(
             stack.push((c, depth.saturating_add(1), Some(at)));
         }
     }
-    // 静かな部分木(自分と子孫が全員 Quiet)。親(深さ 0)は縮めも隠しもしない。
-    let mut quiet: Vec<bool> = members.iter().map(|m| m.tier == Tier::Quiet).collect();
-    for m in (0..members.len()).rev() {
-        if !quiet[m]
-            && let Some(p) = members[m].parent
-        {
-            quiet[p] = false;
-        }
-    }
-    // 単位の番号。親が単位に入っていない静かな子から新しい単位を始め、その子孫は同じ単位に入る。
-    let mut units = 0;
-    for m in 0..members.len() {
-        if !quiet[m] || (members[m].depth == 0 && orphan_of.is_none()) {
-            continue;
-        }
-        let inherited = members[m].parent.and_then(|p| members[p].unit);
-        members[m].unit = inherited.or_else(|| {
-            units += 1;
-            Some(units - 1)
-        });
-    }
+    let units = assign_units(&mut members, orphan_of.is_some());
     let lead = if orphan_of.is_some() {
         members.iter().map(|m| m.rank).min().unwrap_or(0)
     } else {
@@ -234,7 +222,35 @@ fn make_family(
         orphan_of,
         lead,
         units,
+        cut_ids: Vec::new(),
+        cut_attention: 0,
     }
+}
+
+/// 静かな部分木(自分と子孫が全員 Quiet)に単位の番号を振り、単位の数を返す。親(深さ 0)は縮めも隠しもしない。
+/// 親が単位に入っていない静かな子から新しい単位を始め、その子孫は同じ単位に入る。
+fn assign_units(members: &mut [Member], orphan: bool) -> usize {
+    let mut quiet: Vec<bool> = members.iter().map(|m| m.tier == Tier::Quiet).collect();
+    for m in (0..members.len()).rev() {
+        if !quiet[m]
+            && let Some(p) = members[m].parent
+        {
+            quiet[p] = false;
+        }
+    }
+    let mut units = 0;
+    for m in 0..members.len() {
+        members[m].unit = None;
+        if !quiet[m] || (members[m].depth == 0 && !orphan) {
+            continue;
+        }
+        let inherited = members[m].parent.and_then(|p| members[p].unit);
+        members[m].unit = inherited.or_else(|| {
+            units += 1;
+            Some(units - 1)
+        });
+    }
+    units
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,7 +312,7 @@ impl Ctx {
 /// 組の中身を、単位ごとの表示(カード・1 行・隠す)に従って並べる。
 fn entries_of(f: &Family, states: &[UnitState]) -> Vec<Entry> {
     let mut out = Vec::with_capacity(f.members.len() + 1);
-    let mut hidden = 0;
+    let mut hidden = f.cut_ids.len();
     for (m, mem) in f.members.iter().enumerate() {
         match mem.unit.map(|u| states[u]) {
             Some(UnitState::Hidden) => hidden += 1,
@@ -573,8 +589,12 @@ fn base_states(c: &Ctx, f: &Family) -> Vec<UnitState> {
             }
         })
         .sum();
+    // 予算で「ほか N 件」にしたスレッドがいれば、その行はもう数えてある。
+    let mut counted = !f.cut_ids.is_empty();
+    if counted {
+        total += MORE_LINE * s + gap;
+    }
     let capacity = c.max_cols as f32 * (c.fresh() - c.overhead() + gap);
-    let mut counted = false;
     for u in (0..f.units).rev() {
         if total <= capacity {
             break;
@@ -749,12 +769,13 @@ const TALL_GROWTH: f32 = 1.25;
 /// 入りきらない盤面を、重ねて必ず 1 枚に収める最後の手段。
 /// 列の高さを仮想的に伸ばして(`max_cols` 列に収まるまで)通常どおり詰め、列ごとに縦の位置を
 /// 画面の高さに縮める。カードの高さは変えないので、縮めた列ではカードが上下に重なる。
+/// 縮めるのはカードが連なっている間隔だけで、プロジェクトと組の見出しの領域は縮めない(`Squash`)。
 /// 重なったカードは `Strip`(上端の 1 行だけが見える)にし、要確認 → 実行中 → その他の順に手前に出す。
 /// 組の枠・見出し・「ほか N 件」も同じ縮め方で置くので、隠した子の置き場(`Layout::anchor`)も残る。
 fn overlap_fit(c: &Ctx, fams: &[PageFam<'_>]) -> Layout {
     let first = pack(c, fams, false, usize::MAX);
     let mut tall = c.area.h * first.cols.div_ceil(c.max_cols).max(1) as f32;
-    let (packed, factors) = loop {
+    let (packed, squash) = loop {
         let virt = Ctx {
             s: c.s,
             area: Rect { h: tall, ..c.area },
@@ -762,41 +783,106 @@ fn overlap_fit(c: &Ctx, fams: &[PageFam<'_>]) -> Layout {
         };
         let packed = pack(&virt, fams, false, c.max_cols);
         if !packed.over || tall > 1.0e15 {
-            let factors = squash_factors(c, fams, &packed);
-            break (packed, factors);
+            let squash = squash_columns(c, fams, &packed);
+            break (packed, squash);
         }
         tall *= TALL_GROWTH;
     };
-    finish(c, fams, packed, &factors)
+    finish(c, fams, packed, &squash)
 }
 
-/// 列ごとの縮め率。仮想の列で決めた縦の位置に掛けて、どのカードの下端も画面の内側に収める(1 なら縮めない)。
-fn squash_factors(c: &Ctx, fams: &[PageFam<'_>], packed: &Packed) -> Vec<f32> {
+/// 重ねた列の、仮想の縦の位置(列の上端から)と画面の位置(領域の上端から)の対応。
+/// `runs` は縮める間隔(仮想の位置の区間)で、1 つの組の最初のカードの上端から最後のカードの上端まで、
+/// または見出しを挟まずに並ぶ単独カードの最初から最後まで。それ以外(見出し・余白・各区間の最後のカードの高さ)は
+/// 縮めないので、見出しは前の区間のカードに覆われず、組の最初のカードは自分の見出しの下に出る。
+struct Squash {
+    f: f32,
+    runs: Vec<(f32, f32)>,
+}
+
+impl Squash {
+    fn squashed(&self) -> bool {
+        self.f < 1.0
+    }
+
+    /// 仮想の縦の位置 `y` の画面での位置。
+    fn at(&self, y: f32) -> f32 {
+        y - (1.0 - self.f) * self.span(y)
+    }
+
+    /// `y` より上にある、縮める間隔の長さの合計。
+    fn span(&self, y: f32) -> f32 {
+        self.runs
+            .iter()
+            .map(|&(a, b)| (y.min(b) - a).max(0.0))
+            .sum()
+    }
+
+    /// どのカード(仮想の上端と高さ)の下端も `limit` に収まる最大の縮め率。縮める間隔だけでは足りなければ None。
+    fn solve(&self, cards: &[(f32, f32)], limit: f32) -> Option<f32> {
+        let mut f = 1.0f32;
+        for &(y, h) in cards {
+            let excess = y + h - limit;
+            if excess <= 0.0 {
+                continue;
+            }
+            let span = self.span(y);
+            if span <= 0.0 {
+                return None;
+            }
+            f = f.min(1.0 - excess / span);
+        }
+        (f >= 0.0).then_some(f)
+    }
+}
+
+/// 列ごとの縮め方。どのカードの下端も画面の内側に収める(収まる列は縮めない)。
+/// 見出しの領域を除いても収まらない列は、見出しも含めて一様に縮める(カードを領域の外へ出さないことを優先する)。
+fn squash_columns(c: &Ctx, fams: &[PageFam<'_>], packed: &Packed) -> Vec<Squash> {
     let limit = c.area.h - c.foot();
-    let mut factors = vec![1.0f32; packed.cols];
+    let mut runs: Vec<Vec<(f32, f32)>> = vec![Vec::new(); packed.cols];
+    let mut cards: Vec<Vec<(f32, f32)>> = vec![Vec::new(); packed.cols];
     for seg in &packed.segs {
         let col = seg.col.min(packed.cols.saturating_sub(1));
+        // 見出しを挟まずに並ぶ単独カードの、最初と最後の上端。
+        let mut solo: Option<(f32, f32)> = None;
         for piece in &seg.pieces {
             let f = fams[piece.fam].f;
-            let mut spans: Vec<(f32, f32)> = Vec::new();
-            if piece.framed {
-                let mut y = piece.y + (FAM_PAD + FAM_HEAD) * c.s;
-                for e in &piece.entries {
-                    let h = c.entry_h(f, e);
-                    spans.push((y, h));
-                    y += h + CHILD_GAP * c.s;
-                }
-            } else {
-                spans.push((piece.y, piece.h));
+            if !piece.framed {
+                cards[col].push((piece.y, piece.h));
+                solo = Some(solo.map_or((piece.y, piece.y), |(a, _)| (a, piece.y)));
+                continue;
             }
-            for (y, h) in spans {
-                if y > 0.0 {
-                    factors[col] = factors[col].min(((limit - h) / y).max(0.0));
+            runs[col].extend(solo.take());
+            let mut y = piece.y + (FAM_PAD + FAM_HEAD) * c.s;
+            let (first, mut last) = (y, y);
+            for e in &piece.entries {
+                let h = c.entry_h(f, e);
+                cards[col].push((y, h));
+                // 「ほか N 件」の行は縮めない(直前のカードがかぶらないよう、区間は最後のメンバーまで)。
+                if matches!(e, Entry::Member { .. }) {
+                    last = y;
                 }
+                y += h + CHILD_GAP * c.s;
             }
+            runs[col].push((first, last));
         }
+        runs[col].extend(solo.take());
     }
-    factors
+    (0..packed.cols)
+        .map(|col| {
+            let mut sq = Squash {
+                f: 1.0,
+                runs: std::mem::take(&mut runs[col]),
+            };
+            sq.runs.retain(|&(a, b)| b > a);
+            sq.f = sq.solve(&cards[col], limit).unwrap_or_else(|| {
+                sq.runs = vec![(0.0, f32::MAX)];
+                sq.solve(&cards[col], limit).unwrap_or(0.0)
+            });
+            sq
+        })
+        .collect()
 }
 
 /// 重ねた列で、上に別のカードが載って隠れるカードを `Strip` にする(`placed` は (ID, 列))。
@@ -826,8 +912,8 @@ fn mark_covered(out: &mut Layout, placed: &[(String, usize)]) {
     }
 }
 
-/// 詰めた結果を座標にする。`factors` は列ごとの縦の縮め率(`overlap_fit` だけが 1 未満を渡す)。
-fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed, factors: &[f32]) -> Layout {
+/// 詰めた結果を座標にする。`squash` は列ごとの縦の縮め方(`overlap_fit` だけが縮める列を渡す)。
+fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed, squash: &[Squash]) -> Layout {
     let s = c.s;
     let mut out = Layout {
         scale: s,
@@ -848,9 +934,9 @@ fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed, factors: &[f32]) -> Lay
     let mut squashed: Vec<(String, usize)> = Vec::new();
     for (si, seg) in packed.segs.iter().enumerate() {
         let col = seg.col.min(cols - 1);
-        let f = factors.get(seg.col).copied().unwrap_or(1.0);
-        let squash = f < 1.0;
-        let sy = |y: f32| c.area.y + y * f;
+        let sq = squash.get(seg.col);
+        let squashed_col = sq.is_some_and(Squash::squashed);
+        let sy = |y: f32| c.area.y + sq.map_or(y, |q| q.at(y));
         let x = x0 + col as f32 * (cw + lane_gap);
         let last_in_col = !packed.segs[si + 1..].iter().any(|o| o.col == seg.col);
         let lane_top = sy(seg.top);
@@ -888,7 +974,7 @@ fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed, factors: &[f32]) -> Lay
                     continue;
                 };
                 let mem = &f_.members[m];
-                let z = if squash {
+                let z = if squashed_col {
                     squashed.push((mem.id.clone(), col));
                     tier_z(mem.tier) + squashed.len() as u32
                 } else {
@@ -935,6 +1021,7 @@ fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed, factors: &[f32]) -> Lay
                 },
                 members: Vec::new(),
                 more: None,
+                more_attention: 0,
                 hidden_ids: Vec::new(),
             };
             let mut at = piece.y + fpad + fhead;
@@ -954,7 +1041,7 @@ fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed, factors: &[f32]) -> Lay
                             w: cw - fpad * 2.0 - indent,
                             h,
                         };
-                        let z = if squash {
+                        let z = if squashed_col {
                             squashed.push((mem.id.clone(), col));
                             tier_z(mem.tier) + squashed.len() as u32
                         } else {
@@ -991,7 +1078,7 @@ fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed, factors: &[f32]) -> Lay
                 }
                 at += h + CHILD_GAP * s;
             }
-            if squash {
+            if squashed_col {
                 shape.rect.h = bottom + fpad - top;
             }
             content_bottom = content_bottom.max(shape.rect.y + shape.rect.h);
@@ -1008,11 +1095,13 @@ fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed, factors: &[f32]) -> Lay
                     .iter()
                     .filter(|m| m.unit.is_some_and(|u| fam.states[u] == UnitState::Hidden))
                     .map(|m| m.id.clone())
+                    .chain(f_.cut_ids.iter().cloned())
                     .collect();
+                shape.more_attention = f_.cut_attention;
             }
             out.families.push(shape);
         }
-        if squash {
+        if squashed_col {
             // 枠は中身を含み、最後の枠は列の下端まで伸ばす(画面の外へは出さない)。
             let area_bottom = c.area.y + c.area.h;
             let bottom = if last_in_col {
@@ -1066,6 +1155,8 @@ pub struct FamilyShape {
     pub members: Vec<ShapeMember>,
     /// 「ほか N 件」の行の位置と件数。
     pub more: Option<(Rect, usize)>,
+    /// 「ほか N 件」のうち、要確認のスレッドの数(表示の予算で集約したときだけ 0 でない)。
+    pub more_attention: usize,
     /// 「ほか N 件」にまとめたスレッドの ID。
     pub hidden_ids: Vec<String>,
 }
@@ -1201,11 +1292,165 @@ const SHRINK_STEP: f32 = 0.9;
 /// 縮めるので、それより小さくしても文字は小さくならず、遠くから読めなくなるだけ。
 const SHRINK_FLOOR: f32 = 0.6;
 
+/// GLES の合成(`miharashi-gpu` の `compose.rs`)が 1 フレームに描く面の数とテクスチャの種類の上限。
+/// 超えると描く順の前(枠・線、次にカード)から捨てられる。`miharashi-gpu` は Linux だけの依存なので値を写してあり、
+/// Linux では `compose.rs` の定数と同じことをテストで確かめる。
+pub const GPU_AGENT_DRAWS: usize = 2048;
+pub const GPU_AGENT_TEXTURES: usize = 512;
+/// 上限から差し引く余裕(枠・線・見出しの数え違いと、将来足す面のため)。
+const DRAWS_RESERVE: usize = 64;
+const TEXTURES_RESERVE: usize = 16;
+/// 親子グループの枠の単色の面(塗り・枠線・要確認の枠線・接続線)。同じ色は 1 枚のテクスチャを共有する。
+const SOLID_TEXTURES: usize = 4;
+
+/// 1 つの配置が GLES の合成に渡す面の数(上限の見積もり)。`AgentScreen::decor_layers` の作り方に合わせてある。
+/// 枠 1 つ = 塗り 1 + 枠線 4 + 接続線(メンバーと「ほか N 件」ごとに最大 2)+ 見出し 1 + 要確認の札 1 + 「ほか N 件」1。
+/// 面(描く数)と、固有のテクスチャ(カード、見出し、札、「ほか」)の数を返す。
+pub fn surface_cost(l: &Layout) -> SurfaceCost {
+    let mut cost = SurfaceCost {
+        draws: l.cards.len(),
+        textures: l.cards.len() + SOLID_TEXTURES,
+    };
+    for f in &l.families {
+        let more = usize::from(f.more.is_some());
+        let labels = 2 + more;
+        cost.draws += 5 + 2 * (f.members.len() + more) + labels;
+        cost.textures += labels;
+    }
+    cost
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SurfaceCost {
+    pub draws: usize,
+    pub textures: usize,
+}
+
+impl SurfaceCost {
+    /// 上限(余裕を引いた値)を超えた分を、減らすべきカードの数に直した値。収まっていれば 0。
+    /// カード 1 枚を減らすと、面が少なくとも 1、テクスチャが 1 減る(枠の線が付くカードは面がもっと減る)。
+    fn excess_cards(self) -> usize {
+        let draws = self.draws.saturating_sub(GPU_AGENT_DRAWS - DRAWS_RESERVE);
+        let textures = self
+            .textures
+            .saturating_sub(GPU_AGENT_TEXTURES - TEXTURES_RESERVE);
+        textures.max(draws.div_ceil(3))
+    }
+}
+
+/// 集約の順に並べた「ほか N 件」の候補(組の位置、メンバーの位置)。
+/// 先頭ほど先に集約する: その他 → 実行中 → 要確認の順で、同じ段では重要でない順(`rank` が大きい順)。
+/// 段は、自分と子孫のうち最も重要なものの段で決める(要確認の子を持つ親は、要確認の段で集約する)。
+/// 子孫は必ず親より前に並ぶので、先頭からどこで切っても、残ったスレッドの親は残る。
+/// 親(各組の先頭のメンバー)は候補に入れない。親のカードの無い置き場は無いため。
+fn cut_order(projects: &[Vec<Family>]) -> Vec<(usize, usize, usize)> {
+    let level = |t: Tier| match t {
+        Tier::Attention => 0u8,
+        Tier::Running => 1,
+        Tier::Quiet => 2,
+    };
+    // (段, 子孫を含めた最も良い rank, 字下げ) と、(プロジェクト, 組, メンバー)の位置。
+    type Key = (u8, usize, u8);
+    type At = (usize, usize, usize);
+    let mut keyed: Vec<(Key, At)> = Vec::new();
+    for (p, fams) in projects.iter().enumerate() {
+        for (i, f) in fams.iter().enumerate() {
+            let mut own: Vec<(u8, usize)> =
+                f.members.iter().map(|m| (level(m.tier), m.rank)).collect();
+            for m in (1..f.members.len()).rev() {
+                if let Some(parent) = f.members[m].parent {
+                    let child = own[m];
+                    own[parent] = (own[parent].0.min(child.0), own[parent].1.min(child.1));
+                }
+            }
+            for (m, member) in f.members.iter().enumerate().skip(1) {
+                keyed.push(((own[m].0, own[m].1, member.depth), (p, i, m)));
+            }
+        }
+    }
+    keyed.sort_unstable_by(|a, b| b.cmp(a));
+    keyed.into_iter().map(|(_, at)| at).collect()
+}
+
+/// `cut` の先頭 `n` 件を「ほか N 件」に回した組(`projects` と同じ位置)。変わらない組はそのまま写す。
+fn cut_families(
+    projects: &[Vec<Family>],
+    order: &[(usize, usize, usize)],
+    n: usize,
+) -> Vec<Vec<Family>> {
+    let mut cut: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for &(p, i, m) in &order[..n] {
+        cut.entry((p, i)).or_default().push(m);
+    }
+    projects
+        .iter()
+        .enumerate()
+        .map(|(p, fams)| {
+            fams.iter()
+                .enumerate()
+                .map(|(i, f)| match cut.get(&(p, i)) {
+                    None => f.clone(),
+                    Some(gone) => cut_family(f, gone),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn cut_family(f: &Family, gone: &[usize]) -> Family {
+    let mut removed = vec![false; f.members.len()];
+    for &m in gone {
+        removed[m] = true;
+    }
+    let mut new_at = vec![usize::MAX; f.members.len()];
+    let mut members: Vec<Member> = Vec::with_capacity(f.members.len() - gone.len());
+    for (m, member) in f.members.iter().enumerate() {
+        if removed[m] {
+            continue;
+        }
+        new_at[m] = members.len();
+        members.push(Member {
+            parent: member.parent.map(|p| new_at[p]),
+            ..member.clone()
+        });
+    }
+    let mut out = f.clone();
+    out.cut_ids = f.cut_ids.clone();
+    out.cut_attention = f.cut_attention;
+    for &m in gone {
+        out.cut_ids.push(f.members[m].id.clone());
+        out.cut_attention += usize::from(f.members[m].tier == Tier::Attention);
+    }
+    out.units = assign_units(&mut members, f.orphan_of.is_some());
+    if f.orphan_of.is_some() {
+        out.lead = members.iter().map(|m| m.rank).min().unwrap_or(f.lead);
+    }
+    out.members = members;
+    out
+}
+
+/// 最初に集約するカードの数の見積もり。どの組も枠 1 つ(見出しと札の 2 面)で済む最も少ない場合の値なので、
+/// 実際に必要な数より小さい。足りなければ `plan_board` が配置を測り直して増やす。
+fn first_cut(projects: &[Vec<Family>], cuttable: usize) -> usize {
+    let cards: usize = projects.iter().flatten().map(|f| f.members.len()).sum();
+    let framed = projects.iter().flatten().filter(|f| f.framed()).count();
+    let by_textures =
+        (GPU_AGENT_TEXTURES - TEXTURES_RESERVE).saturating_sub(SOLID_TEXTURES + 2 * framed);
+    let by_draws = (GPU_AGENT_DRAWS - DRAWS_RESERVE).saturating_sub(7 * framed) / 3;
+    cards
+        .saturating_sub(by_textures.min(by_draws))
+        .min(cuttable)
+}
+
 /// 全プロジェクトの組を、常に 1 枚の配置にする。
 /// `projects` はプロジェクトの表示順で、各プロジェクトの組は重要な順。収まらなければ次の順に縮める。
 /// 1. 静かな単位を 1 行表示 → 全部 1 行 → 「ほか N 件」に隠す(`fit_page`)。
 /// 2. 全部の組を 1 枚のまま、scale を `SHRINK_STEP` ずつ `SHRINK_FLOOR` まで下げて、1. をやり直す。
 /// 3. それでも入らなければ、下限の scale で列を重ねる(`overlap_fit`)。
+///
+/// 重ねた配置は数百〜数千枚のカードを 1 枚に入れられるが、GLES の合成には面とテクスチャの上限がある
+/// (`GPU_AGENT_DRAWS`、`GPU_AGENT_TEXTURES`)。配置が `surface_cost` で上限を超えるときは、
+/// 重要でないスレッドから「ほか N 件」に回してやり直す(`cut_order`)。収まる盤面は何も省かない。
 pub fn plan_board(area: Rect, scale: f32, projects: &[Vec<Family>]) -> Layout {
     if area.w <= 0.0 || area.h <= 0.0 || projects.iter().all(Vec::is_empty) {
         return Layout::default();
@@ -1217,6 +1462,29 @@ pub fn plan_board(area: Rect, scale: f32, projects: &[Vec<Family>]) -> Layout {
             .collect();
         return layout(area, scale, &groups);
     }
+    let order = cut_order(projects);
+    let mut cut = first_cut(projects, order.len());
+    let mut rounds = 0u32;
+    loop {
+        let layout = if cut == 0 {
+            plan_all(area, scale, projects)
+        } else {
+            plan_all(area, scale, &cut_families(projects, &order, cut))
+        };
+        let excess = surface_cost(&layout).excess_cards();
+        if excess == 0 || cut >= order.len() {
+            return layout;
+        }
+        // 超えた分のカードを減らして測り直す。配置し直すと枠が増えて面が増えることもあるので、
+        // 3 回を過ぎたら進める幅を倍にしていき、必ず終わらせる。
+        rounds += 1;
+        let step = excess.max(1) << rounds.saturating_sub(3).min(16);
+        cut = (cut + step).min(order.len());
+    }
+}
+
+/// 全部の組を 1 枚に配置する(省かない)。
+fn plan_all(area: Rect, scale: f32, projects: &[Vec<Family>]) -> Layout {
     let items: Vec<(usize, usize)> = projects
         .iter()
         .enumerate()
@@ -1655,16 +1923,262 @@ mod tests {
 
     #[test]
     fn layout_work_stays_bounded_by_the_number_of_scale_steps() {
-        // 2047 人の要確認の子。縮めても入らず、重ねて 1 枚にする。時間は縮める段数ぶんの倍数程度。
+        // 2047 人の要確認の子。縮めても入らず、重ねて 1 枚にする。GLES の上限に収まらない分は「ほか N 件」にまとめる。
+        // 時間は縮める段数と、予算で測り直す回数の倍数程度。
         let mut nodes = vec![node("p", None, Tier::Running)];
         nodes.extend((0..2047).map(|i| node(&format!("a{i}"), Some("p"), Tier::Attention)));
         let projects = [fams(&nodes)];
         let started = std::time::Instant::now();
         let l = plan_board(AREA, 1.0, &projects);
         let took = started.elapsed();
-        assert_eq!(l.cards.len(), 2048);
+        assert_eq!(l.cards.len() + hidden_in(&l), 2048);
+        assert_within_budget(&l);
         assert_inside(&l, AREA);
         assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    }
+
+    /// 配置が、GLES の合成に渡す面とテクスチャの上限(余裕を引いた値)に収まる。
+    fn assert_within_budget(l: &Layout) {
+        let cost = surface_cost(l);
+        assert_eq!(cost.excess_cards(), 0, "{cost:?}");
+        assert!(cost.draws <= GPU_AGENT_DRAWS && cost.textures <= GPU_AGENT_TEXTURES);
+    }
+
+    #[test]
+    fn a_board_within_the_budget_keeps_every_card() {
+        // 数百枚でも、上限に収まる盤面は何も「ほか N 件」に回さない。
+        let nodes = family_with(0, "a")
+            .into_iter()
+            .chain((0..200).map(|i| node(&format!("c{i}"), Some("a"), Tier::Attention)))
+            .collect::<Vec<_>>();
+        let projects = [fams(&nodes)];
+        let l = plan_board(AREA, 1.0, &projects);
+        assert_eq!(l.cards.len(), count(&projects));
+        assert!(l.families.iter().all(|f| f.more_attention == 0));
+        assert_within_budget(&l);
+    }
+
+    #[test]
+    fn over_the_budget_quiet_go_first_then_running_then_attention() {
+        // 親 1 + 要確認 300 + 実行中 300 + その他 300。全部は GLES の上限に入らない。
+        let mut nodes = vec![node("p", None, Tier::Running)];
+        nodes.extend((0..300).map(|i| node(&format!("a{i}"), Some("p"), Tier::Attention)));
+        nodes.extend((0..300).map(|i| node(&format!("r{i}"), Some("p"), Tier::Running)));
+        nodes.extend((0..300).map(|i| node(&format!("q{i}"), Some("p"), Tier::Quiet)));
+        let projects = [fams(&nodes)];
+        let l = plan_board(AREA, 1.0, &projects);
+        assert_within_budget(&l);
+        assert_inside(&l, AREA);
+        // 要確認は全部カードで出る。その他は 1 枚も残らず、実行中が代わりに削られる。
+        assert!((0..300).all(|i| l.cards.contains_key(&format!("a{i}"))));
+        assert!(!(0..300).any(|i| l.cards.contains_key(&format!("q{i}"))));
+        let running = (0..300)
+            .filter(|i| l.cards.contains_key(&format!("r{i}")))
+            .count();
+        assert!(running > 0 && running < 300, "{running}");
+        // 実行中の中では重要な順(先頭)から残る。
+        assert!(l.cards.contains_key("r0") && !l.cards.contains_key("r299"));
+        // 件数が合う: 「ほか N 件」の N は、まとめたスレッドの数と同じ。要確認は含まない。
+        assert_eq!(l.cards.len() + hidden_in(&l), 901);
+        let more: usize = l
+            .families
+            .iter()
+            .filter_map(|f| f.more)
+            .map(|(_, n)| n)
+            .sum();
+        assert_eq!(more, hidden_in(&l));
+        assert!(l.families.iter().all(|f| f.more_attention == 0));
+        // まとめたスレッドの置き場は親のカード。
+        assert_eq!(l.anchor("q299"), Some(l.cards["p"].rect));
+    }
+
+    #[test]
+    fn attention_beyond_the_budget_is_counted_in_the_more_line() {
+        // 3 プロジェクトに親 1 + 要確認 600 ずつ。要確認までまとめないと上限に入らない。
+        let projects: Vec<Vec<Family>> = (0..3)
+            .map(|g| {
+                let p = format!("g{g}");
+                let mut nodes = vec![node(&p, None, Tier::Running)];
+                nodes
+                    .extend((0..600).map(|i| node(&format!("{p}a{i}"), Some(&p), Tier::Attention)));
+                fams(&nodes)
+            })
+            .collect();
+        let l = plan_board(AREA, 1.0, &projects);
+        assert_within_budget(&l);
+        assert_inside(&l, AREA);
+        let total = count(&projects);
+        assert_eq!(l.cards.len() + hidden_in(&l), total);
+        assert!(hidden_in(&l) > 0);
+        assert_headings_uncovered(&l);
+        // 集約したのは全部要確認。「ほか N 件」の N と、そのうちの要確認の数が合う。
+        for f in &l.families {
+            if let Some((_, n)) = f.more {
+                assert_eq!(n, f.hidden_ids.len());
+                assert_eq!(f.more_attention, n);
+            }
+        }
+        let attention_hidden: usize = l.families.iter().map(|f| f.more_attention).sum();
+        assert_eq!(attention_hidden, hidden_in(&l));
+        // 親は必ず残り、重要な順(先頭)から残る。
+        assert!((0..3).all(|g| l.cards.contains_key(&format!("g{g}"))));
+        assert!((0..3).all(|g| l.cards.contains_key(&format!("g{g}a0"))));
+        assert!(
+            (0..3).all(|g| l.anchor(&format!("g{g}a599")) == Some(l.cards[&format!("g{g}")].rect))
+        );
+    }
+
+    #[test]
+    fn a_parent_with_an_attention_child_is_cut_with_the_attention_not_with_the_quiet() {
+        // 親 P の子 C(静か)に孫 G(要確認)。C を先に消すと G の親がいなくなるので、G と同じ段まで残る。
+        let mut nodes = vec![
+            node("p", None, Tier::Running),
+            node("c", Some("p"), Tier::Quiet),
+        ];
+        nodes.push(node("g", Some("c"), Tier::Attention));
+        nodes.extend((0..700).map(|i| node(&format!("q{i}"), Some("p"), Tier::Quiet)));
+        let l = plan_board(AREA, 1.0, &[fams(&nodes)]);
+        assert_within_budget(&l);
+        assert!(l.cards.contains_key("g"));
+        assert!(l.cards.contains_key("c"), "孫の親は残る");
+    }
+
+    #[test]
+    fn cutting_keeps_a_card_for_every_group() {
+        // 親だけは集約しない。親子グループが数百あって予算を超えても、各組の親のカードは残る。
+        let projects: Vec<Vec<Family>> = (0..40)
+            .map(|g| {
+                let p = format!("g{g}");
+                let mut nodes = vec![node(&p, None, Tier::Running)];
+                nodes.extend((0..30).map(|i| node(&format!("{p}a{i}"), Some(&p), Tier::Attention)));
+                fams(&nodes)
+            })
+            .collect();
+        let l = plan_board(AREA, 1.0, &projects);
+        assert_within_budget(&l);
+        assert!((0..40).all(|g| l.cards.contains_key(&format!("g{g}"))));
+        assert_eq!(l.cards.len() + hidden_in(&l), count(&projects));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gpu_limits_match_the_compositor() {
+        assert_eq!(GPU_AGENT_DRAWS, miharashi_gpu::compose::AGENT_DRAWS);
+        assert_eq!(GPU_AGENT_TEXTURES, miharashi_gpu::compose::AGENT_TEXTURES);
+    }
+
+    fn overlaps(a: Rect, b: Rect) -> bool {
+        a.x < b.x + b.w - 0.5
+            && b.x < a.x + a.w - 0.5
+            && a.y < b.y + b.h - 0.5
+            && b.y < a.y + a.h - 0.5
+    }
+
+    /// 組の見出しもプロジェクトの見出しも、どのカードにも覆われない。組の最初のカードは自分の見出しの下にある。
+    fn assert_headings_uncovered(l: &Layout) {
+        for shape in &l.families {
+            for (id, card) in &l.cards {
+                assert!(
+                    !overlaps(shape.head, card.rect),
+                    "{id} {:?} covers a group heading {:?}",
+                    card.rect,
+                    shape.head
+                );
+            }
+            if let Some((more, _)) = shape.more {
+                for (id, card) in &l.cards {
+                    assert!(
+                        !overlaps(more, card.rect),
+                        "{id} {:?} covers a more line {more:?}",
+                        card.rect
+                    );
+                }
+            }
+            if let Some(first) = shape.members.first() {
+                assert!(
+                    first.rect.y >= shape.head.y + shape.head.h - 0.5,
+                    "{:?} starts above its heading {:?}",
+                    first.rect,
+                    shape.head
+                );
+            }
+        }
+        for lane in &l.lanes {
+            for (id, card) in &l.cards {
+                assert!(
+                    !overlaps(lane.head, card.rect),
+                    "{id} {:?} covers a project heading {:?}",
+                    card.rect,
+                    lane.head
+                );
+            }
+            for shape in &l.families {
+                assert!(!overlaps(lane.head, shape.head));
+            }
+        }
+    }
+
+    #[test]
+    fn overlapped_columns_keep_every_heading_clear_of_the_cards() {
+        // 16 のプロジェクトそれぞれに、親 1 + 要確認の子 5。1920x1080(領域 1856x788)で重ねる。
+        for w in [1856.0, 2496.0] {
+            let area = Rect { w, ..AREA };
+            let projects: Vec<Vec<Family>> = (0..16)
+                .map(|g| {
+                    let p = format!("g{g}");
+                    let mut nodes = vec![node(&p, None, Tier::Running)];
+                    nodes.extend(
+                        (0..5).map(|i| node(&format!("{p}a{i}"), Some(&p), Tier::Attention)),
+                    );
+                    fams(&nodes)
+                })
+                .collect();
+            let l = plan_board(area, 1.0, &projects);
+            assert!((l.scale - SHRINK_FLOOR).abs() < 1e-6, "重ねる盤面のはず");
+            assert!(l.cards.values().any(|c| c.mode == CardMode::Strip));
+            assert_headings_uncovered(&l);
+            assert_inside(&l, area);
+        }
+    }
+
+    #[test]
+    fn headings_stay_clear_of_cards_when_groups_stack_in_one_column() {
+        // 狭い領域(2 列)に、親子グループと単独スレッドが混ざって積まれ、重なる。
+        let area = Rect { w: 800.0, ..AREA };
+        let mut projects: Vec<Vec<Family>> = Vec::new();
+        for g in 0..4 {
+            let p = format!("g{g}");
+            let mut nodes = vec![node(&p, None, Tier::Running)];
+            nodes.extend((0..4).map(|i| node(&format!("{p}a{i}"), Some(&p), Tier::Attention)));
+            nodes.extend((0..3).map(|i| node(&format!("{p}s{i}"), None, Tier::Running)));
+            projects.push(fams(&nodes));
+        }
+        let l = plan_board(area, 1.0, &projects);
+        assert!(l.cards.values().any(|c| c.mode == CardMode::Strip));
+        assert_headings_uncovered(&l);
+        assert_inside(&l, area);
+        assert_eq!(l.cards.len() + hidden_in(&l), count(&projects));
+    }
+
+    #[test]
+    fn a_column_whose_headings_alone_do_not_fit_still_keeps_the_cards_inside() {
+        // 見出しだけで列の高さを超える極端な盤面では、見出しも一様に縮めて、カードは領域の内側に収める。
+        let area = Rect {
+            w: 400.0,
+            h: 300.0,
+            ..AREA
+        };
+        let projects: Vec<Vec<Family>> = (0..12)
+            .map(|g| {
+                let p = format!("g{g}");
+                let mut nodes = vec![node(&p, None, Tier::Running)];
+                nodes.extend((0..3).map(|i| node(&format!("{p}a{i}"), Some(&p), Tier::Attention)));
+                fams(&nodes)
+            })
+            .collect();
+        let l = plan_board(area, 1.0, &projects);
+        assert_inside(&l, area);
+        assert_eq!(l.cards.len() + hidden_in(&l), count(&projects));
     }
 
     #[test]

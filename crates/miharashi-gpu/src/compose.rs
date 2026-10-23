@@ -95,13 +95,13 @@ pub struct AgentGpuCard<'a> {
 
 /// 1 フレームに描く Agent の面の数の上限。親子グループの枠・接続線・見出しも 1 回の描画として数える。
 /// 同じ色の枠・線は 1 枚のテクスチャを使い回すので、描画の数はテクスチャの数よりずっと多くなる。
-const AGENT_DRAWS: usize = 2048;
+pub const AGENT_DRAWS: usize = 2048;
 /// 1 フレームに使う Agent のテクスチャ(面の id の種類)の上限。使っていないテクスチャは毎フレーム捨てる。
-const AGENT_TEXTURES: usize = 512;
+pub const AGENT_TEXTURES: usize = 512;
 
 /// `ids`(描く順の面の id)のうち、描く範囲の先頭の位置を返す。上限を超えるときは描く順の前
 /// (親子グループの枠・線)から捨て、カード、ポップアップの順に残す。
-fn agent_draw_start(ids: &[u64]) -> usize {
+pub fn agent_draw_start(ids: &[u64]) -> usize {
     let mut seen = std::collections::HashSet::new();
     let mut start = ids.len();
     for (i, id) in ids.iter().enumerate().rev() {

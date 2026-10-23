@@ -943,12 +943,15 @@ impl AgentScreen {
             .iter()
             .map(|shape| {
                 let fam = &self.arrangement.families[shape.project][shape.family];
+                // 「ほか N 件」に回した子(表示の予算で集約した要確認の子を含む)も数える。
                 let badge = child_attention_label(
                     shape
                         .members
                         .iter()
-                        .filter(|m| Some(m.id.as_str()) != shape.root.as_deref())
-                        .filter_map(|m| by_id.get(m.id.as_str()).copied()),
+                        .map(|m| &m.id)
+                        .chain(&shape.hidden_ids)
+                        .filter(|id| Some(id.as_str()) != shape.root.as_deref())
+                        .filter_map(|id| by_id.get(id.as_str()).copied()),
                 );
                 (
                     format!("{}:{}:{}", shape.project, shape.family, shape.piece),
@@ -956,13 +959,14 @@ impl AgentScreen {
                     family_heading(fam, shape, &by_id),
                     badge,
                     shape.more.map_or(0, |(_, n)| n),
+                    shape.more_attention,
                 )
             })
             .collect();
         let mut out = Vec::new();
         let mut used = HashSet::new();
         let edge_w = 2.0 * s;
-        for (key, d, heading, badge, hidden) in views {
+        for (key, d, heading, badge, hidden, hidden_attention) in views {
             let edge = if badge.is_some() {
                 FRAME_EDGE_ALERT
             } else {
@@ -1032,7 +1036,7 @@ impl AgentScreen {
             if let Some(m) = d.more {
                 label(
                     "more",
-                    &format!("ほか {hidden} 件"),
+                    &more_label(hidden, hidden_attention),
                     layout::Rect {
                         x: m.x + 8.0 * s,
                         w: m.w - 8.0 * s,
@@ -1636,6 +1640,15 @@ fn label_layer(
             alpha,
         },
     });
+}
+
+/// 「ほか N 件」の行。表示の予算で要確認の子までまとめたときは、要確認を含むことが分かるようにする。
+fn more_label(hidden: usize, attention: usize) -> String {
+    if attention > 0 {
+        format!("ほか {hidden} 件(要確認 {attention})")
+    } else {
+        format!("ほか {hidden} 件")
+    }
 }
 
 /// 子の要確認の件数。種類が 1 つなら「子に承認待ち 1」、混ざっていれば「子に要確認 N」。
@@ -3003,6 +3016,81 @@ mod tests {
         assert!(cards.iter().all(|c| c.id != s.id_map["run"]));
         assert!(!s.surfaces.contains_key("run"));
         assert!(s.surfaces.contains_key("boss"));
+    }
+
+    /// 親 1 + 承認待ちの子 `n` 人を 3 つのプロジェクトに分けた取得(GLES の上限を超える)。
+    fn many_approvals(n: usize) -> Vec<AgentEntry> {
+        let mut v = Vec::new();
+        for g in 0..3 {
+            let boss = format!("boss{g}");
+            let mut b = entry(&boss, AgentState::Running);
+            b.project_id = format!("proj{g}");
+            v.push(b);
+            for i in 0..n {
+                let mut c = child(&format!("g{g}a{i}"), &boss, AgentState::Approval);
+                c.project_id = format!("proj{g}");
+                c.has_pending_approvals = true;
+                v.push(c);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn attention_children_over_the_surface_budget_are_counted_in_the_more_line_and_the_badge() {
+        let now = Instant::now();
+        let mut s = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(many_approvals(600));
+        s.sync(&snap, now);
+        render_for_test(&mut s, &snap, now);
+        let hidden: usize = s.board.families.iter().map(|f| f.hidden_ids.len()).sum();
+        assert!(hidden > 0, "上限を超えるので集約するはず");
+        let key_of = |name: &str| -> Vec<String> {
+            s.labels
+                .iter()
+                .filter(|(id, _)| id.ends_with(name))
+                .map(|(_, l)| l.key.clone())
+                .collect()
+        };
+        // 「ほか N 件」は、要確認を含むことが分かる。
+        let more = key_of(":more");
+        assert!(!more.is_empty());
+        assert!(more.iter().all(|k| k.contains("要確認")), "{more:?}");
+        // 枠の札は、集約した子も含めた全件(600)を数える。
+        let badges = key_of(":badge");
+        assert!(
+            badges.iter().any(|k| k.starts_with("子に承認待ち 600|")),
+            "{badges:?}"
+        );
+        // 上部の要確認の件数は全件のまま。
+        assert_eq!(s.entries.iter().filter(|e| attention(e)).count(), 3 * 600);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn attention_cards_survive_the_gpu_compositor_selection() {
+        // 上限を超える盤面でも、合成が捨てる(描く順の前から)のは枠・線までで、要確認のカードは全部残る。
+        let now = Instant::now();
+        let mut s = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(many_approvals(600));
+        s.sync(&snap, now);
+        let cards = render_for_test(&mut s, &snap, now);
+        let ids: Vec<u64> = cards.iter().map(|c| c.id).collect();
+        let start = miharashi_gpu::compose::agent_draw_start(&ids);
+        assert_eq!(start, 0, "面 {} 枚が上限内に収まる", ids.len());
+        let distinct: HashSet<u64> = ids.iter().copied().collect();
+        assert!(distinct.len() <= miharashi_gpu::compose::AGENT_TEXTURES);
+        assert!(ids.len() <= miharashi_gpu::compose::AGENT_DRAWS);
+        // 配置に置いた要確認のカードは、全部描く範囲にある。
+        let placed: Vec<u64> = s
+            .board
+            .cards
+            .keys()
+            .filter(|id| id.contains('a'))
+            .map(|id| s.id_map[id])
+            .collect();
+        assert!(!placed.is_empty());
+        assert!(placed.iter().all(|id| ids[start..].contains(id)));
     }
 
     /// 件数の多い取得を画面が取り込む時間(組み立て + 配置 + 描画の準備)。
