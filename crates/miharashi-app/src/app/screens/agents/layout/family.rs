@@ -11,7 +11,8 @@
 //!    下限 `SHRINK_FLOOR`)。小さい scale では最小幅も小さくなり、列が増える。
 //! 5. 下限の scale でも入らないとき(要確認の子が非常に多いなど)の最後の手段は、列を縦に仮想的に伸ばして
 //!    詰め、できた列を画面の高さに縮めること(`overlap_fit`)。カードは高さを保ったまま重なり、要確認は
-//!    手前に出る。縮めるのはカードが連なる間隔だけで、見出しと「ほか N 件」の行は縮めない。
+//!    手前に出る。縮めるのはカードが連なる間隔だけで、見出しと「ほか N 件」の行は縮めない。区間に最後の
+//!    カードより高いカード(親)があるときは、その下端が次の見出しにかからないよう、後ろに固定の余白を足す。
 //!    ページには分けず、要確認のカードを画面の外に置くことも、欠落させることもしない。
 //! 6. ただし GLES の合成の上限(面・テクスチャ)を超える枚数は 1 枚に出せないので、配置が上限を超えるときは
 //!    重要でない方(その他 → 実行中 → 要確認)から「ほか N 件」にまとめてやり直す(`plan_board`、`cut_order`)。
@@ -766,6 +767,9 @@ const TIER_Z: u32 = 1_000_000;
 /// 列を仮想的に伸ばす倍率(`overlap_fit`)。
 const TALL_GROWTH: f32 = 1.25;
 
+/// 収まる最小の高さに近づけるときの二分探索の回数(`overlap_fit`)。
+const TALL_REFINE: usize = 8;
+
 /// 入りきらない盤面を、重ねて必ず 1 枚に収める最後の手段。
 /// 列の高さを仮想的に伸ばして(`max_cols` 列に収まるまで)通常どおり詰め、列ごとに縦の位置を
 /// 画面の高さに縮める。カードの高さは変えないので、縮めた列ではカードが上下に重なる。
@@ -774,20 +778,34 @@ const TALL_GROWTH: f32 = 1.25;
 /// 組の枠・見出し・「ほか N 件」も同じ縮め方で置くので、隠した子の置き場(`Layout::anchor`)も残る。
 fn overlap_fit(c: &Ctx, fams: &[PageFam<'_>]) -> Layout {
     let first = pack(c, fams, false, usize::MAX);
+    let virt = |tall: f32| Ctx {
+        s: c.s,
+        area: Rect { h: tall, ..c.area },
+        max_cols: c.max_cols,
+    };
     let mut tall = c.area.h * first.cols.div_ceil(c.max_cols).max(1) as f32;
-    let (packed, squash) = loop {
-        let virt = Ctx {
-            s: c.s,
-            area: Rect { h: tall, ..c.area },
-            max_cols: c.max_cols,
-        };
-        let packed = pack(&virt, fams, false, c.max_cols);
+    let mut low = c.area.h;
+    let mut packed = loop {
+        let packed = pack(&virt(tall), fams, false, c.max_cols);
         if !packed.over || tall > 1.0e15 {
-            let squash = squash_columns(c, fams, &packed);
-            break (packed, squash);
+            break packed;
         }
+        low = tall;
         tall *= TALL_GROWTH;
     };
+    // 伸ばしすぎると前の列に組が偏り、その列の固定の部分(見出し)が収まらなくなるので、
+    // 収まる最小の高さに近づけて列の負荷をならす。
+    for _ in 0..TALL_REFINE {
+        let mid = (low + tall) / 2.0;
+        let trial = pack(&virt(mid), fams, false, c.max_cols);
+        if trial.over {
+            low = mid;
+        } else {
+            tall = mid;
+            packed = trial;
+        }
+    }
+    let squash = squash_columns(c, fams, &packed);
     finish(c, fams, packed, &squash)
 }
 
@@ -795,10 +813,39 @@ fn overlap_fit(c: &Ctx, fams: &[PageFam<'_>]) -> Layout {
 /// `runs` は縮める間隔(仮想の位置の区間)で、1 つの組の最初のカードの上端から最後のカードの上端まで、
 /// または見出しを挟まずに並ぶ単独カードの最初から最後まで。それ以外(見出し・余白・各区間の最後のカードの高さ)は
 /// 縮めないので、見出しは前の区間のカードに覆われず、組の最初のカードは自分の見出しの下に出る。
+/// `gaps` は区間の終わり(最後のカードの上端)と、その後ろに足す固定の余白。区間内に最後のカードより高い
+/// カード(子より高い親)があっても、その下端が次の見出しや「ほか N 件」の行にかからないようにする。
 struct Squash {
     f: f32,
     runs: Vec<(f32, f32)>,
+    gaps: Vec<(f32, f32)>,
 }
+
+/// 区間の後ろに続くもの(次の見出しや「ほか N 件」の行)の、最後のカードの上端からの距離 `room` と、
+/// 区間のカード(仮想の上端と高さ)。縮め率 `f` では、カード `(y, h)` の下端は最後のカードの上端より
+/// `h - f * (end - y)` だけ下に出るので、それが `room` を超える分を固定の余白にする。
+struct Tail {
+    end: f32,
+    room: f32,
+    cards: Vec<(f32, f32)>,
+}
+
+impl Tail {
+    fn gap(&self, f: f32) -> f32 {
+        let reach = self
+            .cards
+            .iter()
+            .map(|&(y, h)| h - f * (self.end - y))
+            .fold(0.0, f32::max);
+        (reach - self.room).max(0.0)
+    }
+}
+
+/// 区間の終わりを判定するときの許容(組み立ての順で生じる浮動小数の誤差を吸収する)。
+const GAP_EPS: f32 = 0.5;
+
+/// 縮め率を二分探索する回数。
+const SOLVE_STEPS: usize = 24;
 
 impl Squash {
     fn squashed(&self) -> bool {
@@ -807,7 +854,8 @@ impl Squash {
 
     /// 仮想の縦の位置 `y` の画面での位置。
     fn at(&self, y: f32) -> f32 {
-        y - (1.0 - self.f) * self.span(y)
+        let gap = if self.squashed() { self.gap(y) } else { 0.0 };
+        y - (1.0 - self.f) * self.span(y) + gap
     }
 
     /// `y` より上にある、縮める間隔の長さの合計。
@@ -815,6 +863,15 @@ impl Squash {
         self.runs
             .iter()
             .map(|&(a, b)| (y.min(b) - a).max(0.0))
+            .sum()
+    }
+
+    /// `y` より上で区間が終わるところに足した余白の合計。区間の最後のカード自身(`y == end`)は動かさない。
+    fn gap(&self, y: f32) -> f32 {
+        self.gaps
+            .iter()
+            .filter(|&&(end, _)| y > end + GAP_EPS)
+            .map(|&(_, g)| g)
             .sum()
     }
 
@@ -834,6 +891,48 @@ impl Squash {
         }
         (f >= 0.0).then_some(f)
     }
+
+    /// `solve` に、区間の後ろの固定の余白(`Tail`)を加えたもの。縮め率が小さいほど余白は大きくなる一方、
+    /// 縮めるほどカードは上に寄るので、収まるかどうかは縮め率に対して単調で、二分探索で最大の縮め率が求まる。
+    /// 収まる縮め率があれば、そのときの余白を `gaps` に入れて返す。
+    fn solve_tails(&mut self, tails: &[Tail], cards: &[(f32, f32)], limit: f32) -> Option<f32> {
+        // 縮め率に依らない、カードごとの「上にある縮める間隔」と「上で終わる区間の数」。
+        let above: Vec<(f32, usize)> = cards
+            .iter()
+            .map(|&(y, _)| {
+                let ended = tails.iter().filter(|t| y > t.end + GAP_EPS).count();
+                (self.span(y), ended)
+            })
+            .collect();
+        let fits = |f: f32| {
+            let mut prefix = vec![0.0f32];
+            for t in tails {
+                prefix.push(prefix[prefix.len() - 1] + t.gap(f));
+            }
+            cards
+                .iter()
+                .zip(&above)
+                .all(|(&(y, h), &(span, ended))| y + h + prefix[ended] - (1.0 - f) * span <= limit)
+        };
+        if !fits(0.0) {
+            return None;
+        }
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..SOLVE_STEPS {
+            let mid = (lo + hi) / 2.0;
+            if fits(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        self.gaps = tails
+            .iter()
+            .map(|t| (t.end, t.gap(lo)))
+            .filter(|&(_, g)| g > 0.0)
+            .collect();
+        Some(lo)
+    }
 }
 
 /// 列ごとの縮め方。どのカードの下端も画面の内側に収める(収まる列は縮めない)。
@@ -841,6 +940,7 @@ impl Squash {
 fn squash_columns(c: &Ctx, fams: &[PageFam<'_>], packed: &Packed) -> Vec<Squash> {
     let limit = c.area.h - c.foot();
     let mut runs: Vec<Vec<(f32, f32)>> = vec![Vec::new(); packed.cols];
+    let mut tails: Vec<Vec<Tail>> = (0..packed.cols).map(|_| Vec::new()).collect();
     let mut cards: Vec<Vec<(f32, f32)>> = vec![Vec::new(); packed.cols];
     for seg in &packed.segs {
         let col = seg.col.min(packed.cols.saturating_sub(1));
@@ -856,16 +956,34 @@ fn squash_columns(c: &Ctx, fams: &[PageFam<'_>], packed: &Packed) -> Vec<Squash>
             runs[col].extend(solo.take());
             let mut y = piece.y + (FAM_PAD + FAM_HEAD) * c.s;
             let (first, mut last) = (y, y);
+            // 区間のカードと、その後ろに最初に置くもの(「ほか N 件」の行)の位置。
+            let mut members: Vec<(f32, f32)> = Vec::new();
+            let mut more = None;
             for e in &piece.entries {
                 let h = c.entry_h(f, e);
                 cards[col].push((y, h));
                 // 「ほか N 件」の行は縮めない(直前のカードがかぶらないよう、区間は最後のメンバーまで)。
                 if matches!(e, Entry::Member { .. }) {
                     last = y;
+                    members.push((y, h));
+                } else {
+                    more = Some(y);
                 }
                 y += h + CHILD_GAP * c.s;
             }
             runs[col].push((first, last));
+            if last > first {
+                // 後ろの行まで、なければ枠の下の余白(次の組との間)まで。
+                let room = match more {
+                    Some(m) => m - last,
+                    None => piece.y + piece.h + c.gap() - last - FAM_PAD * c.s,
+                };
+                tails[col].push(Tail {
+                    end: last,
+                    room,
+                    cards: members,
+                });
+            }
         }
         runs[col].extend(solo.take());
     }
@@ -874,12 +992,23 @@ fn squash_columns(c: &Ctx, fams: &[PageFam<'_>], packed: &Packed) -> Vec<Squash>
             let mut sq = Squash {
                 f: 1.0,
                 runs: std::mem::take(&mut runs[col]),
+                gaps: Vec::new(),
             };
             sq.runs.retain(|&(a, b)| b > a);
-            sq.f = sq.solve(&cards[col], limit).unwrap_or_else(|| {
-                sq.runs = vec![(0.0, f32::MAX)];
-                sq.solve(&cards[col], limit).unwrap_or(0.0)
-            });
+            let cards = &cards[col];
+            // 縮めずに収まる列はそのまま。縮めるときは、余白つき → 余白なし → 一様な縮めの順に、
+            // カードが収まる最初の縮め方を使う。
+            let plain = sq.solve(cards, limit);
+            sq.f = if plain == Some(1.0) {
+                1.0
+            } else {
+                sq.solve_tails(&tails[col], cards, limit)
+                    .or(plain)
+                    .unwrap_or_else(|| {
+                        sq.runs = vec![(0.0, f32::MAX)];
+                        sq.solve(cards, limit).unwrap_or(0.0)
+                    })
+            };
             sq
         })
         .collect()
@@ -2158,6 +2287,66 @@ mod tests {
         assert_headings_uncovered(&l);
         assert_inside(&l, area);
         assert_eq!(l.cards.len() + hidden_in(&l), count(&projects));
+    }
+
+    /// 1 つのプロジェクトに、実行中の親と要確認の子 `kids[i]` 人の組を並べる。
+    fn one_project_of(kids: &[usize]) -> Vec<Vec<Family>> {
+        let mut nodes = Vec::new();
+        for (g, &n) in kids.iter().enumerate() {
+            let p = format!("g{g}");
+            nodes.push(node(&p, None, Tier::Running));
+            nodes.extend((0..n).map(|i| node(&format!("{p}a{i}"), Some(&p), Tier::Attention)));
+        }
+        vec![fams(&nodes)]
+    }
+
+    #[test]
+    fn a_parent_taller_than_the_last_card_does_not_cover_the_next_heading() {
+        // 23 組。先頭の組だけ子 1 人、残りは 15 人。親は子より背が高く、強く重ねると次の見出しにかかる。
+        let area = Rect { w: 1856.0, ..AREA };
+        let mut kids = vec![15; 23];
+        kids[0] = 1;
+        let projects = one_project_of(&kids);
+        let l = plan_board(area, 1.0, &projects);
+        assert!(
+            l.cards.values().any(|c| c.mode == CardMode::Strip),
+            "重ねる盤面のはず"
+        );
+        assert_headings_uncovered(&l);
+        assert_inside(&l, area);
+        assert_eq!(l.cards.len() + hidden_in(&l), count(&projects));
+    }
+
+    #[test]
+    fn headings_stay_clear_when_group_heights_differ() {
+        // 子の数の違う組を、いくつかの幅と組の数で重ねる。どの見出しも「ほか N 件」の行もカードに覆われない。
+        let mut overlapped = 0;
+        for w in [1856.0, 2496.0] {
+            let area = Rect { w, ..AREA };
+            for n in 8..=22 {
+                for base in [1usize, 3] {
+                    let kids: Vec<usize> = (0..n)
+                        .map(|g| if g % 4 == 0 { base } else { 6 + (g * 7) % 12 })
+                        .collect();
+                    let mut projects = one_project_of(&kids);
+                    // 静かな子と実行中の子を持つ組と、別のプロジェクトも混ぜる。
+                    let mut nodes = vec![node("m", None, Tier::Running)];
+                    nodes.extend((0..9).map(|i| node(&format!("mq{i}"), Some("m"), Tier::Quiet)));
+                    nodes.extend((0..3).map(|i| node(&format!("mr{i}"), Some("m"), Tier::Running)));
+                    projects.push(fams(&nodes));
+                    let l = plan_board(area, 1.0, &projects);
+                    overlapped += l.cards.values().any(|c| c.mode == CardMode::Strip) as usize;
+                    assert_headings_uncovered(&l);
+                    assert_inside(&l, area);
+                    assert_eq!(
+                        l.cards.len() + hidden_in(&l),
+                        count(&projects),
+                        "w={w} n={n}"
+                    );
+                }
+            }
+        }
+        assert!(overlapped > 10, "重ねる盤面を十分に含む: {overlapped}");
     }
 
     #[test]
