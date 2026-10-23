@@ -65,9 +65,21 @@ pub struct Layout {
     pub cards: HashMap<String, CardSlot>,
     /// 親子グループの枠(`family::plan_board` が作る。単独スレッドだけの配置では空)。
     pub families: Vec<family::FamilyShape>,
+    /// この配置を作ったときの scale。1 枚に収めるために、渡された scale より小さいことがある。
+    /// 枠や見出しの寸法は、画面の scale ではなくこの値から求める(空の配置では 0)。
+    pub scale: f32,
 }
 
 impl Layout {
+    /// 配置の scale。まだ配置が無い(0 の)ときは `fallback`。
+    pub fn scale_or(&self, fallback: f32) -> f32 {
+        if self.scale > 0.0 {
+            self.scale
+        } else {
+            fallback
+        }
+    }
+
     /// カードの置き場。カードが無い(「ほか N 件」にまとめた)スレッドは、親のカード、
     /// 親も無ければグループの見出しの位置を返す。ポップアップの元位置と戻り先に使う。
     pub fn anchor(&self, id: &str) -> Option<Rect> {
@@ -89,7 +101,10 @@ impl Layout {
 
 /// `groups` は表示順に並んだプロジェクトごとのスレッド ID。各グループの中は重要な順。
 pub fn layout(area: Rect, scale: f32, groups: &[Vec<String>]) -> Layout {
-    let mut out = Layout::default();
+    let mut out = Layout {
+        scale,
+        ..Layout::default()
+    };
     let groups = groups
         .iter()
         .enumerate()

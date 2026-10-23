@@ -319,7 +319,7 @@ fn family_snapshot(base: &AgentSnapshot) -> AgentSnapshot {
     }
 }
 
-/// 子が多すぎて「ほか N 件」と巡回が起きる場面。
+/// 子が多すぎて「ほか N 件」と、盤面全体の縮小が起きる場面(1 枚に収める)。
 fn family_many_snapshot(base: &AgentSnapshot) -> AgentSnapshot {
     const POOL: [&str; 12] = [
         "設定の確認",
@@ -624,7 +624,7 @@ pub fn write_fixtures(
         size,
     )?;
 
-    // 子が多すぎる場面: 「ほか N 件」と、15 秒ごとの自動巡回(要確認の組が最初のページ)。
+    // 子が多すぎる場面: 「ほか N 件」と、盤面全体の縮小で、ページに分けず 1 枚に収める。
     let mut many_screen = AgentScreen::new(size, false, stale_secs);
     many_screen.on_enter(changed_at);
     let many = family_many_snapshot(&changed);
@@ -641,20 +641,6 @@ pub fn write_fixtures(
         text,
         size,
     )?;
-    for page in 2..=3 {
-        let at = changed_at + Duration::from_secs(16 * (page - 1));
-        many_world.agents.last_success = Some(wall + Duration::from_secs(7 + 16 * (page - 1)));
-        many_world.agents.last_success_mono = Some(at);
-        save(
-            &mut many_screen,
-            &many_world,
-            at,
-            &format!("agents-family-many-p{page}"),
-            out,
-            text,
-            size,
-        )?;
-    }
     // 「ほか N 件」にまとめた子の変更は、親のカードを元位置にしてポップアップする。
     let hidden_id = "many-0-q13";
     many_world.agents = collapsed_child_snapshot(&many, hidden_id, wall, changed_at);

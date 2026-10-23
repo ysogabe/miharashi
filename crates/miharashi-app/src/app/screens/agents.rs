@@ -15,8 +15,6 @@ const NEW_INTRO: Duration = Duration::from_millis(700);
 const RETURN: Duration = Duration::from_millis(800);
 const MAX_AGE_SECS: Duration = Duration::from_secs(30);
 const MOVE_TWEEN: Duration = Duration::from_millis(500);
-/// 全体が 1 枚に収まらないとき、次のページへ進める間隔。
-const PAGE_INTERVAL: Duration = Duration::from_secs(15);
 /// ヘッダーと集計行の下端、フッターの区切り線より上が、枠を並べる領域。
 const BOARD_TOP: f32 = 212.0;
 const BOARD_BOTTOM_MARGIN: f32 = 80.0;
@@ -125,21 +123,20 @@ pub struct AgentScreen {
     next_seen: u64,
     last_activity: HashMap<String, Instant>,
     poses: HashMap<String, PoseTween>,
-    /// いま表示しているページの配置。
+    /// いま表示している配置(常に 1 枚)。
     board: layout::Layout,
     arrangement: Arrangement,
     /// 親子グループの枠・接続線に使う単色の面(色ごとに 1 枚を使い回す)。
     solids: HashMap<[u8; 4], (u64, Arc<Pixmap>)>,
     /// 親子グループの見出し・「ほか N 件」の文字の面。
     labels: HashMap<String, Label>,
-    pages: Vec<layout::Layout>,
-    pages_dirty: bool,
+    /// 配置を作ったか(まだ一度も作っていないときは false)。
+    planned: bool,
+    /// 取得結果が変わり、配置を作り直すか確かめる必要がある。
+    board_dirty: bool,
     /// 配置(`plan_board`)を作り直した回数。テストで、変わっていないときに作り直さないことを確かめる。
     #[cfg(test)]
     replans: usize,
-    page: usize,
-    /// 表示中のページを出し始めた時刻。ページが 1 枚のとき、まだ表示していないときは None。
-    page_since: Option<Instant>,
     goal_notified: HashMap<String, Instant>,
     stale: bool,
     overflow_updates: usize,
@@ -187,12 +184,10 @@ impl AgentScreen {
             arrangement: Arrangement::default(),
             solids: HashMap::new(),
             labels: HashMap::new(),
-            pages: Vec::new(),
-            pages_dirty: true,
+            planned: false,
+            board_dirty: true,
             #[cfg(test)]
             replans: 0,
-            page: 0,
-            page_since: None,
             goal_notified: HashMap::new(),
             stale: false,
             overflow_updates: 0,
@@ -429,7 +424,7 @@ impl AgentScreen {
             self.change_cursor = self.change_cursor.max(snap.change_cursor);
         }
         self.entries = entries;
-        self.pages_dirty = true;
+        self.board_dirty = true;
         self.last_snapshot = snap.clone();
         if redraw {
             self.background_dirty = true;
@@ -586,19 +581,19 @@ impl AgentScreen {
         }
     }
 
-    /// 取得結果が変わったときに、親子グループを組み直す。ページごとの配置(`plan_board`)を作り直すのは、
+    /// 取得結果が変わったときに、親子グループを組み直す。配置(`plan_board`)を作り直すのは、
     /// 配置に関わる値(スレッドの ID・親・状態の段・重要な順・プロジェクト)が変わったときだけ。
     /// ポップアップを出している間は、対象のカードと戻り先を動かさないよう、作り直しを終わるまで待つ。
-    fn ensure_pages(&mut self) {
-        if !self.pages_dirty && !self.pages.is_empty() {
+    fn ensure_board(&mut self) {
+        if !self.board_dirty && self.planned {
             return;
         }
-        if self.focus.is_some() && !self.pages.is_empty() {
+        if self.focus.is_some() && self.planned {
             return;
         }
-        self.pages_dirty = false;
+        self.board_dirty = false;
         let arrangement = self.arrange();
-        let same_plan = !self.pages.is_empty() && arrangement.families == self.arrangement.families;
+        let same_plan = self.planned && arrangement.families == self.arrangement.families;
         self.arrangement = arrangement;
         if same_plan {
             return;
@@ -607,10 +602,8 @@ impl AgentScreen {
         {
             self.replans += 1;
         }
-        self.pages =
-            family::plan_board(self.board_area(), self.scale(), &self.arrangement.families);
-        self.page = self.page.min(self.pages.len().saturating_sub(1));
-        let board = self.pages[self.page].clone();
+        self.planned = true;
+        let board = family::plan_board(self.board_area(), self.scale(), &self.arrangement.families);
         if board != self.board {
             self.board = board;
             self.background_dirty = true;
@@ -618,32 +611,8 @@ impl AgentScreen {
     }
 
     #[cfg(test)]
-    fn layout(&self, arrangement: &Arrangement) -> Vec<layout::Layout> {
+    fn layout(&self, arrangement: &Arrangement) -> layout::Layout {
         family::plan_board(self.board_area(), self.scale(), &arrangement.families)
-    }
-
-    fn set_page(&mut self, page: usize, now: Instant) {
-        self.page = page.min(self.pages.len().saturating_sub(1));
-        self.page_since = Some(now);
-        self.board = self.pages[self.page].clone();
-        self.background_dirty = true;
-    }
-
-    /// 全体が 1 枚に収まらないとき、`PAGE_INTERVAL` ごとに次のページへ。ポップアップの間は切り替えない。
-    fn rotate_pages(&mut self, now: Instant) -> bool {
-        self.ensure_pages();
-        if self.pages.len() <= 1 || !self.presentable || self.focus.is_some() {
-            if self.pages.len() <= 1 {
-                self.page_since = None;
-            }
-            return false;
-        }
-        let since = *self.page_since.get_or_insert(now);
-        if now.saturating_duration_since(since) < PAGE_INTERVAL {
-            return false;
-        }
-        self.set_page((self.page + 1) % self.pages.len(), now);
-        true
     }
 
     fn activate_event(&mut self, now: Instant) -> bool {
@@ -679,10 +648,10 @@ impl AgentScreen {
                 .saturating_add(count.saturating_sub(1));
             self.background_dirty = true;
         }
-        self.ensure_pages();
-        // どのページにも置き場が無いスレッドの変更は、キューを詰まらせないよう捨てる。
-        let pages = &self.pages;
-        let placed = |id: &str| pages.iter().any(|p| p.anchor(id).is_some());
+        self.ensure_board();
+        // 置き場が無いスレッドの変更は、キューを詰まらせないよう捨てる。
+        let board = &self.board;
+        let placed = |id: &str| board.anchor(id).is_some();
         let gone: Vec<String> = self
             .queue
             .iter()
@@ -712,15 +681,6 @@ impl AgentScreen {
         let Some(event) = self.queue.remove(pos) else {
             return false;
         };
-        // 別のページにあるスレッドは、ポップアップを始める前にそのページへ移る(出している間は切り替えない)。
-        if self.board.anchor(&event.thread_id).is_none()
-            && let Some(page) = self
-                .pages
-                .iter()
-                .position(|p| p.anchor(&event.thread_id).is_some())
-        {
-            self.set_page(page, now);
-        }
         self.pending_new.remove(&event.thread_id);
         let urgent = self
             .entries
@@ -771,7 +731,7 @@ impl AgentScreen {
     fn render_scene(&mut self, ctx: &mut RenderContext<'_>, composite_cpu: bool) {
         let snap = self.last_snapshot.clone();
         let now = self.last_now;
-        self.ensure_pages();
+        self.ensure_board();
         // 毎フレーム全スレッドを複製しないよう、描いている間だけ借りる。
         let groups = std::mem::take(&mut self.arrangement.groups);
         // ポップアップの間は配置(対象のカードと戻り先)を前のまま保つので、`groups` は古いことがある。
@@ -787,7 +747,6 @@ impl AgentScreen {
                 &snap,
                 &groups,
                 &self.board,
-                (self.page, self.pages.len()),
                 self.scale(),
                 self.overflow_updates,
                 now,
@@ -969,7 +928,8 @@ impl AgentScreen {
         homes: &HashMap<String, layout::Rect>,
         text: &mut miharashi_render::TextEngine,
     ) -> Vec<draw::AgentCardSurface> {
-        let s = self.scale();
+        // 枠や見出しの寸法は、配置を作ったときの scale(1 枚に収めるために小さいことがある)に合わせる。
+        let s = self.board.scale_or(self.scale());
         let alpha = if self.stale { 0.65 } else { 1.0 };
         let by_id: HashMap<&str, &AgentEntry> = self
             .entries
@@ -983,12 +943,15 @@ impl AgentScreen {
             .iter()
             .map(|shape| {
                 let fam = &self.arrangement.families[shape.project][shape.family];
+                // 「ほか N 件」に回した子(表示の予算で集約した要確認の子を含む)も数える。
                 let badge = child_attention_label(
                     shape
                         .members
                         .iter()
-                        .filter(|m| Some(m.id.as_str()) != shape.root.as_deref())
-                        .filter_map(|m| by_id.get(m.id.as_str()).copied()),
+                        .map(|m| &m.id)
+                        .chain(&shape.hidden_ids)
+                        .filter(|id| Some(id.as_str()) != shape.root.as_deref())
+                        .filter_map(|id| by_id.get(id.as_str()).copied()),
                 );
                 (
                     format!("{}:{}:{}", shape.project, shape.family, shape.piece),
@@ -996,13 +959,14 @@ impl AgentScreen {
                     family_heading(fam, shape, &by_id),
                     badge,
                     shape.more.map_or(0, |(_, n)| n),
+                    shape.more_attention,
                 )
             })
             .collect();
         let mut out = Vec::new();
         let mut used = HashSet::new();
         let edge_w = 2.0 * s;
-        for (key, d, heading, badge, hidden) in views {
+        for (key, d, heading, badge, hidden, hidden_attention) in views {
             let edge = if badge.is_some() {
                 FRAME_EDGE_ALERT
             } else {
@@ -1072,7 +1036,7 @@ impl AgentScreen {
             if let Some(m) = d.more {
                 label(
                     "more",
-                    &format!("ほか {hidden} 件"),
+                    &more_label(hidden, hidden_attention),
                     layout::Rect {
                         x: m.x + 8.0 * s,
                         w: m.w - 8.0 * s,
@@ -1211,7 +1175,6 @@ impl Screen for AgentScreen {
     fn on_enter(&mut self, _: Instant) {
         // Show the current layout at once on return instead of sliding to it.
         self.poses.clear();
-        self.page_since = None;
         self.text_dirty = true;
         self.background_dirty = true;
     }
@@ -1233,7 +1196,6 @@ impl Screen for AgentScreen {
             self.pending_new.clear();
             self.focus = None;
             self.paused_at = None;
-            self.page_since = None;
             self.change_cursor = self.last_snapshot.change_cursor;
             self.background_dirty = true;
         }
@@ -1244,7 +1206,7 @@ impl Screen for AgentScreen {
         self.world_wall = world.wall.map(SystemTime::from);
         let mut redraw = self.sync(&world.agents, now);
         redraw |= self.advance(now);
-        redraw |= self.rotate_pages(now);
+        self.ensure_board();
         // Land each finished move on an exact frame, and keep drawing while any card moves.
         let mut moving = false;
         for tween in self.poses.values_mut() {
@@ -1326,13 +1288,14 @@ fn draw_background(
     snap: &AgentSnapshot,
     groups: &[Group],
     board: &layout::Layout,
-    (page, pages): (usize, usize),
     scale: f32,
     overflow: usize,
     now: Instant,
     stale_secs: u64,
     wall: SystemTime,
 ) {
+    // プロジェクトの見出しは、配置を作ったときの scale に合わせる。
+    let scale = board.scale_or(scale);
     let w = canvas.width() as f32;
     let h = canvas.height() as f32;
     canvas.clear(miharashi_render::canvas::rgba(8, 12, 20, 255));
@@ -1464,12 +1427,8 @@ fn draw_background(
     } else {
         "-- スレッド".into()
     };
-    // 要確認は全ページの分を数える。ページに分けているときは 0 件でも出す。
     let urgent = snap.entries.iter().filter(|e| attention(e)).count();
-    if pages > 1 {
-        count = format!("ページ {}/{pages} · {count}", page + 1);
-    }
-    if urgent > 0 || pages > 1 {
+    if urgent > 0 {
         count.push_str(&format!(" · 要確認 {urgent} 件"));
     }
     if overflow > 0 {
@@ -1681,6 +1640,15 @@ fn label_layer(
             alpha,
         },
     });
+}
+
+/// 「ほか N 件」の行。表示の予算で要確認の子までまとめたときは、要確認を含むことが分かるようにする。
+fn more_label(hidden: usize, attention: usize) -> String {
+    if attention > 0 {
+        format!("ほか {hidden} 件(要確認 {attention})")
+    } else {
+        format!("ほか {hidden} 件")
+    }
 }
 
 /// 子の要確認の件数。種類が 1 つなら「子に承認待ち 1」、混ざっていれば「子に要確認 N」。
@@ -2093,7 +2061,7 @@ mod tests {
         let groups = s.groups();
         assert_eq!(groups.len(), 3);
         assert_eq!(groups.iter().map(|g| g.entries.len()).sum::<usize>(), 13);
-        let board = s.layout(&s.arrange()).remove(0);
+        let board = s.layout(&s.arrange());
         assert_eq!(board.cards.len(), 13);
         let lane_of = |id: &str| {
             let x = board.cards[id].rect.x;
@@ -2117,7 +2085,7 @@ mod tests {
         s.sync(&snap, now);
         assert_eq!(s.seen.len(), 13);
         assert!((0..6).all(|i| !s.seen.contains_key(&format!("a{i}"))));
-        assert_eq!(s.layout(&s.arrange())[0].cards.len(), 13);
+        assert_eq!(s.layout(&s.arrange()).cards.len(), 13);
     }
     #[test]
     fn attention_comes_first_in_its_project_then_running_then_recent() {
@@ -2586,7 +2554,7 @@ mod tests {
             priority: 2,
         }
     }
-    /// 9 つの親子グループ(それぞれ別のプロジェクト)。1920x1080 では 1 ページに収まらない。
+    /// 9 つの親子グループ(それぞれ別のプロジェクト)。1920x1080 では scale を下げないと 1 枚に収まらない。
     fn nine_families() -> Vec<AgentEntry> {
         let mut v = Vec::new();
         for g in 0..9 {
@@ -2619,7 +2587,7 @@ mod tests {
         assert_eq!(arr.groups.len(), 1);
         assert_eq!(arr.groups[0].entries.len(), 2);
         assert_eq!(arr.families[0].len(), 1);
-        let board = &s.layout(&arr)[0];
+        let board = &s.layout(&arr);
         assert_eq!(board.cards["boss"].depth, 0);
         assert_eq!(board.cards["kid"].depth, 1);
     }
@@ -2661,7 +2629,7 @@ mod tests {
             ]),
             now,
         );
-        s.ensure_pages();
+        s.ensure_board();
         let by_id: HashMap<&str, &AgentEntry> = s
             .entries
             .iter()
@@ -2735,7 +2703,7 @@ mod tests {
         let mut s = AgentScreen::new((1920, 1080), false, 30);
         let snap = snapshot_of(big_family(100));
         s.sync(&snap, now);
-        s.ensure_pages();
+        s.ensure_board();
         let hidden = s
             .board
             .families
@@ -2768,8 +2736,35 @@ mod tests {
         assert_eq!(s.focus.as_ref().unwrap().event.thread_id, "run");
     }
 
+    /// LP の動画に使う筋書き(親子グループの見本 + 子 1 人)は、縮めも重ねもせず、ふつうの大きさで 1 枚に収まる。
     #[test]
-    fn pages_rotate_only_when_the_board_does_not_fit_and_not_during_a_popup() {
+    fn the_family_video_scenario_fits_at_full_size() {
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let base = Instant::now();
+        let scenario = crate::agent_demo::Scenario::family_video(
+            wall,
+            base,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+        );
+        for size in [(1920, 1080), (2560, 1080)] {
+            for at in [0, 6, 12] {
+                let mut s = AgentScreen::new(size, false, 30);
+                s.sync(&scenario.at(Duration::from_secs(at)), base);
+                s.ensure_board();
+                assert_eq!(s.board.scale, s.scale(), "{size:?} {at}");
+                assert!(
+                    s.board
+                        .cards
+                        .values()
+                        .all(|c| c.mode != layout::CardMode::Strip)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_crowded_board_stays_one_board_and_a_popup_never_moves_it() {
         let now = Instant::now();
         let mut s = AgentScreen::new((1920, 1080), false, 30);
         let snap = snapshot_of(nine_families());
@@ -2778,58 +2773,49 @@ mod tests {
             ..Default::default()
         };
         s.tick(&world, now);
-        assert!(s.pages.len() > 1);
-        // 要確認の組が最初のページ。
-        assert!(s.pages[0].cards.contains_key("g8c0"));
-        assert_eq!(s.page, 0);
-        s.tick(&world, now + PAGE_INTERVAL - Duration::from_secs(1));
-        assert_eq!(s.page, 0);
-        s.tick(&world, now + PAGE_INTERVAL);
-        assert_eq!(s.page, 1);
-        assert!(!s.board.cards.is_empty() && s.board == s.pages[1]);
-        // ポップアップの間は、間隔を過ぎていても切り替えない。
+        // 全部のスレッドが、いまの 1 枚の中に置かれる(scale は下がるが、ページには分けない)。
+        let board = s.board.clone();
+        assert_eq!(board.cards.len(), 36);
+        assert!(board.scale > 0.0 && board.scale < s.scale());
+        // 何時間たっても配置は同じ(巡回しない)。
+        s.tick(&world, now + Duration::from_secs(15));
+        s.tick(&world, now + Duration::from_secs(60));
+        assert_eq!(s.board, board);
+        // ポップアップの対象はいつでも今の配置にあり、始める前にどこかへ移ることはない。
         s.enqueue(change_event("g0", EventKind::Changed));
-        let t2 = now + PAGE_INTERVAL * 2;
+        let t2 = now + Duration::from_secs(120);
         s.tick(&world, t2);
         assert!(s.focus.is_some());
-        // 別のページのスレッドなら、ポップアップを始める前にそのページへ移っている。
-        let shown = s.page;
         assert!(s.board.anchor("g0").is_some());
-        s.tick(&world, t2 + Duration::from_secs(2));
         s.tick(&world, t2 + Duration::from_secs(4));
-        assert_eq!(s.page, shown);
-        // 終わったあと、そのページを出し始めてから間隔が過ぎれば次のページへ進む。
-        s.tick(&world, t2 + Duration::from_secs(6));
+        s.tick(&world, t2 + Duration::from_secs(8));
         assert!(s.focus.is_none());
-        s.tick(&world, t2 + PAGE_INTERVAL + Duration::from_secs(6));
-        assert_ne!(s.page, shown);
-        // 1 枚に収まる盤面では回らない。
+        assert_eq!(s.board, board);
+        // 収まる盤面は、縮めない。
         let mut single = AgentScreen::new((1920, 1080), false, 30);
         let one = crate::screen::World {
             agents: snapshot_of(big_family(2)),
             ..Default::default()
         };
         single.tick(&one, now);
-        single.tick(&one, now + PAGE_INTERVAL * 3);
-        assert_eq!((single.pages.len(), single.page), (1, 0));
+        assert!((single.board.scale - single.scale()).abs() < 1e-6);
     }
 
     #[test]
-    fn a_change_on_another_page_switches_to_it_and_never_hides_the_new_card() {
+    fn a_change_to_any_thread_of_a_crowded_board_pops_up_and_never_hides_the_new_card() {
         let now = Instant::now();
         let mut s = AgentScreen::new((1920, 1080), false, 30);
         let snap = snapshot_of(nine_families());
         s.sync(&snap, now);
-        s.ensure_pages();
-        let last = s.pages.len() - 1;
-        let target = s.pages[last].cards.keys().next().unwrap().clone();
-        assert!(s.board.anchor(&target).is_none());
-        s.enqueue(change_event(&target, EventKind::New));
+        s.ensure_board();
+        for target in ["g0", "g4c2", "g8c0"] {
+            assert!(s.board.anchor(target).is_some(), "{target}");
+        }
+        s.enqueue(change_event("g8c2", EventKind::New));
         assert!(s.activate_event(now));
-        assert_eq!(s.page, last);
         let cards = render_for_test(&mut s, &snap, now + Duration::from_millis(300));
-        assert!(cards.iter().any(|c| c.id == s.id_map[&target]));
-        // どのページにも無いスレッドのイベントはキューに残らない。
+        assert!(cards.iter().any(|c| c.id == s.id_map["g8c2"]));
+        // 置き場が無いスレッドのイベントはキューに残らない。
         s.focus = None;
         s.enqueue(change_event("nobody", EventKind::New));
         s.queue.clear();
@@ -2839,8 +2825,8 @@ mod tests {
         assert!(s.queue.is_empty() && !s.pending_new.contains("nobody"));
     }
 
-    /// 5 組以上の親子グループで、別のページのスレッドをポップアップ中に別の組が要確認になって順位が変わっても、
-    /// 対象のカードと戻り先は今のページにあり、配置の差し替えはポップアップが終わってから反映される。
+    /// 親子グループが多い盤面で、ポップアップ中に別の組が要確認になって順位が変わっても、
+    /// 対象のカードと戻り先は今の配置にあり、配置の差し替えはポップアップが終わってから反映される。
     #[test]
     fn a_popup_keeps_its_target_and_return_place_when_other_groups_reorder() {
         let now = Instant::now();
@@ -2851,19 +2837,12 @@ mod tests {
             ..Default::default()
         };
         s.tick(&world(entries.clone()), now);
-        assert!(s.pages.len() > 1);
-        let last = s.pages.len() - 1;
-        let target = s.pages[last]
-            .cards
-            .keys()
-            .find(|id| id.starts_with('g') && id.contains('c'))
-            .unwrap()
-            .clone();
+        let target = "g5c1".to_string();
+        assert!(s.board.anchor(&target).is_some());
         s.enqueue(change_event(&target, EventKind::Changed));
         assert!(s.activate_event(now));
-        assert_eq!(s.page, last);
         let replans = s.replans;
-        // 別の組の子が要確認になる。組は最初のページへ上がり、ほかのページの組も順位が動く。
+        // 別の組の子が要確認になる。組は先頭へ上がり、ほかの組も順位が動く。
         let mut moved = entries;
         moved
             .iter_mut()
@@ -2876,15 +2855,13 @@ mod tests {
         assert!(s.focus.is_some());
         assert_eq!(s.replans, replans, "ポップアップの間は作り直さない");
         assert!(s.board.anchor(&target).is_some());
-        assert!(s.pages[s.page].anchor(&target).is_some());
-        assert_eq!(s.board, s.pages[s.page]);
         assert!(mid.iter().any(|c| c.id == s.id_map[&target]));
-        // 終わったあとに反映される: 要確認の組が最初のページに来る。
+        // 終わったあとに反映される: 要確認の組が最初に来る(組の並びは変わるが、全員が今の配置にある)。
         let later = now + Duration::from_secs(8);
         s.tick(&world(moved), later);
         assert!(s.focus.is_none());
         assert_eq!(s.replans, replans + 1);
-        assert!(s.pages[0].cards.contains_key("g0c0"));
+        assert!(s.board.cards.contains_key("g0c0") && s.board.cards.contains_key(&target));
     }
 
     /// ポップアップの間は配置(対象のカードと戻り先)を前のまま保つので、その間に別のスレッドが一覧から消えても、
@@ -2899,18 +2876,10 @@ mod tests {
             ..Default::default()
         };
         s.tick(&world(entries.clone()), now);
-        assert!(s.pages.len() > 1);
-        let last = s.pages.len() - 1;
-        let target = s.pages[last]
-            .cards
-            .keys()
-            .find(|id| id.starts_with('g') && id.contains('c'))
-            .unwrap()
-            .clone();
+        let target = "g5c1".to_string();
         s.enqueue(change_event(&target, EventKind::Changed));
         assert!(s.activate_event(now));
-        assert_eq!(s.page, last);
-        // 今のページにある、対象でない子が一覧から消える(アーカイブ・片付け・時間切れなど)。
+        // 今の配置にある、対象でない子が一覧から消える(アーカイブ・片付け・時間切れなど)。
         let gone = s
             .board
             .cards
@@ -2934,13 +2903,13 @@ mod tests {
             assert!(cards.iter().any(|c| c.id == s.id_map[&target]), "{step}");
             assert!(cards.iter().all(|c| c.id != gone_card), "{step}");
         }
-        // 終わったあとに作り直され、消えたスレッドはどのページにも無い。
+        // 終わったあとに作り直され、消えたスレッドはどこにも無い。
         let later = now + Duration::from_secs(8);
         s.tick(&world(remaining.clone()), later);
         assert!(s.focus.is_none());
         let cards = render_for_test(&mut s, &snapshot_of(remaining), later);
         assert!(cards.iter().all(|c| c.id != gone_card));
-        assert!(s.pages.iter().all(|p| p.anchor(&gone).is_none()));
+        assert!(s.board.anchor(&gone).is_none());
         assert!(
             s.arrangement
                 .groups
@@ -2977,7 +2946,7 @@ mod tests {
         let cards = render_for_test(&mut s, &snapshot_of(remaining.clone()), t);
         assert!(cards.iter().any(|c| c.id == s.id_map["g1c1"]));
         assert!(cards.iter().all(|c| c.id != gone_card));
-        assert!(s.pages.iter().all(|p| p.anchor("g0c1").is_none()));
+        assert!(s.board.anchor("g0c1").is_none());
         // 最後のイベントの対象が消えても、キューは空になるだけで落ちない。
         let remaining: Vec<AgentEntry> = remaining
             .into_iter()
@@ -2993,17 +2962,17 @@ mod tests {
         let now = Instant::now();
         let mut s = AgentScreen::new((1920, 1080), false, 30);
         s.sync(&snapshot_of(nine_families()), now);
-        s.ensure_pages();
+        s.ensure_board();
         assert_eq!(s.replans, 1);
         // 中身が同じ(Arc だけ新しい)取得では作り直さない。
         s.sync(&snapshot_of(nine_families()), now + Duration::from_secs(1));
-        s.ensure_pages();
+        s.ensure_board();
         assert_eq!(s.replans, 1);
         // 題名が変わっても配置は変わらない。表示用のスレッドの中身は新しくなる。
         let mut renamed = nine_families();
         renamed[1].title = "新しい題名".into();
         s.sync(&snapshot_of(renamed), now + Duration::from_secs(2));
-        s.ensure_pages();
+        s.ensure_board();
         assert_eq!(s.replans, 1);
         assert!(
             s.arrangement
@@ -3016,7 +2985,7 @@ mod tests {
         let mut moved = nine_families();
         moved[1].state = AgentState::Approval;
         s.sync(&snapshot_of(moved), now + Duration::from_secs(3));
-        s.ensure_pages();
+        s.ensure_board();
         assert_eq!(s.replans, 2);
     }
 
@@ -3041,12 +3010,87 @@ mod tests {
         let mut s = AgentScreen::new((1920, 1080), false, 30);
         let snap = snapshot_of(big_family(1));
         s.sync(&snap, now);
-        s.ensure_pages();
+        s.ensure_board();
         s.board.cards.get_mut("run").unwrap().rect.x = 5000.0;
         let cards = render_for_test(&mut s, &snap, now);
         assert!(cards.iter().all(|c| c.id != s.id_map["run"]));
         assert!(!s.surfaces.contains_key("run"));
         assert!(s.surfaces.contains_key("boss"));
+    }
+
+    /// 親 1 + 承認待ちの子 `n` 人を 3 つのプロジェクトに分けた取得(GLES の上限を超える)。
+    fn many_approvals(n: usize) -> Vec<AgentEntry> {
+        let mut v = Vec::new();
+        for g in 0..3 {
+            let boss = format!("boss{g}");
+            let mut b = entry(&boss, AgentState::Running);
+            b.project_id = format!("proj{g}");
+            v.push(b);
+            for i in 0..n {
+                let mut c = child(&format!("g{g}a{i}"), &boss, AgentState::Approval);
+                c.project_id = format!("proj{g}");
+                c.has_pending_approvals = true;
+                v.push(c);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn attention_children_over_the_surface_budget_are_counted_in_the_more_line_and_the_badge() {
+        let now = Instant::now();
+        let mut s = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(many_approvals(600));
+        s.sync(&snap, now);
+        render_for_test(&mut s, &snap, now);
+        let hidden: usize = s.board.families.iter().map(|f| f.hidden_ids.len()).sum();
+        assert!(hidden > 0, "上限を超えるので集約するはず");
+        let key_of = |name: &str| -> Vec<String> {
+            s.labels
+                .iter()
+                .filter(|(id, _)| id.ends_with(name))
+                .map(|(_, l)| l.key.clone())
+                .collect()
+        };
+        // 「ほか N 件」は、要確認を含むことが分かる。
+        let more = key_of(":more");
+        assert!(!more.is_empty());
+        assert!(more.iter().all(|k| k.contains("要確認")), "{more:?}");
+        // 枠の札は、集約した子も含めた全件(600)を数える。
+        let badges = key_of(":badge");
+        assert!(
+            badges.iter().any(|k| k.starts_with("子に承認待ち 600|")),
+            "{badges:?}"
+        );
+        // 上部の要確認の件数は全件のまま。
+        assert_eq!(s.entries.iter().filter(|e| attention(e)).count(), 3 * 600);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn attention_cards_survive_the_gpu_compositor_selection() {
+        // 上限を超える盤面でも、合成が捨てる(描く順の前から)のは枠・線までで、要確認のカードは全部残る。
+        let now = Instant::now();
+        let mut s = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(many_approvals(600));
+        s.sync(&snap, now);
+        let cards = render_for_test(&mut s, &snap, now);
+        let ids: Vec<u64> = cards.iter().map(|c| c.id).collect();
+        let start = miharashi_gpu::compose::agent_draw_start(&ids);
+        assert_eq!(start, 0, "面 {} 枚が上限内に収まる", ids.len());
+        let distinct: HashSet<u64> = ids.iter().copied().collect();
+        assert!(distinct.len() <= miharashi_gpu::compose::AGENT_TEXTURES);
+        assert!(ids.len() <= miharashi_gpu::compose::AGENT_DRAWS);
+        // 配置に置いた要確認のカードは、全部描く範囲にある。
+        let placed: Vec<u64> = s
+            .board
+            .cards
+            .keys()
+            .filter(|id| id.contains('a'))
+            .map(|id| s.id_map[id])
+            .collect();
+        assert!(!placed.is_empty());
+        assert!(placed.iter().all(|id| ids[start..].contains(id)));
     }
 
     /// 件数の多い取得を画面が取り込む時間(組み立て + 配置 + 描画の準備)。
@@ -3061,11 +3105,11 @@ mod tests {
             let snap = snapshot_of(entries.clone());
             let started = std::time::Instant::now();
             s.sync(&snap, now);
-            s.ensure_pages();
+            s.ensure_board();
             let first = started.elapsed();
             let started = std::time::Instant::now();
             s.sync(&snapshot_of(entries), now + Duration::from_secs(5));
-            s.ensure_pages();
+            s.ensure_board();
             let same = started.elapsed();
             let started = std::time::Instant::now();
             render_for_test(&mut s, &snap, now + Duration::from_secs(6));
