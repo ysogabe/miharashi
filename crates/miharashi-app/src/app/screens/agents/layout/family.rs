@@ -2320,6 +2320,8 @@ mod tests {
     #[test]
     fn headings_stay_clear_when_group_heights_differ() {
         // 子の数の違う組を、いくつかの幅と組の数で重ねる。どの見出しも「ほか N 件」の行もカードに覆われない。
+        // 組の数は 22 までにしている: 組ごとの固定の高さ(見出し・親・余白)の合計が列に収まらないほど多い盤面
+        // (幅 1856 で 26 組以上など)は、余白つきの縮めが成り立たず、従来の縮め(`solve_tails` の外)になる。
         let mut overlapped = 0;
         for w in [1856.0, 2496.0] {
             let area = Rect { w, ..AREA };
