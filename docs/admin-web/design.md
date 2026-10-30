@@ -49,7 +49,7 @@
    - `/etc/miharashi` に書けない問題、`toml_edit` を足す問題、保存の失敗で起動できなくなる問題の 3 つを同時に避けられる。
    - 代償は「設定の出どころが 2 つになる」こと。ページには項目ごとに「効いている値 / ファイルの値 / 上書き / 次回起動」を並べ、「ファイルの値に戻す」を置く。`check-config` と起動ログに上書きの件数と値を出し、SSH で直す人が気づけるようにする。外のスクリプトは `miharashi config-get` で同じ規則の値を取る(方針 8)。
 2. **上書きは型のある構造体で読む(汎用のテーブル結合はしない)。** `Overlay` と内側の構造体の全部に `deny_unknown_fields` を付け、変えられる項目だけを `Option` で持つ。読み込みでも API でも、この構造体を通らない項目は書けない。合わせた `Config` に対して既存の `validate()` を掛ける。
-3. **トークンを送る接続先は守る。** `home_assistant.url` は上書きの対象から外す(表示だけ)。`agents.url` は、root 所有の設定ファイルにある `[admin] allowed_hosts` か、設定ファイルの `agents.url` と同じホストだけを認める。既存の `check_url` は DNS の偽装しか防がないので、ホストの制限は上書きに固有の規則として足す。上書きにある URL は、画面が無効でも必ず検査する。
+3. **トークンを送る接続先は守る。** `home_assistant.url` は上書きの対象から外す(表示だけ)。`agents.url` は、root 所有の設定ファイルにある `[admin] allowed_hosts` か、設定ファイルに書かれた `agents.url` と同じ origin(scheme・ホスト・ポート)だけを認め、https から http への格下げは認めない。プログラムの既定値は照合の相手にしない。既存の `check_url` は DNS の偽装しか防がないので、この制限は上書きに固有の規則として足す。上書きにある URL は、画面が無効でも必ず検査する。
 4. **起動時の安全弁。** 上書きが読めない・合わせた設定が検証に通らない・許されないホストを含むときは、設定ファイルだけで起動し、理由を stderr と管理 API に出す。さらに、上書きを使って起動した直後に異常終了したときは、次の起動で上書きを外す(印のファイル)。管理ページから直せる状態を必ず残す。守る範囲は「管理ページが書いたもの」まで。設定ファイル自体が壊れていれば今までどおり起動しない。
 5. **認証は管理ページ専用のトークン。** ブラウザは `Authorization` を自動で付けないので、ページの JavaScript が `sessionStorage` のトークンをヘッダーに付ける。Cookie は使わない。設定の書き換えと再起動はキー操作より強い権限なので、常時電源の入った Echo Show 5 に置くパネルのトークンとは分ける。ファイルだけでなく値も別でなければならず、同じ値なら管理ページを無効にする。CSRF が成り立たない前提は「安全面」に規則として書く。
 6. **再起動は自分で終了して `Restart=always` に任せる。** `systemctl` は使えない。起動から 120 秒間と、受け付けてから終了するまでは 429 で断る。
@@ -125,18 +125,19 @@ flowchart LR
 # 管理ページから保存した値の置き場所。設定ファイルより優先する。あれば [admin] が無効でも読む。
 # 壊れていたり検証に通らなければ無視して、この設定ファイルだけで起動する(理由は journal と管理ページに出る)。
 # overlay_file = "/var/lib/miharashi/admin.toml"
-# 管理ページから T3 の接続先(agents.url)に使えるホスト。この設定ファイルの agents.url のホストは常に使える。
-# ホスト名か IP アドレスだけを書く(ポートとパスは管理ページで自由に変えられる)。
-# allowed_hosts = []
+# 管理ページから T3 の接続先(agents.url)に使える接続先。この設定ファイルに書いた agents.url(scheme・ホスト・ポートが同じもの)
+# は常に使える。別のホストやポートを使うにはここに host か host:port を書く(port を書かなければ 80 / 443 だけ)。
+# https の設定を管理ページから http に変えることはできない。パスは自由。
+# allowed_hosts = []           # 例: ["192.0.2.30:3773", "t3.example.test"]
 ```
 
 - `admin.enabled = true` で `panel.enabled = false` は `validate` で拒否(「admin.enabled = true には panel.enabled = true が必要」)。
 - `overlay_file` は `admin.enabled` に関係なく、ファイルがあれば読む。管理ページを止めても保存した値が消えないため。
-- `allowed_hosts` の各要素はホスト名(英数字・`-`・`.`)か IP アドレス(IPv6 は `[]` 無し)だけ。それ以外は `validate` で拒否。
+- `allowed_hosts` の各要素はホスト名(英数字・`-`・`.`)か IP アドレス(IPv6 は `[]` で囲む)で、`:port`(数字)を付けてもよい。それ以外は `validate` で拒否。
 
 ### 上書きファイル(`admin.toml`)
 
-変えられる項目だけ。全部 `Option`。無いキーは「上書きしない」。`home_assistant` のテーブルは無い(あれば知らないキーとして無視・拒否)。
+変えられる項目だけ。全部 `Option`。無いキーは「上書きしない」。`home_assistant` のテーブルは無い。知らないキー(外側・内側とも)があるときの扱いは、**読み込みでは上書きファイル全体を無視**(`report.error`)、**PUT では 400** で、部分的に受け入れることはしない。
 
 ```toml
 # miharashi の管理ページが書くファイル。手で直してもよいが、ここに無い項目は書けない(起動時に無視される)。
@@ -180,10 +181,15 @@ pub struct OverlayScreen { pub enabled: Option<bool> }
 
 impl Overlay {
     /// 上書きに固有の規則。読み込みと保存の両方から呼ぶ(1 か所に書く)。
-    /// - 3 つの url: 共通の文字の検査(制御文字・空白・'"'・'\\'・'@' を拒否、http(s) で始まり、host が解釈でき、port は数字)
-    /// - agents.url: 画面が無効でも agents::check_url を通す。host が base.admin.allowed_hosts か base.agents.url の host と一致すること
+    /// - 3 つの url: 共通の文字の検査(制御文字・空白・'"'・'\\'・'@' を拒否、authority は ASCII だけで '%' も不可、
+    ///   http(s) で始まり、ureq::http::Uri で読めて host が空でなく、port があれば数字)
+    /// - agents.url: 画面が無効でも agents::check_url を通す。さらに origin(scheme・host・port)が次のどれかと一致すること:
+    ///   (a) 設定ファイルの文面に書かれた agents.url の origin(base_agents_url: Option<&str>。プログラムの既定値は使わない。
+    ///       空文字や未記載なら候補に入れない)
+    ///   (b) base.admin.allowed_hosts の各要素(host か host:port。port が無ければ scheme の既定ポート(80 / 443)だけ)
+    ///   scheme は、(a) が https なら https だけ(http への格下げは不可)。(b) は http でも https でもよい(http は check_url の規則で IP か localhost に限られる)
     /// - aircraft.url / geoframe.url: 共通の文字の検査だけ(トークンを送らない)
-    pub fn check(&self, base: &Config) -> Result<(), String>;
+    pub fn check(&self, base: &Config, base_agents_url: Option<&str>) -> Result<(), String>;
     pub fn apply(&self, cfg: &mut Config);          // Some の項目だけ代入
     pub fn entries(&self) -> Vec<(&'static str, String)>; // ("aircraft.enabled", "false") の一覧(ログ・check-config 用)
     pub fn is_empty(&self) -> bool;
@@ -191,12 +197,16 @@ impl Overlay {
 pub struct OverlayReport {
     pub path: PathBuf,
     pub exists: bool,
+    pub generation: String,                      // 読んだ時点の上書きファイルの世代("none" = 無い)
     pub applied: Vec<(&'static str, String)>,   // 効いた項目
-    pub error: Option<String>,                   // 無視した理由(読めない・知らないキー・規則違反・検証に通らない・前回の起動が早く終わった)
+    pub error: Option<String>,                   // 無視した理由(読めない・知らないキー・規則違反・検証に通らない・前回の起動が早く終わった・印を書けない)
+    pub error_kind: Option<OverlayErrorKind>,    // Parse / UnknownKey / Rule / Validate / BootFailed / MarkerUnwritable
+    pub boot_failed_generation: Option<String>,  // BootFailed のとき、印に書かれていた上書きの世代
 }
 /// 起動時に読んだもの一式。実行ループと panel が持ち回る。
 pub struct LoadedConfig {
     pub base_path: Option<PathBuf>,
+    pub base_agents_url: Option<String>, // 設定ファイルの文面に書かれた agents.url(未記載・空なら None。allowed_hosts の照合用)
     pub base: Config,       // 上書き前(ページの「ファイルの値」)
     pub effective: Config,  // 実際に使う(上書き後。無視したときは base と同じ)
     pub report: OverlayReport,
@@ -213,7 +223,13 @@ impl Config {
 ```
 
 - 読み込みの順: base を `Config::load`(失敗なら今までどおりエラーで終了)→ 印が残っていれば overlay を無視(`report.error` = 「前回の起動が 60 秒以内に終わったので上書きを外した」。印は消す)→ overlay が無ければ `report.applied` は空 → あれば `toml::from_str::<Overlay>`(失敗は `report.error`)→ `check(&base)`(失敗は `report.error`)→ `base.clone()` に `apply` → `validate`(失敗は `report.error`、effective は base)。
-- 印のファイル(`admin.boot`、`overlay_file` と同じディレクトリ): 上書きが効いた(`report.applied` が空でない)状態で `load_with_overlay` が返ったら、**`main` がすぐに書く**(表示の初期化、`app::kiosk`、DRM・GL の初期化より前)。上書きで有効にした画面(cube・vrm・agents)の初期化はこれらの中で失敗するので、実行ループに入ってから書くのでは遅い。実行ループが 60 秒動いたら消す。正常終了の経路(SIGTERM・SIGINT、キーの quit、`max_seconds`、管理ページの再起動)でも消す。描画エラーでの終了、`kill -9`、初期化の途中の失敗では残る。管理ページ由来の再起動は起動から 120 秒たたないと受け付けないので、誤って外すことはない。`check-config` と `config-get` は印を見て結果に反映するが、消しも書きもしない(`consume_marker = false`)。
+- 印のファイル(`admin.boot`、`overlay_file` と同じディレクトリ):
+  - **書く時機**: `run` サブコマンドで、上書きが効いた(`report.applied` が空でない)状態で `load_with_overlay` が返ったら、**`main` がすぐに書く**(表示の初期化、`app::kiosk`、DRM・GL の初期化より前)。上書きで有効にした画面(cube・vrm・agents)の初期化はこれらの中で失敗するので、実行ループに入ってから書くのでは遅い。SIGTERM・SIGINT のハンドラーの登録(今は `runtime.rs:470-473`)は、印を書く前に `main` へ移す(登録前に `systemctl stop` が来ると既定の動作で死んで印が残るため)。
+  - **中身**: 1 行の JSON `{"pid": n, "boot_id": "<\/proc/sys/kernel/random/boot_id>", "generation": "<起動時の上書きの世代>", "started_at": "..."}`。
+  - **消す時機**: 実行ループが 60 秒動いたら消す。正常終了の経路(SIGTERM・SIGINT、キーの quit、`max_seconds`、管理ページの再起動)でも消す。描画エラーでの終了、`kill -9`、初期化の途中の失敗では残る。
+  - **判定**(`load_with_overlay`): 印があっても、(1) `boot_id` が今の起動と違う(電源断・再起動のあと)か、(2) `pid` のプロセスがまだ生きている(上書きで問題なく起動した直後の 60 秒間に `check-config`・`config-get`・`next` の計算が見た)なら、失敗とは見ない。それ以外は「上書きで起動した直後に終了した(原因が上書きとは限らない)」として上書きを無視し、`report.error_kind = boot_failed`、`report.boot_failed_generation = 印の generation` にする。
+  - **書けないとき**: 印を書けなければ(ディレクトリに書けない・ディスクがいっぱい)、上書きを無視して設定ファイルだけで起動し、`report.error` に理由を入れる(印なしで上書きを使うと、落ちる上書きでまた systemd が止まる)。
+  - **消す・書くのは `run` だけ**(`consume_marker = true`)。`check-config`・`config-get`・`png`・`bench`・`demo-video`・`kms-info` などは印を見るだけで、消しも書きもしない(`consume_marker = false`)。管理ページ由来の再起動は起動から 120 秒たたないと受け付けないので、誤って外すことはない。
 - `check-config` の出力(上書きが効いているとき):
 
 ```
@@ -238,7 +254,7 @@ OK
 | GET | `/admin`、`/admin/app.js`、`/admin/app.css` | なし | 埋め込んだ静的ファイル。`Content-Type` はそれぞれ `text/html; charset=utf-8`、`text/javascript`、`text/css`。ヘッダーに `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`、`X-Frame-Options: DENY`、`Cache-Control: no-store`、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer` |
 | GET | `/api/v1/admin/overview` | 管理 | 下の JSON。ページはタブが見えている間、5 秒ごとに読む |
 | PUT | `/api/v1/admin/config` | 管理 | 本文 `{"generation": "<overview で受け取った値>", "overlay": {...}}`。`overlay` は上書き全体(`Overlay` と同じ形の JSON。無いキーと `null` は上書きしない)。手順: 今の上書きファイルの世代と `generation` を比べ、違えば `409 {"error":"上書きファイルが変わっている。読み直してから保存する"}` → 今の設定ファイルを読み直して `parse`(失敗は `409 {"error":"設定ファイルが読めない: …"}`)→ `Overlay::check(&base)`(失敗は `400`)→ 重ねて `validate`(失敗は `400 {"error":"<validate の文>"}`)→ 書く(失敗は `500`)→ `204`。知らないキー(内側も)・読めない JSON は `400`。本文の上限は 16 KiB(`413`) |
-| POST | `/api/v1/admin/restart` | 管理 | 本文なし。起動から 120 秒未満、または既に受け付けて終了待ちなら `429 {"error": "...", "retry_after_s": n}`。起動中(`Shared.state` がまだ無い)は `503`。受け付けたら `restart_requested` を立て、印のファイルを消し、`202 {"restart_in_s": 1}` を返してから実行ループに `PanelInput::Restart` を送る |
+| POST | `/api/v1/admin/restart` | 管理 | 本文なし。起動から 120 秒未満、または既に受け付けて終了待ちなら `429 {"error": "...", "retry_after_s": n}`。`boot_failed` で今の上書きの世代が印のものと同じなら `409`。起動中(`Shared.state` がまだ無い)は `503`。受け付けたら `restart_requested` を立て、印のファイルを消し、`202 {"restart_in_s": 1}` を返してから実行ループに `PanelInput::Restart` を送る |
 | POST | `/api/v1/admin/probe` | 管理 | (R18、あると良い)`{"target": "geoframe" \| "agents" \| "aircraft", "url": "..."}`。URL は保存と同じ規則(`Overlay::check` の該当する URL の規則。許可ホストを含む)を通してから GET を試す。規則: `Authorization` を付けない、`max_redirects(0)`、`timeout_global(3s)`、応答は状態コードと所要時間と短い理由だけ(本文・ヘッダーは返さない)、対象と送り元の IP を journal に 1 行出す。`200 {"ok": bool, "status": 200 \| null, "elapsed_ms": n, "error": "..." \| null}`。管理ワーカーとは別の probe スレッドで行い、同時に 1 本まで(`429`)。`home_assistant` は対象外 |
 | OPTIONS | すべて | — | `405`(CORS の事前確認に応えない。`Access-Control-Allow-*` はどの応答にも付けない) |
 
@@ -293,8 +309,10 @@ JSON の応答(既存のパネル API を含む)にも `X-Content-Type-Options: 
 ```
 
 - `items[].effective` は今動いているプロセスの値(`LoadedConfig.effective`)。`file` は起動時に読んだ設定ファイルの値(`LoadedConfig.base`)。`overlay` は**今の `admin.toml` の値**(リクエストのたびに読み直す)。`next` は「次回起動の値」で、今の設定ファイルを読み直し、今の `admin.toml` を起動時と同じ規則(壊れている・規則違反なら無視)で重ねて求める。設定ファイルが読めないときは `next` を `null` にし、`overlay.error` に理由を入れる。
-- `overlay.pending_restart` は、どれかの項目で `next != effective` のとき `true`。壊れた上書きの警告(`overlay.error`)とは別。ただし `overlay.error` が「前回の起動が 60 秒以内に終わった」(印による無視)のときは、上書きファイルがまだ残っていて `next != effective` になるが、その上書きで起動に失敗した直後なので、ページは「この上書きで起動に失敗した。直してから再起動する」と出し、再起動ボタンを強調しない(`overlay.error_kind: "boot_failed"` で区別する)。
-- `allowed_hosts` の照合: ホスト名は小文字にそろえ、IPv6 の `[]` は外し、完全一致だけ(末尾一致やワイルドカードは無い)。設定ファイルの `agents.url` のホストも同じ規則で比べる。
+- `overlay.pending_restart` は、どれかの項目で `next != effective` のとき `true`。壊れた上書きの警告(`overlay.error`)とは別。ただし `overlay.error_kind` が `boot_failed`(印による無視)で、**今の `admin.toml` の世代が印に書かれた世代と同じ**間は、その上書きで起動した直後に終了したばかりなので、ページは「この上書きで起動した直後に終了した(原因が上書きとは限らない)。直すか取り消してから再起動する」と出し、再起動ボタンを無効にする。`POST /api/v1/admin/restart` もこの間は `409 {"error":"起動に失敗した上書きのまま。保存して世代を変えてから"}` を返す(そうしないと、管理ページからの再起動 1 回で起動が 2 回(落ちる → 設定ファイルだけで起動)になり、押し続けると 300 秒に 6 回で systemd が止まる)。保存して世代が変われば `boot_failed` は解け、再起動できる。
+- `allowed_hosts` の照合: ホストは `ureq::http::Uri::host()` で 1 回だけ取り出し、`check_url` の判定と照合の両方に同じ値を使う(取り出し方を 2 通りにしない)。IP アドレスは `IpAddr` に直して比べる(`2001:db8:0::1` と `2001:db8::1` は同じ)。ホスト名は小文字にそろえて完全一致(末尾のドット・末尾一致・ワイルドカードは無い)。ポートは明示されていなければ scheme の既定ポート。表記ゆれ(IPv4 の先頭 0、IPv4 射影、ゾーン ID)はすべて「一致しない」側に倒れる。
+- 照合の相手に、プログラムの既定値(`ConfigAgents::default()` の url、`config.rs:495`)は**使わない**。設定ファイルに `[agents] url` が書かれていないときは `allowed_hosts` だけで照合する。`load_with_overlay` は base の生の TOML から `agents.url` の有無を見て `base_agents_url` を決め、`LoadedConfig` に持たせる(PUT でも同じ値を使う)。
+- 照合は origin 単位(scheme・host・port)。「同じホストの別のポート」も `allowed_hosts` に `host:port` で書かないと通らない。理由: 許可ホスト上の一般ユーザーが高いポートで待ち受ければトークンを受け取れるため。https の設定を http に格下げすることも通らない(管理トークンを盗聴できる人は T3 のトークンも盗聴できてしまう)。
 - `feeds[].error` と `overlay.error` は 200 文字で切り、URL のクエリは落とす。外部サービスの応答本文はそのまま入れない(既存の `error_summary` と同じ短い要約)。
 - `feeds[].state` と各取得元の対応:
 
@@ -365,8 +383,8 @@ JavaScript はフレームワークを使わず、`fetch` と DOM 操作だけ�
 - **CSRF が成り立たない前提(守る規則)**: (1) Cookie を使わない。(2) 状態を変える経路はすべて `Authorization` ヘッダーを要する(このヘッダーがあると、ブラウザは他のサイトからの送信の前に事前確認を行う)。(3) `Access-Control-Allow-*` を一切返さず、`OPTIONS` は 405。(4) トークンを URL のクエリや本文で受け取らない。この 4 つのどれかを崩す変更は、CSRF 対策を別に足す必要がある。
 - **Host ヘッダーと DNS rebinding**: 確かめていない。すべての経路が `Authorization` を要するので、他のサイトから名前を向け直しても呼べない。前提 (2) が崩れると効いてくるので、ここに書いておく。
 - **書けるファイルの範囲**: 書くのは `overlay_file` とその `.prev` / `.tmp-*`、印だけ。パスは設定から取り、リクエストからは受け取らない。`/etc/miharashi` には触らない。
-- **接続先の誘導**: `agents.url` のホストは `allowed_hosts` か設定ファイルの `agents.url` のホストに限る。既存の `check_url` が「平文 http はホスト名不可(IP か localhost)」で DNS の偽装を防ぐ。GEOFRAME と tar1090 はトークンを送らないので、形の検査だけ。GEOFRAME は写真の URL をキオスクが取りに行くので、`geoframe.url` を変えると任意の URL(ループバックを含む)を取らせられる(「リスクと対策」。写真の URL を同じ origin に限る対応は別の Issue)。
-- **再起動の抑止**: 起動から 120 秒間と、受け付けてから終了するまでは 429。起動の数で数えると 300 秒に最大 3 回(管理ページ由来の再起動は 2 回)で、5 回には届かない。上書きが原因で起動直後に落ちる経路は、印のファイルで次の起動から上書きを外す(R9)。残るリスク: 管理操作の再起動とクラッシュの再起動が 300 秒に合計 5 回重なると systemd が止まり、SSH の `systemctl reset-failed` が要る。
+- **接続先の誘導**: `agents.url` の origin は `allowed_hosts` か、設定ファイルに書かれた `agents.url` の origin に限る(プログラムの既定値は相手にしない。https から http への格下げは不可。ポートも照合する)。既存の `check_url` が「平文 http はホスト名不可(IP か localhost)」で DNS の偽装を防ぐ。GEOFRAME と tar1090 はトークンを送らないので、形の検査だけ。GEOFRAME は写真の URL をキオスクが取りに行くので、`geoframe.url` を変えると任意の URL(ループバックを含む)を取らせられる(「リスクと対策」。写真の URL を同じ origin に限る対応は別の Issue)。
+- **再起動の抑止**: 起動から 120 秒間と、受け付けてから終了するまでは 429。起動の数で数えると 300 秒に最大 3 回(管理ページ由来の再起動は 2 回)で、5 回には届かない。上書きが原因で起動直後に落ちる経路は、印のファイルで次の起動から上書きを外す(R9)。落ちた上書きの世代のままの再起動は 409 で断る(再起動 1 回で起動が 2 回になる経路を塞ぐ)。残るリスク: 管理操作の再起動とクラッシュの再起動が 300 秒に合計 5 回重なると systemd が止まり、SSH の `systemctl reset-failed` が要る。
 - **秘密情報**: トークンの値はどの応答にも入れない。`admin.toml` に秘密は入らない(userinfo の拒否)。ページは `sessionStorage` にトークンを置く(タブを閉じると消える。`localStorage` は使わない)。エラー文に外部サービスの応答本文をそのまま入れない。R19 の `t3-agent.meta.json` に `sessionId` を入れる場合も、`overview` には出さない。
 - **外部への通信**: 管理ページ自体はキオスクから外へ通信しない。R18 の疎通確認だけは、保存と同じ規則を通した URL に GET を行い、`Authorization` を付けず、`max_redirects(0)`、`timeout_global(3s)`、応答の本文とヘッダーは読まず、journal に 1 行出す。ループバックの空きポートを状態コードと時間で探れることは、家で 1 人が使う前提で受け入れる。ブラウザの `fetch` は `connect-src 'self'` で listen 以外へ出せない。
 - **サーバーの詰まり**: 管理のリクエストは管理ワーカー(同時 1 本)で処理し、本文の読み取りは 5 秒で諦める。パネルのスレッドは認証と受け渡しだけ。疎通確認はさらに別のスレッドで同時 1 本。
@@ -385,13 +403,13 @@ JavaScript はフレームワークを使わず、`fetch` と DOM 操作だけ�
 | AC4 | 単体(`panel.rs`): base を `agents.enabled = true`・`url` 正しい・`ui.start_screen = "agents"` にし、PUT で `{"agents":{"enabled":false}}` → 400 と「ui.start_screen = agents には agents.enabled = true が必要」。`admin.toml` が変わらない |
 | AC5 | 単体: 書き込みの手順を関数に分け、(a) tmp を書いた直後、(b) `.prev` を作った直後、(c) rename 後、の各状態をディレクトリに作って `load_with_overlay` を呼び、前の内容か新しい内容のどちらかになること。残った tmp が起動時に消えること |
 | AC6 | 単体: `{"panel":{"listen":"..."}}`、`{"agents":{"token_file":"..."}}`、`{"geoframe":{"photo_interval_secs":1}}`、`{"home_assistant":{"url":"..."}}`、userinfo 付き URL、空白・`"`・制御文字を含む URL、`agents.enabled=false` で `agents.url` が不正、許可されないホスト → すべて 400。`admin.toml` が変わらない |
-| AC7 | 単体(`config.rs`): `Overlay::check` に base(`agents.url = http://192.0.2.30:3773`、`allowed_hosts = ["t3.example.test"]`)を渡し、`http://192.0.2.30:4000` と `https://t3.example.test/` は Ok、`http://192.0.2.31:3773` は Err。`load_with_overlay` で許されないホストの overlay が無視され `report.error` に理由 |
+| AC7 | 単体(`config.rs`): `Overlay::check` に base(文面の `agents.url = http://192.0.2.30:3773`、`allowed_hosts = ["t3.example.test", "192.0.2.40:4000"]`)を渡し、`http://192.0.2.30:3773/x`・`https://t3.example.test/`・`http://192.0.2.40:4000` は Ok、`http://192.0.2.30:4000`(ポート違い)・`http://192.0.2.31:3773`・`https://t3.example.test:8443`(port 無しの要素は既定ポートだけ)は Err。文面が `https://192.0.2.30` のとき `http://192.0.2.30` は Err(格下げ)。`[agents]` が無い base と `url = ""` の base では、既定値のホスト(`192.168.0.132`)が Err で `allowed_hosts` だけが通る。`https://:443` のような空ホストは Err。表記ゆれ(`192.000.002.030`、`2001:db8:0::1` と `2001:db8::1`、末尾のドット)。`load_with_overlay` で許されない overlay が無視され `report.error` に理由 |
 | AC8 | 単体: base のパスに壊れた TOML を置いて PUT → 409。`admin.toml` が変わらない |
 | AC9 | 単体: `{"aircraft":{"enabled":null}}` を PUT → `admin.toml` に `aircraft.enabled` が無く、`items` の `next` が base の値。全部 `null` で PUT → `admin.toml` が無く `.prev` がある |
 | AC10 | 単体: `POST restart` → `p.inputs()` に `Restart`、2 回目は 429 と `requested: true`。`started` を 10 秒前にして 429 と `retry_after_s`。実機: ボタン → journal に「管理ページからの再起動」→ 3 秒後に起動。モニター消灯中に再起動して、再起動後の状態を確認 |
 | AC11 | 単体(`panel.rs`): 4 通り(値を変える保存・同じ値・取り消しで同じ・壊れた overlay)で `pending_restart` |
 | AC12 | 単体(`config.rs`): 壊れた TOML / 知らないキー / 検証に通らない、の 3 つの overlay で `load_with_overlay` が base を返し `report.error` に理由。stderr の文言はテストで組み立てた文字列と比べる |
-| AC13 | 単体: 印のファイルの書き込み・削除・判定を関数に分け、印がある状態の `load_with_overlay(consume_marker = true)` が overlay を無視して理由(`error_kind: boot_failed`)を返し、印を消すこと。`consume_marker = false` では印が残ること。実機: 上書きで `cube.enabled = true` にして起動 → 初期化中(数秒以内)に `kill -9` → 次の起動のログに理由、ページの赤い帯、再起動ボタンが強調されない |
+| AC13 | 単体: 印のファイルの書き込み・削除・判定を関数に分け、(a) 印がある(pid は死んでいる、boot_id は同じ)状態の `load_with_overlay(consume_marker = true)` が overlay を無視して `error_kind: boot_failed` と世代を返し、印を消す。(b) `consume_marker = false` では印が残る。(c) pid が生きている印は失敗と見ない。(d) boot_id が違う印は失敗と見ない。(e) 印を書けないディレクトリでは overlay を無視して `marker_unwritable`。(f) `boot_failed` で世代が同じ間は `POST restart` が 409、保存して世代が変わると `overview` の `error_kind` が消え restart が受け付けられる。実機: 上書きで `cube.enabled = true` にして起動 → 初期化中(数秒以内)に `kill -9` → 次の起動のログに理由、ページの帯、再起動ボタンが無効 |
 | AC14 | 単体(`main.rs` か `config.rs`): `check-config` の出力を組み立てる関数に `OverlayReport` を渡して文字列を比べる(効いている・無い・無視した、の 3 通り) |
 | AC15 | 単体: `FeedReport` への変換を、対応表の各行(None・初回前・ok・failing・auth)で確かめる。実機(または `photos.rs` の模擬サーバー): GEOFRAME を止める・戻す。`room.enabled = false` で `disaster` が `ok`。T3 のトークンを外して `auth_required`。各取得元の取得間隔の 2 倍まで待つ |
 | AC16 | 単体: 一時ファイルに 0644 / 0600 / 無し / 読めない(0000)で `check_token_file`。所有者違いは `uid` 引数を偽の値にして判定 |
@@ -414,7 +432,9 @@ JavaScript はフレームワークを使わず、`fetch` と DOM 操作だけ�
 | 管理トークンが盗まれ、HA や T3 のトークンの送り先を変えられる | HA の URL は対象外。T3 の URL は許可ホストの範囲。`check_url` で平文のホスト名を拒否。管理トークンの重みを `example.toml` と USAGE に書く |
 | 設定の出どころが 2 つになり、SSH で直した値が効かず戸惑う | ページに「効いている / ファイル / 上書き / 次回起動」を並べる。`check-config` と起動ログに上書きの件数と値。`example.toml` と USAGE に説明。`admin.toml` の先頭にコメント。外のスクリプトは `config-get` で同じ規則 |
 | 保存と再起動の間に SSH で設定ファイルが変わり、再起動時に合わせた設定が検証に通らない | 起動時の安全弁で base だけで起動し、ページに理由が出る。保存時は**その時点の**設定ファイルで検証する(起動時のコピーは使わない) |
-| 上書きが検証には通るが起動の途中で落ち、3 秒ごとの再起動で systemd が止まる | 印のファイル(R9)で次の起動から上書きを外す。それでも止まったら SSH で `systemctl reset-failed`(USAGE に既にある) |
+| 上書きが検証には通るが起動の途中で落ち、3 秒ごとの再起動で systemd が止まる | 印のファイル(R9)で次の起動から上書きを外す。落ちた世代のままの再起動は 409。それでも止まったら SSH で `systemctl reset-failed`(USAGE に既にある) |
+| 起動から 60 秒以内の電源断や `systemctl stop` で、上書きが誤って外れる | 印に boot_id と pid を書き、boot_id が違えば無視。シグナルの登録を印より前に。文言は「原因が上書きとは限らない」 |
+| プログラムの既定の `agents.url` に実在しそうな LAN の IP(`192.168.0.132`)が入っている | 照合の相手にしない(今回)。既定値を `192.0.2.x` か空に直すのは別の Issue(公開物のプライバシーの決まりにも関わる。Issue #60 と同じ系統) |
 | `miharashi-t3-token` が古い URL や無視された上書きの URL で確認する | `config-get` で次回起動の値を取る。届かなければトークンを置き換えない(今と同じ)。発行先は t3 CLI のペアリングで決まり、URL では変わらない |
 | 不正な上書きで起動できなくなる | 起動時の安全弁(R8)。保存前の検証(R4・R5) |
 | 再起動の連打で systemd が止まる | 120 秒の抑止と受け付け済みフラグ(起動は 300 秒に最大 3 回)。残るリスク: 管理操作の再起動とクラッシュの再起動が 300 秒に合計 5 回重なると systemd が止まる |
@@ -431,7 +451,7 @@ JavaScript はフレームワークを使わず、`fetch` と DOM 操作だけ�
 タスクに分けて別々に実装させるため、最初に共有する型(契約)を固める。
 
 0. **契約(config.rs、panel.rs、screen.rs。最初のコミット)**: `Admin` セクション(`allowed_hosts` を含む)、`Overlay` と内側の構造体(`deny_unknown_fields`)、`OverlayReport`、`LoadedConfig`、`Config::value`、`AdminSources`・`FeedReport`・`TokenState` の型、`App::admin_sources` の既定実装、`PanelInput::Restart` の列挙子。中身は最小で、`cargo build` と既存テストが通ること。
-1. **設定の上書き(config.rs、main.rs)**: `Overlay::check`(共通の文字の検査、許可ホスト、画面が無効でも検査)、`load_with_overlay`(印の判定を含む)、起動ログと `check-config` の出力、`config-get` サブコマンド、`geoframe.url` / `aircraft.url` の最小の検査、`example.toml` に `[admin]`。テスト: AC3(読み込み側)・AC6(検査)・AC7・AC12・AC13(単体)・AC14・AC17(Rust 側)。
+1. **設定の上書き(config.rs、main.rs)**: `Overlay::check`(共通の文字の検査、origin の照合と格下げの禁止、`base_agents_url` の決め方、画面が無効でも検査)、`load_with_overlay`(印の判定: pid・boot_id・世代。印を書く・消す)、`main` でのシグナル登録と印の書き込み、起動ログと `check-config` の出力、`config-get` サブコマンド、`geoframe.url` / `aircraft.url` の最小の検査、`example.toml` に `[admin]`。テスト: AC3(読み込み側)・AC6(検査)・AC7・AC12・AC13(単体)・AC14・AC17(Rust 側)。
 2. **管理トークンと読み取り API(panel.rs、runtime.rs)**: `admin.token_file` の読み込み(厳しい規則、パネルと同値の拒否)、完全一致の振り分け表、管理ワーカースレッドと受け渡し、`/api/v1/admin/overview` の `host` / `version` / `uptime_s` / `screen` / `config_file` / `overlay`(`generation` を含む)/ `allowed_hosts` / `items`(`next` と `pending_restart` を含む)、`restart` と 120 秒の抑止と受け付け済みフラグ、実行ループの終了、印の書き込みと削除、JSON への `nosniff`、`OPTIONS` の 405。テスト: AC2・AC3(API 側)・AC10(単体)・AC11・AC21・AC22(HTTP 側)。
 3. **保存(panel.rs)**: `PUT /api/v1/admin/config`、世代の比較、設定ファイルの読み直し、`Overlay::check` と検証、原子的な書き込み、`.prev`、tmp の掃除。テスト: AC4・AC5・AC6(API 側)・AC8・AC9・AC20。
 4. **取得元とトークンの状態(app.rs、photos.rs、aircraft.rs、panel.rs)**: `KioskApp::admin_sources`、`FeedReport` への変換、GEOFRAME の `last_ok`、航空機の `last_error`、`check_token_file`、エラー文の切り詰め。テスト: AC15(単体)・AC16。
