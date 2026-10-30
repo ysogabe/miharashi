@@ -9,3 +9,4 @@
 .hero-status{font-size:10px;color:#c1b89d;line-height:1.8;margin:17px 0 0}
 @media(max-width:780px){.metric .micro-label{font-size:7px}}
 @media(max-width:520px){.metric .micro-label{font-size:7px}.card-heading .micro-label{font-size:7px}.hero-status{font-size:9px}}
+.shot-note a,.faq-list details p a{color:var(--mint);text-underline-offset:3px}

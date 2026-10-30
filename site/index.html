@@ -61,7 +61,7 @@
           <figcaption><span><strong>PHOTO FRAME</strong> 写真を巡回し、ぼかした背景の上に大きな時刻と日付。旅や季節の区切りには地図のカード。</span></figcaption>
         </figure>
       </div>
-      <p class="shot-note">写真は公開用に用意した風景画像です。実機では GEOFRAME(写真サーバー)の写真を表示します。以下の 3 画面は、位置や個人のデータを公開せずに表示内容を伝えるため、実装済みの描画処理に仮データを渡した見本です。実際の観測値・予報・作業状況ではありません。</p>
+      <p class="shot-note">写真は公開用に用意した風景画像です。実機では <a href="https://ysogabe.github.io/geoframe/">GEOFRAME</a>(写真サーバー)の写真を表示します。以下の 3 画面は、位置や個人のデータを公開せずに表示内容を伝えるため、実装済みの描画処理に仮データを渡した見本です。実際の観測値・予報・作業状況ではありません。</p>
       <div class="shot-grid screen-samples">
         <figure class="shot">
           <img src="images/room-demo.png" width="2560" height="1080" loading="lazy" alt="仮データの ROOM &amp; WEATHER。室内センサーの値と履歴、東京地方の今日・明日・週間予報、千代田区の警報・注意報の表示例">
@@ -154,12 +154,12 @@
       <details><summary>どんなハードウェアで動きますか？</summary><p>Linux で DRM/KMS が使える GPU があれば動きます。作者の実機は、表示に CPU 内蔵の GPU を使い、計算用に別の GPU を積んだ構成です。特定の型番やメモリ容量を前提にはしていません。</p></details>
       <details><summary>CPU や GPU の温度・電力は、すべて取れますか？</summary><p>ドライバーやセンサーが値を出していれば表示します。出ていない値は「--」になります。CPU の電力は RAPL からの推定値で、システム全体の消費電力ではありません。</p></details>
       <details><summary>テンキーが無くても使えますか？</summary><p>使えます。操作パネルを有効にしていれば、キーボードが無くても起動し、あとから挿されたテンキーも自動で使い始めます。</p></details>
-      <details><summary>写真はどこから表示しますか？</summary><p>GEOFRAME(自宅の写真サーバー)から取得します。1 枚のファイルを指定して表示することもできます。</p></details>
+      <details><summary>写真はどこから表示しますか？</summary><p><a href="https://ysogabe.github.io/geoframe/">GEOFRAME</a>(自宅の写真サーバー)から取得します。1 枚のファイルを指定して表示することもできます。</p></details>
       <details><summary>Home Assistant が止まったら、モニターは消えたままになりますか？</summary><p>なりません。Home Assistant と通信できないときは点灯させておきます。手動の「常に消灯」も、通信できない状態が続けば自動に戻ります。</p></details>
       <details><summary>自分の環境でも使えますか？</summary><p>ソースは公開していますが、今は作者の環境で毎日使いながら育てている段階です。表示先や監視対象は設定で変えられるようにしています。</p></details>
     </div></div></section>
 
-    <section class="shell docs-section" aria-labelledby="docs-title"><div><p class="eyebrow">Read more</p><h2 id="docs-title">ソースと設計書は、GitHub に。</h2><p>使い方、要件、技術設計、検証記録をまとめています。</p></div><div class="doc-links"><a href="https://github.com/ysogabe/miharashi"><span>01 / SOURCE</span><strong>GitHub リポジトリ <span aria-hidden="true">↗</span></strong></a><a href="https://github.com/ysogabe/miharashi/tree/main/docs"><span>02 / DOCUMENTS</span><strong>使い方と設計書 <span aria-hidden="true">↗</span></strong></a><a href="https://github.com/ysogabe/miharashi/blob/main/docs/panel/DESIGN.md"><span>03 / PANEL DESIGN</span><strong>操作パネルの設計 <span aria-hidden="true">↗</span></strong></a><a href="https://github.com/ysogabe/miharashi-panel"><span>04 / PANEL APP</span><strong>パネルアプリのソース <span aria-hidden="true">↗</span></strong></a></div></section>
+    <section class="shell docs-section" aria-labelledby="docs-title"><div><p class="eyebrow">Read more</p><h2 id="docs-title">ソースと設計書は、GitHub に。</h2><p>使い方、要件、技術設計、検証記録をまとめています。</p></div><div class="doc-links"><a href="https://github.com/ysogabe/miharashi"><span>01 / SOURCE</span><strong>GitHub リポジトリ <span aria-hidden="true">↗</span></strong></a><a href="https://github.com/ysogabe/miharashi/tree/main/docs"><span>02 / DOCUMENTS</span><strong>使い方と設計書 <span aria-hidden="true">↗</span></strong></a><a href="https://github.com/ysogabe/miharashi/blob/main/docs/panel/DESIGN.md"><span>03 / PANEL DESIGN</span><strong>操作パネルの設計 <span aria-hidden="true">↗</span></strong></a><a href="https://github.com/ysogabe/miharashi-panel"><span>04 / PANEL APP</span><strong>パネルアプリのソース <span aria-hidden="true">↗</span></strong></a><a href="https://ysogabe.github.io/geoframe/"><span>05 / PHOTO SERVER</span><strong>写真の管理は GEOFRAME <span aria-hidden="true">↗</span></strong></a></div></section>
   </main>
   <footer class="shell footer"><span>Miharashi <span class="footer-separator">/</span> Rust Linux Kiosk Dashboard</span><span>2026.10.16</span></footer>
 </body>
