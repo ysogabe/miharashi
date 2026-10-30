@@ -81,13 +81,13 @@ flowchart LR
     B -- "PUT /api/v1/admin/config(generation 付き)" --> S
     B -- "POST /api/v1/admin/restart" --> S
     S -- "管理のリクエストを渡す(同時 1 本)" --> W[admin ワーカースレッド]
-    W -- "base を読み直し → 重ねて validate + 上書きの規則 → 一時ファイル → rename" --> O[/var/lib/miharashi/admin.toml]
+    W -- "base を読み直し → 重ねて validate + 上書きの規則 → 一時ファイル → rename" --> O["/var/lib/miharashi/admin.toml"]
     W -- "PanelInput::Restart" --> R[実行ループ(runtime.rs)]
     R -- "exit 0" --> SD[systemd Restart=always]
-    SD -- "run --config /etc/miharashi/config.toml" --> L[Config::load_with_overlay]
-    C[/etc/miharashi/config.toml<br>[admin] allowed_hosts] --> L
+    SD -- "run --config /etc/miharashi/config.toml" --> L["Config::load_with_overlay"]
+    C["/etc/miharashi/config.toml<br>[admin] allowed_hosts"] --> L
     O --> L
-    M[/var/lib/miharashi/admin.boot(印)] --> L
+    M["/var/lib/miharashi/admin.boot(印)"] --> L
     L -- "合わせた Config か、失敗なら base と理由" --> R
     A[app::kiosk が作る取得スレッド群] -- "AdminSources(読むだけの参照)" --> W
     T[miharashi-t3-token] -- "miharashi config-get agents.url" --> L
@@ -98,10 +98,10 @@ flowchart LR
 | 場所 | 変更 |
 |---|---|
 | `config.rs` | `Admin` セクション(`allowed_hosts` を含む)、`Overlay` 構造体と上書きに固有の規則(`Overlay::check(&base)`)、`Config::load_with_overlay`、`LoadedConfig`(base・effective・report)、`Config::value(key)`、印のファイルの判定。`geoframe.url` と `aircraft.url` の最小の検査 |
-| `main.rs` | `load_config` が `LoadedConfig` を返す。`check-config` が上書きの件数と値を出す。`config-get <key>` サブコマンド |
+| `main.rs` | `load_config` が `LoadedConfig` を返す。`run` では上書きが効いていれば直後に印を書く。`check-config` が上書きの件数と値を出す。`config-get <key>` サブコマンド |
 | `panel.rs` | 管理トークンの読み込み、管理ワーカースレッド、`/admin*` の静的配信、`/api/v1/admin/*`、`PanelInput::Restart`、管理用の本文上限とレート制限、`AdminSources` と `FeedReport`、JSON 応答への `nosniff` |
 | `screen.rs`、`app.rs` | `App` トレイトに `admin_sources(&self) -> AdminSources`(既定は空)。`KioskApp` が各画面の取得状態の参照を返す |
-| `runtime.rs` | `PanelInput::Restart` を受けて終了。`LoadedConfig`・起動時刻・`app.admin_sources()` を `Panel::spawn` に渡す。印のファイルの書き込み・60 秒後の削除・正常終了時の削除 |
+| `runtime.rs` | `PanelInput::Restart` を受けて終了。`LoadedConfig`・起動時刻・`app.admin_sources()` を `Panel::spawn` に渡す。印のファイルの 60 秒後の削除・正常終了時の削除(書くのは `main`) |
 | `photos.rs` | GEOFRAME の「最後に取得できた時刻」(通信が成功した時刻。キャッシュの表示は含まない) |
 | `aircraft.rs` | 取得の失敗を状態として持つ(`last_error`) |
 | `admin/`(新規、`panel.rs` から `include_str!`) | `index.html`、`app.js`、`app.css` |
@@ -202,16 +202,18 @@ pub struct LoadedConfig {
     pub report: OverlayReport,
 }
 impl Config {
-    /// base を読んで検証し、overlay があれば check → apply → validate。どこかで失敗したら effective = base にし、理由を report に入れる。
-    /// boot_marker が残っていれば(前回、上書きで起動して 60 秒以内に異常終了)、overlay を読まずに無視し、理由を report に入れる。
-    pub fn load_with_overlay(base: &Path, overlay: &Path, boot_marker: &Path) -> Result<LoadedConfig, String>;
+    /// base を読んで検証し、base.admin.overlay_file があれば check → apply → validate。どこかで失敗したら effective = base にし、理由を report に入れる。
+    /// 印(overlay_file と同じディレクトリの admin.boot)が残っていれば(前回、上書きで起動して 60 秒以内に異常終了)、overlay を読まずに無視し、理由を report に入れる。
+    /// consume_marker = true(run)なら印を消し、新しい印を書く準備をする。false(check-config、config-get)なら印に触らない。
+    /// overlay_file と印のパスは base から決まる(テストでは base の admin.overlay_file に一時ディレクトリを書く)。
+    pub fn load_with_overlay(base: &Path, consume_marker: bool) -> Result<LoadedConfig, String>;
     /// 管理ページが扱うキー("aircraft.enabled" など)の値を文字列で返す。知らないキーは None。
     pub fn value(&self, key: &str) -> Option<String>;
 }
 ```
 
 - 読み込みの順: base を `Config::load`(失敗なら今までどおりエラーで終了)→ 印が残っていれば overlay を無視(`report.error` = 「前回の起動が 60 秒以内に終わったので上書きを外した」。印は消す)→ overlay が無ければ `report.applied` は空 → あれば `toml::from_str::<Overlay>`(失敗は `report.error`)→ `check(&base)`(失敗は `report.error`)→ `base.clone()` に `apply` → `validate`(失敗は `report.error`、effective は base)。
-- 印のファイル(`admin.boot`、`overlay_file` と同じディレクトリ): 上書きが効いた状態で起動したら実行ループの最初に書き、60 秒動いたら消す。正常終了の経路(SIGTERM・SIGINT、キーの quit、`max_seconds`、管理ページの再起動)でも消す。描画エラーでの終了や `kill -9`、起動の途中の失敗(`load_config` の後)では残る。管理ページ由来の再起動は起動から 120 秒たたないと受け付けないので、誤って外すことはない。
+- 印のファイル(`admin.boot`、`overlay_file` と同じディレクトリ): 上書きが効いた(`report.applied` が空でない)状態で `load_with_overlay` が返ったら、**`main` がすぐに書く**(表示の初期化、`app::kiosk`、DRM・GL の初期化より前)。上書きで有効にした画面(cube・vrm・agents)の初期化はこれらの中で失敗するので、実行ループに入ってから書くのでは遅い。実行ループが 60 秒動いたら消す。正常終了の経路(SIGTERM・SIGINT、キーの quit、`max_seconds`、管理ページの再起動)でも消す。描画エラーでの終了、`kill -9`、初期化の途中の失敗では残る。管理ページ由来の再起動は起動から 120 秒たたないと受け付けないので、誤って外すことはない。`check-config` と `config-get` は印を見て結果に反映するが、消しも書きもしない(`consume_marker = false`)。
 - `check-config` の出力(上書きが効いているとき):
 
 ```
@@ -259,6 +261,7 @@ JSON の応答(既存のパネル API を含む)にも `X-Content-Type-Options: 
     "exists": true,
     "generation": "9f2c1a7e3b5d8c40",
     "error": null,
+    "error_kind": null,
     "pending_restart": false
   },
   "allowed_hosts": ["192.0.2.30", "t3.example.test"],
@@ -290,7 +293,8 @@ JSON の応答(既存のパネル API を含む)にも `X-Content-Type-Options: 
 ```
 
 - `items[].effective` は今動いているプロセスの値(`LoadedConfig.effective`)。`file` は起動時に読んだ設定ファイルの値(`LoadedConfig.base`)。`overlay` は**今の `admin.toml` の値**(リクエストのたびに読み直す)。`next` は「次回起動の値」で、今の設定ファイルを読み直し、今の `admin.toml` を起動時と同じ規則(壊れている・規則違反なら無視)で重ねて求める。設定ファイルが読めないときは `next` を `null` にし、`overlay.error` に理由を入れる。
-- `overlay.pending_restart` は、どれかの項目で `next != effective` のとき `true`。壊れた上書きの警告(`overlay.error`)とは別。
+- `overlay.pending_restart` は、どれかの項目で `next != effective` のとき `true`。壊れた上書きの警告(`overlay.error`)とは別。ただし `overlay.error` が「前回の起動が 60 秒以内に終わった」(印による無視)のときは、上書きファイルがまだ残っていて `next != effective` になるが、その上書きで起動に失敗した直後なので、ページは「この上書きで起動に失敗した。直してから再起動する」と出し、再起動ボタンを強調しない(`overlay.error_kind: "boot_failed"` で区別する)。
+- `allowed_hosts` の照合: ホスト名は小文字にそろえ、IPv6 の `[]` は外し、完全一致だけ(末尾一致やワイルドカードは無い)。設定ファイルの `agents.url` のホストも同じ規則で比べる。
 - `feeds[].error` と `overlay.error` は 200 文字で切り、URL のクエリは落とす。外部サービスの応答本文はそのまま入れない(既存の `error_summary` と同じ短い要約)。
 - `feeds[].state` と各取得元の対応:
 
@@ -326,7 +330,7 @@ JavaScript はフレームワークを使わず、`fetch` と DOM 操作だけ�
 ### 実行ループと App
 
 - `PanelInput::Restart` を足す。`runtime.rs:678-695` の受け取りで `restart = true` にし、`for` の後で `break "管理ページからの再起動"`。終了処理は既存(`:816-845`)のまま、終了コード 0。
-- `runtime::run` は `LoadedConfig` を受け取る(`cfg` は `effective`)。上書きが効いていれば実行ループの最初に印を書き、60 秒後と正常終了の経路で消す。`Panel::spawn` に `LoadedConfig`(base・report・base_path)、`started: Instant`、`app.admin_sources()` を渡す。
+- `runtime::run` は `LoadedConfig` を受け取る(`cfg` は `effective`)。印は `main` が `load_with_overlay` の直後に書き(上の「印のファイル」)、実行ループが 60 秒後と正常終了の経路で消す。`Panel::spawn` に `LoadedConfig`(base・report・base_path)、`started: Instant`、`app.admin_sources()` を渡す。
 - `App` トレイト(`screen.rs`)に `fn admin_sources(&self) -> AdminSources { AdminSources::default() }` を足す。`KioskApp`(`app.rs`)が、各画面が持つ `env::Shared`、`weather::Shared`、`disaster::HomeShared`、写真の状態、`aircraft::Shared`、T3 のスナップショットの参照を `Option` で詰めて返す。参照は読むだけ。
 - `AdminSources` と `FeedReport` の型は `panel.rs` に置く(`app.rs` が依存する向きは今の `panel_view` と同じ)。
 
@@ -387,7 +391,7 @@ JavaScript はフレームワークを使わず、`fetch` と DOM 操作だけ�
 | AC10 | 単体: `POST restart` → `p.inputs()` に `Restart`、2 回目は 429 と `requested: true`。`started` を 10 秒前にして 429 と `retry_after_s`。実機: ボタン → journal に「管理ページからの再起動」→ 3 秒後に起動。モニター消灯中に再起動して、再起動後の状態を確認 |
 | AC11 | 単体(`panel.rs`): 4 通り(値を変える保存・同じ値・取り消しで同じ・壊れた overlay)で `pending_restart` |
 | AC12 | 単体(`config.rs`): 壊れた TOML / 知らないキー / 検証に通らない、の 3 つの overlay で `load_with_overlay` が base を返し `report.error` に理由。stderr の文言はテストで組み立てた文字列と比べる |
-| AC13 | 単体: 印のファイルの書き込み・削除・判定を関数に分け、印がある状態の `load_with_overlay` が overlay を無視して理由を返し、印を消すこと。実機: 上書きで起動 → 60 秒以内に `kill -9` → 次の起動のログに理由、ページの赤い帯 |
+| AC13 | 単体: 印のファイルの書き込み・削除・判定を関数に分け、印がある状態の `load_with_overlay(consume_marker = true)` が overlay を無視して理由(`error_kind: boot_failed`)を返し、印を消すこと。`consume_marker = false` では印が残ること。実機: 上書きで `cube.enabled = true` にして起動 → 初期化中(数秒以内)に `kill -9` → 次の起動のログに理由、ページの赤い帯、再起動ボタンが強調されない |
 | AC14 | 単体(`main.rs` か `config.rs`): `check-config` の出力を組み立てる関数に `OverlayReport` を渡して文字列を比べる(効いている・無い・無視した、の 3 通り) |
 | AC15 | 単体: `FeedReport` への変換を、対応表の各行(None・初回前・ok・failing・auth)で確かめる。実機(または `photos.rs` の模擬サーバー): GEOFRAME を止める・戻す。`room.enabled = false` で `disaster` が `ok`。T3 のトークンを外して `auth_required`。各取得元の取得間隔の 2 倍まで待つ |
 | AC16 | 単体: 一時ファイルに 0644 / 0600 / 無し / 読めない(0000)で `check_token_file`。所有者違いは `uid` 引数を偽の値にして判定 |
