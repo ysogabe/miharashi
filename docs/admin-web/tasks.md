@@ -6,7 +6,7 @@
 
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
-| T0 | 契約: `Admin` セクション(allowed_hosts)、`Overlay` と内側の構造体、`OverlayReport`・`LoadedConfig`・`Config::value`、`AdminSources`・`FeedReport`・`TokenState`、`App::admin_sources` の既定、`PanelInput::Restart`。中身は最小、ビルドと既存テストが通る | (土台) | - | quick | 未着手 | | | |
+| T0 | 契約: `Admin` セクション(allowed_hosts)、`Overlay` と内側の構造体、`OverlayReport`・`LoadedConfig`・`Config::value`、`AdminSources`・`FeedReport`・`TokenState`、`App::admin_sources` の既定、`PanelInput::Restart`。中身は最小、ビルドと既存テストが通る | (土台) | - | quick | 実装中 | 8dc24b096c5d5fdad5dc6291f76e2b9322b524f7 | | |
 | T1 | 設定の上書き: `Overlay::check`(文字の検査、origin 照合、格下げ禁止、base_agents_url、無効でも検査)、`load_with_overlay`(印: pid/boot_id/世代、書く・消す・書けない)、`main` のシグナル登録と印、起動ログ、`check-config`、`config-get`、geoframe/aircraft url の最小検査、example.toml の `[admin]` | AC3(読込), AC6(検査), AC7, AC12, AC13(単体), AC14, AC17(Rust 側) | T0 | full | 未着手 | | | |
 | T2 | 管理トークンと読み取り API: admin.token_file(厳しい規則、パネルと同値拒否)、完全一致の振り分け表、管理ワーカースレッド、`/api/v1/admin/overview`(items/next/pending_restart/generation/allowed_hosts/error_kind)、`restart`(120 秒、受付済み、boot_failed 409)、実行ループの終了、印の 60 秒後・正常終了時の削除、JSON の nosniff、OPTIONS 405 | AC2, AC3(API), AC10(単体), AC11, AC21, AC22(HTTP 側) | T1 | full | 未着手 | | | |
 | T3 | 保存: `PUT /api/v1/admin/config`、世代の比較、設定ファイルの読み直し、check と validate、原子的な書き込み(create_new・hard link の .prev・rename・dir fsync)、tmp の掃除 | AC4, AC5, AC6(API 側), AC8, AC9, AC20 | T2 | full | 未着手 | | | |
