@@ -66,6 +66,47 @@ pub enum PanelInput {
     Screen(&'static str),
     /// 自動巡回を再開する(true)・止めたままにする(false)
     Rotation(bool),
+    /// 管理ページからのキオスクの再起動
+    Restart,
+}
+
+/// 管理ページに見せる取得 1 つの状態(docs/admin-web/design.md の `feeds`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedState {
+    NotRunning,
+    Connecting,
+    Ok,
+    Failing,
+    AuthRequired,
+    Forbidden,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct FeedReport {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub state: FeedState,
+    /// 最後に成功した時刻(RFC3339)
+    pub last_ok: Option<String>,
+    pub error: Option<String>,
+}
+
+/// トークンファイルの状態(管理ページの `tokens[].state`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenState {
+    Ok,
+    Missing,
+    Unreadable,
+    WrongOwner,
+    LoosePermissions,
+}
+
+/// 取得スレッドの状態を読むための参照の束。None = その取得が動いていない(理由は文字列)。
+#[derive(Default)]
+pub struct AdminSources {
+    // T4 で各取得元の Option<Arc<...>> と理由を足す
 }
 
 /// モニターの手動オーバーライド(auto / force_on / force_off)を切り替える先。実体は `ScreenPower`。

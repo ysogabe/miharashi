@@ -682,6 +682,10 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                 redraw |= app.set_rotation(on);
                 continue;
             }
+            // 管理ページからの再起動は画面を選ぶ操作ではない。T2 で終了処理を足す(今は何もしない)
+            if input == PanelInput::Restart {
+                continue;
+            }
             if let Some(p) = &power {
                 p.on_key();
             }
@@ -690,6 +694,7 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                     PanelInput::Key(key) => app.on_key(key),
                     PanelInput::Screen(id) => app.show_screen(id),
                     PanelInput::Rotation(_) => unreachable!("上で扱った"),
+                    PanelInput::Restart => unreachable!("上で扱った"),
                 };
             }
         }

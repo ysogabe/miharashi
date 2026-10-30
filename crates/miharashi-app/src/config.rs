@@ -1,5 +1,6 @@
 //! TOML 設定。未指定の項目は既定値を使い、未知のキーは typo として拒否する。
 use serde::Deserialize;
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -24,6 +25,7 @@ pub struct Config {
     pub cube: Cube,
     pub gl_check: GlCheck,
     pub vrm: Vrm,
+    pub admin: Admin,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -159,6 +161,165 @@ pub struct Panel {
     pub token_file: String,
     /// `POST /api/v1/input` を 1 秒にこの回数まで受け付ける。超えたら 429。
     pub max_rate_per_sec: u32,
+}
+
+/// ブラウザから見る管理ページ(docs/admin-web/design.md)。`[panel]` が有効なときだけ動く。既定は無効。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Admin {
+    pub enabled: bool,
+    /// 管理トークンを 1 行で書いたファイル(`panel.token_file` とは別のファイル・別の値)。
+    pub token_file: String,
+    /// 管理ページから保存した値の置き場所。設定ファイルより優先する。
+    pub overlay_file: String,
+    /// 管理ページから `agents.url` に使える接続先(host か host:port)。
+    pub allowed_hosts: Vec<String>,
+}
+
+impl Default for Admin {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token_file: "/etc/miharashi/admin.token".into(),
+            overlay_file: "/var/lib/miharashi/admin.toml".into(),
+            allowed_hosts: Vec::new(),
+        }
+    }
+}
+
+/// 管理ページが書く上書きファイル(`admin.toml`)。変えられる項目だけで、全部 `Option`(無い = 上書きしない)。
+/// 内側の構造体にも `deny_unknown_fields` を付ける(外側だけでは内側の知らないキーが黙って捨てられる)。
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Overlay {
+    pub geoframe: OverlayUrl,
+    pub agents: OverlayScreenUrl,
+    pub aircraft: OverlayScreenUrl,
+    pub room: OverlayScreen,
+    pub cube: OverlayScreen,
+    pub vrm: OverlayScreen,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OverlayUrl {
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OverlayScreenUrl {
+    pub enabled: Option<bool>,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OverlayScreen {
+    pub enabled: Option<bool>,
+}
+
+impl Overlay {
+    /// Some の項目だけ `cfg` へ代入する。
+    pub fn apply(&self, cfg: &mut Config) {
+        if let Some(v) = &self.geoframe.url {
+            cfg.geoframe.url = v.clone();
+        }
+        if let Some(v) = self.agents.enabled {
+            cfg.agents.enabled = v;
+        }
+        if let Some(v) = &self.agents.url {
+            cfg.agents.url = v.clone();
+        }
+        if let Some(v) = self.aircraft.enabled {
+            cfg.aircraft.enabled = v;
+        }
+        if let Some(v) = &self.aircraft.url {
+            cfg.aircraft.url = v.clone();
+        }
+        if let Some(v) = self.room.enabled {
+            cfg.room.enabled = v;
+        }
+        if let Some(v) = self.cube.enabled {
+            cfg.cube.enabled = v;
+        }
+        if let Some(v) = self.vrm.enabled {
+            cfg.vrm.enabled = v;
+        }
+    }
+
+    /// 入っている項目の一覧(ログ・check-config 用)。例: `("aircraft.enabled", "false")`。
+    pub fn entries(&self) -> Vec<(&'static str, String)> {
+        let mut v = Vec::new();
+        if let Some(x) = &self.geoframe.url {
+            v.push(("geoframe.url", x.clone()));
+        }
+        if let Some(x) = self.agents.enabled {
+            v.push(("agents.enabled", x.to_string()));
+        }
+        if let Some(x) = &self.agents.url {
+            v.push(("agents.url", x.clone()));
+        }
+        if let Some(x) = self.aircraft.enabled {
+            v.push(("aircraft.enabled", x.to_string()));
+        }
+        if let Some(x) = &self.aircraft.url {
+            v.push(("aircraft.url", x.clone()));
+        }
+        if let Some(x) = self.room.enabled {
+            v.push(("room.enabled", x.to_string()));
+        }
+        if let Some(x) = self.cube.enabled {
+            v.push(("cube.enabled", x.to_string()));
+        }
+        if let Some(x) = self.vrm.enabled {
+            v.push(("vrm.enabled", x.to_string()));
+        }
+        v
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// 上書きファイルを読んだ結果で、無視したときの理由の種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayErrorKind {
+    Parse,
+    UnknownKey,
+    Rule,
+    Validate,
+    BootFailed,
+    MarkerUnwritable,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverlayReport {
+    pub path: PathBuf,
+    pub exists: bool,
+    /// 読んだ時点の上書きファイルの世代("none" = 無い)
+    pub generation: String,
+    /// 効いた項目
+    pub applied: Vec<(&'static str, String)>,
+    /// 無視した理由
+    pub error: Option<String>,
+    pub error_kind: Option<OverlayErrorKind>,
+    /// BootFailed のとき、印に書かれていた上書きの世代
+    pub boot_failed_generation: Option<String>,
+}
+
+/// 起動時に読んだもの一式。実行ループと panel が持ち回る。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedConfig {
+    pub base_path: Option<PathBuf>,
+    /// 設定ファイルの文面に書かれた agents.url(未記載・空なら None。allowed_hosts の照合用)
+    pub base_agents_url: Option<String>,
+    /// 上書き前(管理ページの「ファイルの値」)
+    pub base: Config,
+    /// 実際に使う(上書き後。無視したときは base と同じ)
+    pub effective: Config,
+    pub report: OverlayReport,
 }
 
 /// T3 の閲覧専用 Agent 一覧。
@@ -534,8 +695,27 @@ impl Config {
         Ok((Self::default(), None))
     }
 
+    /// 管理ページが扱うキー(`aircraft.enabled` など)の値を文字列で返す。知らないキーは None。
+    pub fn value(&self, key: &str) -> Option<String> {
+        Some(match key {
+            "geoframe.url" => self.geoframe.url.clone(),
+            "home_assistant.url" => self.home_assistant.url.clone(),
+            "agents.url" => self.agents.url.clone(),
+            "agents.enabled" => self.agents.enabled.to_string(),
+            "aircraft.url" => self.aircraft.url.clone(),
+            "aircraft.enabled" => self.aircraft.enabled.to_string(),
+            "room.enabled" => self.room.enabled.to_string(),
+            "cube.enabled" => self.cube.enabled.to_string(),
+            "vrm.enabled" => self.vrm.enabled.to_string(),
+            _ => return None,
+        })
+    }
+
     fn validate(&self) -> Result<(), String> {
         miharashi_linux_validate(self)?;
+        if self.admin.enabled && !self.panel.enabled {
+            return Err("admin.enabled = true には panel.enabled = true が必要".into());
+        }
         if self.geoframe.reconnect_min_secs == 0
             || self.geoframe.reconnect_max_secs < self.geoframe.reconnect_min_secs
         {
@@ -729,6 +909,69 @@ fn miharashi_linux_validate(_: &Config) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admin_defaults_and_rules() {
+        let a = Config::parse("").unwrap().admin;
+        assert!(!a.enabled);
+        assert_eq!(a.token_file, "/etc/miharashi/admin.token");
+        assert_eq!(a.overlay_file, "/var/lib/miharashi/admin.toml");
+        assert!(a.allowed_hosts.is_empty());
+        let e = Config::parse("[admin]\nenabled = true\n").unwrap_err();
+        assert!(e.contains("panel.enabled"), "{e}");
+        assert!(Config::parse("[admin]\nnope = 1\n").is_err());
+        let ok = "[panel]\nenabled = true\nlisten = \"192.0.2.5:8095\"\n[admin]\nenabled = true\n";
+        assert!(Config::parse(ok).unwrap().admin.enabled);
+    }
+
+    #[test]
+    fn overlay_apply_entries_and_is_empty() {
+        assert!(Overlay::default().is_empty());
+        assert!(Overlay::default().entries().is_empty());
+        let o: Overlay = toml::from_str(
+            "[aircraft]\nenabled = false\n[agents]\nurl = \"http://192.0.2.30:3773\"\n[cube]\nenabled = true\n",
+        )
+        .unwrap();
+        assert!(!o.is_empty());
+        let mut c = Config::default();
+        o.apply(&mut c);
+        assert!(!c.aircraft.enabled);
+        assert_eq!(c.agents.url, "http://192.0.2.30:3773");
+        assert!(c.cube.enabled);
+        assert_eq!(c.geoframe.url, Config::default().geoframe.url);
+        assert_eq!(
+            o.entries(),
+            vec![
+                ("agents.url", "http://192.0.2.30:3773".to_string()),
+                ("aircraft.enabled", "false".to_string()),
+                ("cube.enabled", "true".to_string()),
+            ]
+        );
+        // 内側の知らないキーも拒否する
+        assert!(toml::from_str::<Overlay>("[room]\nurl = \"x\"\n").is_err());
+        assert!(toml::from_str::<Overlay>("[home_assistant]\nurl = \"x\"\n").is_err());
+    }
+
+    #[test]
+    fn config_value_keys() {
+        let c = Config::default();
+        for k in [
+            "geoframe.url",
+            "home_assistant.url",
+            "agents.url",
+            "agents.enabled",
+            "aircraft.url",
+            "aircraft.enabled",
+            "room.enabled",
+            "cube.enabled",
+            "vrm.enabled",
+        ] {
+            assert!(c.value(k).is_some(), "{k}");
+        }
+        assert_eq!(c.value("aircraft.enabled").as_deref(), Some("true"));
+        assert_eq!(c.value("agents.enabled").as_deref(), Some("false"));
+        assert_eq!(c.value("panel.token_file"), None);
+    }
 
     #[test]
     fn empty_config_uses_defaults() {
