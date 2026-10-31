@@ -627,6 +627,10 @@ fn put_config_decision(ctx: &Ctx, body: &[u8]) -> (u16, Value) {
         Ok(v) => v,
         Err(e) => return fail(400, format!("本文を読めない: {e}")),
     };
+    // serde は構造体を配列からも読むので、本文も overlay もオブジェクトであることを先に確かめる
+    if !value.is_object() {
+        return fail(400, "本文はオブジェクトで書く");
+    }
     if value.get("overlay").is_some() && !overlay_shape_ok(&value) {
         return fail(400, "overlay はオブジェクト(各項目もオブジェクト)で書く");
     }
@@ -1898,6 +1902,7 @@ mod tests {
                 r#"{{"generation":"{g}","overlay":{{"agents":[true,"http://192.0.2.30:3773"]}}}}"#
             ),
             format!(r#"{{"generation":"{g}","overlay":{{"agents":null}}}}"#),
+            format!(r#"["{g}",{{}}]"#),
             "not json".to_string(),
             "[]".to_string(),
             String::new(),
