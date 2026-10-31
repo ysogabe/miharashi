@@ -2,8 +2,8 @@
 //! 管理の `Request` をここの管理ワーカー(1 本)に渡す。本文の読み取り・処理・応答はワーカーで行うので、
 //! 遅いクライアントがいても操作パネルのキーは待たされない。
 //!
-//! 今ある経路: `GET /api/v1/admin/overview`、`POST /api/v1/admin/restart`。
-//! `PUT /api/v1/admin/config`(T3)と `/admin*` の静的配信(T5)は、表には入れて今は 404。
+//! 今ある経路: `GET /api/v1/admin/overview`、`POST /api/v1/admin/restart`、`PUT /api/v1/admin/config`。
+//! `/admin*` の静的配信(T5)は、表には入れて今は 404。
 use super::{
     AdminSources, HttpError, PanelInput, RateLimit, Reaper, Route, Shared, body_prefetched, error,
     json_response, same_secret,
@@ -11,6 +11,7 @@ use super::{
 use crate::config::{
     self, Config, LoadedConfig, Overlay, OverlayErrorKind, overlay_generation, remove_boot_marker,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::Read;
 use std::net::SocketAddr;
@@ -20,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-use tiny_http::{Header, Request};
+use tiny_http::{Header, Request, Response};
 
 /// `Panel::start` に渡す、管理ページの材料。
 pub struct AdminContext {
@@ -186,7 +187,7 @@ fn worker(rx: Receiver<Job>, ctx: Arc<Ctx>, busy: Arc<AtomicBool>) {
 fn handle(job: Job, ctx: &Ctx) {
     let Job { req, route } = job;
     let who = super::peer(&req);
-    let (req, _body) = match read_body(req, ctx) {
+    let (req, body) = match read_body(req, ctx) {
         Body::Done(req, body) => (req, body),
         Body::Refused(req, (code, msg)) => {
             eprintln!("admin: {who} 本文 -> {code}: {msg}");
@@ -204,13 +205,14 @@ fn handle(job: Job, ctx: &Ctx) {
             return;
         }
     };
-    // 今の経路は本文を使わない(T3 の PUT config が使う)
+    // 本文を使うのは PUT config だけ
     match route {
         Route::AdminOverview => {
             let _ = req.respond(json_response(200, &overview(ctx)));
         }
         Route::AdminRestart => restart(req, ctx, &who),
-        // PUT config(T3)と静的配信(T5)は未実装
+        Route::AdminConfig => put_config(req, ctx, &who, &body),
+        // 静的配信(T5)は未実装
         _ => {
             let _ = req.respond(error(404, "ない"));
         }
@@ -583,6 +585,106 @@ fn restart_decision(ctx: &Ctx) -> (u16, Value) {
         remove_boot_marker(&config::boot_marker_dir(&startup.path));
     }
     (202, json!({"restart_in_s": 1}))
+}
+
+/// 上書きの文字列の長さの上限(バイト)。
+const MAX_VALUE_BYTES: usize = 2048;
+
+/// `PUT /api/v1/admin/config` の本文。外側の知らないキーも 400。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PutConfig {
+    generation: String,
+    overlay: Overlay,
+}
+
+/// 本文の `overlay` は JSON のオブジェクトで、その中の各テーブルもオブジェクトでなければならない。
+/// serde は構造体を配列からも読む(`[]` や `[true, \"…\"]`)ので、読む前に形を確かめる。
+fn overlay_shape_ok(body: &Value) -> bool {
+    body.get("overlay")
+        .and_then(Value::as_object)
+        .is_some_and(|o| o.values().all(Value::is_object))
+}
+
+/// `PUT /api/v1/admin/config`。
+fn put_config(req: Request, ctx: &Ctx, who: &str, body: &[u8]) {
+    let (code, resp) = put_config_decision(ctx, body);
+    eprintln!("admin: {who} config -> {code}");
+    let resp = if code == 204 {
+        Response::from_data(Vec::new()).with_status_code(204)
+    } else {
+        json_response(code, &resp)
+    };
+    let _ = req.respond(resp);
+}
+
+/// 検査して保存する(順番は設計書のとおり)。戻り値: (状態コード、204 以外の本文)。
+fn put_config_decision(ctx: &Ctx, body: &[u8]) -> (u16, Value) {
+    if !ctx.limiter.lock().unwrap().allow(Instant::now()) {
+        return (429, json!({"error": "操作が速すぎる", "retry_after_s": 1}));
+    }
+    let value: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return fail(400, format!("本文を読めない: {e}")),
+    };
+    if value.get("overlay").is_some() && !overlay_shape_ok(&value) {
+        return fail(400, "overlay はオブジェクト(各項目もオブジェクト)で書く");
+    }
+    let put: PutConfig = match serde_json::from_value(value) {
+        Ok(p) => p,
+        Err(e) => return fail(400, format!("本文を読めない: {e}")),
+    };
+    if let Some((key, _)) = put
+        .overlay
+        .entries()
+        .into_iter()
+        .find(|(_, v)| v.len() > MAX_VALUE_BYTES)
+    {
+        return fail(
+            400,
+            format!("{key}: 値が長すぎる({MAX_VALUE_BYTES} バイトまで)"),
+        );
+    }
+    // 1. 世代: 読み込んだ後に上書きファイルが変わっていたら保存しない
+    let path = &ctx.loaded.report.path;
+    let current = match std::fs::read(path) {
+        Ok(bytes) => overlay_generation(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "none".into(),
+        Err(e) => return fail(500, format!("上書きファイルを読めない: {e}")),
+    };
+    if current != put.generation {
+        return fail(409, "上書きファイルが変わっている。読み直してから保存する");
+    }
+    // 2. 今の設定ファイルを読み直す
+    let (base, base_agents_url) = match Config::reload_base(ctx.loaded.base_path.as_deref()) {
+        Ok(b) => b,
+        Err(e) => return fail(409, format!("設定ファイルが読めない: {e}")),
+    };
+    // 3. 上書きに固有の規則
+    if let Err(e) = put.overlay.check(&base, base_agents_url.as_deref()) {
+        return fail(400, e);
+    }
+    // 4. 重ねた設定を今と同じ規則で検証
+    let mut merged = base.clone();
+    put.overlay.apply(&mut merged);
+    if let Err(e) = merged.validate() {
+        return fail(400, e);
+    }
+    // 5. 書く
+    if let Err(e) = config::save_overlay(path, &put.overlay) {
+        eprintln!("admin: 上書きを保存できない: {e}");
+        return fail(500, format!("保存できない: {e}"));
+    }
+    eprintln!(
+        "admin: 上書きを保存した: {}({} 項目)",
+        path.display(),
+        put.overlay.entries().len()
+    );
+    (204, Value::Null)
+}
+
+fn fail(code: u16, msg: impl AsRef<str>) -> (u16, Value) {
+    (code, json!({"error": clip(msg.as_ref())}))
 }
 
 #[cfg(test)]
@@ -1585,14 +1687,575 @@ mod tests {
         let fx = Fx::new("pages");
         let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
         let (_p, base) = start(loaded, 200);
-        // T5 まで: 管理が有効でも 404(認証は要らない)。PUT config は T3
+        // T5 まで: 管理が有効でも 404(認証は要らない)
         for path in ["/admin", "/admin/app.js", "/admin/app.css"] {
             assert_eq!(get(&base, path, None).0, 404, "{path}");
         }
-        assert_eq!(
-            call("PUT", &base, "/api/v1/admin/config", Some(ADMIN_TOKEN)).0,
-            404
-        );
         assert_eq!(call("PUT", &base, "/api/v1/admin/config", None).0, 401);
+    }
+
+    // ---- PUT /api/v1/admin/config(T3) ----
+
+    /// 本文つきで PUT する。429 は返さずにそのまま返す。
+    fn put_raw(base: &str, token: Option<&str>, body: &str) -> (u16, Value) {
+        let mut b = agent()
+            .put(format!("{base}/api/v1/admin/config"))
+            .content_type("application/json");
+        if let Some(t) = token {
+            b = b.header("Authorization", format!("Bearer {t}"));
+        }
+        let mut resp = b.send(body.to_string()).unwrap();
+        let code = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        (code, serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    /// 管理トークンで PUT する。レート制限(1 秒に 5 回)に当たったら待ってやり直す。
+    fn put(base: &str, body: &str) -> (u16, Value) {
+        loop {
+            let (code, v) = put_raw(base, Some(ADMIN_TOKEN), body);
+            if code != 429 {
+                return (code, v);
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    fn put_overlay(base: &str, generation: &str, overlay: &str) -> (u16, Value) {
+        put(
+            base,
+            &format!(r#"{{"generation":"{generation}","overlay":{overlay}}}"#),
+        )
+    }
+
+    fn generation(base: &str) -> String {
+        overview(base)["overlay"]["generation"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn overlay_bytes(fx: &Fx) -> Option<Vec<u8>> {
+        std::fs::read(fx.path("admin.toml")).ok()
+    }
+
+    /// 保存の途中経過が残っていない(tmp が無い)。
+    fn no_tmp(fx: &Fx) -> bool {
+        std::fs::read_dir(&fx.dir)
+            .unwrap()
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().contains(".tmp-"))
+    }
+
+    const AGENTS_BASE: &str = "[agents]\nenabled = true\nurl = \"http://192.0.2.30:3773\"\n\
+                               [ui]\nstart_screen = \"agents\"\n";
+
+    #[test]
+    fn ac4_validate_failure_is_400_and_the_overlay_is_unchanged() {
+        let fx = Fx::new("put-ac4");
+        let base_path = fx.base("", AGENTS_BASE);
+        let before = "[room]\nenabled = false\n";
+        fx.overlay(before);
+        let loaded = Config::load_with_overlay(&base_path, false).unwrap();
+        assert_eq!(loaded.report.error, None);
+        let (_p, base) = start(loaded, 200);
+        let g = generation(&base);
+        let (code, v) = put_overlay(&base, &g, r#"{"agents":{"enabled":false}}"#);
+        assert_eq!(code, 400, "{v}");
+        assert_eq!(
+            v["error"],
+            "ui.start_screen = agents には agents.enabled = true が必要"
+        );
+        assert_eq!(overlay_bytes(&fx).unwrap(), before.as_bytes());
+        assert!(!fx.path("admin.toml.prev").exists() && no_tmp(&fx));
+        // 画面を有効のまま別の値を保存するのは通る
+        let (code, v) = put_overlay(&base, &g, r#"{"agents":{"enabled":true}}"#);
+        assert_eq!(code, 204, "{v}");
+    }
+
+    #[test]
+    fn ac6_bad_bodies_are_400_and_the_overlay_is_unchanged() {
+        let fx = Fx::new("put-ac6");
+        let base_path = fx.base("", "");
+        let before = "[room]\nenabled = false\n";
+        fx.overlay(before);
+        let loaded = Config::load_with_overlay(&base_path, false).unwrap();
+        let (_p, base) = start(loaded, 200);
+        let g = generation(&base);
+        let long_url = format!("http://192.0.2.1/{}", "a".repeat(3000));
+        let overlays: Vec<(String, &str)> = [
+            // 外側の知らないキー
+            (
+                r#"{"panel":{"listen":"192.0.2.1:8790"}}"#.to_string(),
+                "unknown field",
+            ),
+            // 内側の知らないキー
+            (
+                r#"{"agents":{"token_file":"/tmp/x"}}"#.to_string(),
+                "unknown field",
+            ),
+            (
+                r#"{"geoframe":{"photo_interval_secs":1}}"#.to_string(),
+                "unknown field",
+            ),
+            // 表示だけの項目
+            (
+                r#"{"home_assistant":{"url":"http://192.0.2.10:8123"}}"#.to_string(),
+                "unknown field",
+            ),
+            // 型の違い
+            (r#"{"room":{"enabled":"yes"}}"#.to_string(), "invalid type"),
+            (r#"{"geoframe":{"url":5}}"#.to_string(), "invalid type"),
+            // userinfo
+            (
+                r#"{"agents":{"url":"http://u:p@192.0.2.30:3773"}}"#.to_string(),
+                "agents.url",
+            ),
+            (
+                r#"{"geoframe":{"url":"http://u:p@192.0.2.20:8080"}}"#.to_string(),
+                "geoframe.url",
+            ),
+            (
+                r#"{"aircraft":{"url":"http://u@192.0.2.50/x.json"}}"#.to_string(),
+                "aircraft.url",
+            ),
+            // 空白・引用符・制御文字
+            (
+                r#"{"geoframe":{"url":"http://192.0.2.20:8080/a b"}}"#.to_string(),
+                "geoframe.url",
+            ),
+            (
+                r#"{"aircraft":{"url":"http://192.0.2.50/\"x"}}"#.to_string(),
+                "aircraft.url",
+            ),
+            (
+                r#"{"aircraft":{"url":"http://192.0.2.50/\u0007"}}"#.to_string(),
+                "aircraft.url",
+            ),
+            (
+                r#"{"geoframe":{"url":"http://192.0.2.20:8080\n"}}"#.to_string(),
+                "geoframe.url",
+            ),
+            (
+                r#"{"agents":{"url":"http://192.0.2.30:3773\t"}}"#.to_string(),
+                "agents.url",
+            ),
+            (
+                r#"{"agents":{"url":"http://192.0.2.30:3773/\\x"}}"#.to_string(),
+                "agents.url",
+            ),
+            // 画面が無効でも agents.url の形を検査する
+            (
+                r#"{"agents":{"enabled":false,"url":"ftp://192.0.2.30:3773"}}"#.to_string(),
+                "agents.url",
+            ),
+            (
+                r#"{"agents":{"enabled":false,"url":"not a url"}}"#.to_string(),
+                "agents.url",
+            ),
+            (
+                r#"{"agents":{"enabled":false,"url":"http://192.0.2.30:3773/path"}}"#.to_string(),
+                "agents.url",
+            ),
+            // 許可されないホスト(設定ファイルに agents.url が無く、allowed_hosts は t3.example.test だけ)
+            (
+                r#"{"agents":{"url":"http://192.0.2.99:3773"}}"#.to_string(),
+                "許可されていない",
+            ),
+            (
+                r#"{"agents":{"enabled":false,"url":"https://t3.example.test:8443"}}"#.to_string(),
+                "許可されていない",
+            ),
+            // 2 KiB を超える文字列
+            (
+                format!(r#"{{"geoframe":{{"url":"{long_url}"}}}}"#),
+                "長すぎる",
+            ),
+        ]
+        .into();
+        for (overlay, want) in &overlays {
+            let (code, v) = put_overlay(&base, &g, overlay);
+            assert_eq!(code, 400, "{overlay}: {v}");
+            let e = v["error"].as_str().unwrap();
+            assert!(e.contains(want), "{overlay}: {e}");
+            assert!(e.chars().count() <= 201, "{overlay}");
+            assert_eq!(overlay_bytes(&fx).unwrap(), before.as_bytes(), "{overlay}");
+            assert!(
+                !fx.path("admin.toml.prev").exists() && no_tmp(&fx),
+                "{overlay}"
+            );
+        }
+        // 外側の知らないキー、足りないキー、読めない本文
+        for body in [
+            format!(r#"{{"generation":"{g}","overlay":{{}},"extra":1}}"#),
+            format!(r#"{{"generation":"{g}"}}"#),
+            format!(r#"{{"generation":"{g}","overlay":null}}"#),
+            r#"{"overlay":{}}"#.to_string(),
+            r#"{"generation":5,"overlay":{}}"#.to_string(),
+            format!(r#"{{"generation":"{g}","overlay":[]}}"#),
+            format!(r#"{{"generation":"{g}","overlay":{{"agents":[]}}}}"#),
+            format!(
+                r#"{{"generation":"{g}","overlay":{{"agents":[true,"http://192.0.2.30:3773"]}}}}"#
+            ),
+            format!(r#"{{"generation":"{g}","overlay":{{"agents":null}}}}"#),
+            "not json".to_string(),
+            "[]".to_string(),
+            String::new(),
+        ] {
+            let (code, v) = put(&base, &body);
+            assert_eq!(code, 400, "{body}: {v}");
+            assert!(v["error"].is_string(), "{body}");
+            assert_eq!(overlay_bytes(&fx).unwrap(), before.as_bytes(), "{body}");
+        }
+        assert_eq!(generation(&base), g, "どれも保存されていない");
+    }
+
+    #[test]
+    fn put_config_needs_the_admin_token_and_is_rate_limited() {
+        let fx = Fx::new("put-auth");
+        let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
+        let (_p, base) = start(loaded, 200);
+        let body = r#"{"generation":"none","overlay":{"room":{"enabled":false}}}"#;
+        assert_eq!(put_raw(&base, None, body).0, 401);
+        assert_eq!(put_raw(&base, Some(PANEL_TOKEN), body).0, 401);
+        assert!(overlay_bytes(&fx).is_none());
+        // restart と同じ 1 秒に 5 回の枠。形が悪い本文も数える
+        let codes: Vec<u16> = (0..10)
+            .map(|_| put_raw(&base, Some(ADMIN_TOKEN), "{}").0)
+            .collect();
+        assert!(codes[..5].iter().all(|c| *c == 400), "{codes:?}");
+        assert!(codes[5..].contains(&429), "{codes:?}");
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(put_raw(&base, Some(ADMIN_TOKEN), body).0, 204);
+    }
+
+    #[test]
+    fn ac8_an_unreadable_base_is_409_and_the_overlay_is_unchanged() {
+        let fx = Fx::new("put-ac8");
+        let base_path = fx.base("", "");
+        let before = "[room]\nenabled = false\n";
+        fx.overlay(before);
+        let loaded = Config::load_with_overlay(&base_path, false).unwrap();
+        let (_p, base) = start(loaded, 200);
+        let g = generation(&base);
+        let overlay = r#"{"room":{"enabled":true}}"#;
+        let good = std::fs::read_to_string(&base_path).unwrap();
+        // TOML として壊れている
+        std::fs::write(&base_path, "[panel\n").unwrap();
+        let (code, v) = put_overlay(&base, &g, overlay);
+        assert_eq!(code, 409, "{v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("設定ファイルが読めない: "),
+            "{v}"
+        );
+        assert_eq!(overlay_bytes(&fx).unwrap(), before.as_bytes());
+        // 検証に通らない
+        std::fs::write(
+            &base_path,
+            format!("{good}\n[ui]\nstart_screen = \"agents\"\n"),
+        )
+        .unwrap();
+        let (code, v) = put_overlay(&base, &g, overlay);
+        assert_eq!(code, 409, "{v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("設定ファイルが読めない: "),
+            "{v}"
+        );
+        // 無くなった
+        std::fs::remove_file(&base_path).unwrap();
+        assert_eq!(put_overlay(&base, &g, overlay).0, 409);
+        assert_eq!(overlay_bytes(&fx).unwrap(), before.as_bytes());
+        assert!(!fx.path("admin.toml.prev").exists() && no_tmp(&fx));
+        // 直ると保存できる
+        std::fs::write(&base_path, good).unwrap();
+        assert_eq!(put_overlay(&base, &g, overlay).0, 204);
+    }
+
+    #[test]
+    fn put_rereads_the_base_so_a_new_allowed_host_counts() {
+        // 起動後に設定ファイルの allowed_hosts を直すと、再起動なしで保存の検査に効く
+        let fx = Fx::new("put-reread");
+        let base_path = fx.base("", "");
+        let loaded = Config::load_with_overlay(&base_path, false).unwrap();
+        let (_p, base) = start(loaded, 200);
+        let url = r#"{"agents":{"url":"http://192.0.2.77:3773"}}"#;
+        assert_eq!(put_overlay(&base, "none", url).0, 400);
+        let text = std::fs::read_to_string(&base_path).unwrap();
+        std::fs::write(
+            &base_path,
+            text.replace(
+                "allowed_hosts = [\"t3.example.test\"]",
+                "allowed_hosts = [\"192.0.2.77:3773\"]",
+            ),
+        )
+        .unwrap();
+        assert_eq!(put_overlay(&base, "none", url).0, 204);
+        // 設定ファイルに書いた agents.url と同じ接続先も通る(文面から取り直す)
+        let text = std::fs::read_to_string(&base_path).unwrap();
+        std::fs::write(
+            &base_path,
+            format!("{text}\n[agents]\nurl = \"http://192.0.2.30:3773\"\n"),
+        )
+        .unwrap();
+        let g = generation(&base);
+        assert_eq!(
+            put_overlay(&base, &g, r#"{"agents":{"url":"http://192.0.2.30:3773"}}"#).0,
+            204
+        );
+    }
+
+    #[test]
+    fn ac9_null_cancels_a_key_and_all_null_removes_the_file() {
+        let fx = Fx::new("put-ac9");
+        let base_path = fx.base("", &format!("[aircraft]\nenabled = true\nurl = \"{A}\"\n"));
+        let old = "[aircraft]\nenabled = false\nurl = \"http://192.0.2.51/x.json\"\n[room]\nenabled = false\n";
+        fx.overlay(old);
+        let loaded = Config::load_with_overlay(&base_path, false).unwrap();
+        assert!(!loaded.effective.aircraft.enabled);
+        let (_p, base) = start(loaded, 200);
+        let g = generation(&base);
+        // aircraft.enabled だけ null(url と room は、この本文に無いので消える)
+        let (code, v) = put_overlay(
+            &base,
+            &g,
+            r#"{"aircraft":{"enabled":null,"url":"http://192.0.2.51/x.json"}}"#,
+        );
+        assert_eq!(code, 204, "{v}");
+        let text = std::fs::read_to_string(fx.path("admin.toml")).unwrap();
+        assert!(
+            !text.contains("enabled") && !text.contains("room"),
+            "{text}"
+        );
+        assert!(text.contains("http://192.0.2.51/x.json"), "{text}");
+        let o: Overlay = toml::from_str(&text).unwrap();
+        assert_eq!(o.aircraft.enabled, None);
+        let v = overview(&base);
+        let it = item(&v, "aircraft.enabled");
+        assert_eq!(
+            (&it["overlay"], &it["next"], &it["file"]),
+            (&Value::Null, &json!(true), &json!(true))
+        );
+        assert_eq!(it["effective"], false);
+        assert_eq!(v["overlay"]["pending_restart"], true);
+        assert_eq!(
+            std::fs::read_to_string(fx.path("admin.toml.prev")).unwrap(),
+            old
+        );
+        // 全部 null → admin.toml が消えて .prev が残る
+        let g = generation(&base);
+        let before = std::fs::read(fx.path("admin.toml")).unwrap();
+        let (code, v) = put_overlay(
+            &base,
+            &g,
+            r#"{"aircraft":{"enabled":null,"url":null},"room":{"enabled":null},"agents":{"url":null}}"#,
+        );
+        assert_eq!(code, 204, "{v}");
+        assert!(!fx.path("admin.toml").exists());
+        assert_eq!(std::fs::read(fx.path("admin.toml.prev")).unwrap(), before);
+        assert!(no_tmp(&fx));
+        let v = overview(&base);
+        assert_eq!(v["overlay"]["exists"], false);
+        assert_eq!(v["overlay"]["generation"], "none");
+        assert_eq!(item(&v, "aircraft.url")["overlay"], Value::Null);
+        assert_eq!(item(&v, "aircraft.url")["next"], A);
+        // 何も無いところへ空を保存しても 204(世代は none)
+        assert_eq!(put_overlay(&base, "none", "{}").0, 204);
+        assert!(!fx.path("admin.toml").exists());
+    }
+
+    #[test]
+    fn ac20_a_stale_generation_is_409() {
+        let fx = Fx::new("put-ac20");
+        let base_path = fx.base("", "");
+        fx.overlay("[room]\nenabled = false\n");
+        let loaded = Config::load_with_overlay(&base_path, false).unwrap();
+        let (_p, base) = start(loaded, 200);
+        let g_old = generation(&base);
+        // 別のタブや SSH が上書きファイルを書き換えた
+        let direct = "[cube]\nenabled = false\n";
+        fx.overlay(direct);
+        let (code, v) = put_overlay(&base, &g_old, r#"{"room":{"enabled":true}}"#);
+        assert_eq!(code, 409, "{v}");
+        assert_eq!(
+            v["error"],
+            "上書きファイルが変わっている。読み直してから保存する"
+        );
+        assert_eq!(overlay_bytes(&fx).unwrap(), direct.as_bytes());
+        assert!(!fx.path("admin.toml.prev").exists());
+        // 読み直した世代なら保存できる
+        let g_new = generation(&base);
+        assert_ne!(g_new, g_old);
+        assert_eq!(g_new, overlay_generation(direct.as_bytes()));
+        let (code, _) = put_overlay(&base, &g_new, r#"{"room":{"enabled":true}}"#);
+        assert_eq!(code, 204);
+        // 同じ世代でもう一度は 409(保存で世代が変わった)
+        let (code, _) = put_overlay(&base, &g_new, r#"{"room":{"enabled":false}}"#);
+        assert_eq!(code, 409);
+        // 上書きファイルが消えた(世代は none)後に、前の世代で保存はできない
+        std::fs::remove_file(fx.path("admin.toml")).unwrap();
+        assert_eq!(put_overlay(&base, &g_new, "{}").0, 409);
+        assert_eq!(
+            put_overlay(&base, "none", r#"{"room":{"enabled":true}}"#).0,
+            204
+        );
+        // 「none」を持ったまま、他で作られたファイルを上書きはしない
+        std::fs::remove_file(fx.path("admin.toml")).unwrap();
+        fx.overlay(direct);
+        assert_eq!(
+            put_overlay(&base, "none", r#"{"room":{"enabled":true}}"#).0,
+            409
+        );
+        assert_eq!(overlay_bytes(&fx).unwrap(), direct.as_bytes());
+    }
+
+    #[test]
+    fn a_saved_overlay_shows_in_the_overview_and_the_next_boot() {
+        let fx = Fx::new("put-overview");
+        let base_path = fx.base("", &format!("[aircraft]\nurl = \"{A}\"\n"));
+        let loaded = Config::load_with_overlay(&base_path, false).unwrap();
+        let default_room = loaded.effective.room.enabled;
+        let (_p, base) = start(loaded, 200);
+        let v = overview(&base);
+        assert_eq!(v["overlay"]["generation"], "none");
+        assert_eq!(v["overlay"]["pending_restart"], false);
+        let saved = format!(
+            r#"{{"aircraft":{{"url":"{B}","enabled":false}},"room":{{"enabled":{}}},"agents":{{"url":"https://t3.example.test"}}}}"#,
+            !default_room
+        );
+        let (code, v) = put_overlay(&base, "none", &saved);
+        assert_eq!(code, 204, "{v}");
+        let bytes = overlay_bytes(&fx).unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).starts_with("# miharashi の管理ページが書くファイル。")
+        );
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(fx.path("admin.toml")).unwrap().mode() & 0o777,
+            0o600
+        );
+        let v = overview(&base);
+        assert_eq!(v["overlay"]["generation"], overlay_generation(&bytes));
+        assert_eq!(v["overlay"]["exists"], true);
+        assert_eq!(v["overlay"]["error"], Value::Null);
+        assert_eq!(v["overlay"]["pending_restart"], true, "効いている値と違う");
+        let it = item(&v, "aircraft.url");
+        assert_eq!(
+            (&it["overlay"], &it["next"], &it["effective"], &it["file"]),
+            (&json!(B), &json!(B), &json!(A), &json!(A))
+        );
+        let it = item(&v, "aircraft.enabled");
+        assert_eq!(
+            (&it["overlay"], &it["next"]),
+            (&json!(false), &json!(false))
+        );
+        assert_eq!(item(&v, "agents.url")["next"], "https://t3.example.test");
+        assert_eq!(item(&v, "home_assistant.url")["overlay"], Value::Null);
+        // 次の起動が見る値も同じ
+        let next = Config::load_with_overlay(&base_path, false).unwrap();
+        assert_eq!(next.report.error, None);
+        assert_eq!(next.effective.aircraft.url, B);
+        assert!(!next.effective.aircraft.enabled);
+        assert_eq!(next.effective.room.enabled, !default_room);
+        assert_eq!(next.effective.agents.url, "https://t3.example.test");
+        // 効いている値と同じ値を保存すると pending_restart は偽に戻る
+        let g = generation(&base);
+        let same = format!(r#"{{"aircraft":{{"url":"{A}"}},"room":{{"enabled":{default_room}}}}}"#);
+        let (code, v) = put_overlay(&base, &g, &same);
+        assert_eq!(code, 204, "{v}");
+        let v = overview(&base);
+        assert_eq!(v["overlay"]["pending_restart"], false);
+        assert_eq!(item(&v, "aircraft.url")["overlay"], A);
+        assert_eq!(item(&v, "aircraft.enabled")["overlay"], Value::Null);
+        // 保存したあとの上書きは、設定ファイルとの照合に通る(read して check に掛けても無視されない)
+        assert_eq!(
+            Config::load_with_overlay(&base_path, false)
+                .unwrap()
+                .report
+                .error,
+            None
+        );
+    }
+
+    #[test]
+    fn saving_clears_a_boot_failed_overlay_so_restart_works() {
+        let fx = Fx::new("put-bootfailed");
+        let base_path = fx.base("", &format!("[aircraft]\nurl = \"{A}\"\n"));
+        let overlay = format!("[aircraft]\nurl = \"{B}\"\n");
+        fx.overlay(&overlay);
+        let generation_at_boot = overlay_generation(overlay.as_bytes());
+        std::fs::write(
+            config::boot_marker_path(&fx.path("admin.toml")),
+            format!(r#"{{"pid":4000000000,"generation":"{generation_at_boot}"}}"#),
+        )
+        .unwrap();
+        let loaded = Config::load_with_overlay(&base_path, true).unwrap();
+        assert_eq!(loaded.report.error_kind, Some(OverlayErrorKind::BootFailed));
+        let (p, base) = start(loaded, 200);
+        assert_eq!(overview(&base)["overlay"]["error_kind"], "boot_failed");
+        assert_eq!(
+            call("POST", &base, "/api/v1/admin/restart", Some(ADMIN_TOKEN)).0,
+            409
+        );
+        // 保存すると世代が変わり、理由が消えて再起動できる
+        let (code, v) = put_overlay(
+            &base,
+            &generation_at_boot,
+            &format!(r#"{{"aircraft":{{"url":"{A}"}}}}"#),
+        );
+        assert_eq!(code, 204, "{v}");
+        let v = overview(&base);
+        assert_ne!(v["overlay"]["generation"], generation_at_boot);
+        assert_eq!(v["overlay"]["error_kind"], Value::Null);
+        assert_eq!(v["overlay"]["error"], Value::Null);
+        assert_eq!(v["restart"]["allowed"], true);
+        assert_eq!(
+            call("POST", &base, "/api/v1/admin/restart", Some(ADMIN_TOKEN)).0,
+            202
+        );
+        assert_eq!(recv(&p), Some(PanelInput::Restart));
+    }
+
+    #[test]
+    fn a_failed_write_is_500_and_leaves_the_old_overlay() {
+        let fx = Fx::new("put-500");
+        let base_path = fx.base("", "");
+        let before = "[room]\nenabled = false\n";
+        fx.overlay(before);
+        let loaded = Config::load_with_overlay(&base_path, false).unwrap();
+        let (_p, base) = start(loaded, 200);
+        let g = generation(&base);
+        // 上書きファイルが読めない(ディレクトリになっている)と、世代が取れず 500
+        let moved = fx.path("admin.toml.moved");
+        std::fs::rename(fx.path("admin.toml"), &moved).unwrap();
+        std::fs::create_dir(fx.path("admin.toml")).unwrap();
+        let (code, v) = put_overlay(&base, &g, r#"{"room":{"enabled":true}}"#);
+        assert_eq!(code, 500, "{v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("上書きファイルを読めない")
+        );
+        std::fs::remove_dir(fx.path("admin.toml")).unwrap();
+        std::fs::rename(&moved, fx.path("admin.toml")).unwrap();
+        // ディレクトリに書けない(root では効かないので飛ばす)と、tmp を作れず 500。前の内容のまま
+        if crate::agents::effective_uid() != 0 {
+            std::fs::set_permissions(&fx.dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let (code, v) = put_overlay(&base, &g, r#"{"room":{"enabled":true}}"#);
+            std::fs::set_permissions(&fx.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(code, 500, "{v}");
+            assert!(
+                v["error"].as_str().unwrap().starts_with("保存できない: "),
+                "{v}"
+            );
+            assert_eq!(overlay_bytes(&fx).unwrap(), before.as_bytes());
+            assert!(!fx.path("admin.toml.prev").exists() && no_tmp(&fx));
+        }
     }
 }

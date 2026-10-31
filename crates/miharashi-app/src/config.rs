@@ -658,6 +658,110 @@ fn remove_stale_tmp(overlay_file: &Path) {
     }
 }
 
+/// 上書きファイルの先頭に付ける 1 行。
+const OVERLAY_HEADER: &str = "# miharashi の管理ページが書くファイル。手で直してもよいが、ここに無い項目は書けない(起動時に無視される)。\n";
+
+/// 保存の書き込みの途中経過のファイル名(`<overlay>.tmp-<pid>`)。
+pub fn overlay_tmp_path(overlay_file: &Path) -> PathBuf {
+    sibling(overlay_file, &format!("tmp-{}", std::process::id()))
+}
+
+/// 直前の上書き(`<overlay>.prev`)。
+pub fn overlay_prev_path(overlay_file: &Path) -> PathBuf {
+    sibling(overlay_file, "prev")
+}
+
+/// `overlay_file` と同じディレクトリの `<名前>.<suffix>`。
+fn sibling(overlay_file: &Path, suffix: &str) -> PathBuf {
+    let name = overlay_file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "admin.toml".into());
+    overlay_file.with_file_name(format!("{name}.{suffix}"))
+}
+
+/// 上書きファイルの中身(先頭の 1 行コメント + TOML)。
+pub fn render_overlay(overlay: &Overlay) -> Result<String, String> {
+    // 何も入っていないテーブル(`[room]` だけ)は書かない
+    let mut table =
+        toml::Table::try_from(overlay).map_err(|e| format!("上書きを TOML にできない: {e}"))?;
+    table.retain(|_, v| v.as_table().is_none_or(|t| !t.is_empty()));
+    let body = toml::to_string(&table).map_err(|e| format!("上書きを TOML にできない: {e}"))?;
+    Ok(format!("{OVERLAY_HEADER}{body}"))
+}
+
+/// 手順 1: `<overlay>.tmp-<pid>` を `create_new`(0600)で作って書き、`sync_all` する。
+/// 既にあれば失敗する。書けなければ作ったファイルは消す。
+pub fn write_overlay_tmp(overlay_file: &Path, text: &str) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let tmp = overlay_tmp_path(overlay_file);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts
+        .open(&tmp)
+        .map_err(|e| format!("{} を作れない: {e}", tmp.display()))?;
+    f.write_all(text.as_bytes())
+        .and_then(|()| f.sync_all())
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("{} に書けない: {e}", tmp.display())
+        })?;
+    Ok(tmp)
+}
+
+/// 手順 2: 今の上書きファイルがあれば、`.prev` を消してからハードリンクで残す(コピーではない)。
+/// 保険なので、失敗しても続ける。
+pub fn link_overlay_prev(overlay_file: &Path) {
+    if std::fs::symlink_metadata(overlay_file).is_err() {
+        return;
+    }
+    let prev = overlay_prev_path(overlay_file);
+    match std::fs::remove_file(&prev) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("admin: {} を消せない: {e}", prev.display()),
+    }
+    if let Err(e) = std::fs::hard_link(overlay_file, &prev) {
+        eprintln!("admin: {} を残せない(続ける): {e}", prev.display());
+    }
+}
+
+/// 手順 3・4: `rename(tmp, overlay_file)` を 1 回して、ディレクトリを `sync_all` する。
+pub fn commit_overlay(tmp: &Path, overlay_file: &Path) -> Result<(), String> {
+    std::fs::rename(tmp, overlay_file).map_err(|e| {
+        let _ = std::fs::remove_file(tmp);
+        format!("{} に置き換えられない: {e}", overlay_file.display())
+    })?;
+    sync_dir(overlay_file)
+}
+
+/// `overlay_file` のあるディレクトリを `sync_all` する。
+fn sync_dir(overlay_file: &Path) -> Result<(), String> {
+    let dir = boot_marker_dir(overlay_file);
+    std::fs::File::open(&dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| format!("{} を同期できない: {e}", dir.display()))
+}
+
+/// 上書きを保存する(管理ページの `PUT`)。どの時点で止まっても `overlay_file` は前の内容か新しい内容のどちらか。
+/// 残った `<overlay>.tmp-*` は先に消す。`overlay` が空なら `.prev` を作ったあと `overlay_file` を削除する(tmp は作らない)。
+pub fn save_overlay(overlay_file: &Path, overlay: &Overlay) -> Result<(), String> {
+    remove_stale_tmp(overlay_file);
+    if overlay.is_empty() {
+        if std::fs::symlink_metadata(overlay_file).is_err() {
+            return Ok(());
+        }
+        link_overlay_prev(overlay_file);
+        std::fs::remove_file(overlay_file)
+            .map_err(|e| format!("{} を消せない: {e}", overlay_file.display()))?;
+        return sync_dir(overlay_file);
+    }
+    let tmp = write_overlay_tmp(overlay_file, &render_overlay(overlay)?)?;
+    link_overlay_prev(overlay_file);
+    commit_overlay(&tmp, overlay_file)
+}
+
 /// toml のエラーを 1 行にする(切り出された本文の抜粋は入れない)。
 fn toml_error_line(e: &toml::de::Error, text: &str) -> String {
     match e.span() {
@@ -712,15 +816,9 @@ impl LoadedConfig {
     }
 }
 
-/// base を読んだあとの共通部分。上書きを重ねて `LoadedConfig` を作る(失敗したら effective = base)。
-fn build_loaded(
-    base_path: Option<PathBuf>,
-    base: Config,
-    base_text: &str,
-    consume_marker: bool,
-) -> LoadedConfig {
-    // 文面に書かれた agents.url(未記載・空なら None)。プログラムの既定値は含めない
-    let base_agents_url = toml::from_str::<toml::Table>(base_text)
+/// 設定ファイルの文面に書かれた agents.url(未記載・空なら None)。プログラムの既定値は含めない。
+fn base_agents_url_of(base_text: &str) -> Option<String> {
+    toml::from_str::<toml::Table>(base_text)
         .ok()
         .and_then(|t| {
             t.get("agents")?
@@ -729,7 +827,17 @@ fn build_loaded(
                 .as_str()
                 .map(str::to_string)
         })
-        .filter(|u| !u.is_empty());
+        .filter(|u| !u.is_empty())
+}
+
+/// base を読んだあとの共通部分。上書きを重ねて `LoadedConfig` を作る(失敗したら effective = base)。
+fn build_loaded(
+    base_path: Option<PathBuf>,
+    base: Config,
+    base_text: &str,
+    consume_marker: bool,
+) -> LoadedConfig {
+    let base_agents_url = base_agents_url_of(base_text);
     let overlay_path = PathBuf::from(&base.admin.overlay_file);
     let marker_path = boot_marker_path(&overlay_path);
     let mut report = OverlayReport {
@@ -1226,6 +1334,17 @@ impl Config {
         ))
     }
 
+    /// 設定ファイルだけを読み直す(管理ページの保存。上書きは重ねない)。戻り値: (base、文面の agents.url)。
+    /// 設定ファイルが無い起動(`base_path` が None)は既定値を base にする。
+    pub fn reload_base(base_path: Option<&Path>) -> Result<(Config, Option<String>), String> {
+        let Some(p) = base_path else {
+            return Ok((Self::default(), None));
+        };
+        let text = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let cfg = Self::parse(&text).map_err(|e| format!("{}: {e}", p.display()))?;
+        Ok((cfg, base_agents_url_of(&text)))
+    }
+
     /// `load_with_overlay` を今のファイルでやり直す(管理ページの「次回起動の値」)。印には触らない。
     /// 設定ファイルが無い起動(`base_path` が None)は既定値を base にする。
     pub fn reload_with_overlay(base_path: Option<&Path>) -> Result<LoadedConfig, String> {
@@ -1251,7 +1370,7 @@ impl Config {
         })
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         miharashi_linux_validate(self)?;
         if self.admin.enabled && !self.panel.enabled {
             return Err("admin.enabled = true には panel.enabled = true が必要".into());
@@ -1891,6 +2010,144 @@ mod tests {
         let bad = t.write("bad.toml", "nope = 1\n");
         assert!(Config::load_with_overlay(&bad, false).is_err());
         assert!(Config::load_with_overlay(&t.path("missing.toml"), false).is_err());
+    }
+
+    fn read_overlay_text(t: &Tmp, name: &str) -> String {
+        std::fs::read_to_string(t.path(name)).unwrap()
+    }
+
+    fn overlay_of(text: &str) -> Overlay {
+        toml::from_str(text).unwrap()
+    }
+
+    fn tmp_files(t: &Tmp) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(&t.0)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("admin.toml.tmp-"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn ac5_render_has_the_comment_and_only_the_set_keys() {
+        let text = render_overlay(&overlay_of(
+            "[aircraft]\nenabled = false\n[geoframe]\nurl = \"http://192.0.2.20:8080\"\n",
+        ))
+        .unwrap();
+        assert!(
+            text.starts_with("# miharashi の管理ページが書くファイル。"),
+            "{text}"
+        );
+        assert!(text.contains("enabled = false") && text.contains("192.0.2.20"));
+        assert!(!text.contains("room") && !text.contains("cube"), "{text}");
+        assert_eq!(
+            overlay_of(&text),
+            overlay_of(
+                "[aircraft]\nenabled = false\n[geoframe]\nurl = \"http://192.0.2.20:8080\"\n"
+            )
+        );
+        // 空でもコメントだけで、TOML として読める
+        let empty = render_overlay(&Overlay::default()).unwrap();
+        assert!(overlay_of(&empty).is_empty(), "{empty}");
+    }
+
+    #[test]
+    fn ac5_every_stage_of_the_write_leaves_the_old_or_the_new_overlay() {
+        use std::os::unix::fs::MetadataExt;
+        let t = Tmp::new("ac5-stages");
+        let base = t.base("");
+        let file = t.path("admin.toml");
+        let prev = overlay_prev_path(&file);
+        let old = overlay_of("[room]\nenabled = false\n");
+        let new = overlay_of("[room]\nenabled = true\n[cube]\nenabled = true\n");
+        save_overlay(&file, &old).unwrap();
+        let old_text = read_overlay_text(&t, "admin.toml");
+        assert!(!prev.exists(), "最初の保存では .prev は作らない");
+        let room = |l: &LoadedConfig| (l.effective.room.enabled, l.effective.cube.enabled);
+
+        // (a) tmp を書いた直後: 上書きファイルは前の内容のまま
+        let tmp = write_overlay_tmp(&file, &render_overlay(&new).unwrap()).unwrap();
+        assert_eq!(tmp, overlay_tmp_path(&file));
+        assert_eq!(read_overlay_text(&t, "admin.toml"), old_text);
+        let l = Config::load_with_overlay(&base, false).unwrap();
+        assert_eq!((l.report.error.clone(), room(&l)), (None, (false, false)));
+        assert_eq!(tmp_files(&t).len(), 1, "読むだけでは tmp を消さない");
+        assert_eq!(std::fs::metadata(&tmp).unwrap().mode() & 0o777, 0o600);
+        // tmp が既にあれば、書き込みは失敗する(create_new)
+        assert!(write_overlay_tmp(&file, "x").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&tmp).unwrap(),
+            render_overlay(&new).unwrap()
+        );
+        // 起動(印を扱う run)が残った tmp を消す
+        let l = Config::load_with_overlay(&base, true).unwrap();
+        assert_eq!((l.report.error.clone(), room(&l)), (None, (false, false)));
+        assert!(tmp_files(&t).is_empty());
+
+        // (b) .prev を作った直後: まだ前の内容。.prev は前の内容
+        let tmp = write_overlay_tmp(&file, &render_overlay(&new).unwrap()).unwrap();
+        link_overlay_prev(&file);
+        assert_eq!(read_overlay_text(&t, "admin.toml"), old_text);
+        assert_eq!(read_overlay_text(&t, "admin.toml.prev"), old_text);
+        assert_eq!(
+            std::fs::metadata(&prev).unwrap().ino(),
+            std::fs::metadata(&file).unwrap().ino(),
+            "コピーではなくリンク"
+        );
+        let l = Config::load_with_overlay(&base, false).unwrap();
+        assert_eq!((l.report.error.clone(), room(&l)), (None, (false, false)));
+
+        // (c) rename 後: 新しい内容。.prev は前の内容のまま、tmp は無い
+        commit_overlay(&tmp, &file).unwrap();
+        assert!(tmp_files(&t).is_empty());
+        assert_eq!(overlay_of(&read_overlay_text(&t, "admin.toml")), new);
+        assert_eq!(read_overlay_text(&t, "admin.toml.prev"), old_text);
+        assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
+        let l = Config::load_with_overlay(&base, false).unwrap();
+        assert_eq!((l.report.error.clone(), room(&l)), (None, (true, true)));
+    }
+
+    #[test]
+    fn ac5_save_overlay_keeps_the_previous_content_and_clears_stale_tmp() {
+        let t = Tmp::new("ac5-save");
+        let file = t.path("admin.toml");
+        let a = overlay_of("[room]\nenabled = false\n");
+        let b = overlay_of("[room]\nenabled = true\n");
+        // 同じ pid の tmp と別の pid の tmp が残っていても、保存は成功して消える
+        t.write(&format!("admin.toml.tmp-{}", std::process::id()), "stale");
+        t.write("admin.toml.tmp-1", "stale");
+        t.write("admin.toml.other", "keep");
+        save_overlay(&file, &a).unwrap();
+        assert!(tmp_files(&t).is_empty());
+        assert!(
+            t.path("admin.toml.other").exists(),
+            "関係ないファイルには触らない"
+        );
+        let a_text = read_overlay_text(&t, "admin.toml");
+        save_overlay(&file, &b).unwrap();
+        assert_eq!(overlay_of(&read_overlay_text(&t, "admin.toml")), b);
+        assert_eq!(read_overlay_text(&t, "admin.toml.prev"), a_text);
+        // 古い .prev があっても置き換わる
+        let b_text = read_overlay_text(&t, "admin.toml");
+        save_overlay(&file, &a).unwrap();
+        assert_eq!(read_overlay_text(&t, "admin.toml.prev"), b_text);
+        // 空 → admin.toml を消し、.prev は消す直前の内容。tmp は作らない
+        let a_text = read_overlay_text(&t, "admin.toml");
+        save_overlay(&file, &Overlay::default()).unwrap();
+        assert!(!file.exists());
+        assert_eq!(read_overlay_text(&t, "admin.toml.prev"), a_text);
+        assert!(tmp_files(&t).is_empty());
+        // 上書きが無いところへ空を保存しても何も起きず、.prev も変わらない
+        save_overlay(&file, &Overlay::default()).unwrap();
+        assert!(!file.exists());
+        assert_eq!(read_overlay_text(&t, "admin.toml.prev"), a_text);
+        // ディレクトリが無ければ失敗し、何も残さない
+        let gone = t.path("no-such-dir/admin.toml");
+        assert!(save_overlay(&gone, &a).is_err());
+        assert!(!t.path("no-such-dir").exists());
     }
 
     #[test]
