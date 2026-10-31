@@ -9,8 +9,6 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 glow = "0.18.0"
 # bench の合成写真(JPEG のエンコード・デコード)。miharashi-render と同じ版
 image = "0.25.10"
-# 操作パネル・管理ページの待ち受けソケットに受信の期限を掛ける(SO_RCVTIMEO。accept したソケットが引き継ぐ)
-libc = "0.2.190"
 miharashi-glscene = { path = "../miharashi-glscene" }
 miharashi-render = { version = "0.1.0", path = "../miharashi-render" }
 # 画面に載せる VRM(WithScene)。GPU・DRM に触れる bin 用の feature は要らない

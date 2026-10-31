@@ -1176,7 +1176,6 @@ dependencies = [
  "chrono",
  "glow",
  "image",
- "libc",
  "miharashi-glscene",
  "miharashi-gpu",
  "miharashi-linux",

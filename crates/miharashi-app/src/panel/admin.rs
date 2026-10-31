@@ -5,19 +5,20 @@
 //! 今ある経路: `GET /api/v1/admin/overview`、`POST /api/v1/admin/restart`。
 //! `PUT /api/v1/admin/config`(T3)と `/admin*` の静的配信(T5)は、表には入れて今は 404。
 use super::{
-    AdminSources, HttpError, PanelInput, RateLimit, Route, Shared, error, json_response,
-    same_secret,
+    AdminSources, HttpError, PanelInput, RateLimit, Reaper, Route, Shared, body_prefetched, error,
+    json_response, same_secret,
 };
 use crate::config::{
     self, Config, LoadedConfig, Overlay, OverlayErrorKind, overlay_generation, remove_boot_marker,
 };
 use serde_json::{Value, json};
+use std::io::Read;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Request};
 
@@ -31,8 +32,10 @@ pub struct AdminContext {
 
 /// 本文の上限。これを超えたら 413。
 const MAX_BODY: usize = 16 * 1024;
-/// 本文を読み切るまでの期限(読み取り全体)。超えたら接続を切る。
+/// 本文を読み切るまでの期限(受信を始めてから、読み取り全体で)。超えたらワーカーは読むのを諦める。
 const BODY_DEADLINE: Duration = Duration::from_secs(5);
+/// 期限を過ぎても読み取りから戻らない読み取りスレッドの数の上限。超えたら新しい本文は 429 で断る。
+const MAX_STALLED_READERS: usize = 4;
 /// 起動からこの時間は再起動を受け付けない(systemd の起動制限に掛からないように)。
 const RESTART_AFTER: Duration = Duration::from_secs(120);
 /// `error` / `overlay.error` の長さの上限(文字数)。
@@ -84,6 +87,10 @@ struct Ctx {
     restart_requested: AtomicBool,
     shared: Arc<Shared>,
     keys: Sender<PanelInput>,
+    /// 本文を読み残した要求の応答と手放しを任せる
+    reaper: Reaper,
+    /// 動いている読み取りスレッドの数
+    readers: Arc<AtomicUsize>,
 }
 
 /// 管理トークンのファイルを読む。`agents::read_token` と同じ厳しい規則: 実行ユーザーの 0600、または
@@ -117,6 +124,7 @@ pub(super) fn prepare(
     shared: &Arc<Shared>,
     keys: &Sender<PanelInput>,
     local: SocketAddr,
+    reaper: &Reaper,
 ) -> (Option<Admin>, Option<String>) {
     let Some(ctx) = ctx.filter(|c| c.loaded.effective.admin.enabled) else {
         return (None, None);
@@ -151,6 +159,8 @@ pub(super) fn prepare(
         restart_requested: AtomicBool::new(false),
         shared: shared.clone(),
         keys: keys.clone(),
+        reaper: reaper.clone(),
+        readers: Arc::new(AtomicUsize::new(0)),
     });
     let b = busy.clone();
     std::thread::Builder::new()
@@ -173,22 +183,27 @@ fn worker(rx: Receiver<Job>, ctx: Arc<Ctx>, busy: Arc<AtomicBool>) {
 }
 
 fn handle(job: Job, ctx: &Ctx) {
-    let Job { mut req, route } = job;
+    let Job { req, route } = job;
     let who = super::peer(&req);
-    let body = match read_body(&mut req) {
-        Ok(b) => b,
-        Err((code, msg)) => {
+    let (req, _body) = match read_body(req, ctx) {
+        Body::Done(req, body) => (req, body),
+        Body::Refused(req, (code, msg)) => {
             eprintln!("admin: {who} 本文 -> {code}: {msg}");
-            // 本文を読み残した接続は使い回さない
-            // (読み残した本文は、別スレッドで手放して読み捨てる)
-            super::reply(
+            // 本文を読み残した接続は使い回さない。読み残しの手放しは後始末スレッドに任せる
+            ctx.reaper.reply(
                 req,
                 error(code, &msg).with_header(Header::from_bytes("Connection", "close").unwrap()),
             );
             return;
         }
+        Body::GaveUp => {
+            eprintln!(
+                "admin: {who} 本文 -> 408: 期限に間に合わなかった(読み取りスレッドが後で応える)"
+            );
+            return;
+        }
     };
-    let _ = body; // 今の経路は本文を使わない(T3 の PUT config が使う)
+    // 今の経路は本文を使わない(T3 の PUT config が使う)
     match route {
         Route::AdminOverview => {
             let _ = req.respond(json_response(200, &overview(ctx)));
@@ -201,18 +216,119 @@ fn handle(job: Job, ctx: &Ctx) {
     }
 }
 
-/// 本文を読む(上限 16 KiB は 413、読み取り全体で 5 秒の期限は 408)。1 回の読み取りは待ち受けソケットの
-/// 受信の期限(`RECV_TIMEOUT`)で切れるので、期限は読むたびに見る(ゆっくり少しずつ送っても 10 秒以内に終わる)。
-fn read_body(req: &mut Request) -> Result<Vec<u8>, HttpError> {
+/// 本文を読んだ結果。
+enum Body {
+    /// 読み切った(要求は手元に戻る。本文は読み切っているので、応答しても手放しても待たない)
+    Done(Request, Vec<u8>),
+    /// 断る(要求は手元に戻る。呼び出し側が応答を書いて、後始末スレッドへ渡す)
+    Refused(Request, HttpError),
+    /// 期限までに読み切れなかった。要求は読み取りスレッドの手元に残る(そのスレッドが読み取りから
+    /// 戻ったときに 408 を書く)ので、ワーカーはもう触れない
+    GaveUp,
+}
+
+/// 読み取りスレッドとワーカーの受け渡し。1 回ずつ使い捨てなので、大きさの差は気にしない。
+#[allow(clippy::large_enum_variant)]
+enum Phase {
+    Reading,
+    Done(Request, Result<Vec<u8>, HttpError>),
+    GaveUp,
+}
+
+struct Handoff {
+    phase: Mutex<Phase>,
+    changed: Condvar,
+}
+
+/// 動いている読み取りスレッドの数を数える。
+struct ReaderCount(Arc<AtomicUsize>);
+
+impl Drop for ReaderCount {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// 本文を読む(上限 16 KiB は 413、読み始めから 5 秒の絶対期限は 408)。
+///
+/// tiny_http が読み切っていない本文(`body_prefetched` が偽)は、相手が送るまで `read` が戻らず、
+/// 戻るまで `Request` は読み取りの中に居るので、期限が来ても 408 を書けない。そこで読み取りを
+/// 要求ごとの別スレッドで行い、ワーカーは期限まで待って諦める(`Body::GaveUp`)。読み取りが戻った
+/// ところで、そのスレッドが 408 を書いて手放す(手放しで止まるのもそのスレッドだけ)。
+fn read_body(mut req: Request, ctx: &Ctx) -> Body {
+    let deadline = Instant::now() + BODY_DEADLINE;
     match req.body_length() {
-        Some(0) => return Ok(Vec::new()),
-        Some(n) if n > MAX_BODY => return Err((413, "本文が大きすぎる".into())),
+        Some(0) => return Body::Done(req, Vec::new()),
+        Some(n) if n > MAX_BODY => return Body::Refused(req, (413, "本文が大きすぎる".into())),
         _ => {}
     }
-    let deadline = Instant::now() + BODY_DEADLINE;
+    if body_prefetched(&req) {
+        // メモリの中にある(または空)。待たずに読める
+        return match read_limited(req.as_reader(), || false) {
+            Ok(body) => Body::Done(req, body),
+            Err(e) => Body::Refused(req, e),
+        };
+    }
+    if ctx.readers.fetch_add(1, Ordering::AcqRel) >= MAX_STALLED_READERS {
+        ctx.readers.fetch_sub(1, Ordering::AcqRel);
+        return Body::Refused(req, (429, "本文を待っている要求が多い".into()));
+    }
+    let count = ReaderCount(ctx.readers.clone());
+    let hand = Arc::new(Handoff {
+        phase: Mutex::new(Phase::Reading),
+        changed: Condvar::new(),
+    });
+    // spawn が失敗したときに要求を取り戻せるよう、箱に入れて渡す
+    let slot = Arc::new(Mutex::new(Some(req)));
+    let (h, s) = (hand.clone(), slot.clone());
+    let spawned = std::thread::Builder::new()
+        .name("admin-body".into())
+        .spawn(move || {
+            let _count = count;
+            let Some(mut req) = s.lock().unwrap().take() else {
+                return;
+            };
+            let gave_up = || matches!(*h.phase.lock().unwrap(), Phase::GaveUp);
+            let result = read_limited(req.as_reader(), gave_up);
+            let mut phase = h.phase.lock().unwrap();
+            if matches!(*phase, Phase::GaveUp) {
+                // ワーカーは諦めて先へ進んだ。ここで 408 を書いて手放す(読み残しの手放しはここで待つ)
+                drop(phase);
+                let resp = error(408, "本文の受信が遅い")
+                    .with_header(Header::from_bytes("Connection", "close").unwrap());
+                let _ = req.respond(resp);
+            } else {
+                *phase = Phase::Done(req, result);
+                h.changed.notify_one();
+            }
+        });
+    if spawned.is_err() {
+        let req = slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("起動に失敗した読み取りが要求を持っていない");
+        return Body::Refused(req, (503, "読み取りスレッドを起こせない".into()));
+    }
+    let wait = deadline.saturating_duration_since(Instant::now());
+    let phase = hand.phase.lock().unwrap();
+    let (mut phase, _) = hand
+        .changed
+        .wait_timeout_while(phase, wait, |p| matches!(p, Phase::Reading))
+        .unwrap();
+    // 読み切っていれば受け取り、そうでなければ諦めたと印を付ける(以降は読み取りスレッドの持ち物)
+    match std::mem::replace(&mut *phase, Phase::GaveUp) {
+        Phase::Done(req, Ok(body)) => Body::Done(req, body),
+        Phase::Done(req, Err(e)) => Body::Refused(req, e),
+        Phase::Reading | Phase::GaveUp => Body::GaveUp,
+    }
+}
+
+/// 本文を最後まで読む(上限は `MAX_BODY`)。1 回の `read` は止まりうるので、`gave_up` が真になったら
+/// 次の `read` に入る前に切り上げる。
+fn read_limited(reader: &mut dyn Read, gave_up: impl Fn() -> bool) -> Result<Vec<u8>, HttpError> {
     let mut body = Vec::new();
-    let mut buf = [0u8; 2048];
-    let reader = req.as_reader();
+    let mut buf = [0u8; 4096];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => return Ok(body),
@@ -223,17 +339,9 @@ fn read_body(req: &mut Request) -> Result<Vec<u8>, HttpError> {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Err((408, "本文の受信が遅い".into()));
-            }
             Err(e) => return Err((400, format!("本文を読めない: {e}"))),
         }
-        if Instant::now() >= deadline {
+        if gave_up() {
             return Err((408, "本文の受信が遅い".into()));
         }
     }
@@ -569,8 +677,7 @@ mod tests {
 
     /// 起動から `age_s` 秒たった状態で、管理ページつきのパネルを立てる。
     fn start(loaded: LoadedConfig, age_s: u64) -> (Panel, String) {
-        let server =
-            crate::panel::bind("127.0.0.1:0".parse().unwrap(), crate::panel::RECV_TIMEOUT).unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let ctx = AdminContext {
             loaded,
             started: Instant::now() - Duration::from_secs(age_s),
@@ -1096,52 +1203,99 @@ mod tests {
         );
     }
 
-    fn slow_post(addr: SocketAddr, declared: usize) -> TcpStream {
+    /// `Content-Length` に `declared` を書き、本文を 10 バイトだけ送って黙る接続(開いたままにして返す)。
+    fn held(addr: SocketAddr, head: &str, declared: usize) -> TcpStream {
         let mut s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         write!(
             s,
-            "POST /api/v1/admin/restart HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {ADMIN_TOKEN}\r\n\
-             Content-Length: {declared}\r\n\r\n0123456789"
+            "{head}\r\nHost: x\r\nContent-Length: {declared}\r\n\r\n0123456789"
         )
         .unwrap();
         s
     }
 
-    #[test]
-    fn a_slow_small_body_does_not_block_the_panel() {
-        // tiny_http は 1 KiB までの本文を、接続のスレッドで読み切ってから要求を渡す。
-        // 途中までしか届かない接続は、受信の期限(5 秒)で切れる
-        let fx = Fx::new("slow-small");
-        let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
-        let (p, base) = start(loaded, 200);
-        let mut slow = slow_post(p.addr(), 1000);
-        let t0 = Instant::now();
-        std::thread::sleep(Duration::from_millis(300));
-        panel_input_is_not_blocked(&p, &base, t0);
-        let mut out = Vec::new();
-        let _ = slow.read_to_end(&mut out);
-        let waited = t0.elapsed();
-        assert!(
-            (Duration::from_secs(4)..Duration::from_secs(8)).contains(&waited),
-            "5 秒後に切れる: {waited:?}"
-        );
-        let text = String::from_utf8_lossy(&out);
-        assert!(text.is_empty() || text.contains(" 408 "), "{text}");
-        assert!(p.inputs().next().is_none(), "遅い要求は再起動にならない");
-        assert_eq!(
-            get(&base, "/api/v1/admin/overview", Some(ADMIN_TOKEN)).0,
-            200
-        );
+    fn status_line(s: &mut TcpStream) -> String {
+        let mut status = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(s), &mut status).unwrap();
+        status
     }
 
     #[test]
-    fn a_slow_large_body_holds_only_the_admin_worker() {
-        // 1 KiB を超える本文は管理ワーカーが読む。5 秒で 408 を返して手放す
+    fn half_sent_bodies_held_open_do_not_block_the_panel() {
+        // AC21。tiny_http は 1 KiB までの本文を、要求をパネルに渡す前に接続のスレッドで読む。
+        // 途中までしか届かない接続は、その接続のスレッドが待つだけで、パネルのスレッドは塞がらない。
+        // `Expect: 100-continue` つきは先読みされず、本文を読み残した要求がパネルに届く(後始末スレッドへ)
+        let fx = Fx::new("held");
+        let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
+        let (p, base) = start(loaded, 200);
+        let auth = format!("Authorization: Bearer {ADMIN_TOKEN}");
+        let mut conns = vec![
+            held(p.addr(), "POST /api/v1/input HTTP/1.1", 1000),
+            held(
+                p.addr(),
+                "POST /api/v1/input HTTP/1.1\r\nExpect: 100-continue",
+                1000,
+            ),
+            held(
+                p.addr(),
+                &format!("PUT /api/v1/admin/config HTTP/1.1\r\n{auth}"),
+                1000,
+            ),
+            held(
+                p.addr(),
+                &format!("PUT /api/v1/admin/config HTTP/1.1\r\n{auth}\r\nExpect: 100-continue"),
+                1000,
+            ),
+        ];
+        let t0 = Instant::now();
+        std::thread::sleep(Duration::from_millis(300));
+        // 認証のない Expect つきには 401 が返る(後始末スレッドが応答を先に書く)
+        assert!(status_line(&mut conns[1]).starts_with("HTTP/1.1 401"));
+        panel_input_is_not_blocked(&p, &base, t0);
+        assert_eq!(
+            get(&base, "/api/v1/status", Some(PANEL_TOKEN)).0,
+            200,
+            "status も答える"
+        );
+        assert!(p.inputs().next().is_none(), "遅い要求は何にもならない");
+        drop(conns);
+    }
+
+    #[test]
+    fn a_full_reaper_queue_does_not_block_the_panel() {
+        // 本文を読み残した要求が、後始末スレッドの容量(32)を超えて溜まっても、パネルは止まらない
+        let fx = Fx::new("reaper-full");
+        let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
+        let (p, base) = start(loaded, 200);
+        let conns: Vec<_> = (0..40)
+            .map(|_| {
+                held(
+                    p.addr(),
+                    "POST /api/v1/input HTTP/1.1\r\nExpect: 100-continue",
+                    1000,
+                )
+            })
+            .collect();
+        let t0 = Instant::now();
+        std::thread::sleep(Duration::from_millis(500));
+        panel_input_is_not_blocked(&p, &base, t0);
+        drop(conns);
+    }
+
+    #[test]
+    fn a_slow_large_body_holds_only_the_admin_worker_until_the_deadline() {
+        // 1 KiB を超える本文は管理ワーカーが読む(別スレッドで)。読み始めから 5 秒の絶対期限で、
+        // ワーカーは諦めて空く。ゆっくり少しずつ送っても期限は延びない。408 は、読み取りが戻ったとき
+        // (相手が次に送るか切ったとき)に読み取りスレッドが書く(止まった read には書き込めない)
         let fx = Fx::new("slow-large");
         let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
         let (p, base) = start(loaded, 200);
-        let mut slow = slow_post(p.addr(), 5000);
+        let mut slow = held(
+            p.addr(),
+            &format!("POST /api/v1/admin/restart HTTP/1.1\r\nAuthorization: Bearer {ADMIN_TOKEN}"),
+            5000,
+        );
         let t0 = Instant::now();
         std::thread::sleep(Duration::from_millis(300));
         panel_input_is_not_blocked(&p, &base, t0);
@@ -1149,62 +1303,69 @@ mod tests {
         let (code, v) = get(&base, "/api/v1/admin/overview", Some(ADMIN_TOKEN));
         assert_eq!(code, 429);
         assert_eq!(v, json!({"error": "管理の処理中", "retry_after_s": 1}));
-        // 408 の状態行が 5 秒ほどで届く(本文を読み残した接続は、そのあと受信の期限で切れる)
-        let mut status = String::new();
-        std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut slow), &mut status).unwrap();
-        let waited = t0.elapsed();
+        // 開始から 4.9 秒に少量送ってまた黙る
+        std::thread::sleep(Duration::from_millis(4900).saturating_sub(t0.elapsed()));
+        slow.write_all(b"abcdef").unwrap();
+        // 5 秒の期限で、ワーカーは空く(残りを待ち続けない)
+        let mut freed = None;
+        while t0.elapsed() < Duration::from_secs(7) {
+            if get(&base, "/api/v1/admin/overview", Some(ADMIN_TOKEN)).0 == 200 {
+                freed = Some(t0.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let freed = freed.expect("ワーカーが空かない");
         assert!(
-            (Duration::from_secs(4)..Duration::from_secs(8)).contains(&waited),
-            "5 秒後に切れる: {waited:?}"
+            (Duration::from_millis(4800)..Duration::from_secs(6)).contains(&freed),
+            "5 秒ほどで空く: {freed:?}"
         );
+        panel_input_is_not_blocked(&p, &base, Instant::now());
+        assert!(p.inputs().next().is_none(), "遅い要求は再起動にならない");
+        // 接続は開いたまま。次に何か届くと、読み取りスレッドが 408 を書く
+        slow.write_all(b"g").unwrap();
+        let status = status_line(&mut slow);
         assert!(status.starts_with("HTTP/1.1 408"), "{status}");
         assert!(p.inputs().next().is_none(), "遅い要求は再起動にならない");
-        // ワーカーは空く
-        assert_eq!(
-            get(&base, "/api/v1/admin/overview", Some(ADMIN_TOKEN)).0,
-            200
-        );
     }
 
     #[test]
-    fn a_rejected_slow_body_does_not_block_the_panel_either() {
-        // 認証が無くて断る要求も、読み残した本文の読み捨てでパネルのスレッドを止めない
+    fn a_rejected_body_is_answered_and_does_not_block_the_panel() {
+        // 認証が無くて断る要求は 401 を返し、読み残した本文の読み捨てでパネルのスレッドを止めない
         let fx = Fx::new("slow-401");
         let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
         let (p, base) = start(loaded, 200);
-        for path in ["/api/v1/admin/config", "/api/v1/input", "/nothing"] {
-            let mut s = TcpStream::connect(p.addr()).unwrap();
-            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-            write!(
-                s,
-                "PUT {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n\r\n0123456789"
-            )
-            .unwrap();
-            let t0 = Instant::now();
-            let mut status = String::new();
-            std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut s), &mut status).unwrap();
-            assert!(status.starts_with("HTTP/1.1 401"), "{path}: {status}");
-            panel_input_is_not_blocked(&p, &base, t0);
-        }
-        // 認証済みの大きい本文も、読まずに 413
-        let mut s = TcpStream::connect(p.addr()).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        write!(
-            s,
-            "POST /api/v1/input HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {PANEL_TOKEN}\r\n\
-             Content-Length: 5000\r\n\r\n0123456789"
-        )
-        .unwrap();
+        let mut s = held(p.addr(), "PUT /nothing HTTP/1.1", 5000);
         let t0 = Instant::now();
-        let mut status = String::new();
-        std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut s), &mut status).unwrap();
-        assert!(status.starts_with("HTTP/1.1 413"), "{status}");
+        let status = status_line(&mut s);
+        assert!(status.starts_with("HTTP/1.1 401"), "{status}");
+        panel_input_is_not_blocked(&p, &base, t0);
+        // 認証済みの大きい本文は、読まずに 413(応答は後始末スレッドが先の読み捨てから戻ったあと)。
+        // どちらにせよパネルは止まらない
+        let _s2 = held(
+            p.addr(),
+            &format!("POST /api/v1/input HTTP/1.1\r\nAuthorization: Bearer {PANEL_TOKEN}"),
+            5000,
+        );
+        let t0 = Instant::now();
+        std::thread::sleep(Duration::from_millis(300));
+        panel_input_is_not_blocked(&p, &base, t0);
+        // 認証済みの Expect つき(パネルの経路)も、パネルのスレッドで読まずに断る
+        let _s3 = held(
+            p.addr(),
+            &format!(
+                "POST /api/v1/input HTTP/1.1\r\nAuthorization: Bearer {PANEL_TOKEN}\r\nExpect: 100-continue"
+            ),
+            100,
+        );
+        let t0 = Instant::now();
+        std::thread::sleep(Duration::from_millis(300));
         panel_input_is_not_blocked(&p, &base, t0);
     }
 
     #[test]
     fn events_survive_the_receive_timeout() {
-        // 待ち受けソケットの受信の期限(5 秒)で、SSE の接続(読む側は黙ったまま)が切れないこと
+        // 6 秒黙っていても、SSE の接続(読む側は黙ったまま)が切れないこと
         let fx = Fx::new("sse");
         let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
         let (p, _base) = start(loaded, 200);

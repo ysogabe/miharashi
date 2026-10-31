@@ -19,7 +19,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryIter, channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TryIter, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response, Server};
@@ -32,44 +32,8 @@ const SCHEMA_VERSION: u32 = 1;
 const MAX_SSE: usize = 4;
 const KEEPALIVE: Duration = Duration::from_secs(15);
 const MAX_BODY: u64 = 1024;
-/// 受信の期限。接続からこの時間なにも届かなければ、tiny_http は黙って切る(ヘッダーや本文を途中までしか
-/// 送らないクライアントに、接続を握らせない。tiny_http は 1 KiB までの本文を、要求をパネルのスレッドに
-/// 渡す前に接続のスレッドで読み切るので、ここで切るしかない)。待ち受けソケットに掛けると accept した
-/// ソケットが引き継ぐ。次の要求を待つ keep-alive の接続も、この時間黙っていれば切れる。
-const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 /// 最後の要求からこの時間はパネルが「つながっている」とみなす(パネルは 5 秒ごとに /status を読む)。
 const CONNECTED_FOR: Duration = Duration::from_secs(30);
-
-/// `addr` で待ち受ける。受信の期限(`RECV_TIMEOUT`)を待ち受けソケットに掛ける。
-fn bind(addr: SocketAddr, recv_timeout: Duration) -> Result<Server, String> {
-    let listener =
-        std::net::TcpListener::bind(addr).map_err(|e| format!("{addr} で待ち受けられない: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        let tv = libc::timeval {
-            tv_sec: recv_timeout.as_secs() as libc::time_t,
-            tv_usec: recv_timeout.subsec_micros() as libc::suseconds_t,
-        };
-        // SAFETY: tv はこの呼び出しの間だけ生きていて、長さも合っている
-        let r = unsafe {
-            libc::setsockopt(
-                listener.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                (&raw const tv).cast(),
-                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-            )
-        };
-        if r != 0 {
-            eprintln!(
-                "panel: 受信の期限を掛けられない(続ける): {}",
-                std::io::Error::last_os_error()
-            );
-        }
-    }
-    Server::from_listener(listener, None).map_err(|e| format!("{addr} で待ち受けられない: {e}"))
-}
 
 /// `listen` が、待ち受けるインターフェースを 1 つに決めた IP:ポートか。
 pub fn check_listen(listen: &str) -> Result<SocketAddr, String> {
@@ -404,7 +368,7 @@ impl Panel {
     ) -> Result<Self, String> {
         let addr = check_listen(&cfg.listen)?;
         let token = read_token(&cfg.token_file)?;
-        let server = bind(addr, RECV_TIMEOUT)?;
+        let server = Server::http(addr).map_err(|e| format!("{addr} で待ち受けられない: {e}"))?;
         Ok(Self::spawn(
             server,
             token,
@@ -436,13 +400,14 @@ impl Panel {
             display_control: display.is_some(),
         });
         let (tx, keys) = channel();
-        let (admin, admin_disabled) = admin::prepare(admin, &token, &shared, &tx, addr);
+        let reaper = Reaper::start();
+        let (admin, admin_disabled) = admin::prepare(admin, &token, &shared, &tx, addr, &reaper);
         let s = shared.clone();
         std::thread::Builder::new()
             .name("panel".into())
             .spawn(move || {
                 let rate = RateLimit::new(max_rate_per_sec);
-                serve(server, token, rate, tx, display, s, admin)
+                serve(server, token, rate, tx, display, s, admin, reaper)
             })
             .expect("panel スレッドを起動できる");
         Self {
@@ -516,33 +481,72 @@ fn error(code: u16, msg: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     json_response(code, &json!({ "error": msg }))
 }
 
-/// 応答して要求を手放す。tiny_http は、読み残した本文があると要求を手放すときに読み捨てる(`EqualReader` の
-/// `Drop`)ので、本文を途中までしか送らない相手に当たるとスレッドが止まる。本文が 1 KiB を超える(または
-/// chunked の)要求への応答は別スレッドで行い、パネルのスレッドや管理ワーカーを止めない。
-/// (1 KiB までの本文は、tiny_http が要求を渡す前に読み切っている)
-fn reply(req: Request, resp: Response<std::io::Cursor<Vec<u8>>>) {
-    let may_drain = req.body_length().is_some_and(|n| n as u64 > MAX_BODY)
-        || req
-            .headers()
-            .iter()
-            .any(|h| h.field.equiv("Transfer-Encoding"));
-    if !may_drain {
-        let _ = req.respond(resp);
-        return;
+/// tiny_http が、本文をこの長さまでなら要求を渡す前に接続のスレッドで読み切る閾値(tiny_http 0.12 の
+/// request.rs の `content_length <= 1024 && !expects_continue`)。パネルの `MAX_BODY` とは別の話。
+const PREFETCH_MAX: u64 = 1024;
+/// 後始末スレッドに預けられる要求の数。
+const REAPER_QUEUE: usize = 32;
+
+/// 本文を、tiny_http が要求を渡す前に読み切っているか。読み切っていれば、読んでも手放しても待たない。
+/// そうでない要求(1 KiB を超える本文、`Expect` つき、`Transfer-Encoding`(chunked)、`Connection: upgrade`)は
+/// 本文を読み残したまま届く。読むと相手が送るまで止まり、手放すと(`EqualReader` の `Drop` が)残りを
+/// 読み捨てようとして相手が送るか切るまで止まる。
+fn body_prefetched(req: &Request) -> bool {
+    let upgrade = req.headers().iter().any(|h| {
+        h.field.equiv("Connection") && h.value.as_str().to_ascii_lowercase().contains("upgrade")
+    });
+    req.body_length().is_none_or(|n| n as u64 <= PREFETCH_MAX)
+        && !has_header(req, "Expect")
+        && !has_header(req, "Transfer-Encoding")
+        && !upgrade
+}
+
+fn has_header(req: &Request, name: &'static str) -> bool {
+    req.headers().iter().any(|h| h.field.equiv(name))
+}
+
+/// 後始末スレッド。本文を読み残した要求に応答して手放す(手放すときの読み捨てが止まるのは、この
+/// スレッドだけ)。パネルのスレッドや管理ワーカーは、本文を読み残した要求を自分で手放さない。
+#[derive(Clone)]
+struct Reaper {
+    tx: SyncSender<(Request, Response<std::io::Cursor<Vec<u8>>>)>,
+}
+
+impl Reaper {
+    fn start() -> Self {
+        let (tx, rx) = sync_channel::<(Request, Response<std::io::Cursor<Vec<u8>>>)>(REAPER_QUEUE);
+        std::thread::Builder::new()
+            .name("panel-reaper".into())
+            .spawn(move || {
+                for (req, resp) in rx {
+                    // 応答は先に書かれる。そのあと手放すときに、読み残しの本文が来るか接続が切れるまで待つ
+                    let _ = req.respond(resp);
+                }
+            })
+            .expect("panel-reaper スレッドを起動できる");
+        Self { tx }
     }
-    let slot = Arc::new(Mutex::new(Some((req, resp))));
-    let s = slot.clone();
-    let spawned = std::thread::Builder::new()
-        .name("panel-reply".into())
-        .spawn(move || {
-            if let Some((req, resp)) = s.lock().unwrap().take() {
-                let _ = req.respond(resp);
+
+    /// 応答して要求を手放す。本文を読み切っている要求は、その場で応答する。
+    fn reply(&self, req: Request, resp: Response<std::io::Cursor<Vec<u8>>>) {
+        if body_prefetched(&req) {
+            let _ = req.respond(resp);
+            return;
+        }
+        match self.tx.try_send((req, resp)) {
+            Ok(()) => {}
+            Err(TrySendError::Full((req, _)) | TrySendError::Disconnected((req, _))) => {
+                // 後始末が詰まっている(読み捨てで止まった接続が溜まっている)。応答を書かずに、手放さず
+                // 捨てる(`forget`)。手放すと読み捨てで待つだけで、待ってよいのは後始末スレッドだけ。
+                // この接続のスレッドは tiny_http の側で、この要求の応答を待って既に止まっているので、
+                // 捨てても止まるスレッドは増えない(接続の fd とそのスレッドは、相手が切れても残る)。
+                eprintln!(
+                    "panel: 後始末が詰まっている。{} の要求を応答せずに捨てる",
+                    peer(&req)
+                );
+                std::mem::forget(req);
             }
-        });
-    if spawned.is_err()
-        && let Some((req, resp)) = slot.lock().unwrap().take()
-    {
-        let _ = req.respond(resp);
+        }
     }
 }
 
@@ -562,23 +566,24 @@ fn serve(
     display: Option<Arc<dyn DisplayControl>>,
     shared: Arc<Shared>,
     admin: Option<admin::Admin>,
+    reaper: Reaper,
 ) {
     for mut req in server.incoming_requests() {
         let path = req.url().split('?').next().unwrap_or("").to_string();
         let method = req.method().clone();
         // CORS の事前確認には応えない(Access-Control-Allow-* はどの応答にも付けない)
         if method == Method::Options {
-            reply(req, error(405, "メソッドが違う"));
+            reaper.reply(req, error(405, "メソッドが違う"));
             continue;
         }
         let (route, auth) = Route::of(&path);
         if route == Route::Healthz {
-            reply(req, json_response(200, &json!({ "ok": true })));
+            reaper.reply(req, json_response(200, &json!({ "ok": true })));
             continue;
         }
         // 管理ページが無効なら、管理の経路は認証より前に 404
         if route.is_admin() && admin.is_none() {
-            reply(req, error(404, "ない"));
+            reaper.reply(req, error(404, "ない"));
             continue;
         }
         let ok = match auth {
@@ -588,20 +593,20 @@ fn serve(
         };
         if !ok {
             eprintln!("panel: {} {method} {path} -> 401", peer(&req));
-            reply(req, error(401, "Authorization: Bearer <token> が必要"));
+            reaper.reply(req, error(401, "Authorization: Bearer <token> が必要"));
             continue;
         }
         if auth == Auth::Panel {
             *shared.last_request.lock().unwrap() = Some(Instant::now());
         }
         if !route.allows(&method) {
-            reply(req, error(405, "メソッドが違う"));
+            reaper.reply(req, error(405, "メソッドが違う"));
             continue;
         }
         if let (true, Some(a)) = (route.is_admin(), &admin) {
             // 本文の読み取り・処理・応答は管理ワーカーに任せる(パネルのキー操作を待たせない)
             if let Err(req) = a.submit(req, route) {
-                reply(
+                reaper.reply(
                     req,
                     json_response(429, &json!({"error": "管理の処理中", "retry_after_s": 1})),
                 );
@@ -683,7 +688,7 @@ fn serve(
             }
             _ => error(404, "ない"),
         };
-        reply(req, resp);
+        reaper.reply(req, resp);
     }
 }
 
@@ -694,6 +699,20 @@ fn read_field(req: &mut Request, field: &str, example: &str) -> Result<String, H
     // 大きいと言っている本文は読まずに断る(途中で止まる相手を待たない)
     if req.body_length().is_some_and(|n| n as u64 > MAX_BODY) {
         return Err((413, "本文が大きすぎる".into()));
+    }
+    // tiny_http が読み切っていない本文は、パネルのスレッドでは読まない(相手が送るまで止まる)。
+    // 断った要求は `reply` が後始末スレッドへ回す
+    if !body_prefetched(req) {
+        return Err(if has_header(req, "Expect") {
+            (417, "Expect は受け付けない".into())
+        } else if has_header(req, "Transfer-Encoding") {
+            (
+                411,
+                "Content-Length の本文だけ受け付ける(chunked は不可)".into(),
+            )
+        } else {
+            (400, "この形の本文は受け付けない".into())
+        });
     }
     let mut body = Vec::new();
     req.as_reader()
@@ -1170,6 +1189,17 @@ mod tests {
         std::fs::write(&p, "short\n").unwrap();
         assert!(read_token(path).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_server_keeps_answering_after_six_idle_seconds() {
+        // 待ち受けソケットに受信の期限を掛けると、新しい接続が 5 秒無いだけで待ち受けが止まった
+        let (p, base) = start(20);
+        p.publish(Some(view(0)), DisplayStatus::default());
+        std::thread::sleep(Duration::from_secs(6));
+        assert_eq!(get(&base, "/api/v1/status", true).0, 200);
+        assert_eq!(post(&base, Some(TOKEN), r#"{"key":"next"}"#), 204);
+        assert!(recv_key(&p).is_some());
     }
 
     #[test]
