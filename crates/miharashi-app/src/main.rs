@@ -109,8 +109,15 @@ fn load_config(cli: &Cli, consume_marker: bool) -> Result<config::LoadedConfig, 
         Some(p) => eprintln!("config: {}", p.display()),
         None => eprintln!("config: 既定値(設定ファイルなし)"),
     }
+    // CLI 引数の検査は印を書く前に済ませる(不正な引数で終了したときに、次の起動の上書きを外させない)
+    if let Some(r) = &cli.renderer {
+        if !matches!(r.as_str(), "auto" | "cpu" | "gles") {
+            return Err("--renderer は auto / cpu / gles".into());
+        }
+    }
     if consume_marker {
-        // 表示・app・DRM・GL の初期化より前に印を書く(上書きで有効にした画面の初期化で落ちても次の起動で外せる)
+        // 表示・app・DRM・GL の初期化より前に印を書く(上書きで有効にした画面の初期化で落ちても次の起動で外せる)。
+        // 書けなければ effective が base に戻るので、CLI の反映はこのあとにする
         loaded.arm_boot_marker();
     }
     let cfg = &mut loaded.effective;
@@ -121,9 +128,6 @@ fn load_config(cli: &Cli, consume_marker: bool) -> Result<config::LoadedConfig, 
         cfg.ui.start_screen = s.clone();
     }
     if let Some(r) = &cli.renderer {
-        if !matches!(r.as_str(), "auto" | "cpu" | "gles") {
-            return Err("--renderer は auto / cpu / gles".into());
-        }
         cfg.display.renderer = r.clone();
     }
     Ok(loaded)
@@ -1134,6 +1138,38 @@ mod tests {
             renderer: Some(renderer.into()),
             ..Cli::default()
         }
+    }
+
+    /// 不正な CLI 引数(`--renderer`)は、起動の印を書く前にエラーにする(次の起動で上書きが外れない)。
+    #[test]
+    fn invalid_renderer_fails_before_the_boot_marker_is_written() {
+        let dir =
+            std::env::temp_dir().join(format!("miharashi-marker-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let overlay = dir.join("admin.toml");
+        std::fs::write(&overlay, "[room]\nenabled = false\n").unwrap();
+        let base = dir.join("config.toml");
+        std::fs::write(
+            &base,
+            format!("[admin]\noverlay_file = \"{}\"\n", overlay.display()),
+        )
+        .unwrap();
+        let mut cli = Cli {
+            config: Some(base),
+            renderer: Some("invalid".into()),
+            ..Cli::default()
+        };
+        assert!(load_config(&cli, true).is_err());
+        assert!(!dir.join("admin.boot").exists(), "印は書かれない");
+        // 正しい引数なら印を書き、CLI の値は effective に残る
+        cli.renderer = Some("cpu".into());
+        cli.seconds = Some(7);
+        let l = load_config(&cli, true).unwrap();
+        assert!(dir.join("admin.boot").exists());
+        assert_eq!(l.effective.display.renderer, "cpu");
+        assert_eq!(l.effective.runtime.max_seconds, 7);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn no_gpu(_: &Config) -> Result<GlesCheck, String> {

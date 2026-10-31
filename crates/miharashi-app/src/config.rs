@@ -298,15 +298,9 @@ impl Overlay {
         let Some(u) = &self.agents.url else {
             return Ok(());
         };
-        let (uri, origin) = parse_url_strict("agents.url", u)?;
-        // 画面が無効でも検査する。check_url は origin だけを受け付けるので、パスは外して渡す
-        // (パスの可否は、agents が有効になったときの validate が決める)
-        let origin_text = format!(
-            "{}://{}",
-            uri.scheme_str().unwrap_or(""),
-            uri.authority().map_or("", |a| a.as_str())
-        );
-        crate::agents::check_url(&origin_text).map_err(|e| format!("agents.url: {e}"))?;
+        let (_, origin) = parse_url_strict("agents.url", u)?;
+        // 画面が無効でも検査する。check_url は origin だけを受け付ける(パス・クエリ・fragment 付きは Err)
+        crate::agents::check_url(u).map_err(|e| format!("agents.url: {e}"))?;
         let from_file = base_agents_url
             .and_then(|b| b.parse::<Uri>().ok())
             .and_then(|b| origin_of(&b));
@@ -327,11 +321,11 @@ impl Overlay {
             .is_some_and(|f| f.https && !origin.https && f.host == origin.host)
         {
             return Err(format!(
-                "agents.url: 設定ファイルの https を http に格下げすることはできない({origin_text})"
+                "agents.url: 設定ファイルの https を http に格下げすることはできない({u})"
             ));
         }
         Err(format!(
-            "agents.url: 接続先 {origin_text} は許可されていない(allowed_hosts か設定ファイルの agents.url と同じ接続先だけ)"
+            "agents.url: 接続先 {u} は許可されていない(allowed_hosts か設定ファイルの agents.url と同じ接続先だけ)"
         ))
     }
 
@@ -371,15 +365,22 @@ fn default_port(https: bool) -> u16 {
     if https { 443 } else { 80 }
 }
 
-/// 読めた `Uri` から origin を作る。http(s) でない・host が空・port が数字でない(`Uri` は黙って捨てる)なら None。
-fn origin_of(uri: &Uri) -> Option<Origin> {
+/// 読めた `Uri` が http(s) で host が空でなければ、その host を返す(userinfo の有無・port は見ない)。
+fn http_host(uri: &Uri) -> Option<(bool, &str)> {
     let https = match uri.scheme_str()? {
         "https" => true,
         "http" => false,
         _ => return None,
     };
     let host = uri.host().filter(|h| !h.is_empty())?;
-    // host の後ろは「無し」か「:数字」だけ(authority は userinfo を持たない前提で、host で始まる)
+    Some((https, host))
+}
+
+/// 読めた `Uri` から origin を作る。http(s) でない・host が空・port が数字でない(`Uri` は黙って捨てる)なら None。
+/// authority は userinfo を持たない前提(上書きの検査は `@` を先に拒否する)。
+fn origin_of(uri: &Uri) -> Option<Origin> {
+    let (https, host) = http_host(uri)?;
+    // host の後ろは「無し」か「:数字」だけ(host で始まる)
     let rest = uri.authority()?.as_str().strip_prefix(host)?;
     let port = match rest {
         "" => default_port(https),
@@ -437,7 +438,8 @@ fn check_http_url(label: &str, url: &str) -> Result<(), String> {
     }
     let uri: Result<Uri, _> = url.parse();
     match uri {
-        Ok(u) if origin_of(&u).is_some() => Ok(()),
+        // userinfo や port の検査は上書きにだけ掛ける(base の既存の書き方は通す)
+        Ok(u) if http_host(&u).is_some() => Ok(()),
         _ => Err(format!("{label}: host を解釈できない({url})")),
     }
 }
@@ -539,17 +541,19 @@ fn boot_marker_dir(overlay_file: &Path) -> PathBuf {
     }
 }
 
-/// 今の起動の ID(電源断・再起動で変わる)。読めなければ固定の文字列(「同じ起動」と見る側に倒れる)。
-fn current_boot_id() -> String {
+/// 今の起動の ID(電源断・再起動で変わる)。読めなければ None(判定では pid だけを見る)。
+fn current_boot_id() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
         .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".into())
+        .filter(|s| !s.is_empty())
 }
 
 #[derive(Serialize, Deserialize)]
 struct MarkerFile {
     pid: u32,
-    boot_id: String,
+    #[serde(default)]
+    boot_id: Option<String>,
     generation: String,
     #[serde(default)]
     started_at: String,
@@ -603,6 +607,11 @@ enum MarkerState {
 }
 
 fn read_marker(path: &Path) -> MarkerState {
+    read_marker_with(path, current_boot_id().as_deref())
+}
+
+/// `now_boot` は今の boot_id(読めなければ None)。両方が取れて違うときだけ別の起動と見る。
+fn read_marker_with(path: &Path, now_boot: Option<&str>) -> MarkerState {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return MarkerState::None,
@@ -611,7 +620,7 @@ fn read_marker(path: &Path) -> MarkerState {
     let Ok(m) = serde_json::from_str::<MarkerFile>(text.trim()) else {
         return MarkerState::Failed(None);
     };
-    if m.boot_id != current_boot_id() {
+    if matches!((m.boot_id.as_deref(), now_boot), (Some(a), Some(b)) if a != b) {
         MarkerState::OtherBoot
     } else if Path::new("/proc").join(m.pid.to_string()).exists() {
         MarkerState::Alive
@@ -1664,6 +1673,18 @@ mod tests {
         b.admin.allowed_hosts = vec!["t3.example.test:3773".into()];
         let e = o.check(&b, None).unwrap_err();
         assert!(e.contains("agents.url") && e.contains("IP"), "{e}");
+        // 無効な画面でも、パス・クエリ・fragment 付きの T3 の URL は拒否する
+        for ng in [
+            "http://192.0.2.30:3773/x",
+            "http://192.0.2.30:3773?x",
+            "http://192.0.2.30:3773#x",
+        ] {
+            let o = overlay(&format!("[agents]\nenabled = false\nurl = \"{ng}\"\n"));
+            let e = o
+                .check(&Config::default(), Some("http://192.0.2.30:3773"))
+                .unwrap_err();
+            assert!(e.contains("agents.url"), "{ng}: {e}");
+        }
         // 許可されない origin
         let e = check_agents(
             Some("http://192.0.2.30:3773"),
@@ -1683,7 +1704,7 @@ mod tests {
         let allowed = ["t3.example.test", "192.0.2.40:4000"];
         // Ok
         for ok in [
-            "http://192.0.2.30:3773/x",
+            "http://192.0.2.30:3773/",
             "http://192.0.2.30:3773",
             "https://t3.example.test/",
             "http://192.0.2.40:4000",
@@ -1691,8 +1712,14 @@ mod tests {
         ] {
             check_agents(base, &allowed, ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
-        // Err: ポート違い・別ホスト・port 無しの要素は既定ポートだけ
+        // Err: ポート違い・別ホスト・port 無しの要素は既定ポートだけ。T3 の URL は origin だけ(パス・クエリ・fragment 付きも不可)
         for ng in [
+            "http://192.0.2.30:3773/x",
+            "http://192.0.2.30:3773/x/",
+            "http://192.0.2.30:3773?x",
+            "http://192.0.2.30:3773/?x",
+            "http://192.0.2.30:3773#x",
+            "https://t3.example.test/x",
             "http://192.0.2.30:4000",
             "http://192.0.2.31:3773",
             "https://t3.example.test:8443",
@@ -1774,7 +1801,7 @@ mod tests {
             "[agents]\nurl = \"http://192.0.2.30:3773/\"\n",
         );
         let l = Config::load_with_overlay(&base, false).unwrap();
-        // パスは agents が有効になったときの validate が決める(無効のうちは通る)
+        // 末尾の "/" だけは origin と同じに扱われる
         assert_eq!(l.report.error, None, "{:?}", l.report.error);
         let base = t.base("[agents]\nurl = \"\"\n");
         assert_eq!(
@@ -1864,7 +1891,7 @@ mod tests {
         t.write("admin.toml", "[room]\nenabled = false\n");
         let marker = boot_marker_path(&t.path("admin.toml"));
         assert_eq!(marker, t.path("admin.boot"));
-        let boot = current_boot_id();
+        let boot = current_boot_id().unwrap_or_else(|| "test-boot".into());
 
         // (b) consume = false では残る。(a) consume = true で BootFailed と世代、印が消える
         std::fs::write(&marker, marker_json(DEAD_PID, &boot, "abc123")).unwrap();
@@ -1921,6 +1948,65 @@ mod tests {
         let l = Config::load_with_overlay(&base, true).unwrap();
         assert_eq!(l.report.error, None);
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn ac13_unreadable_boot_id_falls_back_to_pid() {
+        let t = Tmp::new("ac13b");
+        let marker = t.path("admin.boot");
+        // 今の boot_id が取れない(None)ときは OtherBoot にせず pid で判定する
+        std::fs::write(&marker, marker_json(DEAD_PID, "some-boot", "abc123")).unwrap();
+        assert!(matches!(
+            read_marker_with(&marker, None),
+            MarkerState::Failed(Some(g)) if g == "abc123"
+        ));
+        std::fs::write(
+            &marker,
+            marker_json(std::process::id(), "some-boot", "abc123"),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_marker_with(&marker, None),
+            MarkerState::Alive
+        ));
+        // 印に boot_id が無い(null・欠落)ときも pid で判定する
+        std::fs::write(
+            &marker,
+            format!("{{\"pid\":{DEAD_PID},\"boot_id\":null,\"generation\":\"abc123\"}}\n"),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_marker_with(&marker, Some("now-boot")),
+            MarkerState::Failed(Some(_))
+        ));
+        // 両方が取れて違うときだけ OtherBoot
+        std::fs::write(&marker, marker_json(DEAD_PID, "some-boot", "abc123")).unwrap();
+        assert!(matches!(
+            read_marker_with(&marker, Some("now-boot")),
+            MarkerState::OtherBoot
+        ));
+        assert!(matches!(
+            read_marker_with(&marker, Some("some-boot")),
+            MarkerState::Failed(Some(_))
+        ));
+    }
+
+    #[test]
+    fn t1_base_url_with_userinfo_loads_but_overlay_rejects_it() {
+        // base の geoframe.url / aircraft.url は userinfo 付きでも読める(上書きが無くても起動エラーにしない)
+        let c = Config::parse(
+            "[geoframe]\nurl = \"http://user:pass@192.0.2.20:8080\"\n[aircraft]\nurl = \"https://u:p@192.0.2.21:8443/a.json\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.geoframe.url, "http://user:pass@192.0.2.20:8080");
+        // 同じ URL を上書きに書くと拒否される
+        for field in ["geoframe", "aircraft"] {
+            let o = overlay(&format!(
+                "[{field}]\nurl = \"http://user:pass@192.0.2.20:8080\"\n"
+            ));
+            let e = o.check(&Config::default(), None).unwrap_err();
+            assert!(e.contains(&format!("{field}.url")), "{e}");
+        }
     }
 
     #[test]
