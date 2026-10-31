@@ -1341,6 +1341,11 @@ mod tests {
             config_get(Some(&base), "aircraft.enabled"),
             Ok("true".to_string())
         );
+        // miharashi-t3-token が読む token_file(上書きの対象ではないので設定ファイルの値)
+        assert_eq!(
+            config_get(Some(&base), "agents.token_file"),
+            Ok("/etc/miharashi/t3-agent.token".to_string())
+        );
         // 上書きあり → 上書きの値(同じ origin、許可ホスト)
         std::fs::write(
             dir.join("admin.toml"),

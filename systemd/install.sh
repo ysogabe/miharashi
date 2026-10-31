@@ -26,5 +26,7 @@ systemctl daemon-reload
 echo "導入しました(起動はしていません)。"
 echo "CPU 消費電力を表示する場合(任意・root で読む小さなヘルパー): systemctl enable --now miharashi-rapl"
 echo "T3 Agent 画面のトークンを自動で更新する場合(任意): systemctl enable --now miharashi-t3-token.timer(docs/USAGE.md の「T3 Agent 一覧」)"
+echo "ブラウザの管理ページを使う場合(任意): 管理トークンを作って [admin] を有効にする(docs/USAGE.md の「管理ページ(ブラウザ)」)。トークンは自動では作りません"
+echo "  head -c 24 /dev/urandom | base64 | sudo install -o root -g $USER_NAME -m 640 /dev/stdin /etc/miharashi/admin.token"
 echo "キオスクの起動: systemctl start miharashi / 自動起動: systemctl enable miharashi"
 echo "ログ: journalctl -t miharashi -f"

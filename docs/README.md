@@ -6,7 +6,7 @@
 
 | 文書 | 内容 |
 |---|---|
-| [使い方](USAGE.md) | ビルド、実行、systemd での常駐、設定、Home Assistant と操作パネルのつなぎ方 |
+| [使い方](USAGE.md) | ビルド、実行、systemd での常駐、設定、Home Assistant と操作パネル・管理ページのつなぎ方 |
 
 ## 要件と設計
 
@@ -21,6 +21,8 @@
 | [次の画面の設計(PoC)](poc/DESIGN-next-screens.md) | 室内環境・天気・航空機などの調査と設計メモ |
 | [監視のコスト](DESIGN-monitoring-cost.md) | 監視スレッドの読み取りごとの CPU 時間、読む間隔の決め方、監視するものを増やすときの手順 |
 | [操作パネルの設計](panel/DESIGN.md) | Echo Show 5 を手元の操作盤にする設計。接続方式の比較、API(§5.2)、段階 |
+| [管理ページの PRD](admin-web/prd.md) | ブラウザから画面の有効/無効と接続先を変え、キオスクを再起動する管理ページの要件と受け入れ条件([Issue #94](https://github.com/ysogabe/miharashi/issues/94)) |
+| [管理ページの設計書](admin-web/design.md) | 設定の上書き(`admin.toml`)、管理トークン、HTTP API、起動の印、`miharashi config-get`、安全面、テスト計画 |
 | [LP 構成書](LP.md) | LP の役割、構成、載せる画像の約束、ローカルでの確認方法 |
 
 ## 検証記録

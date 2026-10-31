@@ -1354,12 +1354,13 @@ impl Config {
         }
     }
 
-    /// 管理ページが扱うキー(`aircraft.enabled` など)の値を文字列で返す。知らないキーは None。
+    /// 管理ページが扱うキー(`aircraft.enabled` など)と、`miharashi-t3-token` が読む `agents.token_file` の値を文字列で返す。知らないキーは None。
     pub fn value(&self, key: &str) -> Option<String> {
         Some(match key {
             "geoframe.url" => self.geoframe.url.clone(),
             "home_assistant.url" => self.home_assistant.url.clone(),
             "agents.url" => self.agents.url.clone(),
+            "agents.token_file" => self.agents.token_file.clone(),
             "agents.enabled" => self.agents.enabled.to_string(),
             "aircraft.url" => self.aircraft.url.clone(),
             "aircraft.enabled" => self.aircraft.enabled.to_string(),
