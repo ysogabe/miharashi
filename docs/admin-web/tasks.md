@@ -16,3 +16,4 @@
 | T7 | 実機の確認(自分で): 本番に入れて AC10・AC11・AC13・AC15・AC19・AC20・AC26 と全画面の回帰確認。本番反映は auto mode で拒否されたらユーザーに依頼 | AC1(実機), AC10, AC11, AC13, AC15, AC19, AC20, AC26 | T5, T6 | manual | 実装中 | daccd690a2c9ca6aab32a898133197dd58d9987a | | |
 
 AC24(R19)・AC23(R18)・AC25(R20)は T8(あると良い)で、時間があれば T7 の前に足す。AC27(例示用アドレスだけ)は全体のレビューで確かめる。
+| T8 | 全体レビュー(Sol)の修正: .prev の作成を必須(AC5)、https→http の格下げは allowed_hosts でも不可(AC7、PRD 優先で設計書を直す)、印の 60 秒は書いた時点から(AC13)、既定 IP の転載をやめる(AC27) | AC5, AC7, AC13, AC27 | T6 | full | 実装中 | a450011 | | Sol の全体レビュー 4 件(中 3・低 1)。Opus の security-review は別に進行中 |
