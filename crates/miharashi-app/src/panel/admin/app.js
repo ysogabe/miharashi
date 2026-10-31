@@ -7,6 +7,7 @@ const POLL_MS = 5000;
 const MAX_TEXT = 300;
 const RESTART_CHECK_MS = 5000;
 const RESTART_GIVE_UP_MS = 90000;
+const REQUEST_TIMEOUT_MS = 8000;
 
 const BOOT_FAILED_TEXT =
   "この上書きで起動した直後に終了した(原因が上書きとは限らない)。直すか取り消してから再起動する";
@@ -140,14 +141,22 @@ async function api(method, path, body) {
     headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(body);
   }
-  const resp = await fetch(path, init);
-  let json = null;
+  // 応答が来ないまま待ち続けない(本体が落ちている間は接続失敗として扱う)
+  const ctl = new AbortController();
+  init.signal = ctl.signal;
+  const timer = setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS);
   try {
-    json = await resp.json();
-  } catch (_) {
-    json = null;
+    const resp = await fetch(path, init);
+    let json = null;
+    try {
+      json = await resp.json();
+    } catch (_) {
+      json = null;
+    }
+    return { status: resp.status, json };
+  } finally {
+    clearTimeout(timer);
   }
-  return { status: resp.status, json };
 }
 
 function errorText(json, fallback) {
@@ -247,11 +256,15 @@ async function fetchOverview() {
   } finally {
     state.inflight = false;
   }
+  // 取得に失敗し続けても、再起動の確認は期限で打ち切る
+  if (state.loggedIn && state.restartWaiting) checkRestarted(null);
   return null;
 }
 
 async function poll() {
   if (!state.loggedIn) return;
+  // 隠れているあいだは取りに行かない(再起動中のフラグは残し、戻ったときの取得で判定する)
+  if (document.visibilityState !== "visible") return;
   const ov = await fetchOverview();
   if (ov && state.loggedIn) renderLive(ov);
 }
@@ -356,15 +369,21 @@ function renderRestart(ov) {
   if (state.restartWaiting) checkRestarted(ov);
 }
 
+// ov が null のときは取得に失敗したとき。期限の判定だけ行う。
 function checkRestarted(ov) {
   const now = Date.now();
   const result = $("restart-result");
-  if (now - state.restartStartedAt >= RESTART_CHECK_MS && typeof ov.uptime_s === "number" && ov.uptime_s < state.restartPrevUptime) {
+  if (ov && now - state.restartStartedAt >= RESTART_CHECK_MS && typeof ov.uptime_s === "number" && ov.uptime_s < state.restartPrevUptime) {
     state.restartWaiting = false;
     showBand(result, "再起動しました", "ok");
   } else if (now - state.restartStartedAt >= RESTART_GIVE_UP_MS) {
     state.restartWaiting = false;
     showBand(result, "再起動したか確かめられなかった。稼働の「起動からの時間」を見る", "warn");
+    if (!ov) {
+      // renderRestart が走らないので、ボタンと理由をここで戻す
+      $("restart").disabled = false;
+      $("restart-reason").textContent = "";
+    }
   }
 }
 
@@ -389,8 +408,10 @@ function buildForm(ov) {
     head.append(el("code", key));
     row.append(head);
 
+    const effectiveKind = item.kind === "bool" ? "bool" : "url";
+    const effective = el("div", "効いている値: " + formatValue(effectiveKind, item.effective), "value effective");
     if (item.kind === "readonly") {
-      row.append(el("div", formatValue("url", item.effective), "value"));
+      row.append(effective);
     } else {
       const kind = item.kind === "bool" ? "bool" : "url";
       const editable = el("div", null, "editable");
@@ -431,6 +452,7 @@ function buildForm(ov) {
 
       editable.append(ovLabel, inputWrap);
       row.append(editable);
+      row.append(effective);
       state.fields.set(key, { kind, cb, input });
     }
 
@@ -473,15 +495,13 @@ function buildOverlay() {
 $("config-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   if (state.saving || !state.loggedIn) return;
+  const body = { generation: state.formGeneration, overlay: buildOverlay() };
   state.saving = true;
-  $("save").disabled = true;
+  setFormBusy(true);
   const result = $("save-result");
   hideBand(result);
   try {
-    const r = await api("PUT", "/api/v1/admin/config", {
-      generation: state.formGeneration,
-      overlay: buildOverlay(),
-    });
+    const r = await api("PUT", "/api/v1/admin/config", body);
     if (r.status === 204) {
       showBand(result, "保存しました。再起動で反映します", "ok");
       await reloadForm();
@@ -503,9 +523,20 @@ $("config-form").addEventListener("submit", async (ev) => {
     showBand(result, "接続できない。保存できたか分からないので、読み直して確かめる", "error");
   } finally {
     state.saving = false;
-    $("save").disabled = false;
+    setFormBusy(false);
   }
 });
+
+// 保存の送信から読み直しが終わるまで、入力を受けない(あとの読み直しで追加の入力を消さないため)
+function setFormBusy(busy) {
+  for (const f of state.fields.values()) {
+    f.cb.disabled = busy;
+    f.input.disabled = busy || !f.cb.checked;
+  }
+  $("save").disabled = busy;
+  $("save").textContent = busy ? "保存中…" : "保存";
+  $("reload").disabled = busy;
+}
 
 // overview を読み直してフォームを作り直す。保存直後は処理中で 429 になることがあるので少し待って繰り返す。
 async function reloadForm() {
