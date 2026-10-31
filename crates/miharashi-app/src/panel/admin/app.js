@@ -439,7 +439,9 @@ function buildForm(ov) {
         input.value = typeof initial === "string" ? initial : "";
         inputWrap = input;
       }
-      input.disabled = !cb.checked;
+      // 保存中に作り直されても、保存が終わる(setFormBusy(false))まで入力を受けない
+      cb.disabled = state.saving;
+      input.disabled = state.saving || !cb.checked;
 
       // 外すと「ファイルの値に戻す」(その項目は null)。入力はファイルの値の表示に戻して無効にする
       cb.addEventListener("change", () => {
@@ -504,7 +506,7 @@ $("config-form").addEventListener("submit", async (ev) => {
     const r = await api("PUT", "/api/v1/admin/config", body);
     if (r.status === 204) {
       showBand(result, "保存しました。再起動で反映します", "ok");
-      await reloadForm();
+      await reloadForm(true);
     } else if (r.status === 401) {
       logout("ログインし直す(トークンが通らなかった)");
     } else if (r.status === 409) {
@@ -539,9 +541,11 @@ function setFormBusy(busy) {
 }
 
 // overview を読み直してフォームを作り直す。保存直後は処理中で 429 になることがあるので少し待って繰り返す。
-async function reloadForm() {
+// 保存中は「読み直す」の応答でフォームを作らない(保存後の読み直し afterSave に任せる)。
+async function reloadForm(afterSave = false) {
   for (let i = 0; i < 4; i += 1) {
     const ov = await fetchOverview();
+    if (!afterSave && state.saving) return false;
     if (ov) {
       buildForm(ov);
       renderLive(ov);
@@ -556,7 +560,7 @@ async function reloadForm() {
 $("reload").addEventListener("click", async () => {
   hideBand($("save-result"));
   const ok = await reloadForm();
-  if (!ok && state.loggedIn) setStatus("読み直せなかった。もう一度押す", "warn");
+  if (!ok && state.loggedIn && !state.saving) setStatus("読み直せなかった。もう一度押す", "warn");
 });
 
 // ---- 再起動 ----
