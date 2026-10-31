@@ -13,6 +13,7 @@
 //! キオスクの中だけで切り替えると HA の画面と食い違うので、実際の切り替えは `DisplayControl` に任せる。
 use crate::config;
 use crate::screen::{KeyPress, PanelRotation, PanelView};
+pub use admin::AdminContext;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -23,14 +24,52 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response, Server};
 
+mod admin;
+
 /// `/api/v1/status` の形を変えたら上げる。パネルはこれを見て古い形を読み分ける。
 const SCHEMA_VERSION: u32 = 1;
 /// 同時に開いておける SSE の数。パネルは 1 台の想定なので少なくてよい。
 const MAX_SSE: usize = 4;
 const KEEPALIVE: Duration = Duration::from_secs(15);
 const MAX_BODY: u64 = 1024;
+/// 受信の期限。接続からこの時間なにも届かなければ、tiny_http は黙って切る(ヘッダーや本文を途中までしか
+/// 送らないクライアントに、接続を握らせない。tiny_http は 1 KiB までの本文を、要求をパネルのスレッドに
+/// 渡す前に接続のスレッドで読み切るので、ここで切るしかない)。待ち受けソケットに掛けると accept した
+/// ソケットが引き継ぐ。次の要求を待つ keep-alive の接続も、この時間黙っていれば切れる。
+const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 /// 最後の要求からこの時間はパネルが「つながっている」とみなす(パネルは 5 秒ごとに /status を読む)。
 const CONNECTED_FOR: Duration = Duration::from_secs(30);
+
+/// `addr` で待ち受ける。受信の期限(`RECV_TIMEOUT`)を待ち受けソケットに掛ける。
+fn bind(addr: SocketAddr, recv_timeout: Duration) -> Result<Server, String> {
+    let listener =
+        std::net::TcpListener::bind(addr).map_err(|e| format!("{addr} で待ち受けられない: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let tv = libc::timeval {
+            tv_sec: recv_timeout.as_secs() as libc::time_t,
+            tv_usec: recv_timeout.subsec_micros() as libc::suseconds_t,
+        };
+        // SAFETY: tv はこの呼び出しの間だけ生きていて、長さも合っている
+        let r = unsafe {
+            libc::setsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&raw const tv).cast(),
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if r != 0 {
+            eprintln!(
+                "panel: 受信の期限を掛けられない(続ける): {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    Server::from_listener(listener, None).map_err(|e| format!("{addr} で待ち受けられない: {e}"))
+}
 
 /// `listen` が、待ち受けるインターフェースを 1 つに決めた IP:ポートか。
 pub fn check_listen(listen: &str) -> Result<SocketAddr, String> {
@@ -55,6 +94,86 @@ fn parse_key(name: &str) -> Result<KeyPress, String> {
         _ => Err(format!(
             "未知のキー {name:?}。使えるのは prev / next / select / up / down / menu"
         )),
+    }
+}
+
+/// 経路ごとに決まった、要るトークン。完全一致の表で決め、「どちらかのトークンなら通す」はしない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Auth {
+    Open,
+    Panel,
+    Admin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Healthz,
+    Status,
+    Events,
+    Input,
+    Screen,
+    Display,
+    Rotation,
+    AdminOverview,
+    AdminRestart,
+    AdminConfig,
+    /// `/admin`、`/admin/app.js`、`/admin/app.css`(静的ファイル。T5)
+    AdminPage,
+    /// 管理の名前空間にあるが、表に無い経路
+    AdminOther,
+    Unknown,
+}
+
+impl Route {
+    /// 経路(パスの完全一致)から、要るトークンを決める。表に無い経路はパネルのトークンが要る(既存の動き)。
+    fn of(path: &str) -> (Route, Auth) {
+        match path {
+            "/api/v1/healthz" => (Route::Healthz, Auth::Open),
+            "/api/v1/status" => (Route::Status, Auth::Panel),
+            "/api/v1/events" => (Route::Events, Auth::Panel),
+            "/api/v1/input" => (Route::Input, Auth::Panel),
+            "/api/v1/screen" => (Route::Screen, Auth::Panel),
+            "/api/v1/display" => (Route::Display, Auth::Panel),
+            "/api/v1/rotation" => (Route::Rotation, Auth::Panel),
+            "/api/v1/admin/overview" => (Route::AdminOverview, Auth::Admin),
+            "/api/v1/admin/restart" => (Route::AdminRestart, Auth::Admin),
+            "/api/v1/admin/config" => (Route::AdminConfig, Auth::Admin),
+            "/admin" | "/admin/app.js" | "/admin/app.css" => (Route::AdminPage, Auth::Open),
+            p if p == "/api/v1/admin"
+                || p.starts_with("/api/v1/admin/")
+                || p.starts_with("/admin/") =>
+            {
+                (Route::AdminOther, Auth::Admin)
+            }
+            _ => (Route::Unknown, Auth::Panel),
+        }
+    }
+
+    fn is_admin(self) -> bool {
+        matches!(
+            self,
+            Route::AdminOverview
+                | Route::AdminRestart
+                | Route::AdminConfig
+                | Route::AdminPage
+                | Route::AdminOther
+        )
+    }
+
+    /// この経路が受け付けるメソッド。`Unknown` は 404、`AdminOther` は 404 なのでどれでもよい。
+    fn allows(self, method: &Method) -> bool {
+        match self {
+            Route::Healthz | Route::Unknown | Route::AdminOther => true,
+            Route::Status | Route::Events | Route::AdminOverview | Route::AdminPage => {
+                *method == Method::Get
+            }
+            Route::Input
+            | Route::Screen
+            | Route::Display
+            | Route::Rotation
+            | Route::AdminRestart => *method == Method::Post,
+            Route::AdminConfig => *method == Method::Put,
+        }
     }
 }
 
@@ -269,19 +388,30 @@ pub struct Panel {
     keys: Receiver<PanelInput>,
     shared: Arc<Shared>,
     addr: SocketAddr,
+    /// 管理ページを無効にした理由(`[admin]` が無効なら None)
+    #[cfg_attr(not(test), allow(dead_code))] // 理由は prepare が stderr に出す。テストが読む
+    admin_disabled: Option<String>,
 }
 
 impl Panel {
     /// 設定どおりに待ち受けを始める。失敗したら Err(キオスクはパネルなしで動き続ける)。
     /// `display` はモニターの切り替え先(HA 連携が無ければ None。`/api/v1/display` は 409)。
+    /// `admin` は管理ページの材料(`[admin]` が有効で、管理トークンが規則を満たすときだけ管理ページが動く)。
     pub fn start(
         cfg: &config::Panel,
         display: Option<Arc<dyn DisplayControl>>,
+        admin: Option<AdminContext>,
     ) -> Result<Self, String> {
         let addr = check_listen(&cfg.listen)?;
         let token = read_token(&cfg.token_file)?;
-        let server = Server::http(addr).map_err(|e| format!("{addr} で待ち受けられない: {e}"))?;
-        Ok(Self::spawn(server, token, cfg.max_rate_per_sec, display))
+        let server = bind(addr, RECV_TIMEOUT)?;
+        Ok(Self::spawn(
+            server,
+            token,
+            cfg.max_rate_per_sec,
+            display,
+            admin,
+        ))
     }
 
     fn spawn(
@@ -289,6 +419,7 @@ impl Panel {
         token: String,
         max_rate_per_sec: u32,
         display: Option<Arc<dyn DisplayControl>>,
+        admin: Option<AdminContext>,
     ) -> Self {
         let addr = server.server_addr().to_ip().expect("TCP で待ち受けている");
         let shared = Arc::new(Shared {
@@ -305,15 +436,26 @@ impl Panel {
             display_control: display.is_some(),
         });
         let (tx, keys) = channel();
+        let (admin, admin_disabled) = admin::prepare(admin, &token, &shared, &tx, addr);
         let s = shared.clone();
         std::thread::Builder::new()
             .name("panel".into())
             .spawn(move || {
                 let rate = RateLimit::new(max_rate_per_sec);
-                serve(server, token, rate, tx, display, s)
+                serve(server, token, rate, tx, display, s, admin)
             })
             .expect("panel スレッドを起動できる");
-        Self { keys, shared, addr }
+        Self {
+            keys,
+            shared,
+            addr,
+            admin_disabled,
+        }
+    }
+
+    #[cfg(test)]
+    fn admin_disabled(&self) -> Option<&str> {
+        self.admin_disabled.as_deref()
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -367,10 +509,41 @@ fn json_response(code: u16, body: &Value) -> Response<std::io::Cursor<Vec<u8>>> 
         .with_status_code(code)
         .with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
         .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap())
+        .with_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap())
 }
 
 fn error(code: u16, msg: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     json_response(code, &json!({ "error": msg }))
+}
+
+/// 応答して要求を手放す。tiny_http は、読み残した本文があると要求を手放すときに読み捨てる(`EqualReader` の
+/// `Drop`)ので、本文を途中までしか送らない相手に当たるとスレッドが止まる。本文が 1 KiB を超える(または
+/// chunked の)要求への応答は別スレッドで行い、パネルのスレッドや管理ワーカーを止めない。
+/// (1 KiB までの本文は、tiny_http が要求を渡す前に読み切っている)
+fn reply(req: Request, resp: Response<std::io::Cursor<Vec<u8>>>) {
+    let may_drain = req.body_length().is_some_and(|n| n as u64 > MAX_BODY)
+        || req
+            .headers()
+            .iter()
+            .any(|h| h.field.equiv("Transfer-Encoding"));
+    if !may_drain {
+        let _ = req.respond(resp);
+        return;
+    }
+    let slot = Arc::new(Mutex::new(Some((req, resp))));
+    let s = slot.clone();
+    let spawned = std::thread::Builder::new()
+        .name("panel-reply".into())
+        .spawn(move || {
+            if let Some((req, resp)) = s.lock().unwrap().take() {
+                let _ = req.respond(resp);
+            }
+        });
+    if spawned.is_err()
+        && let Some((req, resp)) = slot.lock().unwrap().take()
+    {
+        let _ = req.respond(resp);
+    }
 }
 
 fn authorized(req: &Request, token: &str) -> bool {
@@ -388,26 +561,59 @@ fn serve(
     keys: Sender<PanelInput>,
     display: Option<Arc<dyn DisplayControl>>,
     shared: Arc<Shared>,
+    admin: Option<admin::Admin>,
 ) {
     for mut req in server.incoming_requests() {
         let path = req.url().split('?').next().unwrap_or("").to_string();
         let method = req.method().clone();
-        if path == "/api/v1/healthz" {
-            let _ = req.respond(json_response(200, &json!({ "ok": true })));
+        // CORS の事前確認には応えない(Access-Control-Allow-* はどの応答にも付けない)
+        if method == Method::Options {
+            reply(req, error(405, "メソッドが違う"));
             continue;
         }
-        if !authorized(&req, &token) {
+        let (route, auth) = Route::of(&path);
+        if route == Route::Healthz {
+            reply(req, json_response(200, &json!({ "ok": true })));
+            continue;
+        }
+        // 管理ページが無効なら、管理の経路は認証より前に 404
+        if route.is_admin() && admin.is_none() {
+            reply(req, error(404, "ない"));
+            continue;
+        }
+        let ok = match auth {
+            Auth::Open => true,
+            Auth::Panel => authorized(&req, &token),
+            Auth::Admin => admin.as_ref().is_some_and(|a| authorized(&req, a.token())),
+        };
+        if !ok {
             eprintln!("panel: {} {method} {path} -> 401", peer(&req));
-            let _ = req.respond(error(401, "Authorization: Bearer <token> が必要"));
+            reply(req, error(401, "Authorization: Bearer <token> が必要"));
             continue;
         }
-        *shared.last_request.lock().unwrap() = Some(Instant::now());
-        let resp = match (&method, path.as_str()) {
-            (Method::Get, "/api/v1/status") => match shared.snapshot().0 {
+        if auth == Auth::Panel {
+            *shared.last_request.lock().unwrap() = Some(Instant::now());
+        }
+        if !route.allows(&method) {
+            reply(req, error(405, "メソッドが違う"));
+            continue;
+        }
+        if let (true, Some(a)) = (route.is_admin(), &admin) {
+            // 本文の読み取り・処理・応答は管理ワーカーに任せる(パネルのキー操作を待たせない)
+            if let Err(req) = a.submit(req, route) {
+                reply(
+                    req,
+                    json_response(429, &json!({"error": "管理の処理中", "retry_after_s": 1})),
+                );
+            }
+            continue;
+        }
+        let resp = match route {
+            Route::Status => match shared.snapshot().0 {
                 Some(v) => json_response(200, &v),
                 None => error(503, "起動中"),
             },
-            (Method::Get, "/api/v1/events") => {
+            Route::Events => {
                 if shared.sse.load(Ordering::Relaxed) >= MAX_SSE {
                     error(503, "SSE の接続が多すぎる")
                 } else {
@@ -423,7 +629,7 @@ fn serve(
                     continue;
                 }
             }
-            (Method::Post, "/api/v1/input") => {
+            Route::Input => {
                 if !rate.allow(Instant::now()) {
                     error(429, "操作が速すぎる")
                 } else {
@@ -436,7 +642,7 @@ fn serve(
                     }
                 }
             }
-            (Method::Post, "/api/v1/screen") => {
+            Route::Screen => {
                 if !rate.allow(Instant::now()) {
                     error(429, "操作が速すぎる")
                 } else {
@@ -449,7 +655,7 @@ fn serve(
                     }
                 }
             }
-            (Method::Post, "/api/v1/display") => {
+            Route::Display => {
                 if !rate.allow(Instant::now()) {
                     error(429, "操作が速すぎる")
                 } else {
@@ -462,7 +668,7 @@ fn serve(
                     }
                 }
             }
-            (Method::Post, "/api/v1/rotation") => {
+            Route::Rotation => {
                 if !rate.allow(Instant::now()) {
                     error(429, "操作が速すぎる")
                 } else {
@@ -475,14 +681,9 @@ fn serve(
                     }
                 }
             }
-            (
-                _,
-                "/api/v1/status" | "/api/v1/events" | "/api/v1/input" | "/api/v1/screen"
-                | "/api/v1/display" | "/api/v1/rotation",
-            ) => error(405, "メソッドが違う"),
             _ => error(404, "ない"),
         };
-        let _ = req.respond(resp);
+        reply(req, resp);
     }
 }
 
@@ -490,6 +691,10 @@ type HttpError = (u16, String);
 
 /// 本文 `{"<field>": "<値>"}` の値を読む。
 fn read_field(req: &mut Request, field: &str, example: &str) -> Result<String, HttpError> {
+    // 大きいと言っている本文は読まずに断る(途中で止まる相手を待たない)
+    if req.body_length().is_some_and(|n| n as u64 > MAX_BODY) {
+        return Err((413, "本文が大きすぎる".into()));
+    }
     let mut body = Vec::new();
     req.as_reader()
         .take(MAX_BODY + 1)
@@ -681,7 +886,7 @@ mod tests {
 
     fn start_with(rate: u32, display: Option<Arc<dyn DisplayControl>>) -> (Panel, String) {
         let server = Server::http("127.0.0.1:0").unwrap();
-        let p = Panel::spawn(server, TOKEN.into(), rate, display);
+        let p = Panel::spawn(server, TOKEN.into(), rate, display, None);
         let base = format!("http://{}", p.addr());
         (p, base)
     }

@@ -534,7 +534,7 @@ pub fn boot_marker_path(overlay_file: &Path) -> PathBuf {
     overlay_file.with_file_name(BOOT_MARKER)
 }
 
-fn boot_marker_dir(overlay_file: &Path) -> PathBuf {
+pub fn boot_marker_dir(overlay_file: &Path) -> PathBuf {
     match overlay_file.parent() {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
         _ => PathBuf::from("."),
@@ -630,7 +630,7 @@ fn read_marker_with(path: &Path, now_boot: Option<&str>) -> MarkerState {
 }
 
 /// 上書きファイルの世代(内容の SHA-256 の先頭 16 桁)。
-fn overlay_generation(bytes: &[u8]) -> String {
+pub(crate) fn overlay_generation(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes)
         .iter()
@@ -1224,6 +1224,15 @@ impl Config {
             &text,
             consume_marker,
         ))
+    }
+
+    /// `load_with_overlay` を今のファイルでやり直す(管理ページの「次回起動の値」)。印には触らない。
+    /// 設定ファイルが無い起動(`base_path` が None)は既定値を base にする。
+    pub fn reload_with_overlay(base_path: Option<&Path>) -> Result<LoadedConfig, String> {
+        match base_path {
+            Some(p) => Self::load_with_overlay(p, false),
+            None => Ok(build_loaded(None, Self::default(), "", false)),
+        }
     }
 
     /// 管理ページが扱うキー(`aircraft.enabled` など)の値を文字列で返す。知らないキーは None。
