@@ -60,17 +60,18 @@ impl Admin {
     }
 
     /// ワーカーに渡す。忙しい(処理中)・ワーカーが無いときは要求を返す(呼び出し側が 429 を返す)。
-    pub(super) fn submit(&self, req: Request, route: Route) -> Result<(), Request> {
+    /// `Request` は大きいので箱に入れて返す。
+    pub(super) fn submit(&self, req: Request, route: Route) -> Result<(), Box<Request>> {
         if self
             .busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return Err(req);
+            return Err(Box::new(req));
         }
         self.tx.send(Job { req, route }).map_err(|e| {
             self.busy.store(false, Ordering::Release);
-            e.0.req
+            Box::new(e.0.req)
         })
     }
 }
@@ -87,7 +88,7 @@ struct Ctx {
     restart_requested: AtomicBool,
     shared: Arc<Shared>,
     keys: Sender<PanelInput>,
-    /// 本文を読み残した要求の応答と手放しを任せる
+    /// 本文を読み残した要求の応答と手放しを任せる(要求ごとのスレッド)
     reaper: Reaper,
     /// 動いている読み取りスレッドの数
     readers: Arc<AtomicUsize>,
@@ -1262,25 +1263,56 @@ mod tests {
         drop(conns);
     }
 
-    #[test]
-    fn a_full_reaper_queue_does_not_block_the_panel() {
-        // 本文を読み残した要求が、後始末スレッドの容量(32)を超えて溜まっても、パネルは止まらない
-        let fx = Fx::new("reaper-full");
-        let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
-        let (p, base) = start(loaded, 200);
-        let conns: Vec<_> = (0..40)
+    /// 本文を読み残した要求を `n` 本、開いたまま返す(パネルの経路で、認証が無いので 401 になる)。
+    fn many_held(addr: SocketAddr, n: usize) -> Vec<TcpStream> {
+        (0..n)
             .map(|_| {
                 held(
-                    p.addr(),
+                    addr,
                     "POST /api/v1/input HTTP/1.1\r\nExpect: 100-continue",
                     1000,
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn many_unread_bodies_held_open_do_not_block_the_panel() {
+        // 本文を読み残した要求が何本溜まっても(後始末は要求ごとのスレッドで、上限も待ち行列も無い)、
+        // パネルは止まらず、後続の応答も遅れない
+        let fx = Fx::new("reaper-many");
+        let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
+        let (p, base) = start(loaded, 200);
+        let mut conns = many_held(p.addr(), 40);
         let t0 = Instant::now();
         std::thread::sleep(Duration::from_millis(500));
         panel_input_is_not_blocked(&p, &base, t0);
+        // 40 本目の 401 も、手前の読み捨てに詰まらず返る
+        assert!(status_line(conns.last_mut().unwrap()).starts_with("HTTP/1.1 401"));
         drop(conns);
+    }
+
+    #[test]
+    fn reaper_threads_are_reclaimed_when_the_peers_close() {
+        // 開いたままの接続を相手が全部閉じたら、後始末のスレッドは全部終わる(資源が残らない)
+        let fx = Fx::new("reaper-reclaim");
+        let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
+        let (p, base) = start(loaded, 200);
+        let conns = many_held(p.addr(), 40);
+        let t0 = Instant::now();
+        let mut peak = 0;
+        while t0.elapsed() < Duration::from_secs(5) && peak < 40 {
+            peak = peak.max(p.reapers());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(peak, 40, "40 本とも読み捨てを待っている");
+        panel_input_is_not_blocked(&p, &base, Instant::now());
+        drop(conns);
+        let t1 = Instant::now();
+        while p.reapers() > 0 && t1.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(p.reapers(), 0, "切断のあとに後始末のスレッドが残っている");
     }
 
     #[test]

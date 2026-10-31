@@ -19,7 +19,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, TryIter, TrySendError, channel, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, TryIter, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response, Server};
@@ -355,6 +355,8 @@ pub struct Panel {
     /// 管理ページを無効にした理由(`[admin]` が無効なら None)
     #[cfg_attr(not(test), allow(dead_code))] // 理由は prepare が stderr に出す。テストが読む
     admin_disabled: Option<String>,
+    #[cfg(test)]
+    reaper: Reaper,
 }
 
 impl Panel {
@@ -400,8 +402,10 @@ impl Panel {
             display_control: display.is_some(),
         });
         let (tx, keys) = channel();
-        let reaper = Reaper::start();
+        let reaper = Reaper::default();
         let (admin, admin_disabled) = admin::prepare(admin, &token, &shared, &tx, addr, &reaper);
+        #[cfg(test)]
+        let test_reaper = reaper.clone();
         let s = shared.clone();
         std::thread::Builder::new()
             .name("panel".into())
@@ -415,7 +419,14 @@ impl Panel {
             shared,
             addr,
             admin_disabled,
+            #[cfg(test)]
+            reaper: test_reaper,
         }
+    }
+
+    #[cfg(test)]
+    fn reapers(&self) -> usize {
+        self.reaper.active()
     }
 
     #[cfg(test)]
@@ -484,9 +495,6 @@ fn error(code: u16, msg: &str) -> Response<std::io::Cursor<Vec<u8>>> {
 /// tiny_http が、本文をこの長さまでなら要求を渡す前に接続のスレッドで読み切る閾値(tiny_http 0.12 の
 /// request.rs の `content_length <= 1024 && !expects_continue`)。パネルの `MAX_BODY` とは別の話。
 const PREFETCH_MAX: u64 = 1024;
-/// 後始末スレッドに預けられる要求の数。
-const REAPER_QUEUE: usize = 32;
-
 /// 本文を、tiny_http が要求を渡す前に読み切っているか。読み切っていれば、読んでも手放しても待たない。
 /// そうでない要求(1 KiB を超える本文、`Expect` つき、`Transfer-Encoding`(chunked)、`Connection: upgrade`)は
 /// 本文を読み残したまま届く。読むと相手が送るまで止まり、手放すと(`EqualReader` の `Drop` が)残りを
@@ -505,48 +513,62 @@ fn has_header(req: &Request, name: &'static str) -> bool {
     req.headers().iter().any(|h| h.field.equiv(name))
 }
 
-/// 後始末スレッド。本文を読み残した要求に応答して手放す(手放すときの読み捨てが止まるのは、この
-/// スレッドだけ)。パネルのスレッドや管理ワーカーは、本文を読み残した要求を自分で手放さない。
-#[derive(Clone)]
+/// 動いている後始末スレッドの数を数える。スレッドが終わる(または起動に失敗して閉じが捨てられる)
+/// ときに減る。
+struct ReapCount(Arc<AtomicUsize>);
+
+impl Drop for ReapCount {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// 応答と手放し。本文を読み残した要求は、要求ごとに作る短命のスレッドで応答して手放す。
+///
+/// 読み残した要求を手放すと、tiny_http の `EqualReader` の `Drop` が残りを読み捨てようとして、相手が
+/// 送るか切るまで戻らない(取り出したストリームを drop しても同じで、tiny_http を変えずに接続を
+/// 強制的に閉じる手は無い)。パネルのスレッドや管理ワーカーが待たないよう、その待ちは要求ごとの
+/// スレッドに持たせる。スレッドは相手が送るか切ると終わり、fd も接続のスレッドも相手の切断と同時に
+/// 回収される。
+///
+/// 同時数の上限は置かない。上限を置いて溢れた要求を捨てる(`mem::forget` など)と、止まった接続が
+/// 溜まったときに fd と接続のスレッドが恒久的に残る。tiny_http は接続ごとにスレッドを持つので、
+/// ここで増えるスレッドも接続の数に収まる(接続数に上限が無いのは既存のパネルと同じで、LAN 限定で
+/// 受け入れる)。
+#[derive(Clone, Default)]
 struct Reaper {
-    tx: SyncSender<(Request, Response<std::io::Cursor<Vec<u8>>>)>,
+    active: Arc<AtomicUsize>,
 }
 
 impl Reaper {
-    fn start() -> Self {
-        let (tx, rx) = sync_channel::<(Request, Response<std::io::Cursor<Vec<u8>>>)>(REAPER_QUEUE);
-        std::thread::Builder::new()
-            .name("panel-reaper".into())
-            .spawn(move || {
-                for (req, resp) in rx {
-                    // 応答は先に書かれる。そのあと手放すときに、読み残しの本文が来るか接続が切れるまで待つ
-                    let _ = req.respond(resp);
-                }
-            })
-            .expect("panel-reaper スレッドを起動できる");
-        Self { tx }
-    }
-
-    /// 応答して要求を手放す。本文を読み切っている要求は、その場で応答する。
+    /// 応答して要求を手放す。本文を読み切っている要求は、その場で応答する(待たない)。
     fn reply(&self, req: Request, resp: Response<std::io::Cursor<Vec<u8>>>) {
         if body_prefetched(&req) {
             let _ = req.respond(resp);
             return;
         }
-        match self.tx.try_send((req, resp)) {
-            Ok(()) => {}
-            Err(TrySendError::Full((req, _)) | TrySendError::Disconnected((req, _))) => {
-                // 後始末が詰まっている(読み捨てで止まった接続が溜まっている)。応答を書かずに、手放さず
-                // 捨てる(`forget`)。手放すと読み捨てで待つだけで、待ってよいのは後始末スレッドだけ。
-                // この接続のスレッドは tiny_http の側で、この要求の応答を待って既に止まっているので、
-                // 捨てても止まるスレッドは増えない(接続の fd とそのスレッドは、相手が切れても残る)。
-                eprintln!(
-                    "panel: 後始末が詰まっている。{} の要求を応答せずに捨てる",
-                    peer(&req)
-                );
-                std::mem::forget(req);
-            }
+        let who = peer(&req);
+        self.active.fetch_add(1, Ordering::AcqRel);
+        let count = ReapCount(self.active.clone());
+        let spawned = std::thread::Builder::new()
+            .name("panel-reap".into())
+            .spawn(move || {
+                let _count = count;
+                // 応答は先に書かれる。そのあと手放すときに、読み残しの本文が来るか接続が切れるまで待つ
+                let _ = req.respond(resp);
+            });
+        if let Err(e) = spawned {
+            // スレッドを起こせない(資源が尽きている)。起動に失敗した閉じに入っていた要求は、応答を
+            // 書けないまま、ここ(spawn の中)で同期に手放される。待ちを逃れる手は無いので、この
+            // ときだけ許す
+            eprintln!("panel: 後始末のスレッドを起こせない。{who} の要求を応答せずに手放す: {e}");
         }
+    }
+
+    /// 動いている後始末スレッドの数(テスト用)。
+    #[cfg(test)]
+    fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
     }
 }
 
@@ -607,7 +629,7 @@ fn serve(
             // 本文の読み取り・処理・応答は管理ワーカーに任せる(パネルのキー操作を待たせない)
             if let Err(req) = a.submit(req, route) {
                 reaper.reply(
-                    req,
+                    *req,
                     json_response(429, &json!({"error": "管理の処理中", "retry_after_s": 1})),
                 );
             }
