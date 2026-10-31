@@ -127,7 +127,7 @@ flowchart LR
 # overlay_file = "/var/lib/miharashi/admin.toml"
 # 管理ページから T3 の接続先(agents.url)に使える接続先。この設定ファイルに書いた agents.url(scheme・ホスト・ポートが同じもの)
 # は常に使える。別のホストやポートを使うにはここに host か host:port を書く(port を書かなければ 80 / 443 だけ)。
-# https の設定を管理ページから http に変えることはできない。パスは自由。
+# https の設定を管理ページから http に変えることはできない(allowed_hosts に書いた接続先は http でもよい)。T3 の URL は origin だけ(パスは書けない)。
 # allowed_hosts = []           # 例: ["192.0.2.30:3773", "t3.example.test"]
 ```
 
@@ -403,7 +403,7 @@ JavaScript はフレームワークを使わず、`fetch` と DOM 操作だけ�
 | AC4 | 単体(`panel.rs`): base を `agents.enabled = true`・`url` 正しい・`ui.start_screen = "agents"` にし、PUT で `{"agents":{"enabled":false}}` → 400 と「ui.start_screen = agents には agents.enabled = true が必要」。`admin.toml` が変わらない |
 | AC5 | 単体: 書き込みの手順を関数に分け、(a) tmp を書いた直後、(b) `.prev` を作った直後、(c) rename 後、の各状態をディレクトリに作って `load_with_overlay` を呼び、前の内容か新しい内容のどちらかになること。残った tmp が起動時に消えること |
 | AC6 | 単体: `{"panel":{"listen":"..."}}`、`{"agents":{"token_file":"..."}}`、`{"geoframe":{"photo_interval_secs":1}}`、`{"home_assistant":{"url":"..."}}`、userinfo 付き URL、空白・`"`・制御文字を含む URL、`agents.enabled=false` で `agents.url` が不正、許可されないホスト → すべて 400。`admin.toml` が変わらない |
-| AC7 | 単体(`config.rs`): `Overlay::check` に base(文面の `agents.url = http://192.0.2.30:3773`、`allowed_hosts = ["t3.example.test", "192.0.2.40:4000"]`)を渡し、`http://192.0.2.30:3773/x`・`https://t3.example.test/`・`http://192.0.2.40:4000` は Ok、`http://192.0.2.30:4000`(ポート違い)・`http://192.0.2.31:3773`・`https://t3.example.test:8443`(port 無しの要素は既定ポートだけ)は Err。文面が `https://192.0.2.30` のとき `http://192.0.2.30` は Err(格下げ)。`[agents]` が無い base と `url = ""` の base では、既定値のホスト(`192.168.0.132`)が Err で `allowed_hosts` だけが通る。`https://:443` のような空ホストは Err。表記ゆれ(`192.000.002.030`、`2001:db8:0::1` と `2001:db8::1`、末尾のドット)。`load_with_overlay` で許されない overlay が無視され `report.error` に理由 |
+| AC7 | 単体(`config.rs`): `Overlay::check` に base(文面の `agents.url = http://192.0.2.30:3773`、`allowed_hosts = ["t3.example.test", "192.0.2.40:4000"]`)を渡し、`http://192.0.2.30:3773`・`https://t3.example.test`・`http://192.0.2.40:4000` は Ok、`http://192.0.2.30:3773/x`(パス付き。`agents::check_url` の既存の規則)は Err、`http://192.0.2.30:4000`(ポート違い)・`http://192.0.2.31:3773`・`https://t3.example.test:8443`(port 無しの要素は既定ポートだけ)は Err。文面が `https://192.0.2.30` のとき `http://192.0.2.30` は Err(格下げ)。`[agents]` が無い base と `url = ""` の base では、既定値のホスト(`192.168.0.132`)が Err で `allowed_hosts` だけが通る。`https://:443` のような空ホストは Err。表記ゆれ(`192.000.002.030`、`2001:db8:0::1` と `2001:db8::1`、末尾のドット)。`load_with_overlay` で許されない overlay が無視され `report.error` に理由 |
 | AC8 | 単体: base のパスに壊れた TOML を置いて PUT → 409。`admin.toml` が変わらない |
 | AC9 | 単体: `{"aircraft":{"enabled":null}}` を PUT → `admin.toml` に `aircraft.enabled` が無く、`items` の `next` が base の値。全部 `null` で PUT → `admin.toml` が無く `.prev` がある |
 | AC10 | 単体: `POST restart` → `p.inputs()` に `Restart`、2 回目は 429 と `requested: true`。`started` を 10 秒前にして 429 と `retry_after_s`。実機: ボタン → journal に「管理ページからの再起動」→ 3 秒後に起動。モニター消灯中に再起動して、再起動後の状態を確認 |
