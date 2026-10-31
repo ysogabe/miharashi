@@ -595,6 +595,25 @@ pub fn remove_boot_marker(dir: &Path) {
     let _ = std::fs::remove_file(dir.join(BOOT_MARKER));
 }
 
+/// 上書きで起動した印を消すまでの時間(docs/admin-web/design.md の R9。印を書いた時点から数える)。
+pub const BOOT_MARKER_SECS: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 印を書いた時刻(`armed_at`)から `ttl` たったら印を消すスレッド(`boot-marker`)を起こす。消したら終わる。
+/// 初期化(表示・GPU・取得スレッドの起動)が長引いて実行ループに入る前に異常終了しても、
+/// 起動から `ttl` を超えて動いていた印は残さない。実行ループ側の削除と重なっても、無いファイルの削除は無視する。
+fn spawn_boot_marker_timer(
+    dir: PathBuf,
+    armed_at: std::time::Instant,
+    ttl: std::time::Duration,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("boot-marker".into())
+        .spawn(move || {
+            std::thread::sleep(ttl.saturating_sub(armed_at.elapsed()));
+            remove_boot_marker(&dir);
+        })
+}
+
 /// 印の判定結果。
 enum MarkerState {
     None,
@@ -817,7 +836,12 @@ impl LoadedConfig {
             self.report.error_kind = Some(OverlayErrorKind::MarkerUnwritable);
             return;
         }
-        self.marker_armed_at = Some(std::time::Instant::now());
+        let armed_at = std::time::Instant::now();
+        self.marker_armed_at = Some(armed_at);
+        // 初期化と独立に 60 秒で消す(detach)。起こせなければ実行ループ側の削除に任せる
+        if let Err(e) = spawn_boot_marker_timer(dir, armed_at, BOOT_MARKER_SECS) {
+            eprintln!("印を消すスレッドを起こせない(実行ループで消す): {e}");
+        }
     }
 }
 
@@ -2396,6 +2420,33 @@ mod tests {
         l.arm_boot_marker();
         assert!(!t.path("admin.boot").exists());
         assert_eq!(l.marker_armed_at, None);
+    }
+
+    #[test]
+    fn boot_marker_timer_removes_the_marker_after_ttl_and_tolerates_a_missing_one() {
+        let t = Tmp::new("bmtimer");
+        write_boot_marker(&t.0, "0123456789abcdef").unwrap();
+        let ttl = std::time::Duration::from_millis(200);
+        let armed_at = std::time::Instant::now();
+        let h = spawn_boot_marker_timer(t.0.clone(), armed_at, ttl).unwrap();
+        assert_eq!(h.thread().name(), Some("boot-marker"));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(t.path("admin.boot").exists(), "ttl の前には消さない");
+        h.join().unwrap();
+        assert!(armed_at.elapsed() >= ttl, "印を書いた時点から数える");
+        assert!(!t.path("admin.boot").exists());
+
+        // 既に消えている(実行ループや再起動が先に消した)ときもパニックしない
+        let h = spawn_boot_marker_timer(t.0.clone(), std::time::Instant::now(), ttl).unwrap();
+        h.join().unwrap();
+        // ttl より前の時刻から数えていれば、待たずに消す
+        write_boot_marker(&t.0, "x").unwrap();
+        let old = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        spawn_boot_marker_timer(t.0.clone(), old, ttl)
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(!t.path("admin.boot").exists());
     }
 
     #[test]

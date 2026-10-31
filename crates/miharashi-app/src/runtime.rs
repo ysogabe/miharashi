@@ -448,8 +448,9 @@ pub(crate) fn draw_frame(
 /// 画面ロジックを作るために必要な、表示先が決まったあとの情報。
 /// 操作パネルの待ち受けに失敗したとき、試し直すまでの間隔。
 const PANEL_RETRY: Duration = Duration::from_secs(30);
-/// 上書きで起動した印を、ループがこの時間動いたら消す(docs/admin-web/design.md の R9)
-const BOOT_MARKER_SECS: Duration = Duration::from_secs(60);
+/// 上書きで起動した印を消すまでの時間(docs/admin-web/design.md の R9)。
+/// 初期化と独立したスレッド(`config::arm_boot_marker`)が主で、実行ループの削除は念のため
+const BOOT_MARKER_SECS: Duration = crate::config::BOOT_MARKER_SECS;
 
 /// 起動の印を消す時か。印を書いた時刻(`armed_at`)から `BOOT_MARKER_SECS` たったら true。
 /// 実行ループの開始ではなく書いた時点から数える(初期化に時間が掛かっても、起動から 60 秒を超えた異常終了で上書きを外させない)
