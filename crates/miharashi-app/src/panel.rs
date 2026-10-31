@@ -496,17 +496,22 @@ fn error(code: u16, msg: &str) -> Response<std::io::Cursor<Vec<u8>>> {
 /// request.rs の `content_length <= 1024 && !expects_continue`)。パネルの `MAX_BODY` とは別の話。
 const PREFETCH_MAX: u64 = 1024;
 /// 本文を、tiny_http が要求を渡す前に読み切っているか。読み切っていれば、読んでも手放しても待たない。
-/// そうでない要求(1 KiB を超える本文、`Expect` つき、`Transfer-Encoding`(chunked)、`Connection: upgrade`)は
+/// 本文が空(`Content-Length` が無いか 0 で、`Transfer-Encoding` も無い)なら、tiny_http は `Expect` が
+/// あっても空の reader を作ってすぐ次の要求を解析するので、読み切っている扱いにする。そうでない要求
+/// (1 KiB を超える本文、本文があって `Expect` つき、`Transfer-Encoding`(chunked)、`Connection: upgrade`)は
 /// 本文を読み残したまま届く。読むと相手が送るまで止まり、手放すと(`EqualReader` の `Drop` が)残りを
 /// 読み捨てようとして相手が送るか切るまで止まる。
 fn body_prefetched(req: &Request) -> bool {
     let upgrade = req.headers().iter().any(|h| {
         h.field.equiv("Connection") && h.value.as_str().to_ascii_lowercase().contains("upgrade")
     });
-    req.body_length().is_none_or(|n| n as u64 <= PREFETCH_MAX)
-        && !has_header(req, "Expect")
-        && !has_header(req, "Transfer-Encoding")
-        && !upgrade
+    if upgrade || has_header(req, "Transfer-Encoding") {
+        return false;
+    }
+    match req.body_length() {
+        None | Some(0) => true,
+        Some(n) => n as u64 <= PREFETCH_MAX && !has_header(req, "Expect"),
+    }
 }
 
 fn has_header(req: &Request, name: &'static str) -> bool {

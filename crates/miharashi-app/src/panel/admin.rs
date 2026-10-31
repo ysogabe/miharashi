@@ -1293,6 +1293,26 @@ mod tests {
     }
 
     #[test]
+    fn pipelined_empty_bodies_with_expect_do_not_spawn_reapers() {
+        // 本文が空(`Content-Length: 0`)なら、tiny_http は `Expect` があっても空の reader を作って
+        // すぐ次の要求を解析する。同じ接続から続けて送られても、その場で応答して後始末スレッドは増えない
+        let fx = Fx::new("reaper-empty-expect");
+        let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
+        let (p, base) = start(loaded, 200);
+        let mut s = TcpStream::connect(p.addr()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        // 認証が無いので 401 になる。応答は読まない
+        let one = "POST /api/v1/input HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nExpect: 100-continue\r\n\r\n";
+        s.write_all(one.repeat(20).as_bytes()).unwrap();
+        let t0 = Instant::now();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(p.reapers(), 0, "空の本文なのに後始末スレッドが増えた");
+        panel_input_is_not_blocked(&p, &base, t0);
+        assert_eq!(p.reapers(), 0);
+        drop(s);
+    }
+
+    #[test]
     fn reaper_threads_are_reclaimed_when_the_peers_close() {
         // 開いたままの接続を相手が全部閉じたら、後始末のスレッドは全部終わる(資源が残らない)
         let fx = Fx::new("reaper-reclaim");
