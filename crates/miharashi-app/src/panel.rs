@@ -502,9 +502,13 @@ const PREFETCH_MAX: u64 = 1024;
 /// 本文を読み残したまま届く。読むと相手が送るまで止まり、手放すと(`EqualReader` の `Drop` が)残りを
 /// 読み捨てようとして相手が送るか切るまで止まる。
 fn body_prefetched(req: &Request) -> bool {
-    let upgrade = req.headers().iter().any(|h| {
-        h.field.equiv("Connection") && h.value.as_str().to_ascii_lowercase().contains("upgrade")
-    });
+    // tiny_http は `Connection` を最初の 1 つだけ見て upgrade を判定する(request.rs)。重複していても
+    // 同じ規則で見ないと、読み切った要求まで未読と誤判定する。
+    let upgrade = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Connection"))
+        .is_some_and(|h| h.value.as_str().to_ascii_lowercase().contains("upgrade"));
     if upgrade || has_header(req, "Transfer-Encoding") {
         return false;
     }
@@ -903,6 +907,22 @@ mod tests {
     use std::io::BufRead;
 
     const TOKEN: &str = "test-token-0123456789";
+
+    #[test]
+    fn body_prefetched_looks_at_the_first_connection_header_only() {
+        // tiny_http は最初の `Connection` だけで upgrade を判定する。同じ規則で見る
+        let req = |values: &[&str]| -> Request {
+            let mut t = tiny_http::TestRequest::new().with_method(Method::Post);
+            for v in values {
+                t = t.with_header(Header::from_bytes("Connection", *v).unwrap());
+            }
+            t.into()
+        };
+        assert!(body_prefetched(&req(&["keep-alive", "upgrade"])));
+        assert!(!body_prefetched(&req(&["upgrade", "keep-alive"])));
+        assert!(!body_prefetched(&req(&["Keep-Alive, Upgrade"])));
+        assert!(body_prefetched(&req(&["close"])));
+    }
 
     fn view(current: usize) -> PanelView {
         PanelView {

@@ -1264,14 +1264,19 @@ mod tests {
     }
 
     /// 本文を読み残した要求を `n` 本、開いたまま返す(パネルの経路で、認証が無いので 401 になる)。
+    /// 1 本ずつ作り、401 を読めてから次を作る。未読の本文を持つ要求への応答は後始末スレッドが書いてから
+    /// 手放しの待ちに入るので、401 を読めた時点でその接続の後始末スレッドは動いている。一斉に作ると、
+    /// tiny_http の接続処理が待ち行列に残って、数えるときに全部が揃わないことがある。
     fn many_held(addr: SocketAddr, n: usize) -> Vec<TcpStream> {
         (0..n)
             .map(|_| {
-                held(
+                let mut s = held(
                     addr,
                     "POST /api/v1/input HTTP/1.1\r\nExpect: 100-continue",
                     1000,
-                )
+                );
+                assert!(status_line(&mut s).starts_with("HTTP/1.1 401"));
+                s
             })
             .collect()
     }
@@ -1283,12 +1288,10 @@ mod tests {
         let fx = Fx::new("reaper-many");
         let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
         let (p, base) = start(loaded, 200);
-        let mut conns = many_held(p.addr(), 40);
+        // 40 本とも 401 が返る(手前の読み捨てに詰まらない)
+        let conns = many_held(p.addr(), 40);
         let t0 = Instant::now();
-        std::thread::sleep(Duration::from_millis(500));
         panel_input_is_not_blocked(&p, &base, t0);
-        // 40 本目の 401 も、手前の読み捨てに詰まらず返る
-        assert!(status_line(conns.last_mut().unwrap()).starts_with("HTTP/1.1 401"));
         drop(conns);
     }
 
@@ -1313,19 +1316,39 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_connection_headers_follow_the_first_one_like_tiny_http() {
+        // tiny_http は `Connection` を最初の 1 つだけ見て upgrade を判定する。`keep-alive` のあとに
+        // `upgrade` が並んでも upgrade 扱いにならず、`Content-Length: 0` は空の reader(先読み済み)になる。
+        // 全件を見て未読と誤判定すると、後始末スレッドが増える
+        let fx = Fx::new("reaper-dup-connection");
+        let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
+        let (p, base) = start(loaded, 200);
+        let mut s = TcpStream::connect(p.addr()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        // 認証が無いので 401 になる。応答は読まない
+        let one = "POST /api/v1/input HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\nConnection: upgrade\r\nContent-Length: 0\r\n\r\n";
+        s.write_all(one.repeat(20).as_bytes()).unwrap();
+        let t0 = Instant::now();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            p.reapers(),
+            0,
+            "先頭の Connection は upgrade ではないのに後始末スレッドが増えた"
+        );
+        panel_input_is_not_blocked(&p, &base, t0);
+        assert_eq!(p.reapers(), 0);
+        drop(s);
+    }
+
+    #[test]
     fn reaper_threads_are_reclaimed_when_the_peers_close() {
         // 開いたままの接続を相手が全部閉じたら、後始末のスレッドは全部終わる(資源が残らない)
         let fx = Fx::new("reaper-reclaim");
         let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
         let (p, base) = start(loaded, 200);
+        // 40 本とも 401 を読めてから数える(後始末スレッドは 401 を書いたあとで待つ)
         let conns = many_held(p.addr(), 40);
-        let t0 = Instant::now();
-        let mut peak = 0;
-        while t0.elapsed() < Duration::from_secs(5) && peak < 40 {
-            peak = peak.max(p.reapers());
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(peak, 40, "40 本とも読み捨てを待っている");
+        assert_eq!(p.reapers(), 40, "40 本とも読み捨てを待っている");
         panel_input_is_not_blocked(&p, &base, Instant::now());
         drop(conns);
         let t1 = Instant::now();
