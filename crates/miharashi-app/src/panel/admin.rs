@@ -5,8 +5,8 @@
 //! 今ある経路: `GET /api/v1/admin/overview`、`POST /api/v1/admin/restart`、`PUT /api/v1/admin/config`。
 //! `/admin*` の静的配信(T5)は、表には入れて今は 404。
 use super::{
-    AdminSources, HttpError, PanelInput, RateLimit, Reaper, Route, Shared, TokenState,
-    body_prefetched, error, json_response, same_secret,
+    AdminSources, HttpError, PanelInput, RateLimit, Reaper, Route, Shared, body_prefetched, error,
+    json_response, same_secret,
 };
 use crate::config::{
     self, Config, LoadedConfig, Overlay, OverlayErrorKind, overlay_generation, remove_boot_marker,
@@ -431,12 +431,8 @@ fn token_reports(cfg: &Config) -> Vec<Value> {
     ]
     .into_iter()
     .map(|(id, path)| {
-        // HA の url が空なら使わない(トークンは読まれない)ので、missing として出す
-        let state = if id == "home_assistant" && cfg.home_assistant.url.is_empty() {
-            TokenState::Missing
-        } else {
-            super::feeds::check_token_file(path, uid, gid)
-        };
+        // 取得が有効かどうかとは別に、ファイルそのものの状態を出す
+        let state = super::feeds::check_token_file(path, uid, gid);
         json!({"id": id, "path": path, "state": state})
     })
     .collect()
@@ -1290,6 +1286,30 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(t["state"], "missing");
+    }
+
+    #[test]
+    fn token_states_do_not_depend_on_the_home_assistant_url() {
+        let fx = Fx::new("tokens-empty-ha-url");
+        let d = fx.dir.display();
+        let base_path = fx.base("", &format!("token_file = \"{d}/ha-token\"\n"));
+        let mut cfg = Config::load_with_overlay(&base_path, false)
+            .unwrap()
+            .effective;
+        cfg.home_assistant.url = String::new();
+        let ha_state = |cfg: &Config| {
+            token_reports(cfg)
+                .into_iter()
+                .find(|t| t["id"] == "home_assistant")
+                .unwrap()["state"]
+                .clone()
+        };
+        fx.token("ha-token", "ha-token-0123456789", 0o600);
+        assert_eq!(ha_state(&cfg), "ok", "url が空でも正常なファイルは ok");
+        fx.token("ha-token", "ha-token-0123456789", 0o644);
+        assert_eq!(ha_state(&cfg), "loose_permissions");
+        std::fs::remove_file(fx.path("ha-token")).unwrap();
+        assert_eq!(ha_state(&cfg), "missing");
     }
 
     #[test]

@@ -21,11 +21,17 @@ pub(super) fn clip_error(s: &str) -> String {
     t
 }
 
+/// URL のクエリの終わりとみなす文字(空白のほか、括弧・引用符・句点。全角を含む)。
+const QUERY_END: [char; 18] = [
+    '"', '\'', '<', '>', ')', ']', '）', '］', '」', '』', '】', '〉', '》', '“', '”', '。', '、',
+    '（',
+];
+
 fn drop_url_queries(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let (mut in_url, mut in_query) = (false, false);
     for c in s.chars() {
-        if c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | '」') {
+        if c.is_whitespace() || QUERY_END.contains(&c) {
             in_url = false;
             in_query = false;
         } else if in_url && !in_query && matches!(c, '?' | '#') {
@@ -390,6 +396,14 @@ mod tests {
         assert_eq!(
             clip_error("GET \"https://example.test/p?k=v#f\" に失敗 (?は残る)"),
             "GET \"https://example.test/p\" に失敗 (?は残る)"
+        );
+        assert_eq!(
+            clip_error("取得失敗（https://example.test/a?x=1）再試行します"),
+            "取得失敗（https://example.test/a）再試行します"
+        );
+        assert_eq!(
+            clip_error("「https://example.test/a?x=1」と(http://h/b?y=2)と[http://h/c?z=3]と。"),
+            "「https://example.test/a」と(http://h/b)と[http://h/c]と。"
         );
         let long = clip_error(&"あ".repeat(500));
         assert_eq!(long.chars().count(), 201);

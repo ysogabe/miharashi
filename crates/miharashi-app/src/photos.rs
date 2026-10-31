@@ -659,8 +659,6 @@ impl Feed {
                 let mut offline = false;
                 let mut photo_failures = 0u32;
                 loop {
-                    // 一覧を取り直した(GEOFRAME と話した)か
-                    let mut opened = false;
                     let loaded = (|| {
                         if catalog.is_none() {
                             if grouping.home.is_none() && matches!(source, Source::Geoframe(_)) {
@@ -669,7 +667,10 @@ impl Feed {
                             let mut c = Catalog::open(&source, size, &grouping)?;
                             c.gpu_max = gpu_max;
                             catalog = Some(c);
-                            opened = true;
+                            // 一覧が取れた時点で GEOFRAME と通信できている(最初の写真が壊れていても)
+                            if let Ok(mut l) = link.lock() {
+                                l.last_ok = Some(chrono::Local::now());
+                            }
                         }
                         catalog
                             .as_mut()
@@ -677,11 +678,10 @@ impl Feed {
                     })();
                     match loaded {
                         Ok(item) => {
-                            // 写真を取れたか一覧を取り直せたときだけ「通信できた」(カードは通信しない)
-                            let talked = opened || matches!(item, Shown::Photo(_));
+                            // 一覧を取り直したとき(上)か写真を取れたときだけ「通信できた」(既存カタログのカードは通信しない)
                             if let Ok(mut l) = link.lock() {
                                 l.status = Some(FeedStatus::Online);
-                                if talked {
+                                if matches!(item, Shown::Photo(_)) {
                                     l.last_ok = Some(chrono::Local::now());
                                 }
                             }
@@ -828,11 +828,19 @@ mod tests {
 
     /// GEOFRAME の最小モック。/api/v1/photos と /derivatives/a.png だけを返す。
     fn mock_server(port: u16) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        mock_server_with_image(port, png_bytes())
+    }
+
+    /// 一覧は返すが、画像として `image` を返す模擬サーバー。
+    fn mock_server_with_image(
+        port: u16,
+        image: Vec<u8>,
+    ) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        let png = png_bytes();
+        let png = image;
         let h = std::thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
                 let Ok((mut s, _)) = listener.accept() else {
@@ -1051,6 +1059,33 @@ mod tests {
         }
         stop2.store(true, Ordering::Relaxed);
         h2.join().unwrap();
+    }
+
+    #[test]
+    fn last_ok_is_set_when_the_list_loads_even_if_the_first_photo_is_broken() {
+        let port = free_port();
+        let (stop, h) = mock_server_with_image(port, b"not an image".to_vec());
+        let feed = Feed::spawn(
+            Source::Geoframe(format!("http://127.0.0.1:{port}")),
+            (64, 36),
+            None,
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+            None,
+        );
+        assert!(
+            wait_event(&feed, 5, |e| matches!(
+                e,
+                FeedEvent::Status(FeedStatus::Retrying { .. })
+            )),
+            "写真が壊れていて再試行状態になる"
+        );
+        assert!(
+            feed.link().lock().unwrap().last_ok.is_some(),
+            "一覧は取れたので通信できた時刻は入る"
+        );
+        stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
     }
 
     #[test]
