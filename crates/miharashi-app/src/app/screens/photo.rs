@@ -91,6 +91,11 @@ impl PhotoScreen {
         }
     }
 
+    /// GEOFRAME との通信の状態(管理ページが読む)。
+    pub fn link(&self) -> crate::photos::LinkShared {
+        self.feed.link()
+    }
+
     /// 写真フィードの状態を `World` に写す Provider。
     pub fn feed_provider(&self) -> FeedStateProvider {
         FeedStateProvider(self.feed_state.clone())

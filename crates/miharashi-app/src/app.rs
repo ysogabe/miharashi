@@ -80,6 +80,63 @@ fn decorated<S: crate::screen::Screen + 'static>(
     ))
 }
 
+/// 管理ページの `feeds` に出す、警報の取得への参照。`room` とは無関係で、`[alerts] disaster` と HA の url で決まる。
+/// `warnings` は `disaster::start` の戻り値。
+pub fn disaster_source(
+    cfg: &Config,
+    warnings: Option<crate::disaster::HomeShared>,
+) -> crate::panel::Source<crate::disaster::HomeShared> {
+    if !cfg.alerts.disaster {
+        return Err("alerts.disaster = false".into());
+    }
+    if cfg.home_assistant.url.is_empty() {
+        return Err("home_assistant.url が空".into());
+    }
+    warnings.ok_or_else(|| "警報の取得を起動できなかった".into())
+}
+
+/// 同じく航空機の取得への参照。`health` は `aircraft::start` が返したもの。
+pub fn aircraft_source(
+    cfg: &Config,
+    health: Option<crate::aircraft::HealthShared>,
+) -> crate::panel::Source<crate::aircraft::HealthShared> {
+    if !cfg.aircraft.enabled {
+        return Err("aircraft.enabled = false".into());
+    }
+    if cfg.aircraft.url.is_empty() {
+        return Err("aircraft.url が空".into());
+    }
+    health.ok_or_else(|| "航空機の取得を起動できなかった".into())
+}
+
+/// 室内環境・天気の取得への参照。`room` は `room_feeds` の戻り値(画面を出さないときは None)。
+fn room_sources(
+    cfg: &Config,
+    room: Option<&RoomFeeds>,
+) -> (
+    crate::panel::Source<crate::env::Shared>,
+    crate::panel::Source<crate::weather::Shared>,
+) {
+    let off = |why: &str| -> String { why.into() };
+    if !cfg.room.enabled {
+        return (
+            Err(off("room.enabled = false")),
+            Err(off("room.enabled = false")),
+        );
+    }
+    let ha_off = if cfg.home_assistant.url.is_empty() {
+        "home_assistant.url が空"
+    } else {
+        "room.tiles が空、または取得を起動できなかった"
+    };
+    let weather_off = "予報の地域が決まらない(home_assistant.url も room.forecast_area も空)";
+    (
+        room.and_then(|r| r.env.clone()).ok_or_else(|| off(ha_off)),
+        room.and_then(|r| r.weather.clone())
+            .ok_or_else(|| off(weather_off)),
+    )
+}
+
 /// キオスクの画面を登録する。並び順が切り替わる順になる(docs/DESIGN-screens.md §2)。
 /// `gpu_max` は GPU 経路のとき Some(GPU で扱える写真の最大の幅と高さ)。室内環境と天気の取得が無い(`room` が None)なら
 /// その画面は、航空機の取得が無効(`aircraft` が None)なら航空機の画面は登録しない。
@@ -94,8 +151,18 @@ pub fn kiosk(
     room: Option<RoomFeeds>,
     aircraft: Option<crate::aircraft::Shared>,
 ) -> ScreenManager {
+    let geoframe = match &source {
+        Source::Geoframe(_) => None,
+        Source::File(..) => Some("写真ファイルを直接指定している(GEOFRAME を使わない)"),
+        Source::Demo { .. } => Some("動画の見本の写真(GEOFRAME を使わない)"),
+    };
     let photo = PhotoScreen::new(cfg, size, gpu_max, source);
     let feed = photo.feed_provider();
+    let (home_assistant, weather) = room_sources(cfg, room.as_ref());
+    let admin_geoframe = match geoframe {
+        None => Ok(photo.link()),
+        Some(why) => Err(why.to_string()),
+    };
     let gl = gpu_max.is_some();
     let mut screens: Vec<Box<dyn crate::screen::Screen>> = vec![
         Box::new(StatusScreen::new()),
@@ -142,9 +209,19 @@ pub fn kiosk(
     )
     .with_gl_available(gpu_max.is_some())
     .with_provider(Box::new(feed));
+    let admin_agents = match &agent_shared {
+        Some(a) => Ok(a.clone()),
+        None => Err("agents.enabled = false".to_string()),
+    };
     if let Some(shared) = agent_shared {
         m = m.with_provider(Box::new(crate::agents::AgentProvider::new(shared)));
     }
+    m = m.with_admin(|a| {
+        a.geoframe = admin_geoframe;
+        a.home_assistant = home_assistant;
+        a.weather = weather;
+        a.agents = admin_agents;
+    });
     m = if cfg.rotation.enabled {
         m.with_rotation(
             &cfg.rotation.steps,
@@ -216,6 +293,91 @@ mod tests {
             None,
         );
         (app, dir)
+    }
+
+    /// 警報の取得は room の画面とは別。`room.enabled = false` でも `ok` になりうる。
+    #[test]
+    fn ac15_admin_sources_follow_the_config_not_the_screens() {
+        use crate::panel::FeedState;
+        let mut cfg = Config::default();
+        cfg.room.enabled = false;
+        cfg.alerts.disaster = true;
+        cfg.home_assistant.url = "http://192.0.2.10:8123".into();
+        cfg.agents.enabled = false;
+        cfg.aircraft.enabled = false;
+        let (dir, p) = test_photo();
+        let warnings = crate::disaster::HomeShared::default();
+        warnings.lock().unwrap().status.ok();
+        let app = kiosk(
+            &cfg,
+            (64, 36),
+            None,
+            Source::File(p, None),
+            Box::new(DummyData::new()),
+            dummy_snapshot(0.0),
+            None,
+            None,
+        )
+        .with_admin(|a| {
+            a.disaster = disaster_source(&cfg, Some(warnings.clone()));
+            a.aircraft = aircraft_source(&cfg, None);
+        });
+        let feeds = App::admin_sources(&app).feeds();
+        let by = |id: &str| feeds.iter().find(|f| f.id == id).unwrap().clone();
+        assert_eq!(
+            by("disaster").state,
+            FeedState::Ok,
+            "room が無効でも警報は動く"
+        );
+        assert!(by("disaster").last_ok.is_some());
+        for id in ["home_assistant", "weather"] {
+            assert_eq!(by(id).state, FeedState::NotRunning, "{id}");
+            assert_eq!(by(id).error.as_deref(), Some("room.enabled = false"));
+        }
+        assert_eq!(
+            by("aircraft").error.as_deref(),
+            Some("aircraft.enabled = false")
+        );
+        assert_eq!(
+            by("agents").error.as_deref(),
+            Some("agents.enabled = false")
+        );
+        // 写真をファイルで指定しているので GEOFRAME は動いていない
+        assert_eq!(by("geoframe").state, FeedState::NotRunning);
+        // 警報の理由: 無効、HA の url が空、起動できなかった
+        cfg.alerts.disaster = false;
+        assert_eq!(
+            disaster_source(&cfg, None).unwrap_err(),
+            "alerts.disaster = false"
+        );
+        cfg.alerts.disaster = true;
+        cfg.home_assistant.url.clear();
+        assert_eq!(
+            disaster_source(&cfg, Some(warnings)).unwrap_err(),
+            "home_assistant.url が空"
+        );
+        cfg.home_assistant.url = "http://192.0.2.10:8123".into();
+        assert!(disaster_source(&cfg, None).is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// room が有効で HA の url があれば、room の取得への参照が入る。
+    #[test]
+    fn admin_sources_hold_the_room_feeds_when_the_room_runs() {
+        let mut cfg = Config::default();
+        cfg.room.enabled = true;
+        cfg.home_assistant.url = "http://192.0.2.10:8123".into();
+        let feeds = RoomFeeds {
+            env: Some(Default::default()),
+            weather: None,
+            warnings: None,
+        };
+        let (env, weather) = room_sources(&cfg, Some(&feeds));
+        assert!(env.is_ok());
+        assert!(weather.unwrap_err().contains("予報の地域"));
+        cfg.home_assistant.url.clear();
+        let (env, _) = room_sources(&cfg, None);
+        assert_eq!(env.unwrap_err(), "home_assistant.url が空");
     }
 
     fn photo_position(app: &ScreenManager) -> usize {

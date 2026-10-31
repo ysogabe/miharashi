@@ -9,6 +9,7 @@ use miharashi_render::trip_card::TripCard;
 use miharashi_render::{Pixmap, photo, screens::PhotoInfo};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub enum Source {
@@ -559,6 +560,17 @@ pub enum FeedStatus {
     },
 }
 
+/// GEOFRAME との通信の状態(管理ページの取得元に出す)。画面が受け取るイベントとは別に、取得スレッドが書く。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Link {
+    /// 通信が最後に成功した時刻(一覧か写真を取れたとき。キャッシュの表示は含まない)
+    pub last_ok: Option<chrono::DateTime<chrono::Local>>,
+    /// 今の状態。None は最初の取得の前
+    pub status: Option<FeedStatus>,
+}
+
+pub type LinkShared = Arc<Mutex<Link>>;
+
 pub enum FeedEvent {
     Photo(PhotoItem),
     /// 旅・季節の切り替わりのカード
@@ -596,6 +608,7 @@ impl HomeLookup {
 pub struct Feed {
     tx: Sender<Cmd>,
     rx: Receiver<FeedEvent>,
+    link: LinkShared,
     /// 別スレッドを使わず、`next` / `prev` のその場で次を読む(動画の書き出し。届く時刻を実時間に依存させない)
     inline: Option<std::cell::RefCell<Inline>>,
 }
@@ -630,9 +643,12 @@ impl Feed {
     ) -> Self {
         let (tx, cmd_rx) = channel::<Cmd>();
         let (ev_tx, rx) = channel();
+        let link = LinkShared::default();
+        let thread_link = link.clone();
         let spawned = std::thread::Builder::new()
             .name("photos".into())
             .spawn(move || {
+                let link = thread_link;
                 let mut grouping = Grouping {
                     home: None,
                     radius_km: home.as_ref().map_or(50.0, |h| h.radius_km),
@@ -651,6 +667,10 @@ impl Feed {
                             let mut c = Catalog::open(&source, size, &grouping)?;
                             c.gpu_max = gpu_max;
                             catalog = Some(c);
+                            // 一覧が取れた時点で GEOFRAME と通信できている(最初の写真が壊れていても)
+                            if let Ok(mut l) = link.lock() {
+                                l.last_ok = Some(chrono::Local::now());
+                            }
                         }
                         catalog
                             .as_mut()
@@ -658,6 +678,13 @@ impl Feed {
                     })();
                     match loaded {
                         Ok(item) => {
+                            // 一覧を取り直したとき(上)か写真を取れたときだけ「通信できた」(既存カタログのカードは通信しない)
+                            if let Ok(mut l) = link.lock() {
+                                l.status = Some(FeedStatus::Online);
+                                if matches!(item, Shown::Photo(_)) {
+                                    l.last_ok = Some(chrono::Local::now());
+                                }
+                            }
                             if offline && ev_tx.send(FeedEvent::Status(FeedStatus::Online)).is_err()
                             {
                                 return;
@@ -699,6 +726,9 @@ impl Feed {
                                 retry_in: wait,
                                 error,
                             };
+                            if let Ok(mut l) = link.lock() {
+                                l.status = Some(status.clone());
+                            }
                             if ev_tx.send(FeedEvent::Status(status)).is_err() {
                                 return;
                             }
@@ -719,6 +749,7 @@ impl Feed {
         Self {
             tx,
             rx,
+            link,
             inline: None,
         }
     }
@@ -735,8 +766,14 @@ impl Feed {
         Self {
             tx,
             rx,
+            link: LinkShared::default(),
             inline: Some(std::cell::RefCell::new(inline)),
         }
+    }
+
+    /// GEOFRAME との通信の状態(管理ページが読む)。
+    pub fn link(&self) -> LinkShared {
+        self.link.clone()
     }
 
     /// 別スレッドを使わない `Feed` か(`next` / `prev` の結果が、呼んだ直後に `try_recv` で取れる)。
@@ -791,11 +828,19 @@ mod tests {
 
     /// GEOFRAME の最小モック。/api/v1/photos と /derivatives/a.png だけを返す。
     fn mock_server(port: u16) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        mock_server_with_image(port, png_bytes())
+    }
+
+    /// 一覧は返すが、画像として `image` を返す模擬サーバー。
+    fn mock_server_with_image(
+        port: u16,
+        image: Vec<u8>,
+    ) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        let png = png_bytes();
+        let png = image;
         let h = std::thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
                 let Ok((mut s, _)) = listener.accept() else {
@@ -973,6 +1018,12 @@ mod tests {
             wait_event(&feed, 5, |e| matches!(e, FeedEvent::Photo(_))),
             "最初の写真"
         );
+        let link = feed.link();
+        let first_ok = {
+            let l = link.lock().unwrap();
+            assert_eq!(l.status, Some(FeedStatus::Online));
+            l.last_ok.expect("通信できた時刻")
+        };
 
         // GEOFRAME 停止 → 取得に失敗して再試行状態になる。
         stop.store(true, Ordering::Relaxed);
@@ -985,6 +1036,15 @@ mod tests {
             )),
             "停止を検出して再試行"
         );
+        {
+            let l = link.lock().unwrap();
+            assert!(matches!(l.status, Some(FeedStatus::Retrying { .. })));
+            assert_eq!(
+                l.last_ok,
+                Some(first_ok),
+                "失敗中も最後に通信できた時刻は残る"
+            );
+        }
 
         // 再開 → 自動的に写真取得が回復する(キー操作なし)。
         let (stop2, h2) = mock_server(port);
@@ -992,8 +1052,40 @@ mod tests {
             wait_event(&feed, 10, |e| matches!(e, FeedEvent::Photo(_))),
             "再開後に写真が回復"
         );
+        {
+            let l = link.lock().unwrap();
+            assert_eq!(l.status, Some(FeedStatus::Online));
+            assert!(l.last_ok.unwrap() > first_ok, "再開後に時刻が進む");
+        }
         stop2.store(true, Ordering::Relaxed);
         h2.join().unwrap();
+    }
+
+    #[test]
+    fn last_ok_is_set_when_the_list_loads_even_if_the_first_photo_is_broken() {
+        let port = free_port();
+        let (stop, h) = mock_server_with_image(port, b"not an image".to_vec());
+        let feed = Feed::spawn(
+            Source::Geoframe(format!("http://127.0.0.1:{port}")),
+            (64, 36),
+            None,
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+            None,
+        );
+        assert!(
+            wait_event(&feed, 5, |e| matches!(
+                e,
+                FeedEvent::Status(FeedStatus::Retrying { .. })
+            )),
+            "写真が壊れていて再試行状態になる"
+        );
+        assert!(
+            feed.link().lock().unwrap().last_ok.is_some(),
+            "一覧は取れたので通信できた時刻は入る"
+        );
+        stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
     }
 
     #[test]
@@ -1012,6 +1104,11 @@ mod tests {
             e,
             FeedEvent::Status(FeedStatus::Retrying { .. })
         )));
+        assert_eq!(
+            feed.link().lock().unwrap().last_ok,
+            None,
+            "一度も通信できていない"
+        );
         let (stop, h) = mock_server(port);
         assert!(wait_event(&feed, 10, |e| matches!(e, FeedEvent::Photo(_))));
         stop.store(true, Ordering::Relaxed);

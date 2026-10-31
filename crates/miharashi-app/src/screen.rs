@@ -232,6 +232,10 @@ pub trait App {
     fn panel_view(&self) -> Option<PanelView> {
         None
     }
+    /// 管理ページが取得の状態を読むための参照(`KioskApp` の実装は T4)。
+    fn admin_sources(&self) -> crate::panel::AdminSources {
+        Default::default()
+    }
 }
 
 /// 登録されている画面 1 つ。`id` はパネルとの約束なので変えない。

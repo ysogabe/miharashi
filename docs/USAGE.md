@@ -221,6 +221,7 @@ t3 auth session list                               # ラベル miharashi-agent-m
 - 古いセッション(同じラベル)は、置き換えてから 60 秒後にスクリプトが失効させます。
 - 失敗すると `miharashi-t3-token.service` が failed になり、状況画面の DETAILS の failed ユニットに出ます。原因は `journalctl -u miharashi-t3-token` で見ます。
 - 自動更新のスクリプトには T3 v0.1.0 以降が要ります(`t3 auth session issue --scope` を使うため)。
+- スクリプトは T3 の URL と `token_file` を `miharashi config-get agents.url` などで取ります(管理ページで変えた URL が、次回起動の値として反映されます。[管理ページ](#管理ページブラウザ)を参照)。`/usr/local/bin/miharashi` が無いときは、警告を出して設定ファイルを直接読みます。関数のテストは `bash systemd/test-miharashi-t3-token.sh`(T3 にはつながず、`cargo test` からも呼びません)。
 - T3 を別のマシンで動かしているときは自動更新を使えません。T3 のマシンで `t3 auth session issue --scope orchestration:read --ttl 30d --label miharashi-agent-monitor --token-only` を実行し、出たトークンを `token_file` に 0600(実行ユーザー)で置き、30 日以内に同じことを繰り返します。古いセッションは `t3 auth session list` で探し、`t3 auth session revoke <ID>` で失効させます。
 
 取得は専用 worker が `GET /api/orchestration/shell` を 5 秒ごとに行い、接続時に環境情報を `GET /.well-known/t3/environment` で取得します。画面は一覧の状態だけを表示し、会話本文や承認内容は取得しません。認証が失効した場合は 401 / 403 を区別して表示し、token ファイルが変更されたときに再試行します。
@@ -242,3 +243,67 @@ t3 auth session list                               # ラベル miharashi-agent-m
 4. Echo Show 5 にアプリを入れる: [miharashi-panel](https://github.com/ysogabe/miharashi-panel) の README を参照。
 
 パネルが有効なら、キーボードが無くても起動します(あとから挿したキーボードも 10 秒以内に使い始めます)。API の仕様は [操作パネルの設計](panel/DESIGN.md) §5.2 にあります。
+
+### 管理ページ(ブラウザ)
+
+SSH で設定ファイルを直さなくても、ブラウザから画面の有効/無効と接続先を変え、キオスクを再起動できます。設計は [管理ページの設計](admin-web/design.md) にあります。
+
+できること:
+
+- 画面の有効/無効(`agents`・`aircraft`・`room`・`cube`・`vrm`)。
+- 接続先の変更。GEOFRAME(`geoframe.url`)、tar1090(`aircraft.url`)、T3(`agents.url`。`allowed_hosts` の範囲だけ)。
+- 保存した値を反映するキオスクの再起動。保存しただけでは今の表示は変わらず、再起動すると効きます(ページに「効いている値」「ファイルの値」「上書き」「次回起動」が並びます)。
+
+できないこと:
+
+- Home Assistant の接続先(`home_assistant.url`)は**表示だけ**です。変えるには SSH で設定ファイルを直します。
+- トークンは入力できません。各トークンのファイルは、置いてあるか・権限が合っているかだけを表示します。
+- 設定ファイル全体は編集しません。管理ページが書くのは、下の上書きファイルだけです。
+
+有効にする手順:
+
+1. 管理トークンを作る。`panel.token` とは別のファイル・別の値にします(同じ値だと管理ページだけ無効になります)。
+   ```sh
+   head -c 24 /dev/urandom | base64 | sudo install -o root -g <実行ユーザー> -m 640 /dev/stdin /etc/miharashi/admin.token
+   ```
+2. 設定に足す。`[panel]` が有効で、管理ページはパネルと同じ `listen` で配信されます(`admin.enabled = true` には `panel.enabled = true` が要ります)。
+   ```toml
+   [panel]
+   enabled = true
+   listen = "192.0.2.20:8790"
+
+   [admin]
+   enabled = true
+   # token_file = "/etc/miharashi/admin.token"
+   # T3 の接続先を、設定ファイルに書いた agents.url 以外にも変えたいときだけ
+   allowed_hosts = ["192.0.2.30:3773", "t3.example.test"]
+   ```
+3. 再起動して(`sudo systemctl restart miharashi`)、ブラウザで `http://192.0.2.20:8790/admin` を開き、管理トークンを入力します。トークンはそのタブの `sessionStorage` に置かれ、タブを閉じると消えます。
+
+`allowed_hosts`:
+
+- 管理ページから `agents.url` に入れてよい接続先です。`host` か `host:port` を書きます。port を書かなければ 80 / 443 だけが通ります(「同じホストの別のポート」は `host:port` で書かないと通りません)。
+- 設定ファイルに書いた `agents.url` の接続先(scheme・ホスト・ポートが同じもの)は、書かなくても常に使えます。
+- 設定ファイルの `agents.url` が `https` なら、管理ページからは `https` だけです(`allowed_hosts` に書いても `http` には変えられません)。設定ファイルが `http` のときの平文の `http` は IP アドレスか `localhost` だけです。上の例の `t3.example.test` のようにホスト名で書く接続先は `https` が要ります。T3 の URL は接続先だけで、パスは書けません。
+
+上書きファイル(`/var/lib/miharashi/admin.toml`):
+
+- 管理ページで保存した値は、設定ファイルではなくこのファイルに書かれます。**設定ファイルより優先**します。`[admin]` が無効でもファイルがあれば読みます。
+- 上書きが効いているかは `miharashi check-config` と起動ログ(`journalctl -t miharashi`)に件数と値が出るので、SSH で設定ファイルを直しても効かないときはここを見ます。
+- 元に戻すには、ページの「ファイルの値に戻す」か、ファイルを消して再起動します。保存のたびに、直前の内容が `admin.toml.prev` に残ります。
+- 壊れている・検証に通らない・許されない接続先を含む上書きは、**ファイル全体を無視**して設定ファイルだけで起動します。理由は起動ログと管理ページに出ます。
+
+起動の印(`/var/lib/miharashi/admin.boot`):
+
+- 上書きで起動すると、この印のファイルを書き、起動してしばらく問題なく動いたら消します。上書きで起動した直後に落ちた(印が残ったまま次の起動になった)ときは、**次の起動で上書きを外して**設定ファイルだけで起動します(原因が上書きとは限りません)。管理ページにその旨が出て、落ちたときの上書きのままの再起動は断ります。
+
+管理トークンの重み:
+
+- 管理トークンを持つ人は、画面を無効にする・キオスクを再起動する・GEOFRAME と tar1090 の接続先を変える・T3 の接続先を `allowed_hosts` の範囲で変える、ことができます。Home Assistant のトークンの送り先には届きません。
+- 通信は平文の HTTP で、パネルと同じく LAN の中だけの前提です。LAN のインターフェースの IP で待ち受け、Tailscale や公開は想定しません。トークンは `panel.token` と同じように扱います。
+
+外のスクリプトから設定の値を取るには `miharashi config-get <key> [--config FILE]` を使います。設定ファイルと上書きを起動時と同じ規則で重ねた値(次回起動の値)を 1 行で出します(`agents.url`・`agents.token_file`・`geoframe.url`・`aircraft.enabled` など)。知らないキーは終了コード 1、設定が読めないときは 2 です。
+
+```sh
+miharashi config-get agents.url --config /etc/miharashi/config.toml
+```

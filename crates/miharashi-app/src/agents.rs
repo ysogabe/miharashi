@@ -968,10 +968,13 @@ fn read_token(path: &str) -> Result<String, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let mode = metadata.mode() & 0o777;
-        let safe_owner = mode == 0o600 && metadata.uid() == effective_uid()
-            || mode == 0o640 && metadata.uid() == 0 && metadata.gid() == effective_gid();
-        if !safe_owner || !matches!(mode, 0o600 | 0o640) {
+        if !token_perms_ok(
+            metadata.mode(),
+            metadata.uid(),
+            metadata.gid(),
+            effective_uid(),
+            effective_gid(),
+        ) {
             return Err("T3 token file は実行ユーザーの 0600、または root:実行グループの 0640 にしてください".into());
         }
     }
@@ -984,15 +987,25 @@ fn read_token(path: &str) -> Result<String, String> {
     Ok(token.to_string())
 }
 
+/// トークンファイルの所有者と権限が規則どおりか: 実行ユーザーの 0600、または root:実行グループの 0640。
+/// `euid` / `egid` は実行ユーザーとグループ(テストでは偽の値を渡す)。
+pub(crate) fn token_perms_ok(mode: u32, uid: u32, gid: u32, euid: u32, egid: u32) -> bool {
+    match mode & 0o777 {
+        0o600 => uid == euid,
+        0o640 => uid == 0 && gid == egid,
+        _ => false,
+    }
+}
+
 #[cfg(unix)]
-fn effective_uid() -> u32 {
+pub(crate) fn effective_uid() -> u32 {
     unsafe extern "C" {
         fn geteuid() -> u32;
     }
     unsafe { geteuid() }
 }
 #[cfg(unix)]
-fn effective_gid() -> u32 {
+pub(crate) fn effective_gid() -> u32 {
     unsafe extern "C" {
         fn getegid() -> u32;
     }

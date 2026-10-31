@@ -1,8 +1,8 @@
 //! キオスクの実行ループ。画面ロジックとは `screen::App` だけでつながり、具体的な型は知らない。
 //! seat/VT の有効・無効、SIGINT/SIGTERM、入力、描画、画面の電源(DPMS)、状態ログを扱う。
 //! 状態ログは共通部分(t / rss / fds / frames / worst_frame)に `App::stats()` の `k=v` を続けて出す。
-use crate::config::Config;
-use crate::panel::{DisplayControl, DisplayStatus, Panel, PanelInput};
+use crate::config::LoadedConfig;
+use crate::panel::{AdminContext, DisplayControl, DisplayStatus, Panel, PanelInput};
 use crate::screen::{App, Composite, GlComposite, GlScene, KeyPress, PhotoData, PhotoRef, Top};
 use crate::screen_power::{Mode as PowerMode, ScreenPower};
 use miharashi_gpu::{
@@ -448,6 +448,15 @@ pub(crate) fn draw_frame(
 /// 画面ロジックを作るために必要な、表示先が決まったあとの情報。
 /// 操作パネルの待ち受けに失敗したとき、試し直すまでの間隔。
 const PANEL_RETRY: Duration = Duration::from_secs(30);
+/// 上書きで起動した印を消すまでの時間(docs/admin-web/design.md の R9)。
+/// 初期化と独立したスレッド(`config::arm_boot_marker`)が主で、実行ループの削除は念のため
+const BOOT_MARKER_SECS: Duration = crate::config::BOOT_MARKER_SECS;
+
+/// 起動の印を消す時か。印を書いた時刻(`armed_at`)から `BOOT_MARKER_SECS` たったら true。
+/// 実行ループの開始ではなく書いた時点から数える(初期化に時間が掛かっても、起動から 60 秒を超えた異常終了で上書きを外させない)
+fn boot_marker_expired(armed_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(armed_at) >= BOOT_MARKER_SECS
+}
 /// キーボードが 1 台も無いとき、挿されていないか見直す間隔。
 const KEYS_RETRY: Duration = Duration::from_secs(10);
 
@@ -466,12 +475,15 @@ pub struct Output {
 }
 
 /// 実行ループ。`make_app` には確定した表示サイズが渡される。
-pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Result<(), String> {
-    let term = Arc::new(AtomicBool::new(false));
-    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
-        signal_hook::flag::register(sig, term.clone()).map_err(|e| format!("signal: {e}"))?;
-    }
-
+/// `term` は SIGINT / SIGTERM で立つフラグ。起動の印を書く前に `main` が登録しておく。
+pub fn run(
+    loaded: &LoadedConfig,
+    term: Arc<AtomicBool>,
+    make_app: impl FnOnce(&Output) -> Box<dyn App>,
+) -> Result<(), String> {
+    // 管理ページの再起動の抑止(起動から 120 秒)の基準。表示の初期化より前に取る
+    let process_start = Instant::now();
+    let cfg = &loaded.effective;
     let seat_mode = SeatMode::parse(&cfg.runtime.seat)?;
     let mut session = Session::open(seat_mode)?;
     eprintln!(
@@ -567,12 +579,25 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
 
     // ループが描画の失敗で終わったときのエラー(終了処理のあとに返す)
     let mut run_err = None;
+    // 上書きで起動した印。ループが BOOT_MARKER_SECS 動いたら消す。正常終了の経路でも消す(描画エラーでは残す)
+    let marker_dir = (!loaded.report.applied.is_empty())
+        .then(|| crate::config::boot_marker_dir(&loaded.report.path));
+    // 印を書いた時刻(書いていなければ、ループの開始から数える)
+    let marker_since = loaded.marker_armed_at.unwrap_or(start);
+    let mut marker_armed = marker_dir.is_some();
+    let mut clean_exit = true;
     let reason = loop {
         if term.load(Ordering::Relaxed) {
             break "シグナルを受信";
         }
         if max.is_some_and(|m| start.elapsed() >= m) {
             break "max_seconds に到達";
+        }
+        if marker_armed && boot_marker_expired(marker_since, Instant::now()) {
+            marker_armed = false;
+            if let Some(d) = &marker_dir {
+                crate::config::remove_boot_marker(d);
+            }
         }
 
         for ev in session.dispatch() {
@@ -658,7 +683,12 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                 .clone()
                 .filter(|p| p.mode().is_some())
                 .map(|p| p as Arc<dyn DisplayControl>);
-            match Panel::start(&cfg.panel, control) {
+            let admin = AdminContext {
+                loaded: loaded.clone(),
+                started: process_start,
+                sources: app.admin_sources(),
+            };
+            match Panel::start(&cfg.panel, control, Some(admin)) {
                 Ok(p) => {
                     eprintln!("panel: {} で待ち受け", p.addr());
                     published_display = display_status(screen_on, power.as_deref());
@@ -675,11 +705,17 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             }
         }
         // パネルのキーもキーボードと同じに扱う(消えている画面では点けるだけ)
+        let mut restart = false;
         for input in panel.iter().flat_map(Panel::inputs) {
             eprintln!("key: panel {input:?}");
             // 巡回の切り替えは画面を選ぶ操作ではない(`/api/v1/display` と同じ)。点けず、消えていても反映する
             if let PanelInput::Rotation(on) = input {
                 redraw |= app.set_rotation(on);
+                continue;
+            }
+            // 管理ページからの再起動は画面を選ぶ操作ではない。ループを抜けて通常の終了処理に進む(終了コード 0)
+            if input == PanelInput::Restart {
+                restart = true;
                 continue;
             }
             if let Some(p) = &power {
@@ -690,8 +726,12 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
                     PanelInput::Key(key) => app.on_key(key),
                     PanelInput::Screen(id) => app.show_screen(id),
                     PanelInput::Rotation(_) => unreachable!("上で扱った"),
+                    PanelInput::Restart => unreachable!("上で扱った"),
                 };
             }
+        }
+        if restart {
+            break "管理ページからの再起動";
         }
         let tick_t0 = Instant::now();
         redraw |= app.tick(tick_t0);
@@ -733,6 +773,7 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
             // 描画の失敗(下地・EGL・page flip など)でも、場面の解放を通る終了処理へ進む(`end_run`)
             let Some((r, p)) = draw_frame(&mut display, app.as_mut(), &mut canvas, &mut run_err)
             else {
+                clean_exit = false;
                 break "描画エラー";
             };
             render_ms.push(r);
@@ -814,6 +855,10 @@ pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Resu
     };
 
     eprintln!("終了: {reason}");
+    // 正常終了(シグナル、キー、max_seconds、管理ページの再起動)なら印を消す。描画エラーでは次の起動のために残す
+    if clean_exit && let Some(d) = &marker_dir {
+        crate::config::remove_boot_marker(d);
+    }
     // 消したまま終わると、元のコンソールも見えなくなる
     if !screen_on && session.is_enabled() {
         let _ = display.set_power(true);
@@ -848,6 +893,18 @@ pub(crate) fn end_run(
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn boot_marker_counts_from_the_time_it_was_written() {
+        let armed = Instant::now();
+        assert!(!boot_marker_expired(armed, armed));
+        assert!(!boot_marker_expired(armed, armed + Duration::from_secs(59)));
+        assert!(boot_marker_expired(armed, armed + BOOT_MARKER_SECS));
+        // 初期化に時間が掛かり、印を書いてから 70 秒後に実行ループへ入った: 最初の周回で消す
+        assert!(boot_marker_expired(armed, armed + Duration::from_secs(70)));
+        // 時刻が逆戻りしても panic しない
+        assert!(!boot_marker_expired(armed + Duration::from_secs(5), armed));
+    }
 
     fn extra(ticks: u64, cpu: &str) -> Vec<(&'static str, String)> {
         vec![

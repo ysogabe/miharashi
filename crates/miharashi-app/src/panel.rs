@@ -13,6 +13,7 @@
 //! キオスクの中だけで切り替えると HA の画面と食い違うので、実際の切り替えは `DisplayControl` に任せる。
 use crate::config;
 use crate::screen::{KeyPress, PanelRotation, PanelView};
+pub use admin::AdminContext;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -22,6 +23,9 @@ use std::sync::mpsc::{Receiver, Sender, TryIter, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response, Server};
+
+mod admin;
+mod feeds;
 
 /// `/api/v1/status` の形を変えたら上げる。パネルはこれを見て古い形を読み分ける。
 const SCHEMA_VERSION: u32 = 1;
@@ -58,6 +62,86 @@ fn parse_key(name: &str) -> Result<KeyPress, String> {
     }
 }
 
+/// 経路ごとに決まった、要るトークン。完全一致の表で決め、「どちらかのトークンなら通す」はしない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Auth {
+    Open,
+    Panel,
+    Admin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Healthz,
+    Status,
+    Events,
+    Input,
+    Screen,
+    Display,
+    Rotation,
+    AdminOverview,
+    AdminRestart,
+    AdminConfig,
+    /// `/admin`、`/admin/app.js`、`/admin/app.css`(静的ファイル。T5)
+    AdminPage,
+    /// 管理の名前空間にあるが、表に無い経路
+    AdminOther,
+    Unknown,
+}
+
+impl Route {
+    /// 経路(パスの完全一致)から、要るトークンを決める。表に無い経路はパネルのトークンが要る(既存の動き)。
+    fn of(path: &str) -> (Route, Auth) {
+        match path {
+            "/api/v1/healthz" => (Route::Healthz, Auth::Open),
+            "/api/v1/status" => (Route::Status, Auth::Panel),
+            "/api/v1/events" => (Route::Events, Auth::Panel),
+            "/api/v1/input" => (Route::Input, Auth::Panel),
+            "/api/v1/screen" => (Route::Screen, Auth::Panel),
+            "/api/v1/display" => (Route::Display, Auth::Panel),
+            "/api/v1/rotation" => (Route::Rotation, Auth::Panel),
+            "/api/v1/admin/overview" => (Route::AdminOverview, Auth::Admin),
+            "/api/v1/admin/restart" => (Route::AdminRestart, Auth::Admin),
+            "/api/v1/admin/config" => (Route::AdminConfig, Auth::Admin),
+            "/admin" | "/admin/app.js" | "/admin/app.css" => (Route::AdminPage, Auth::Open),
+            p if p == "/api/v1/admin"
+                || p.starts_with("/api/v1/admin/")
+                || p.starts_with("/admin/") =>
+            {
+                (Route::AdminOther, Auth::Admin)
+            }
+            _ => (Route::Unknown, Auth::Panel),
+        }
+    }
+
+    fn is_admin(self) -> bool {
+        matches!(
+            self,
+            Route::AdminOverview
+                | Route::AdminRestart
+                | Route::AdminConfig
+                | Route::AdminPage
+                | Route::AdminOther
+        )
+    }
+
+    /// この経路が受け付けるメソッド。`Unknown` は 404、`AdminOther` は 404 なのでどれでもよい。
+    fn allows(self, method: &Method) -> bool {
+        match self {
+            Route::Healthz | Route::Unknown | Route::AdminOther => true,
+            Route::Status | Route::Events | Route::AdminOverview | Route::AdminPage => {
+                *method == Method::Get
+            }
+            Route::Input
+            | Route::Screen
+            | Route::Display
+            | Route::Rotation
+            | Route::AdminRestart => *method == Method::Post,
+            Route::AdminConfig => *method == Method::Put,
+        }
+    }
+}
+
 /// パネルから実行ループへ渡す操作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelInput {
@@ -66,6 +150,72 @@ pub enum PanelInput {
     Screen(&'static str),
     /// 自動巡回を再開する(true)・止めたままにする(false)
     Rotation(bool),
+    /// 管理ページからのキオスクの再起動
+    Restart,
+}
+
+/// 管理ページに見せる取得 1 つの状態(docs/admin-web/design.md の `feeds`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedState {
+    NotRunning,
+    Connecting,
+    Ok,
+    Failing,
+    AuthRequired,
+    Forbidden,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct FeedReport {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub state: FeedState,
+    /// 最後に成功した時刻(RFC3339)
+    pub last_ok: Option<String>,
+    pub error: Option<String>,
+}
+
+/// トークンファイルの状態(管理ページの `tokens[].state`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenState {
+    Ok,
+    Missing,
+    Unreadable,
+    WrongOwner,
+    LoosePermissions,
+}
+
+/// 取得スレッドの状態への参照。`Err` = その取得が動いていない(理由。`feeds[].error` に出る)。
+pub type Source<T> = Result<T, String>;
+
+/// 取得スレッドの状態を読むための参照の束(読むだけ)。`KioskApp` 相当(`ScreenManager`)が組み立てる。
+#[derive(Clone)]
+pub struct AdminSources {
+    pub geoframe: Source<crate::photos::LinkShared>,
+    pub home_assistant: Source<crate::env::Shared>,
+    pub weather: Source<crate::weather::Shared>,
+    /// 警報。room 画面とは無関係(`[alerts] disaster` と HA の url で決まる)
+    pub disaster: Source<crate::disaster::HomeShared>,
+    pub aircraft: Source<crate::aircraft::HealthShared>,
+    pub agents: Source<crate::agents::Shared>,
+}
+
+impl Default for AdminSources {
+    fn default() -> Self {
+        fn none<T>() -> Source<T> {
+            Err("取得元が登録されていない".to_string())
+        }
+        Self {
+            geoframe: none(),
+            home_assistant: none(),
+            weather: none(),
+            disaster: none(),
+            aircraft: none(),
+            agents: none(),
+        }
+    }
 }
 
 /// モニターの手動オーバーライド(auto / force_on / force_off)を切り替える先。実体は `ScreenPower`。
@@ -228,19 +378,32 @@ pub struct Panel {
     keys: Receiver<PanelInput>,
     shared: Arc<Shared>,
     addr: SocketAddr,
+    /// 管理ページを無効にした理由(`[admin]` が無効なら None)
+    #[cfg_attr(not(test), allow(dead_code))] // 理由は prepare が stderr に出す。テストが読む
+    admin_disabled: Option<String>,
+    #[cfg(test)]
+    reaper: Reaper,
 }
 
 impl Panel {
     /// 設定どおりに待ち受けを始める。失敗したら Err(キオスクはパネルなしで動き続ける)。
     /// `display` はモニターの切り替え先(HA 連携が無ければ None。`/api/v1/display` は 409)。
+    /// `admin` は管理ページの材料(`[admin]` が有効で、管理トークンが規則を満たすときだけ管理ページが動く)。
     pub fn start(
         cfg: &config::Panel,
         display: Option<Arc<dyn DisplayControl>>,
+        admin: Option<AdminContext>,
     ) -> Result<Self, String> {
         let addr = check_listen(&cfg.listen)?;
         let token = read_token(&cfg.token_file)?;
         let server = Server::http(addr).map_err(|e| format!("{addr} で待ち受けられない: {e}"))?;
-        Ok(Self::spawn(server, token, cfg.max_rate_per_sec, display))
+        Ok(Self::spawn(
+            server,
+            token,
+            cfg.max_rate_per_sec,
+            display,
+            admin,
+        ))
     }
 
     fn spawn(
@@ -248,6 +411,7 @@ impl Panel {
         token: String,
         max_rate_per_sec: u32,
         display: Option<Arc<dyn DisplayControl>>,
+        admin: Option<AdminContext>,
     ) -> Self {
         let addr = server.server_addr().to_ip().expect("TCP で待ち受けている");
         let shared = Arc::new(Shared {
@@ -264,15 +428,36 @@ impl Panel {
             display_control: display.is_some(),
         });
         let (tx, keys) = channel();
+        let reaper = Reaper::default();
+        let (admin, admin_disabled) = admin::prepare(admin, &token, &shared, &tx, addr, &reaper);
+        #[cfg(test)]
+        let test_reaper = reaper.clone();
         let s = shared.clone();
         std::thread::Builder::new()
             .name("panel".into())
             .spawn(move || {
                 let rate = RateLimit::new(max_rate_per_sec);
-                serve(server, token, rate, tx, display, s)
+                serve(server, token, rate, tx, display, s, admin, reaper)
             })
             .expect("panel スレッドを起動できる");
-        Self { keys, shared, addr }
+        Self {
+            keys,
+            shared,
+            addr,
+            admin_disabled,
+            #[cfg(test)]
+            reaper: test_reaper,
+        }
+    }
+
+    #[cfg(test)]
+    fn reapers(&self) -> usize {
+        self.reaper.active()
+    }
+
+    #[cfg(test)]
+    fn admin_disabled(&self) -> Option<&str> {
+        self.admin_disabled.as_deref()
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -326,10 +511,100 @@ fn json_response(code: u16, body: &Value) -> Response<std::io::Cursor<Vec<u8>>> 
         .with_status_code(code)
         .with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
         .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap())
+        .with_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap())
 }
 
 fn error(code: u16, msg: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     json_response(code, &json!({ "error": msg }))
+}
+
+/// tiny_http が、本文をこの長さまでなら要求を渡す前に接続のスレッドで読み切る閾値(tiny_http 0.12 の
+/// request.rs の `content_length <= 1024 && !expects_continue`)。パネルの `MAX_BODY` とは別の話。
+const PREFETCH_MAX: u64 = 1024;
+/// 本文を、tiny_http が要求を渡す前に読み切っているか。読み切っていれば、読んでも手放しても待たない。
+/// 本文が空(`Content-Length` が無いか 0 で、`Transfer-Encoding` も無い)なら、tiny_http は `Expect` が
+/// あっても空の reader を作ってすぐ次の要求を解析するので、読み切っている扱いにする。そうでない要求
+/// (1 KiB を超える本文、本文があって `Expect` つき、`Transfer-Encoding`(chunked)、`Connection: upgrade`)は
+/// 本文を読み残したまま届く。読むと相手が送るまで止まり、手放すと(`EqualReader` の `Drop` が)残りを
+/// 読み捨てようとして相手が送るか切るまで止まる。
+fn body_prefetched(req: &Request) -> bool {
+    // tiny_http は `Connection` を最初の 1 つだけ見て upgrade を判定する(request.rs)。重複していても
+    // 同じ規則で見ないと、読み切った要求まで未読と誤判定する。
+    let upgrade = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Connection"))
+        .is_some_and(|h| h.value.as_str().to_ascii_lowercase().contains("upgrade"));
+    if upgrade || has_header(req, "Transfer-Encoding") {
+        return false;
+    }
+    match req.body_length() {
+        None | Some(0) => true,
+        Some(n) => n as u64 <= PREFETCH_MAX && !has_header(req, "Expect"),
+    }
+}
+
+fn has_header(req: &Request, name: &'static str) -> bool {
+    req.headers().iter().any(|h| h.field.equiv(name))
+}
+
+/// 動いている後始末スレッドの数を数える。スレッドが終わる(または起動に失敗して閉じが捨てられる)
+/// ときに減る。
+struct ReapCount(Arc<AtomicUsize>);
+
+impl Drop for ReapCount {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// 応答と手放し。本文を読み残した要求は、要求ごとに作る短命のスレッドで応答して手放す。
+///
+/// 読み残した要求を手放すと、tiny_http の `EqualReader` の `Drop` が残りを読み捨てようとして、相手が
+/// 送るか切るまで戻らない(取り出したストリームを drop しても同じで、tiny_http を変えずに接続を
+/// 強制的に閉じる手は無い)。パネルのスレッドや管理ワーカーが待たないよう、その待ちは要求ごとの
+/// スレッドに持たせる。スレッドは相手が送るか切ると終わり、fd も接続のスレッドも相手の切断と同時に
+/// 回収される。
+///
+/// 同時数の上限は置かない。上限を置いて溢れた要求を捨てる(`mem::forget` など)と、止まった接続が
+/// 溜まったときに fd と接続のスレッドが恒久的に残る。tiny_http は接続ごとにスレッドを持つので、
+/// ここで増えるスレッドも接続の数に収まる(接続数に上限が無いのは既存のパネルと同じで、LAN 限定で
+/// 受け入れる)。
+#[derive(Clone, Default)]
+struct Reaper {
+    active: Arc<AtomicUsize>,
+}
+
+impl Reaper {
+    /// 応答して要求を手放す。本文を読み切っている要求は、その場で応答する(待たない)。
+    fn reply(&self, req: Request, resp: Response<std::io::Cursor<Vec<u8>>>) {
+        if body_prefetched(&req) {
+            let _ = req.respond(resp);
+            return;
+        }
+        let who = peer(&req);
+        self.active.fetch_add(1, Ordering::AcqRel);
+        let count = ReapCount(self.active.clone());
+        let spawned = std::thread::Builder::new()
+            .name("panel-reap".into())
+            .spawn(move || {
+                let _count = count;
+                // 応答は先に書かれる。そのあと手放すときに、読み残しの本文が来るか接続が切れるまで待つ
+                let _ = req.respond(resp);
+            });
+        if let Err(e) = spawned {
+            // スレッドを起こせない(資源が尽きている)。起動に失敗した閉じに入っていた要求は、応答を
+            // 書けないまま、ここ(spawn の中)で同期に手放される。待ちを逃れる手は無いので、この
+            // ときだけ許す
+            eprintln!("panel: 後始末のスレッドを起こせない。{who} の要求を応答せずに手放す: {e}");
+        }
+    }
+
+    /// 動いている後始末スレッドの数(テスト用)。
+    #[cfg(test)]
+    fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
 }
 
 fn authorized(req: &Request, token: &str) -> bool {
@@ -347,26 +622,60 @@ fn serve(
     keys: Sender<PanelInput>,
     display: Option<Arc<dyn DisplayControl>>,
     shared: Arc<Shared>,
+    admin: Option<admin::Admin>,
+    reaper: Reaper,
 ) {
     for mut req in server.incoming_requests() {
         let path = req.url().split('?').next().unwrap_or("").to_string();
         let method = req.method().clone();
-        if path == "/api/v1/healthz" {
-            let _ = req.respond(json_response(200, &json!({ "ok": true })));
+        // CORS の事前確認には応えない(Access-Control-Allow-* はどの応答にも付けない)
+        if method == Method::Options {
+            reaper.reply(req, error(405, "メソッドが違う"));
             continue;
         }
-        if !authorized(&req, &token) {
+        let (route, auth) = Route::of(&path);
+        if route == Route::Healthz {
+            reaper.reply(req, json_response(200, &json!({ "ok": true })));
+            continue;
+        }
+        // 管理ページが無効なら、管理の経路は認証より前に 404
+        if route.is_admin() && admin.is_none() {
+            reaper.reply(req, error(404, "ない"));
+            continue;
+        }
+        let ok = match auth {
+            Auth::Open => true,
+            Auth::Panel => authorized(&req, &token),
+            Auth::Admin => admin.as_ref().is_some_and(|a| authorized(&req, a.token())),
+        };
+        if !ok {
             eprintln!("panel: {} {method} {path} -> 401", peer(&req));
-            let _ = req.respond(error(401, "Authorization: Bearer <token> が必要"));
+            reaper.reply(req, error(401, "Authorization: Bearer <token> が必要"));
             continue;
         }
-        *shared.last_request.lock().unwrap() = Some(Instant::now());
-        let resp = match (&method, path.as_str()) {
-            (Method::Get, "/api/v1/status") => match shared.snapshot().0 {
+        if auth == Auth::Panel {
+            *shared.last_request.lock().unwrap() = Some(Instant::now());
+        }
+        if !route.allows(&method) {
+            reaper.reply(req, error(405, "メソッドが違う"));
+            continue;
+        }
+        if let (true, Some(a)) = (route.is_admin(), &admin) {
+            // 本文の読み取り・処理・応答は管理ワーカーに任せる(パネルのキー操作を待たせない)
+            if let Err(req) = a.submit(req, route) {
+                reaper.reply(
+                    *req,
+                    json_response(429, &json!({"error": "管理の処理中", "retry_after_s": 1})),
+                );
+            }
+            continue;
+        }
+        let resp = match route {
+            Route::Status => match shared.snapshot().0 {
                 Some(v) => json_response(200, &v),
                 None => error(503, "起動中"),
             },
-            (Method::Get, "/api/v1/events") => {
+            Route::Events => {
                 if shared.sse.load(Ordering::Relaxed) >= MAX_SSE {
                     error(503, "SSE の接続が多すぎる")
                 } else {
@@ -382,7 +691,7 @@ fn serve(
                     continue;
                 }
             }
-            (Method::Post, "/api/v1/input") => {
+            Route::Input => {
                 if !rate.allow(Instant::now()) {
                     error(429, "操作が速すぎる")
                 } else {
@@ -395,7 +704,7 @@ fn serve(
                     }
                 }
             }
-            (Method::Post, "/api/v1/screen") => {
+            Route::Screen => {
                 if !rate.allow(Instant::now()) {
                     error(429, "操作が速すぎる")
                 } else {
@@ -408,7 +717,7 @@ fn serve(
                     }
                 }
             }
-            (Method::Post, "/api/v1/display") => {
+            Route::Display => {
                 if !rate.allow(Instant::now()) {
                     error(429, "操作が速すぎる")
                 } else {
@@ -421,7 +730,7 @@ fn serve(
                     }
                 }
             }
-            (Method::Post, "/api/v1/rotation") => {
+            Route::Rotation => {
                 if !rate.allow(Instant::now()) {
                     error(429, "操作が速すぎる")
                 } else {
@@ -434,14 +743,9 @@ fn serve(
                     }
                 }
             }
-            (
-                _,
-                "/api/v1/status" | "/api/v1/events" | "/api/v1/input" | "/api/v1/screen"
-                | "/api/v1/display" | "/api/v1/rotation",
-            ) => error(405, "メソッドが違う"),
             _ => error(404, "ない"),
         };
-        let _ = req.respond(resp);
+        reaper.reply(req, resp);
     }
 }
 
@@ -449,6 +753,24 @@ type HttpError = (u16, String);
 
 /// 本文 `{"<field>": "<値>"}` の値を読む。
 fn read_field(req: &mut Request, field: &str, example: &str) -> Result<String, HttpError> {
+    // 大きいと言っている本文は読まずに断る(途中で止まる相手を待たない)
+    if req.body_length().is_some_and(|n| n as u64 > MAX_BODY) {
+        return Err((413, "本文が大きすぎる".into()));
+    }
+    // tiny_http が読み切っていない本文は、パネルのスレッドでは読まない(相手が送るまで止まる)。
+    // 断った要求は `reply` が後始末スレッドへ回す
+    if !body_prefetched(req) {
+        return Err(if has_header(req, "Expect") {
+            (417, "Expect は受け付けない".into())
+        } else if has_header(req, "Transfer-Encoding") {
+            (
+                411,
+                "Content-Length の本文だけ受け付ける(chunked は不可)".into(),
+            )
+        } else {
+            (400, "この形の本文は受け付けない".into())
+        });
+    }
     let mut body = Vec::new();
     req.as_reader()
         .take(MAX_BODY + 1)
@@ -612,6 +934,22 @@ mod tests {
 
     const TOKEN: &str = "test-token-0123456789";
 
+    #[test]
+    fn body_prefetched_looks_at_the_first_connection_header_only() {
+        // tiny_http は最初の `Connection` だけで upgrade を判定する。同じ規則で見る
+        let req = |values: &[&str]| -> Request {
+            let mut t = tiny_http::TestRequest::new().with_method(Method::Post);
+            for v in values {
+                t = t.with_header(Header::from_bytes("Connection", *v).unwrap());
+            }
+            t.into()
+        };
+        assert!(body_prefetched(&req(&["keep-alive", "upgrade"])));
+        assert!(!body_prefetched(&req(&["upgrade", "keep-alive"])));
+        assert!(!body_prefetched(&req(&["Keep-Alive, Upgrade"])));
+        assert!(body_prefetched(&req(&["close"])));
+    }
+
     fn view(current: usize) -> PanelView {
         PanelView {
             screens: vec![
@@ -640,7 +978,7 @@ mod tests {
 
     fn start_with(rate: u32, display: Option<Arc<dyn DisplayControl>>) -> (Panel, String) {
         let server = Server::http("127.0.0.1:0").unwrap();
-        let p = Panel::spawn(server, TOKEN.into(), rate, display);
+        let p = Panel::spawn(server, TOKEN.into(), rate, display, None);
         let base = format!("http://{}", p.addr());
         (p, base)
     }
@@ -924,6 +1262,17 @@ mod tests {
         std::fs::write(&p, "short\n").unwrap();
         assert!(read_token(path).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_server_keeps_answering_after_six_idle_seconds() {
+        // 待ち受けソケットに受信の期限を掛けると、新しい接続が 5 秒無いだけで待ち受けが止まった
+        let (p, base) = start(20);
+        p.publish(Some(view(0)), DisplayStatus::default());
+        std::thread::sleep(Duration::from_secs(6));
+        assert_eq!(get(&base, "/api/v1/status", true).0, 200);
+        assert_eq!(post(&base, Some(TOKEN), r#"{"key":"next"}"#), 204);
+        assert!(recv_key(&p).is_some());
     }
 
     #[test]
