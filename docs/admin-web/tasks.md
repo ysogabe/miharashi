@@ -14,6 +14,6 @@
 | T5 | ページ: admin/ の index.html・app.js・app.css、静的配信とヘッダー(CSP ほか)、ログイン・稼働・項目(dirty/世代/readonly/使えるホスト)・保存・再起動(boot_failed で無効)・取得元・トークン、Page Visibility、textContent のみ | AC1(ヘッダー), AC22(app.js の文字列検査) | T3, T4 | full | 完了 | ba23b75 | c8d3947, 9eaf96a, 872fdb2 | Sol 3 回。r1 必須 2(保存中の編集が消える、効いている値の表示)、r2 必須 1(読み直しの応答が保存中のフォームを有効化)、r3 指摘なし。実機の確認は T7 |
 | T6 | スクリプトと文書: miharashi-t3-token の関数/main 分離と `config-get`、install.sh の admin.token、USAGE の「管理ページ」節、panel/DESIGN.md §5.2、docs/README.md の索引、example.toml 最終形 | AC17(スクリプト側), AC18 | T1 | full | 完了 | 0e3aa39 | 15d4b85, c0314a8 | Sol 必須 1(テストの後始末の検証漏れ)→修正、再レビューで指摘なし |
 | T7 | 実機の確認(自分で): 本番に入れて AC10・AC11・AC13・AC15・AC19・AC20・AC26 と全画面の回帰確認。本番反映は auto mode で拒否されたらユーザーに依頼 | AC1(実機), AC10, AC11, AC13, AC15, AC19, AC20, AC26 | T5, T6 | manual | 実装中 | daccd690a2c9ca6aab32a898133197dd58d9987a | | |
-| T8 | 全体レビュー(Sol)の修正: .prev の作成を必須(AC5)、https→http の格下げは allowed_hosts でも不可(AC7、PRD 優先で設計書を直す)、印の 60 秒は書いた時点から(AC13)、既定 IP の転載をやめる(AC27) | AC5, AC7, AC13, AC27 | T6 | full | 完了 | a450011 | 5d6cd61 | Sol の全体レビュー 4 件を修正(再確認待ち)。Opus の security-review: PREFLIGHT OK、High/Medium 0 件 |
+| T8 | 全体レビュー(Sol)の修正: .prev の作成を必須(AC5)、https→http の格下げは allowed_hosts でも不可(AC7、PRD 優先で設計書を直す)、印の 60 秒は書いた時点から(AC13)、既定 IP の転載をやめる(AC27) | AC5, AC7, AC13, AC27 | T6 | full | 完了 | a450011 | 5d6cd61, 8bbd22b | Sol の全体レビュー 4 件を修正。再確認で印の 60 秒が初期化中をカバーしない件(中)→タイマースレッドで修正。Opus の security-review: PREFLIGHT OK、High/Medium 0 件 |
 
 AC24(R19)・AC23(R18)・AC25(R20)は T9(あると良い)で、時間があれば足す。AC27(例示用アドレスだけ)は全体のレビューで確かめる。
