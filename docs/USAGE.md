@@ -284,7 +284,7 @@ SSH で設定ファイルを直さなくても、ブラウザから画面の有�
 
 - 管理ページから `agents.url` に入れてよい接続先です。`host` か `host:port` を書きます。port を書かなければ 80 / 443 だけが通ります(「同じホストの別のポート」は `host:port` で書かないと通りません)。
 - 設定ファイルに書いた `agents.url` の接続先(scheme・ホスト・ポートが同じもの)は、書かなくても常に使えます。
-- 設定ファイルの `https` を管理ページから `http` に変えることはできません(`allowed_hosts` に書いた接続先なら `http` でもかまいません)。ただし平文の `http` は IP アドレスか `localhost` だけです。上の例の `t3.example.test` のようにホスト名で書く接続先は `https` が要ります。T3 の URL は接続先だけで、パスは書けません。
+- 設定ファイルの `agents.url` が `https` なら、管理ページからは `https` だけです(`allowed_hosts` に書いても `http` には変えられません)。設定ファイルが `http` のときの平文の `http` は IP アドレスか `localhost` だけです。上の例の `t3.example.test` のようにホスト名で書く接続先は `https` が要ります。T3 の URL は接続先だけで、パスは書けません。
 
 上書きファイル(`/var/lib/miharashi/admin.toml`):
 

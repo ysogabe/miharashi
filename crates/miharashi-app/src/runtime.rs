@@ -450,6 +450,12 @@ pub(crate) fn draw_frame(
 const PANEL_RETRY: Duration = Duration::from_secs(30);
 /// 上書きで起動した印を、ループがこの時間動いたら消す(docs/admin-web/design.md の R9)
 const BOOT_MARKER_SECS: Duration = Duration::from_secs(60);
+
+/// 起動の印を消す時か。印を書いた時刻(`armed_at`)から `BOOT_MARKER_SECS` たったら true。
+/// 実行ループの開始ではなく書いた時点から数える(初期化に時間が掛かっても、起動から 60 秒を超えた異常終了で上書きを外させない)
+fn boot_marker_expired(armed_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(armed_at) >= BOOT_MARKER_SECS
+}
 /// キーボードが 1 台も無いとき、挿されていないか見直す間隔。
 const KEYS_RETRY: Duration = Duration::from_secs(10);
 
@@ -575,6 +581,8 @@ pub fn run(
     // 上書きで起動した印。ループが BOOT_MARKER_SECS 動いたら消す。正常終了の経路でも消す(描画エラーでは残す)
     let marker_dir = (!loaded.report.applied.is_empty())
         .then(|| crate::config::boot_marker_dir(&loaded.report.path));
+    // 印を書いた時刻(書いていなければ、ループの開始から数える)
+    let marker_since = loaded.marker_armed_at.unwrap_or(start);
     let mut marker_armed = marker_dir.is_some();
     let mut clean_exit = true;
     let reason = loop {
@@ -584,7 +592,7 @@ pub fn run(
         if max.is_some_and(|m| start.elapsed() >= m) {
             break "max_seconds に到達";
         }
-        if marker_armed && start.elapsed() >= BOOT_MARKER_SECS {
+        if marker_armed && boot_marker_expired(marker_since, Instant::now()) {
             marker_armed = false;
             if let Some(d) = &marker_dir {
                 crate::config::remove_boot_marker(d);
@@ -884,6 +892,18 @@ pub(crate) fn end_run(
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn boot_marker_counts_from_the_time_it_was_written() {
+        let armed = Instant::now();
+        assert!(!boot_marker_expired(armed, armed));
+        assert!(!boot_marker_expired(armed, armed + Duration::from_secs(59)));
+        assert!(boot_marker_expired(armed, armed + BOOT_MARKER_SECS));
+        // 初期化に時間が掛かり、印を書いてから 70 秒後に実行ループへ入った: 最初の周回で消す
+        assert!(boot_marker_expired(armed, armed + Duration::from_secs(70)));
+        // 時刻が逆戻りしても panic しない
+        assert!(!boot_marker_expired(armed + Duration::from_secs(5), armed));
+    }
 
     fn extra(ticks: u64, cpu: &str) -> Vec<(&'static str, String)> {
         vec![

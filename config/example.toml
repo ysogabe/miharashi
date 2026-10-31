@@ -27,7 +27,7 @@
 # overlay_file = "/var/lib/miharashi/admin.toml"
 # 管理ページから T3 の接続先(agents.url)に使える接続先。この設定ファイルに書いた agents.url(scheme・ホスト・ポートが同じもの)
 # は常に使える。別のホストやポートを使うにはここに host か host:port を書く(port を書かなければ 80 / 443 だけ)。
-# https の設定を管理ページから http に変えることはできない(allowed_hosts に書いた接続先は http でもよい)。T3 の URL は origin だけ(パスは書けない)。
+# https の設定を管理ページから http に変えることはできない(設定ファイルの agents.url が https なら、管理ページからは https だけ。allowed_hosts に書いても http には変えられない)。T3 の URL は origin だけ(パスは書けない)。
 # allowed_hosts = []           # 例: ["192.0.2.30:3773", "t3.example.test"]
 
 [input]

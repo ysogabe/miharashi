@@ -127,7 +127,7 @@ flowchart LR
 # overlay_file = "/var/lib/miharashi/admin.toml"
 # 管理ページから T3 の接続先(agents.url)に使える接続先。この設定ファイルに書いた agents.url(scheme・ホスト・ポートが同じもの)
 # は常に使える。別のホストやポートを使うにはここに host か host:port を書く(port を書かなければ 80 / 443 だけ)。
-# https の設定を管理ページから http に変えることはできない(allowed_hosts に書いた接続先は http でもよい)。T3 の URL は origin だけ(パスは書けない)。
+# https の設定を管理ページから http に変えることはできない(設定ファイルの agents.url が https なら、管理ページからは https だけ。allowed_hosts に書いても http には変えられない)。T3 の URL は origin だけ(パスは書けない)。
 # allowed_hosts = []           # 例: ["192.0.2.30:3773", "t3.example.test"]
 ```
 
@@ -187,7 +187,8 @@ impl Overlay {
     ///   (a) 設定ファイルの文面に書かれた agents.url の origin(base_agents_url: Option<&str>。プログラムの既定値は使わない。
     ///       空文字や未記載なら候補に入れない)
     ///   (b) base.admin.allowed_hosts の各要素(host か host:port。port が無ければ scheme の既定ポート(80 / 443)だけ)
-    ///   scheme は、(a) が https なら https だけ(http への格下げは不可)。(b) は http でも https でもよい(http は check_url の規則で IP か localhost に限られる)
+    ///   scheme は、設定ファイルの agents.url が https なら、(b) に書かれていても https だけ(http への格下げは不可。格下げの検査を (b) の照合より前に置く)。
+    ///   (a) が http か未記載なら、(b) は http でも https でもよい(http は check_url の規則で IP か localhost に限られる)
     /// - aircraft.url / geoframe.url: 共通の文字の検査だけ(トークンを送らない)
     pub fn check(&self, base: &Config, base_agents_url: Option<&str>) -> Result<(), String>;
     pub fn apply(&self, cfg: &mut Config);          // Some の項目だけ代入
@@ -312,7 +313,7 @@ JSON の応答(既存のパネル API を含む)にも `X-Content-Type-Options: 
 - `overlay.pending_restart` は、どれかの項目で `next != effective` のとき `true`。壊れた上書きの警告(`overlay.error`)とは別。ただし `overlay.error_kind` が `boot_failed`(印による無視)で、**今の `admin.toml` の世代が印に書かれた世代と同じ**間は、その上書きで起動した直後に終了したばかりなので、ページは「この上書きで起動した直後に終了した(原因が上書きとは限らない)。直すか取り消してから再起動する」と出し、再起動ボタンを無効にする。`POST /api/v1/admin/restart` もこの間は `409 {"error":"起動に失敗した上書きのまま。保存して世代を変えてから"}` を返す(そうしないと、管理ページからの再起動 1 回で起動が 2 回(落ちる → 設定ファイルだけで起動)になり、押し続けると 300 秒に 6 回で systemd が止まる)。保存して世代が変われば `boot_failed` は解け、再起動できる。
 - `allowed_hosts` の照合: ホストは `ureq::http::Uri::host()` で 1 回だけ取り出し、`check_url` の判定と照合の両方に同じ値を使う(取り出し方を 2 通りにしない)。IP アドレスは `IpAddr` に直して比べる(`2001:db8:0::1` と `2001:db8::1` は同じ)。ホスト名は小文字にそろえて完全一致(末尾のドット・末尾一致・ワイルドカードは無い)。ポートは明示されていなければ scheme の既定ポート。表記ゆれ(IPv4 の先頭 0、IPv4 射影、ゾーン ID)はすべて「一致しない」側に倒れる。
 - 照合の相手に、プログラムの既定値(`ConfigAgents::default()` の url、`config.rs:495`)は**使わない**。設定ファイルに `[agents] url` が書かれていないときは `allowed_hosts` だけで照合する。`load_with_overlay` は base の生の TOML から `agents.url` の有無を見て `base_agents_url` を決め、`LoadedConfig` に持たせる(PUT でも同じ値を使う)。
-- 照合は origin 単位(scheme・host・port)。「同じホストの別のポート」も `allowed_hosts` に `host:port` で書かないと通らない。理由: 許可ホスト上の一般ユーザーが高いポートで待ち受ければトークンを受け取れるため。https の設定を http に格下げすることも通らない(管理トークンを盗聴できる人は T3 のトークンも盗聴できてしまう)。
+- 照合は origin 単位(scheme・host・port)。「同じホストの別のポート」も `allowed_hosts` に `host:port` で書かないと通らない。理由: 許可ホスト上の一般ユーザーが高いポートで待ち受ければトークンを受け取れるため。設定ファイルの agents.url が https なら、管理ページからは https だけ(`allowed_hosts` に書いても http には変えられない。管理トークンを盗聴できる人は T3 のトークンも盗聴できてしまう)。
 - `feeds[].error` と `overlay.error` は 200 文字で切り、URL のクエリは落とす。外部サービスの応答本文はそのまま入れない(既存の `error_summary` と同じ短い要約)。
 - `feeds[].state` と各取得元の対応:
 
@@ -403,7 +404,7 @@ JavaScript はフレームワークを使わず、`fetch` と DOM 操作だけ�
 | AC4 | 単体(`panel.rs`): base を `agents.enabled = true`・`url` 正しい・`ui.start_screen = "agents"` にし、PUT で `{"agents":{"enabled":false}}` → 400 と「ui.start_screen = agents には agents.enabled = true が必要」。`admin.toml` が変わらない |
 | AC5 | 単体: 書き込みの手順を関数に分け、(a) tmp を書いた直後、(b) `.prev` を作った直後、(c) rename 後、の各状態をディレクトリに作って `load_with_overlay` を呼び、前の内容か新しい内容のどちらかになること。残った tmp が起動時に消えること |
 | AC6 | 単体: `{"panel":{"listen":"..."}}`、`{"agents":{"token_file":"..."}}`、`{"geoframe":{"photo_interval_secs":1}}`、`{"home_assistant":{"url":"..."}}`、userinfo 付き URL、空白・`"`・制御文字を含む URL、`agents.enabled=false` で `agents.url` が不正、許可されないホスト → すべて 400。`admin.toml` が変わらない |
-| AC7 | 単体(`config.rs`): `Overlay::check` に base(文面の `agents.url = http://192.0.2.30:3773`、`allowed_hosts = ["t3.example.test", "192.0.2.40:4000"]`)を渡し、`http://192.0.2.30:3773`・`https://t3.example.test`・`http://192.0.2.40:4000` は Ok、`http://192.0.2.30:3773/x`(パス付き。`agents::check_url` の既存の規則)は Err、`http://192.0.2.30:4000`(ポート違い)・`http://192.0.2.31:3773`・`https://t3.example.test:8443`(port 無しの要素は既定ポートだけ)は Err。文面が `https://192.0.2.30` のとき `http://192.0.2.30` は Err(格下げ)。`[agents]` が無い base と `url = ""` の base では、既定値のホスト(`192.168.0.132`)が Err で `allowed_hosts` だけが通る。`https://:443` のような空ホストは Err。表記ゆれ(`192.000.002.030`、`2001:db8:0::1` と `2001:db8::1`、末尾のドット)。`load_with_overlay` で許されない overlay が無視され `report.error` に理由 |
+| AC7 | 単体(`config.rs`): `Overlay::check` に base(文面の `agents.url = http://192.0.2.30:3773`、`allowed_hosts = ["t3.example.test", "192.0.2.40:4000"]`)を渡し、`http://192.0.2.30:3773`・`https://t3.example.test`・`http://192.0.2.40:4000` は Ok、`http://192.0.2.30:3773/x`(パス付き。`agents::check_url` の既存の規則)は Err、`http://192.0.2.30:4000`(ポート違い)・`http://192.0.2.31:3773`・`https://t3.example.test:8443`(port 無しの要素は既定ポートだけ)は Err。文面が `https://192.0.2.30` のとき `http://192.0.2.30` は Err(格下げ)。文面が `https://t3.example.test` で `allowed_hosts` に `t3.example.test`・`192.0.2.40:4000` があっても、`http://t3.example.test`・`http://192.0.2.40:4000` は Err(格下げは `allowed_hosts` より先)で、`https://192.0.2.40:4000` は Ok。`[agents]` が無い base と `url = ""` の base では、プログラムの既定のホスト(`ConfigAgents::default().url` から取る。テストに IP のリテラルは書かない)が Err で `allowed_hosts` だけが通る。`https://:443` のような空ホストは Err。表記ゆれ(`192.000.002.030`、`2001:db8:0::1` と `2001:db8::1`、末尾のドット)。`load_with_overlay` で許されない overlay が無視され `report.error` に理由 |
 | AC8 | 単体: base のパスに壊れた TOML を置いて PUT → 409。`admin.toml` が変わらない |
 | AC9 | 単体: `{"aircraft":{"enabled":null}}` を PUT → `admin.toml` に `aircraft.enabled` が無く、`items` の `next` が base の値。全部 `null` で PUT → `admin.toml` が無く `.prev` がある |
 | AC10 | 単体: `POST restart` → `p.inputs()` に `Restart`、2 回目は 429 と `requested: true`。`started` を 10 秒前にして 429 と `retry_after_s`。実機: ボタン → journal に「管理ページからの再起動」→ 3 秒後に起動。モニター消灯中に再起動して、再起動後の状態を確認 |
@@ -434,7 +435,7 @@ JavaScript はフレームワークを使わず、`fetch` と DOM 操作だけ�
 | 保存と再起動の間に SSH で設定ファイルが変わり、再起動時に合わせた設定が検証に通らない | 起動時の安全弁で base だけで起動し、ページに理由が出る。保存時は**その時点の**設定ファイルで検証する(起動時のコピーは使わない) |
 | 上書きが検証には通るが起動の途中で落ち、3 秒ごとの再起動で systemd が止まる | 印のファイル(R9)で次の起動から上書きを外す。落ちた世代のままの再起動は 409。それでも止まったら SSH で `systemctl reset-failed`(USAGE に既にある) |
 | 起動から 60 秒以内の電源断や `systemctl stop` で、上書きが誤って外れる | 印に boot_id と pid を書き、boot_id が違えば無視。シグナルの登録を印より前に。文言は「原因が上書きとは限らない」 |
-| プログラムの既定の `agents.url` に実在しそうな LAN の IP(`192.168.0.132`)が入っている | 照合の相手にしない(今回)。既定値を `192.0.2.x` か空に直すのは別の Issue(公開物のプライバシーの決まりにも関わる。Issue #60 と同じ系統) |
+| プログラムの既定の `agents.url` に実在しそうな LAN の IP が入っている | 照合の相手にしない(今回)。既定値を `192.0.2.x` か空に直すのは別の Issue(公開物のプライバシーの決まりにも関わる。Issue #60 と同じ系統) |
 | `miharashi-t3-token` が古い URL や無視された上書きの URL で確認する | `config-get` で次回起動の値を取る。届かなければトークンを置き換えない(今と同じ)。発行先は t3 CLI のペアリングで決まり、URL では変わらない |
 | 不正な上書きで起動できなくなる | 起動時の安全弁(R8)。保存前の検証(R4・R5) |
 | 再起動の連打で systemd が止まる | 120 秒の抑止と受け付け済みフラグ(起動は 300 秒に最大 3 回)。残るリスク: 管理操作の再起動とクラッシュの再起動が 300 秒に合計 5 回重なると systemd が止まる |

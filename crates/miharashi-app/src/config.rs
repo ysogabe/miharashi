@@ -286,7 +286,7 @@ impl Overlay {
     /// - agents.url: 画面が無効でも `agents::check_url` を通す。さらに origin(scheme・host・port)が次のどれかと一致すること:
     ///   (a) 設定ファイルの文面に書かれた agents.url の origin(`base_agents_url`。プログラムの既定値は使わない)
     ///   (b) `base.admin.allowed_hosts` の各要素(host か host:port。port が無ければ scheme の既定ポートだけ)
-    ///   (a) が https なら、同じホストへの http への格下げは (a) では認めない((b) に書かれていれば通る)
+    ///   設定ファイルの agents.url が https なら、上書きは (b) に書かれていても https だけ(http への格下げは認めない。PRD R5)
     /// - aircraft.url / geoframe.url: 共通の文字の検査だけ(トークンを送らない)
     pub fn check(&self, base: &Config, base_agents_url: Option<&str>) -> Result<(), String> {
         if let Some(u) = &self.geoframe.url {
@@ -304,6 +304,12 @@ impl Overlay {
         let from_file = base_agents_url
             .and_then(|b| b.parse::<Uri>().ok())
             .and_then(|b| origin_of(&b));
+        // 設定ファイルの agents.url が https なら、allowed_hosts に書いてあっても http にはできない(格下げの検査が先)
+        if from_file.as_ref().is_some_and(|f| f.https) && !origin.https {
+            return Err(format!(
+                "agents.url: 設定ファイルの agents.url が https なので、http への格下げはできない(allowed_hosts に書いても不可): {u}"
+            ));
+        }
         if from_file.as_ref() == Some(&origin) {
             return Ok(());
         }
@@ -315,14 +321,6 @@ impl Overlay {
         });
         if allowed {
             return Ok(());
-        }
-        if from_file
-            .as_ref()
-            .is_some_and(|f| f.https && !origin.https && f.host == origin.host)
-        {
-            return Err(format!(
-                "agents.url: 設定ファイルの https を http に格下げすることはできない({u})"
-            ));
         }
         Err(format!(
             "agents.url: 接続先 {u} は許可されていない(allowed_hosts か設定ファイルの agents.url と同じ接続先だけ)"
@@ -524,6 +522,8 @@ pub struct LoadedConfig {
     /// 実際に使う(上書き後。無視したときは base と同じ)
     pub effective: Config,
     pub report: OverlayReport,
+    /// 起動の印を書いた時刻(印を書いていなければ None)。印を消す 60 秒はここから数える
+    pub marker_armed_at: Option<std::time::Instant>,
 }
 
 /// 起動の印(`admin.boot`)のファイル名。`overlay_file` と同じディレクトリに置く。
@@ -711,20 +711,19 @@ pub fn write_overlay_tmp(overlay_file: &Path, text: &str) -> Result<PathBuf, Str
 }
 
 /// 手順 2: 今の上書きファイルがあれば、`.prev` を消してからハードリンクで残す(コピーではない)。
-/// 保険なので、失敗しても続ける。
-pub fn link_overlay_prev(overlay_file: &Path) {
+/// 旧内容を残せなければ Err(置き換えない)。今の上書きファイルが無ければ何もしない(`.prev` は作らない)。
+pub fn link_overlay_prev(overlay_file: &Path) -> Result<(), String> {
     if std::fs::symlink_metadata(overlay_file).is_err() {
-        return;
+        return Ok(());
     }
     let prev = overlay_prev_path(overlay_file);
     match std::fs::remove_file(&prev) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => eprintln!("admin: {} を消せない: {e}", prev.display()),
+        Err(e) => return Err(format!("{} を消せない: {e}", prev.display())),
     }
-    if let Err(e) = std::fs::hard_link(overlay_file, &prev) {
-        eprintln!("admin: {} を残せない(続ける): {e}", prev.display());
-    }
+    std::fs::hard_link(overlay_file, &prev)
+        .map_err(|e| format!("{} に直前の内容を残せない: {e}", prev.display()))
 }
 
 /// 手順 3・4: `rename(tmp, overlay_file)` を 1 回して、ディレクトリを `sync_all` する。
@@ -746,19 +745,23 @@ fn sync_dir(overlay_file: &Path) -> Result<(), String> {
 
 /// 上書きを保存する(管理ページの `PUT`)。どの時点で止まっても `overlay_file` は前の内容か新しい内容のどちらか。
 /// 残った `<overlay>.tmp-*` は先に消す。`overlay` が空なら `.prev` を作ったあと `overlay_file` を削除する(tmp は作らない)。
+/// 既存の上書きファイルがあるのに `.prev` を作れなければ、何も置き換えず Err(AC5)。
 pub fn save_overlay(overlay_file: &Path, overlay: &Overlay) -> Result<(), String> {
     remove_stale_tmp(overlay_file);
     if overlay.is_empty() {
         if std::fs::symlink_metadata(overlay_file).is_err() {
             return Ok(());
         }
-        link_overlay_prev(overlay_file);
+        link_overlay_prev(overlay_file)?;
         std::fs::remove_file(overlay_file)
             .map_err(|e| format!("{} を消せない: {e}", overlay_file.display()))?;
         return sync_dir(overlay_file);
     }
     let tmp = write_overlay_tmp(overlay_file, &render_overlay(overlay)?)?;
-    link_overlay_prev(overlay_file);
+    if let Err(e) = link_overlay_prev(overlay_file) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     commit_overlay(&tmp, overlay_file)
 }
 
@@ -812,7 +815,9 @@ impl LoadedConfig {
             self.report.applied.clear();
             self.report.error = Some(format!("起動の印を書けないので上書きを使わない: {e}"));
             self.report.error_kind = Some(OverlayErrorKind::MarkerUnwritable);
+            return;
         }
+        self.marker_armed_at = Some(std::time::Instant::now());
     }
 }
 
@@ -855,6 +860,7 @@ fn build_loaded(
         effective: base.clone(),
         base,
         report: report.clone(),
+        marker_armed_at: None,
     };
 
     if consume_marker {
@@ -1861,9 +1867,19 @@ mod tests {
         let e = check_agents(Some("https://192.0.2.30"), &[], "http://192.0.2.30").unwrap_err();
         assert!(e.contains("格下げ"), "{e}");
         check_agents(Some("https://192.0.2.30"), &[], "https://192.0.2.30:443/").unwrap();
+        // allowed_hosts に書いてあっても、設定ファイルが https なら http にはできない(同じホストも別のホストも)。https なら通る
+        let https_base = Some("https://192.0.2.40:4000");
+        let allowed_https = ["192.0.2.40:4000", "192.0.2.41"];
+        for ng in ["http://192.0.2.40:4000", "http://192.0.2.41"] {
+            let e = check_agents(https_base, &allowed_https, ng).unwrap_err();
+            assert!(e.contains("格下げ"), "{ng}: {e}");
+        }
+        check_agents(https_base, &allowed_https, "https://192.0.2.41").unwrap();
+        // 設定ファイルが http なら、allowed_hosts に書いた http はこれまでどおり通る
+        check_agents(base, &allowed_https, "http://192.0.2.40:4000").unwrap();
         // [agents] が無い(None)と url = ""(None)では、既定値のホストは使えず allowed_hosts だけが通る
-        let default_host = Config::default().agents.url;
-        assert!(default_host.contains("192.168.0.132"));
+        // (既定のホストは IP のリテラルを書かず、プログラムの既定値から取る)
+        let default_host = ConfigAgents::default().url;
         assert!(check_agents(None, &[], &default_host).is_err());
         assert!(check_agents(None, &["192.0.2.40:4000"], &default_host).is_err());
         check_agents(None, &["192.0.2.40:4000"], "http://192.0.2.40:4000").unwrap();
@@ -1946,6 +1962,19 @@ mod tests {
                 .base_agents_url,
             None
         );
+        // 設定ファイルが https なら、allowed_hosts に書いた http の上書きも無視する(読み込み時にも格下げは不可)
+        let https_base = t.base(
+            "allowed_hosts = [\"192.0.2.40:4000\"]\n[agents]\nurl = \"https://192.0.2.40:4000\"\n",
+        );
+        t.write(
+            "admin.toml",
+            "[agents]\nurl = \"http://192.0.2.40:4000\"\n[room]\nenabled = false\n",
+        );
+        let l = Config::load_with_overlay(&https_base, false).unwrap();
+        assert_eq!(l.report.error_kind, Some(OverlayErrorKind::Rule));
+        assert!(l.report.error.as_deref().unwrap().contains("格下げ"));
+        assert_eq!(l.effective, l.base);
+        assert!(l.report.applied.is_empty());
     }
 
     #[test]
@@ -2090,7 +2119,7 @@ mod tests {
 
         // (b) .prev を作った直後: まだ前の内容。.prev は前の内容
         let tmp = write_overlay_tmp(&file, &render_overlay(&new).unwrap()).unwrap();
-        link_overlay_prev(&file);
+        link_overlay_prev(&file).unwrap();
         assert_eq!(read_overlay_text(&t, "admin.toml"), old_text);
         assert_eq!(read_overlay_text(&t, "admin.toml.prev"), old_text);
         assert_eq!(
@@ -2149,6 +2178,35 @@ mod tests {
         let gone = t.path("no-such-dir/admin.toml");
         assert!(save_overlay(&gone, &a).is_err());
         assert!(!t.path("no-such-dir").exists());
+    }
+
+    #[test]
+    fn ac5_save_fails_without_replacing_when_prev_cannot_be_made() {
+        let t = Tmp::new("ac5-prev-fail");
+        let file = t.path("admin.toml");
+        let a = overlay_of("[room]\nenabled = false\n");
+        let b = overlay_of("[room]\nenabled = true\n");
+        // 既存の admin.toml が無ければ .prev は作らないまま保存できる
+        save_overlay(&file, &a).unwrap();
+        assert!(!overlay_prev_path(&file).exists());
+        let a_text = read_overlay_text(&t, "admin.toml");
+        // .prev が(空でない)ディレクトリで消せない: 保存は Err、admin.toml は前の内容のまま、tmp も残らない
+        let prev = overlay_prev_path(&file);
+        std::fs::create_dir(&prev).unwrap();
+        std::fs::write(prev.join("keep"), "x").unwrap();
+        let e = save_overlay(&file, &b).unwrap_err();
+        assert!(e.contains("admin.toml.prev"), "{e}");
+        assert_eq!(read_overlay_text(&t, "admin.toml"), a_text);
+        assert!(tmp_files(&t).is_empty());
+        assert!(prev.join("keep").exists());
+        // 空の保存(取り消し)も、.prev を残せなければ admin.toml を消さない
+        assert!(save_overlay(&file, &Overlay::default()).is_err());
+        assert_eq!(read_overlay_text(&t, "admin.toml"), a_text);
+        // .prev が直れば保存できる
+        std::fs::remove_dir_all(&prev).unwrap();
+        save_overlay(&file, &b).unwrap();
+        assert_eq!(overlay_of(&read_overlay_text(&t, "admin.toml")), b);
+        assert_eq!(read_overlay_text(&t, "admin.toml.prev"), a_text);
     }
 
     #[test]
@@ -2321,9 +2379,13 @@ mod tests {
         assert!(l.report.applied.is_empty());
         assert_eq!(l.effective, l.base);
         assert!(l.report.error.is_some());
-        // 書けるときは印が置かれ、上書きは効いたまま
+        assert_eq!(l.marker_armed_at, None, "書けなければ時刻も記録しない");
+        // 書けるときは印が置かれ、上書きは効いたまま。印を書いた時刻が記録される(60 秒はここから数える)
         let mut l = Config::load_with_overlay(&base, true).unwrap();
+        assert_eq!(l.marker_armed_at, None, "読んだだけでは印を書いていない");
+        let before = std::time::Instant::now();
         l.arm_boot_marker();
+        assert!(l.marker_armed_at.is_some_and(|a| a >= before));
         assert_eq!(l.report.error, None);
         assert!(!l.effective.room.enabled);
         assert!(t.path("admin.boot").exists());
@@ -2333,6 +2395,7 @@ mod tests {
         let mut l = Config::load_with_overlay(&base, true).unwrap();
         l.arm_boot_marker();
         assert!(!t.path("admin.boot").exists());
+        assert_eq!(l.marker_armed_at, None);
     }
 
     #[test]
