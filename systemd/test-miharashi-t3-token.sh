@@ -101,33 +101,51 @@ if [[ -e "$called" ]]; then ng "(d) t3 か curl が呼ばれた: $(cat "$called"
 # --- AC18: 確認に失敗したらトークンを置き換えない ---
 MIHARASHI_BIN=$tmp/miharashi
 token=$tmp/state/t3-agent.token
-run_main() { (main >"$tmp/out" 2>"$tmp/err"); }
+# main は本番と同じ set -eu で動かす(サブシェルの中。終了コードは外で受ける)。
+# ケースごとに専用の TMPDIR を渡し、秘密情報の入る作業ディレクトリ(mktemp -d)が残らないことを確かめられるようにする。
+run_main() {
+    case_tmp=$(mktemp -d "$tmp/case.XXXXXX")
+    (
+        set -eu
+        export TMPDIR=$case_tmp
+        main
+    ) >"$tmp/out" 2>"$tmp/err"
+}
+# assert_failed_cleanly <名前>: 失敗したケースの後始末(作業ディレクトリ・token_file の隣の一時ファイル・新セッションの失効)
+assert_failed_cleanly() {
+    check "$1: TMPDIR に作業ディレクトリが残らない" "" "$(ls -A "$case_tmp")"
+    check "$1: token_file のディレクトリに一時ファイルが残らない" "$before" "$(ls -A "$tmp/state")"
+    if grep -q '^t3 auth session revoke new-session$' "$called"; then ok "$1: 今回作ったセッションを失効させる"; else ng "$1: 今回のセッションを失効させていない: $(cat "$called")"; fi
+}
 
 echo OLDTOKEN >"$token"
 before=$(ls -A "$tmp/state")
+: >"$called"
 CURL_STUB_MODE=fail run_main
 check "AC18: curl が失敗すると main は失敗する" "1" "$?"
 check "AC18: token_file は変わらない" "OLDTOKEN" "$(cat "$token")"
-check "AC18: 一時ファイルも残らない" "$before" "$(ls -A "$tmp/state")"
+assert_failed_cleanly "AC18(curl 失敗)"
 if grep -q 'T3 に届きません' "$tmp/err"; then ok "AC18: die の文言"; else ng "AC18: die の文言がない: $(cat "$tmp/err")"; fi
 if grep -q 'curl .*http://192.0.2.30:3773/api/orchestration/shell' "$called"; then ok "AC18: 確認は config-get の URL に行う"; else ng "AC18: 確認の URL が違う: $(cat "$called")"; fi
-if grep -q 'auth session revoke new-session' "$called"; then ok "AC18: 今回作ったセッションは失効させる"; else ng "AC18: 今回のセッションを失効させていない"; fi
 
 : >"$called"
 CURL_STUB_MODE=401 run_main
 check "AC18: HTTP 401 でも失敗する" "1" "$?"
 check "AC18: 401 でも token_file は変わらない" "OLDTOKEN" "$(cat "$token")"
+assert_failed_cleanly "AC18(401)"
 
 : >"$called"
 T3_STUB_SCOPE=orchestration:write CURL_STUB_MODE=ok run_main
 check "AC18: 権限が違うと失敗する" "1" "$?"
 check "AC18: 権限が違うと token_file は変わらない" "OLDTOKEN" "$(cat "$token")"
 if grep -q 'curl' "$called"; then ng "AC18: 権限が違うのに curl まで進んだ"; else ok "AC18: 権限が違えば確認まで進まない"; fi
+assert_failed_cleanly "AC18(権限違い)"
 
 # 成功する場合(スタブが意味のあるものだと確かめる)
 : >"$called"
 CURL_STUB_MODE=ok run_main
 check "成功: main が通る" "0" "$?"
+check "成功: TMPDIR に作業ディレクトリが残らない" "" "$(ls -A "$case_tmp")"
 check "成功: token_file が置き換わる" "NEWTOKEN-0123456789" "$(cat "$token")"
 check "成功: 権限は 0600" "600" "$(stat -c %a "$token")"
 if grep -q 'auth session revoke old-session' "$called"; then ok "成功: 古いセッションを失効させる"; else ng "成功: 古いセッションを失効させていない"; fi
