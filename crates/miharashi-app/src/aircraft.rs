@@ -19,6 +19,17 @@ const MAX_SEEN_POS: f64 = 60.0;
 /// 最新の取得結果と、取得した時刻。
 pub type Shared = Arc<Mutex<Option<(Instant, AircraftView)>>>;
 
+/// 取得の成否(管理ページの取得元に出す)。`Shared` とは別に取得スレッドが書く。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Health {
+    /// `aircraft.json` を最後に取れた時刻
+    pub last_ok: Option<chrono::DateTime<chrono::Local>>,
+    /// 直近の失敗の (時刻, 短い理由)。次に取れたら消す
+    pub last_error: Option<(chrono::DateTime<chrono::Local>, String)>,
+}
+
+pub type HealthShared = Arc<Mutex<Health>>;
+
 /// 主な空港の日本語名(IATA)。表に無ければ adsbdb の都市名(英語)を使う。
 fn airport_ja(iata: &str) -> Option<&'static str> {
     Some(match iata {
@@ -375,23 +386,30 @@ pub fn advanced(view: &AircraftView, secs: f64) -> AircraftView {
 }
 
 /// 取得を始める。無効なら None。
-pub fn start(cfg: &Config) -> Option<Shared> {
+pub fn start(cfg: &Config) -> Option<(Shared, HealthShared)> {
     if !cfg.enabled || cfg.url.is_empty() {
         return None;
     }
     let shared: Shared = Arc::new(Mutex::new(None));
-    let (out, cfg) = (shared.clone(), cfg.clone());
+    let health = HealthShared::default();
+    let (out, cfg, h) = (shared.clone(), cfg.clone(), health.clone());
     let spawned = std::thread::Builder::new()
         .name("aircraft".into())
-        .spawn(move || run(out, cfg));
+        .spawn(move || run(out, h, cfg));
     if let Err(e) = spawned {
         eprintln!("aircraft: スレッドを起動できない: {e}");
         return None;
     }
-    Some(shared)
+    Some((shared, health))
 }
 
-fn run(out: Shared, cfg: Config) {
+fn set_error(health: &HealthShared, reason: &str) {
+    if let Ok(mut h) = health.lock() {
+        h.last_error = Some((chrono::Local::now(), reason.to_string()));
+    }
+}
+
+fn run(out: Shared, health: HealthShared, cfg: Config) {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(8)))
         .build()
@@ -407,6 +425,9 @@ fn run(out: Shared, cfg: Config) {
                 Some(r) => eprintln!("aircraft: 受信機 {:.4},{:.4}", r.0, r.1),
                 None if !warned => eprintln!("aircraft: 受信機の位置を取れない(再試行を続ける)"),
                 None => {}
+            }
+            if rx.is_none() {
+                set_error(&health, "受信機の位置を取れない");
             }
         }
         if let Some(r) = rx {
@@ -429,12 +450,18 @@ fn run(out: Shared, cfg: Config) {
                     if let Ok(mut g) = out.lock() {
                         *g = Some((Instant::now(), view));
                     }
+                    if let Ok(mut h) = health.lock() {
+                        h.last_ok = Some(chrono::Local::now());
+                        h.last_error = None;
+                    }
                 }
-                Err(e) if !warned => {
-                    warned = true;
-                    eprintln!("aircraft: 取得できない(再試行を続ける): {e}");
+                Err(e) => {
+                    set_error(&health, &e);
+                    if !warned {
+                        warned = true;
+                        eprintln!("aircraft: 取得できない(再試行を続ける): {e}");
+                    }
                 }
-                Err(_) => {}
             }
         } else {
             warned = true;

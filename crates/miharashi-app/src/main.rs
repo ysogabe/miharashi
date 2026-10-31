@@ -204,8 +204,14 @@ fn run(cli: Cli) -> Result<(), String> {
     let (alert_tx, alerts) = std::sync::mpsc::channel();
     quake::start(&cfg.alerts, &cfg.home_assistant, alert_tx.clone());
     let warnings = disaster::start(&cfg.alerts, &cfg.home_assistant, alert_tx);
+    // 警報と航空機の取得は、画面の有無とは別に動く。管理ページが状態を読めるよう、参照を渡しておく
+    let admin_disaster = app::disaster_source(cfg, warnings.clone());
     let room = room_feeds(cfg, warnings);
-    let planes = aircraft::start(&cfg.aircraft);
+    let (planes, plane_health) = match aircraft::start(&cfg.aircraft) {
+        Some((shared, health)) => (Some(shared), Some(health)),
+        None => (None, None),
+    };
+    let admin_aircraft = app::aircraft_source(cfg, plane_health);
     runtime::run(&loaded, term, |out| {
         Box::new(
             app::kiosk(
@@ -218,6 +224,10 @@ fn run(cli: Cli) -> Result<(), String> {
                 room,
                 planes,
             )
+            .with_admin(|a| {
+                a.disaster = admin_disaster;
+                a.aircraft = admin_aircraft;
+            })
             .with_alerts(Some(alerts)),
         )
     })

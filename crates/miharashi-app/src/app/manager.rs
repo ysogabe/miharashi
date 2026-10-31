@@ -102,6 +102,8 @@ pub struct ScreenManager {
     top_valid: bool,
     /// 前回 `Composite::Gl` で返した画面(`report_scene_failure` の対象)
     scene_screen: Option<usize>,
+    /// 管理ページが取得の状態を読むための参照(読むだけ)
+    admin: crate::panel::AdminSources,
     pub ticks: u64,
     pub keys: u64,
 }
@@ -152,6 +154,7 @@ impl ScreenManager {
             top: None,
             top_valid: false,
             scene_screen: None,
+            admin: Default::default(),
             ticks: 0,
             keys: 0,
         };
@@ -477,6 +480,12 @@ impl ScreenManager {
             self.clean = Some(c);
         }
         glitch::refresh_frame(canvas, self.clean.as_ref().expect("上で描いた"), t, seed);
+    }
+
+    /// 管理ページに渡す取得元の参照を、`f` で書き換える(画面が持たない取得 = 警報・航空機は `main` が足す)。
+    pub fn with_admin(mut self, f: impl FnOnce(&mut crate::panel::AdminSources)) -> Self {
+        f(&mut self.admin);
+        self
     }
 
     /// アラートの受け口をつなぐ。
@@ -997,6 +1006,10 @@ impl App for ScreenManager {
             out.push(("gl_objs", live.iter().sum::<i64>().to_string()));
         }
         out
+    }
+
+    fn admin_sources(&self) -> crate::panel::AdminSources {
+        self.admin.clone()
     }
 
     fn panel_view(&self) -> Option<PanelView> {

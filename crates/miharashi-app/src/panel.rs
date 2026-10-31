@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 mod admin;
+mod feeds;
 
 /// `/api/v1/status` の形を変えたら上げる。パネルはこれを見て古い形を読み分ける。
 const SCHEMA_VERSION: u32 = 1;
@@ -186,10 +187,35 @@ pub enum TokenState {
     LoosePermissions,
 }
 
-/// 取得スレッドの状態を読むための参照の束。None = その取得が動いていない(理由は文字列)。
-#[derive(Default)]
+/// 取得スレッドの状態への参照。`Err` = その取得が動いていない(理由。`feeds[].error` に出る)。
+pub type Source<T> = Result<T, String>;
+
+/// 取得スレッドの状態を読むための参照の束(読むだけ)。`KioskApp` 相当(`ScreenManager`)が組み立てる。
+#[derive(Clone)]
 pub struct AdminSources {
-    // T4 で各取得元の Option<Arc<...>> と理由を足す
+    pub geoframe: Source<crate::photos::LinkShared>,
+    pub home_assistant: Source<crate::env::Shared>,
+    pub weather: Source<crate::weather::Shared>,
+    /// 警報。room 画面とは無関係(`[alerts] disaster` と HA の url で決まる)
+    pub disaster: Source<crate::disaster::HomeShared>,
+    pub aircraft: Source<crate::aircraft::HealthShared>,
+    pub agents: Source<crate::agents::Shared>,
+}
+
+impl Default for AdminSources {
+    fn default() -> Self {
+        fn none<T>() -> Source<T> {
+            Err("取得元が登録されていない".to_string())
+        }
+        Self {
+            geoframe: none(),
+            home_assistant: none(),
+            weather: none(),
+            disaster: none(),
+            aircraft: none(),
+            agents: none(),
+        }
+    }
 }
 
 /// モニターの手動オーバーライド(auto / force_on / force_off)を切り替える先。実体は `ScreenPower`。

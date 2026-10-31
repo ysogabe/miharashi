@@ -5,8 +5,8 @@
 //! 今ある経路: `GET /api/v1/admin/overview`、`POST /api/v1/admin/restart`、`PUT /api/v1/admin/config`。
 //! `/admin*` の静的配信(T5)は、表には入れて今は 404。
 use super::{
-    AdminSources, HttpError, PanelInput, RateLimit, Reaper, Route, Shared, body_prefetched, error,
-    json_response, same_secret,
+    AdminSources, HttpError, PanelInput, RateLimit, Reaper, Route, Shared, TokenState,
+    body_prefetched, error, json_response, same_secret,
 };
 use crate::config::{
     self, Config, LoadedConfig, Overlay, OverlayErrorKind, overlay_generation, remove_boot_marker,
@@ -39,8 +39,6 @@ const BODY_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_STALLED_READERS: usize = 4;
 /// 起動からこの時間は再起動を受け付けない(systemd の起動制限に掛からないように)。
 const RESTART_AFTER: Duration = Duration::from_secs(120);
-/// `error` / `overlay.error` の長さの上限(文字数)。
-const MAX_ERROR_CHARS: usize = 200;
 
 /// パネルのスレッドが持つ、管理ワーカーへの入口。
 pub(super) struct Admin {
@@ -81,7 +79,6 @@ impl Admin {
 struct Ctx {
     loaded: LoadedConfig,
     started: Instant,
-    #[allow(dead_code)] // T4(feeds)で使う
     sources: AdminSources,
     /// `restart` と、T3 の `PUT config` で共有する(1 秒に 5 回)
     limiter: Mutex<RateLimit>,
@@ -350,13 +347,9 @@ fn read_limited(reader: &mut dyn Read, gave_up: impl Fn() -> bool) -> Result<Vec
     }
 }
 
+/// `error` / `overlay.error` に出す文字列: URL のクエリを落とし、200 文字で切る。
 fn clip(s: &str) -> String {
-    if s.chars().count() <= MAX_ERROR_CHARS {
-        return s.to_string();
-    }
-    let mut t: String = s.chars().take(MAX_ERROR_CHARS).collect();
-    t.push('…');
-    t
+    super::feeds::clip_error(s)
 }
 
 fn rfc3339(t: chrono::DateTime<chrono::Local>) -> String {
@@ -422,6 +415,31 @@ fn boot_failed_same_generation(report: &config::OverlayReport, current: &str) ->
 fn retry_after_s(started: Instant) -> u64 {
     let left = RESTART_AFTER.saturating_sub(started.elapsed());
     left.as_secs() + u64::from(left.subsec_nanos() > 0)
+}
+
+/// overview の `tokens`。(id, 設定のパス)の 4 つを `check_token_file` で調べる。値は読まない。
+fn token_reports(cfg: &Config) -> Vec<Value> {
+    let (uid, gid) = (
+        crate::agents::effective_uid(),
+        crate::agents::effective_gid(),
+    );
+    [
+        ("home_assistant", &cfg.home_assistant.token_file),
+        ("agents", &cfg.agents.token_file),
+        ("panel", &cfg.panel.token_file),
+        ("admin", &cfg.admin.token_file),
+    ]
+    .into_iter()
+    .map(|(id, path)| {
+        // HA の url が空なら使わない(トークンは読まれない)ので、missing として出す
+        let state = if id == "home_assistant" && cfg.home_assistant.url.is_empty() {
+            TokenState::Missing
+        } else {
+            super::feeds::check_token_file(path, uid, gid)
+        };
+        json!({"id": id, "path": path, "state": state})
+    })
+    .collect()
 }
 
 /// `GET /api/v1/admin/overview` の本文。
@@ -516,8 +534,8 @@ fn overview(ctx: &Ctx) -> Value {
         },
         "allowed_hosts": allowed_hosts,
         "items": items,
-        "feeds": [],
-        "tokens": [],
+        "feeds": ctx.sources.feeds(),
+        "tokens": token_reports(&ctx.loaded.effective),
         "restart": {
             "allowed": retry == 0 && !requested && !boot_failed,
             "retry_after_s": retry,
@@ -606,6 +624,11 @@ fn overlay_shape_ok(body: &Value) -> bool {
         .is_some_and(|o| o.values().all(Value::is_object))
 }
 
+/// 世代の形: `none`、または `overlay_generation` が返す 16 桁の小文字の 16 進。
+fn generation_form_ok(g: &str) -> bool {
+    g == "none" || (g.len() == 16 && g.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
 /// `PUT /api/v1/admin/config`。
 fn put_config(req: Request, ctx: &Ctx, who: &str, body: &[u8]) {
     let (code, resp) = put_config_decision(ctx, body);
@@ -638,6 +661,12 @@ fn put_config_decision(ctx: &Ctx, body: &[u8]) -> (u16, Value) {
         Ok(p) => p,
         Err(e) => return fail(400, format!("本文を読めない: {e}")),
     };
+    if !generation_form_ok(&put.generation) {
+        return fail(
+            400,
+            "generation は overview で受け取った値(16 桁の 16 進、または none)",
+        );
+    }
     if let Some((key, _)) = put
         .overlay
         .entries()
@@ -662,7 +691,11 @@ fn put_config_decision(ctx: &Ctx, body: &[u8]) -> (u16, Value) {
     // 2. 今の設定ファイルを読み直す
     let (base, base_agents_url) = match Config::reload_base(ctx.loaded.base_path.as_deref()) {
         Ok(b) => b,
-        Err(e) => return fail(409, format!("設定ファイルが読めない: {e}")),
+        Err(e) => {
+            // TOML のエラーは設定ファイルの本文の抜粋を含む。応答には出さず、journal に残す
+            eprintln!("admin: 設定ファイルを読めない: {e}");
+            return fail(409, "設定ファイルが読めない(詳細は journal)");
+        }
     };
     // 3. 上書きに固有の規則
     if let Err(e) = put.overlay.check(&base, base_agents_url.as_deref()) {
@@ -784,11 +817,15 @@ mod tests {
 
     /// 起動から `age_s` 秒たった状態で、管理ページつきのパネルを立てる。
     fn start(loaded: LoadedConfig, age_s: u64) -> (Panel, String) {
+        start_with(loaded, age_s, AdminSources::default())
+    }
+
+    fn start_with(loaded: LoadedConfig, age_s: u64, sources: AdminSources) -> (Panel, String) {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let ctx = AdminContext {
             loaded,
             started: Instant::now() - Duration::from_secs(age_s),
-            sources: AdminSources::default(),
+            sources,
         };
         let p = Panel::spawn(server, PANEL_TOKEN.into(), 20, None, Some(ctx));
         p.publish(Some(view()), DisplayStatus::default());
@@ -1045,8 +1082,32 @@ mod tests {
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(v["screen"], json!({"id": "photo", "title": "PHOTO FRAME"}));
         assert_eq!(v["allowed_hosts"], json!(["t3.example.test"]));
-        assert_eq!(v["feeds"], json!([]));
-        assert_eq!(v["tokens"], json!([]));
+        // 取得元が何も登録されていなければ、どれも not_running
+        let ids: Vec<&str> = v["feeds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "geoframe",
+                "home_assistant",
+                "weather",
+                "disaster",
+                "aircraft",
+                "agents"
+            ]
+        );
+        assert!(
+            v["feeds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|f| f["state"] == "not_running" && f["last_ok"].is_null())
+        );
+        assert_eq!(v["tokens"].as_array().unwrap().len(), 4);
         assert_eq!(v["config_file"]["path"], base_path.display().to_string());
         assert!(v["config_file"]["modified_at"].is_string());
         assert!(v["uptime_s"].as_u64().unwrap() >= 200);
@@ -1164,6 +1225,94 @@ mod tests {
         let long = clip(&"あ".repeat(500));
         assert_eq!(long.chars().count(), 201);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn overview_shows_feeds_and_token_states() {
+        let fx = Fx::new("feeds-tokens");
+        fx.token("panel.token", "panel-token-0123456789", 0o600);
+        fx.token("ha-token", "ha-token-0123456789", 0o644);
+        fx.token("t3.token", "t3-token-0123456789", 0o600);
+        let d = fx.dir.display();
+        let base_path = fx.base(
+            "",
+            &format!("token_file = \"{d}/ha-token\"\n[agents]\ntoken_file = \"{d}/t3.token\"\n"),
+        );
+        let loaded = Config::load_with_overlay(&base_path, false).unwrap();
+        // 取得元: GEOFRAME は ok、航空機は動いていない、T3 は認証が要る、HA は失敗
+        let link = crate::photos::LinkShared::default();
+        *link.lock().unwrap() = crate::photos::Link {
+            last_ok: Some(chrono::Local::now()),
+            status: Some(crate::photos::FeedStatus::Online),
+        };
+        let env = crate::env::Shared::default();
+        env.lock().unwrap().status.fail("接続できない".into());
+        let agents = crate::agents::Shared::default();
+        agents.write().unwrap().connection = crate::agents::AgentConnection::AuthenticationRequired;
+        let sources = AdminSources {
+            geoframe: Ok(link),
+            home_assistant: Ok(env),
+            aircraft: Err("aircraft.enabled = false".into()),
+            agents: Ok(agents),
+            ..AdminSources::default()
+        };
+        let (_p, base) = start_with(loaded, 200, sources);
+        let v = overview(&base);
+        let feeds = v["feeds"].as_array().unwrap();
+        let by = |id: &str| feeds.iter().find(|f| f["id"] == id).unwrap();
+        assert_eq!(by("geoframe")["state"], "ok");
+        assert_eq!(by("geoframe")["label"], "GEOFRAME(写真)");
+        assert!(by("geoframe")["last_ok"].as_str().unwrap().contains('T'));
+        assert_eq!(by("home_assistant")["state"], "failing");
+        assert_eq!(by("home_assistant")["error"], "接続できない");
+        assert_eq!(by("aircraft")["state"], "not_running");
+        assert_eq!(by("aircraft")["error"], "aircraft.enabled = false");
+        assert_eq!(by("agents")["state"], "auth_required");
+        assert_eq!(by("weather")["state"], "not_running");
+        // トークン: HA は緩い、T3 は ok、パネルは ok、管理は ok
+        let tokens = v["tokens"].as_array().unwrap();
+        let tk = |id: &str| tokens.iter().find(|t| t["id"] == id).unwrap();
+        assert_eq!(tk("home_assistant")["state"], "loose_permissions");
+        assert_eq!(tk("home_assistant")["path"], format!("{d}/ha-token"));
+        assert_eq!(tk("agents")["state"], "ok");
+        assert_eq!(tk("panel")["state"], "ok");
+        assert_eq!(tk("admin")["state"], "ok");
+        // 値は返らない
+        assert!(!v.to_string().contains("0123456789"));
+        // T3 のトークンが無くなったら missing
+        std::fs::remove_file(fx.path("t3.token")).unwrap();
+        let v = overview(&base);
+        let t = v["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == "agents")
+            .unwrap()
+            .clone();
+        assert_eq!(t["state"], "missing");
+    }
+
+    #[test]
+    fn put_rejects_a_malformed_generation() {
+        let fx = Fx::new("put-generation-form");
+        let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
+        let (_p, base) = start(loaded, 200);
+        for g in [
+            "",
+            "NONE",
+            "9F2C1A7E3B5D8C40",
+            "9f2c1a7e3b5d8c4",
+            "9f2c1a7e3b5d8c400",
+            "zzzzzzzzzzzzzzzz",
+            "9f2c1a7e3b5d8c4é",
+        ] {
+            let (code, v) = put_overlay(&base, g, "{}");
+            assert_eq!(code, 400, "{g}: {v}");
+            assert!(v["error"].as_str().unwrap().contains("generation"), "{g}");
+        }
+        // 形が正しければ(違う世代でも)形の検査は通り、世代の比較で 409
+        assert_eq!(put_overlay(&base, "0123456789abcdef", "{}").0, 409);
+        assert_eq!(put_overlay(&base, "none", "{}").0, 204);
     }
 
     #[test]
@@ -1950,11 +2099,8 @@ mod tests {
         let (code, v) = put_overlay(&base, &g, overlay);
         assert_eq!(code, 409, "{v}");
         assert!(
-            v["error"]
-                .as_str()
-                .unwrap()
-                .starts_with("設定ファイルが読めない: "),
-            "{v}"
+            v["error"] == "設定ファイルが読めない(詳細は journal)",
+            "TOML のエラー(本文の抜粋を含む)は出さない: {v}"
         );
         assert_eq!(overlay_bytes(&fx).unwrap(), before.as_bytes());
         // 検証に通らない
@@ -1966,11 +2112,8 @@ mod tests {
         let (code, v) = put_overlay(&base, &g, overlay);
         assert_eq!(code, 409, "{v}");
         assert!(
-            v["error"]
-                .as_str()
-                .unwrap()
-                .starts_with("設定ファイルが読めない: "),
-            "{v}"
+            v["error"] == "設定ファイルが読めない(詳細は journal)",
+            "検証のエラーも詳細は出さない: {v}"
         );
         // 無くなった
         std::fs::remove_file(&base_path).unwrap();
