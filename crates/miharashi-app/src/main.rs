@@ -101,12 +101,19 @@ fn parse_cli(argv: Vec<String>) -> Result<Cli, String> {
     Ok(c)
 }
 
-fn load_config(cli: &Cli) -> Result<Config, String> {
-    let (mut cfg, path) = Config::discover(cli.config.as_deref())?;
-    match &path {
+/// 設定ファイルに管理ページの上書きを重ねて読む。`consume_marker` は `run` だけが true(起動の印を消す)。
+/// CLI の `--seconds` / `--screen` / `--renderer` は effective だけに掛ける。
+fn load_config(cli: &Cli, consume_marker: bool) -> Result<config::LoadedConfig, String> {
+    let mut loaded = Config::discover_with_overlay(cli.config.as_deref(), consume_marker)?;
+    match &loaded.base_path {
         Some(p) => eprintln!("config: {}", p.display()),
         None => eprintln!("config: 既定値(設定ファイルなし)"),
     }
+    if consume_marker {
+        // 表示・app・DRM・GL の初期化より前に印を書く(上書きで有効にした画面の初期化で落ちても次の起動で外せる)
+        loaded.arm_boot_marker();
+    }
+    let cfg = &mut loaded.effective;
     if let Some(s) = cli.seconds {
         cfg.runtime.max_seconds = s;
     }
@@ -119,7 +126,34 @@ fn load_config(cli: &Cli) -> Result<Config, String> {
         }
         cfg.display.renderer = r.clone();
     }
-    Ok(cfg)
+    Ok(loaded)
+}
+
+/// `check-config` の出力。(stdout, stderr)。上書きが効いていれば件数と値を、無視したときは理由を stderr に出す。
+fn check_config_output(report: &config::OverlayReport) -> (String, Option<String>) {
+    let mut out = String::from("OK");
+    if let Some(t) = report.applied_text() {
+        out.push('\n');
+        out.push_str(&t);
+    }
+    (out, report.ignored_text())
+}
+
+/// `config-get` の失敗。終了コードは UnknownKey = 1、Unreadable = 2。
+#[derive(Debug, PartialEq)]
+enum ConfigGetError {
+    UnknownKey(String),
+    Unreadable(String),
+}
+
+/// `config-get <key>` の本体。設定ファイル + 上書き(起動時と同じ規則。印は消さない)の effective の値。
+fn config_get(config: Option<&std::path::Path>, key: &str) -> Result<String, ConfigGetError> {
+    let loaded =
+        Config::discover_with_overlay(config, false).map_err(ConfigGetError::Unreadable)?;
+    loaded
+        .effective
+        .value(key)
+        .ok_or_else(|| ConfigGetError::UnknownKey(format!("知らないキー: {key}")))
 }
 
 fn source(cfg: &Config, cli: &Cli) -> Source {
@@ -148,18 +182,30 @@ fn data_source(
 
 #[cfg(target_os = "linux")]
 fn run(cli: Cli) -> Result<(), String> {
-    let cfg = load_config(&cli)?;
-    let src = source(&cfg, &cli);
-    let (data, snap) = data_source(&cfg, cli.dummy)?;
+    // 起動の印を書く前に登録する(登録前に SIGTERM が来ると既定の動作で死んで印が残る)
+    let term = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        signal_hook::flag::register(sig, term.clone()).map_err(|e| format!("signal: {e}"))?;
+    }
+    let loaded = load_config(&cli, true)?;
+    if let Some(t) = loaded.report.applied_text() {
+        eprintln!("{t}");
+    }
+    if let Some(t) = loaded.report.ignored_text() {
+        eprintln!("{t}");
+    }
+    let cfg = &loaded.effective;
+    let src = source(cfg, &cli);
+    let (data, snap) = data_source(cfg, cli.dummy)?;
     let (alert_tx, alerts) = std::sync::mpsc::channel();
     quake::start(&cfg.alerts, &cfg.home_assistant, alert_tx.clone());
     let warnings = disaster::start(&cfg.alerts, &cfg.home_assistant, alert_tx);
-    let room = room_feeds(&cfg, warnings);
+    let room = room_feeds(cfg, warnings);
     let planes = aircraft::start(&cfg.aircraft);
-    runtime::run(&cfg, |out| {
+    runtime::run(&loaded, term, |out| {
         Box::new(
             app::kiosk(
-                &cfg,
+                cfg,
                 out.size,
                 out.gpu_max_texture,
                 src,
@@ -216,7 +262,7 @@ fn png(cli: Cli) -> Result<(), String> {
 
 /// `png` の本体。GPU の検出と初期化(`open`)を差し替えられる(GPU のない環境の試験用)。
 fn png_with(cli: Cli, open: &OpenGles) -> Result<(), String> {
-    let cfg = load_config(&cli)?;
+    let cfg = load_config(&cli, false)?.effective;
     let size = cli.size.unwrap_or((1920, 1080));
     let out = cli.out.clone().unwrap_or_else(|| "work/out".into());
     let mut snap = data::dummy_snapshot(0.0);
@@ -826,7 +872,7 @@ fn open_gles_checker(_: &Config) -> Result<GlesCheck, String> {
 /// CPU 描画のベースライン。`--size` を省くと 1920x1080 と 2560x1080 の両方を測る。
 /// `--photo` を省くと 4032x3024 の合成画像を使う(ネットワークに依存しない)。
 fn bench(cli: Cli) -> Result<(), String> {
-    let cfg = load_config(&cli)?;
+    let cfg = load_config(&cli, false)?.effective;
     let sizes = match cli.size {
         Some(s) => vec![s],
         None => vec![(1920, 1080), (2560, 1080)],
@@ -845,7 +891,7 @@ fn bench(cli: Cli) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn bench_metrics(cli: Cli) -> Result<(), String> {
     use miharashi_linux::metrics::{GpuSel, SamplerOptions, profile};
-    let cfg = load_config(&cli)?;
+    let cfg = load_config(&cli, false)?.effective;
     let gpu = GpuSel::parse(&cfg.metrics.gpu)?;
     let opts = SamplerOptions {
         state_file: None,
@@ -901,7 +947,7 @@ fn bench_metrics(_: Cli) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn bench_gpu(cli: Cli) -> Result<(), String> {
     use miharashi_linux::drm_select::{CardSel, choose_card, scan};
-    let cfg = load_config(&cli)?;
+    let cfg = load_config(&cli, false)?.effective;
     let cards = scan();
     let card = choose_card(&cards, &CardSel::parse(&cfg.display.card))?;
     let pci = card
@@ -952,7 +998,7 @@ fn bench_gpu(_: Cli) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn bench_scene(cli: Cli) -> Result<(), String> {
     use miharashi_linux::drm_select::{CardSel, choose_card, scan};
-    let cfg = load_config(&cli)?;
+    let cfg = load_config(&cli, false)?.effective;
     let cards = scan();
     let card = choose_card(&cards, &CardSel::parse(&cfg.display.card))?;
     let pci = card
@@ -976,7 +1022,7 @@ fn bench_scene(_: Cli) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn kms_info(cli: Cli) -> Result<(), String> {
     use miharashi_linux::drm_select::{CardSel, choose_card, choose_connector, scan};
-    let cfg = load_config(&cli)?;
+    let cfg = load_config(&cli, false)?.effective;
     let cards = scan();
     for c in &cards {
         println!(
@@ -1026,6 +1072,9 @@ fn main() -> Result<(), String> {
     } else {
         "run".into()
     };
+    // config-get は最初の引数がキー(位置引数)
+    let key = (cmd == "config-get" && rest.first().is_some_and(|k| !k.starts_with("--")))
+        .then(|| rest.remove(0));
     let cli = parse_cli(rest)?;
     match cmd.as_str() {
         "run" => run(cli),
@@ -1039,9 +1088,35 @@ fn main() -> Result<(), String> {
         "bench-scene" => bench_scene(cli),
         "bench-metrics" => bench_metrics(cli),
         "kms-info" => kms_info(cli),
-        "check-config" => load_config(&cli).map(|_| println!("OK")),
+        "check-config" => load_config(&cli, false).map(|loaded| {
+            let (out, err) = check_config_output(&loaded.report);
+            println!("{out}");
+            if let Some(e) = err {
+                eprintln!("{e}");
+            }
+        }),
+        "config-get" => {
+            let Some(key) = key else {
+                eprintln!("使い方: miharashi config-get <key> [--config FILE]");
+                std::process::exit(2);
+            };
+            match config_get(cli.config.as_deref(), &key) {
+                Ok(v) => {
+                    println!("{v}");
+                    Ok(())
+                }
+                Err(ConfigGetError::UnknownKey(e)) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                Err(ConfigGetError::Unreadable(e)) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
+        }
         other => Err(format!(
-            "unknown command {other}(run / png / agents-demo / demo-video / intro-video / agents-intro-video / bench / bench-gpu / bench-scene / bench-metrics / kms-info / check-config)"
+            "unknown command {other}(run / png / agents-demo / demo-video / intro-video / agents-intro-video / bench / bench-gpu / bench-scene / bench-metrics / kms-info / check-config / config-get)"
         )),
     }
 }
@@ -1137,6 +1212,172 @@ mod tests {
             );
             assert!(x == y, "{n}: 時刻が変わると絵が変わる");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    fn report(applied: Vec<(&'static str, String)>, error: Option<&str>) -> config::OverlayReport {
+        config::OverlayReport {
+            path: "/var/lib/miharashi/admin.toml".into(),
+            exists: true,
+            generation: "0123456789abcdef".into(),
+            applied,
+            error: error.map(str::to_string),
+            error_kind: None,
+            boot_failed_generation: None,
+        }
+    }
+
+    /// AC14: check-config の出力は、効いている・無い・無視した、の 3 通り。
+    #[test]
+    fn check_config_output_for_applied_none_and_ignored() {
+        let applied = report(
+            vec![
+                ("aircraft.enabled", "false".into()),
+                ("agents.url", "http://192.0.2.30:3773".into()),
+            ],
+            None,
+        );
+        assert_eq!(
+            check_config_output(&applied),
+            (
+                "OK\n上書き: /var/lib/miharashi/admin.toml(2 項目)\n  aircraft.enabled = false\n  agents.url = http://192.0.2.30:3773".to_string(),
+                None
+            )
+        );
+        assert_eq!(
+            check_config_output(&report(vec![], None)),
+            ("OK".to_string(), None)
+        );
+        assert_eq!(
+            check_config_output(&report(vec![], Some("知らないキーがある"))),
+            (
+                "OK".to_string(),
+                Some(
+                    "上書き: /var/lib/miharashi/admin.toml を無視した: 知らないキーがある"
+                        .to_string()
+                )
+            )
+        );
+    }
+
+    /// 一時ディレクトリに base と overlay を置き、base のパスを返す。
+    fn config_dir(name: &str, base_extra: &str, overlay: Option<&str>) -> (PathBuf, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("miharashi-cfgget-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("config.toml");
+        std::fs::write(
+            &base,
+            format!(
+                "[admin]\noverlay_file = \"{}\"\n{base_extra}",
+                dir.join("admin.toml").display()
+            ),
+        )
+        .unwrap();
+        if let Some(o) = overlay {
+            std::fs::write(dir.join("admin.toml"), o).unwrap();
+        }
+        (dir, base)
+    }
+
+    /// AC17: config-get は起動時と同じ規則の値を出す。印には触らない。
+    #[test]
+    fn config_get_follows_the_startup_rules() {
+        let file_url = "http://192.0.2.30:3773";
+        let base_text = format!("[agents]\nurl = \"{file_url}\"\n");
+        // 上書きなし → 設定ファイルの値
+        let (dir, base) = config_dir("none", &base_text, None);
+        assert_eq!(
+            config_get(Some(&base), "agents.url"),
+            Ok(file_url.to_string())
+        );
+        assert_eq!(
+            config_get(Some(&base), "aircraft.enabled"),
+            Ok("true".to_string())
+        );
+        // 上書きあり → 上書きの値(同じ origin、許可ホスト)
+        std::fs::write(
+            dir.join("admin.toml"),
+            "[agents]\nurl = \"http://192.0.2.30:3773/\"\n[aircraft]\nenabled = false\n[geoframe]\nurl = \"http://192.0.2.20:8080\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config_get(Some(&base), "aircraft.enabled"),
+            Ok("false".to_string())
+        );
+        assert_eq!(
+            config_get(Some(&base), "geoframe.url"),
+            Ok("http://192.0.2.20:8080".to_string())
+        );
+        assert_eq!(
+            config_get(Some(&base), "agents.url"),
+            Ok("http://192.0.2.30:3773/".to_string())
+        );
+        // 許されないホスト → 上書き全体を無視して base の値
+        std::fs::write(
+            dir.join("admin.toml"),
+            "[agents]\nurl = \"http://192.0.2.31:3773\"\n[aircraft]\nenabled = false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config_get(Some(&base), "agents.url"),
+            Ok(file_url.to_string())
+        );
+        assert_eq!(
+            config_get(Some(&base), "aircraft.enabled"),
+            Ok("true".to_string())
+        );
+        // 壊れた上書き・知らないキーのある上書き → base の値
+        for broken in [
+            "[agents\nurl = ",
+            "[agents]\ntoken_file = \"/x\"\n[aircraft]\nenabled = false\n",
+        ] {
+            std::fs::write(dir.join("admin.toml"), broken).unwrap();
+            assert_eq!(
+                config_get(Some(&base), "aircraft.enabled"),
+                Ok("true".to_string()),
+                "{broken}"
+            );
+            assert_eq!(
+                config_get(Some(&base), "agents.url"),
+                Ok(file_url.to_string())
+            );
+        }
+        // 前回の起動が早く終わった印 → 上書きを無視し、印は消さない
+        std::fs::write(dir.join("admin.toml"), "[aircraft]\nenabled = false\n").unwrap();
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+        let marker = dir.join("admin.boot");
+        std::fs::write(
+            &marker,
+            format!("{{\"pid\":2000000000,\"boot_id\":\"{}\",\"generation\":\"x\",\"started_at\":\"\"}}\n", boot.trim()),
+        )
+        .unwrap();
+        if !boot.trim().is_empty() {
+            assert_eq!(
+                config_get(Some(&base), "aircraft.enabled"),
+                Ok("true".to_string())
+            );
+        }
+        assert!(marker.exists(), "config-get は印を消さない");
+        // 知らないキー → UnknownKey(終了コード 1)、設定が読めない → Unreadable(終了コード 2)
+        assert!(matches!(
+            config_get(Some(&base), "panel.token_file"),
+            Err(ConfigGetError::UnknownKey(_))
+        ));
+        assert!(matches!(
+            config_get(Some(&base), "nope"),
+            Err(ConfigGetError::UnknownKey(_))
+        ));
+        let bad = dir.join("bad.toml");
+        std::fs::write(&bad, "nope = 1\n").unwrap();
+        assert!(matches!(
+            config_get(Some(&bad), "agents.url"),
+            Err(ConfigGetError::Unreadable(_))
+        ));
+        assert!(matches!(
+            config_get(Some(&dir.join("missing.toml")), "agents.url"),
+            Err(ConfigGetError::Unreadable(_))
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

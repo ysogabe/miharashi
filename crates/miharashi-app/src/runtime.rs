@@ -1,7 +1,7 @@
 //! キオスクの実行ループ。画面ロジックとは `screen::App` だけでつながり、具体的な型は知らない。
 //! seat/VT の有効・無効、SIGINT/SIGTERM、入力、描画、画面の電源(DPMS)、状態ログを扱う。
 //! 状態ログは共通部分(t / rss / fds / frames / worst_frame)に `App::stats()` の `k=v` を続けて出す。
-use crate::config::Config;
+use crate::config::LoadedConfig;
 use crate::panel::{DisplayControl, DisplayStatus, Panel, PanelInput};
 use crate::screen::{App, Composite, GlComposite, GlScene, KeyPress, PhotoData, PhotoRef, Top};
 use crate::screen_power::{Mode as PowerMode, ScreenPower};
@@ -466,12 +466,13 @@ pub struct Output {
 }
 
 /// 実行ループ。`make_app` には確定した表示サイズが渡される。
-pub fn run(cfg: &Config, make_app: impl FnOnce(&Output) -> Box<dyn App>) -> Result<(), String> {
-    let term = Arc::new(AtomicBool::new(false));
-    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
-        signal_hook::flag::register(sig, term.clone()).map_err(|e| format!("signal: {e}"))?;
-    }
-
+/// `term` は SIGINT / SIGTERM で立つフラグ。起動の印を書く前に `main` が登録しておく。
+pub fn run(
+    loaded: &LoadedConfig,
+    term: Arc<AtomicBool>,
+    make_app: impl FnOnce(&Output) -> Box<dyn App>,
+) -> Result<(), String> {
+    let cfg = &loaded.effective;
     let seat_mode = SeatMode::parse(&cfg.runtime.seat)?;
     let mut session = Session::open(seat_mode)?;
     eprintln!(

@@ -13,6 +13,23 @@
 # mode = "preferred"       # preferred / 1920x1080 / 1920x1080@60
 # renderer = "cpu"         # cpu / gles / auto(GLES を試し、使えなければ cpu に戻る)。描画は表示カードの GPU だけで行う
 
+[admin]
+# ブラウザから見る管理ページ(docs/admin-web/design.md)。[panel] が有効なときだけ動き、同じ listen で配信する。既定は無効。
+# 管理トークンを持つ人は、画面の有効/無効と GEOFRAME・tar1090・T3 の接続先(T3 は下の allowed_hosts の範囲)を変え、
+# キオスクを再起動できる。Home Assistant の接続先はここでは変えられない(表示だけ)。
+# トークンは panel.token とは別のファイルで、値も別にする(同じ値なら管理ページは無効)。0600 で実行ユーザー所有、
+# または 0640 で root:<実行ユーザー>。16 文字以上を 1 行。
+# 例: head -c 24 /dev/urandom | base64 | sudo install -o root -g hermes -m 640 /dev/stdin /etc/miharashi/admin.token
+# enabled = false
+# token_file = "/etc/miharashi/admin.token"
+# 管理ページから保存した値の置き場所。設定ファイルより優先する。あれば [admin] が無効でも読む。
+# 壊れていたり検証に通らなければ無視して、この設定ファイルだけで起動する(理由は journal と管理ページに出る)。
+# overlay_file = "/var/lib/miharashi/admin.toml"
+# 管理ページから T3 の接続先(agents.url)に使える接続先。この設定ファイルに書いた agents.url(scheme・ホスト・ポートが同じもの)
+# は常に使える。別のホストやポートを使うにはここに host か host:port を書く(port を書かなければ 80 / 443 だけ)。
+# https の設定を管理ページから http に変えることはできない。パスは自由。
+# allowed_hosts = []           # 例: ["192.0.2.30:3773", "t3.example.test"]
+
 [input]
 # devices = []             # デバイス名に含む文字列。空なら 4/6 か矢印キーを持つ全キーボード
 
