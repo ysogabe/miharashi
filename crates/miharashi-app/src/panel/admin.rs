@@ -3,7 +3,7 @@
 //! 遅いクライアントがいても操作パネルのキーは待たされない。
 //!
 //! 今ある経路: `GET /api/v1/admin/overview`、`POST /api/v1/admin/restart`、`PUT /api/v1/admin/config`。
-//! `/admin*` の静的配信(T5)は、表には入れて今は 404。
+//! 静的ファイル `/admin`、`/admin/app.js`、`/admin/app.css` も同じワーカーで返す(埋め込み。認証なし)。
 use super::{
     AdminSources, HttpError, PanelInput, RateLimit, Reaper, Route, Shared, body_prefetched, error,
     json_response, same_secret,
@@ -209,11 +209,41 @@ fn handle(job: Job, ctx: &Ctx) {
         }
         Route::AdminRestart => restart(req, ctx, &who),
         Route::AdminConfig => put_config(req, ctx, &who, &body),
-        // 静的配信(T5)は未実装
+        Route::AdminPage => {
+            let resp = static_file(req.url().split('?').next().unwrap_or(""));
+            let _ = req.respond(resp);
+        }
+        // 表に無い管理の経路
         _ => {
             let _ = req.respond(error(404, "ない"));
         }
     }
+}
+
+const INDEX_HTML: &str = include_str!("admin/index.html");
+const APP_JS: &str = include_str!("admin/app.js");
+const APP_CSS: &str = include_str!("admin/app.css");
+
+/// ページに付ける CSP。インラインの script・style は許さず、自分の origin だけを許す。
+const PAGE_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; \
+                        img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+
+/// 埋め込んだ静的ファイルの応答。`path` は表(`Route::of`)にある 3 つのどれか。
+fn static_file(path: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    let (body, content_type) = match path {
+        "/admin" => (INDEX_HTML, "text/html; charset=utf-8"),
+        "/admin/app.js" => (APP_JS, "text/javascript; charset=utf-8"),
+        "/admin/app.css" => (APP_CSS, "text/css; charset=utf-8"),
+        _ => return error(404, "ない"),
+    };
+    let h = |name: &str, value: &str| Header::from_bytes(name, value).unwrap();
+    Response::from_data(body.as_bytes().to_vec())
+        .with_header(h("Content-Type", content_type))
+        .with_header(h("Content-Security-Policy", PAGE_CSP))
+        .with_header(h("X-Frame-Options", "DENY"))
+        .with_header(h("Cache-Control", "no-store"))
+        .with_header(h("X-Content-Type-Options", "nosniff"))
+        .with_header(h("Referrer-Policy", "no-referrer"))
 }
 
 /// 本文を読んだ結果。
@@ -1855,16 +1885,144 @@ mod tests {
         assert!(lower(&r).contains("x-content-type-options: nosniff"), "{r}");
     }
 
+    /// 認証なしで GET して、応答の全文(ステータス行・ヘッダー・本文)を返す。
+    fn raw_get(p: &Panel, path: &str) -> String {
+        raw(
+            p.addr(),
+            &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+        )
+    }
+
     #[test]
-    fn static_pages_are_not_served_yet() {
+    fn static_pages_are_served_with_security_headers() {
         let fx = Fx::new("pages");
         let loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
-        let (_p, base) = start(loaded, 200);
-        // T5 まで: 管理が有効でも 404(認証は要らない)
-        for path in ["/admin", "/admin/app.js", "/admin/app.css"] {
-            assert_eq!(get(&base, path, None).0, 404, "{path}");
+        let (p, _base) = start(loaded, 200);
+        let pages = [
+            ("/admin", "text/html; charset=utf-8", INDEX_HTML),
+            ("/admin/app.js", "text/javascript; charset=utf-8", APP_JS),
+            ("/admin/app.css", "text/css; charset=utf-8", APP_CSS),
+        ];
+        for (path, content_type, body) in pages {
+            // 認証なしで返る。クエリがあっても同じ
+            for url in [path.to_string(), format!("{path}?x=1")] {
+                let r = raw_get(&p, &url);
+                assert!(r.starts_with("HTTP/1.1 200"), "{url}: {r}");
+                let l = r.to_ascii_lowercase();
+                assert!(
+                    l.contains(&format!("content-type: {content_type}")),
+                    "{url}: {r}"
+                );
+                assert!(
+                    l.contains(&format!(
+                        "content-security-policy: {}",
+                        PAGE_CSP.to_ascii_lowercase()
+                    )),
+                    "{url}: {r}"
+                );
+                assert!(l.contains("x-frame-options: deny"), "{url}: {r}");
+                assert!(l.contains("cache-control: no-store"), "{url}: {r}");
+                assert!(l.contains("x-content-type-options: nosniff"), "{url}: {r}");
+                assert!(l.contains("referrer-policy: no-referrer"), "{url}: {r}");
+                assert!(!l.contains("access-control-allow"), "{url}: {r}");
+                assert!(r.ends_with(body), "{url}: 本文が埋め込んだ内容と違う");
+            }
         }
-        assert_eq!(call("PUT", &base, "/api/v1/admin/config", None).0, 401);
+        // CSP は固定の文面(インラインを許す 'unsafe-inline' を含まない)
+        assert_eq!(
+            PAGE_CSP,
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; \
+             img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+        );
+        assert!(!PAGE_CSP.contains("unsafe"));
+        // GET 以外は 405。表に無い /admin/ 配下は管理トークンが要り(401)、あっても 404
+        for m in ["POST", "PUT", "DELETE", "OPTIONS"] {
+            for path in ["/admin", "/admin/app.js", "/admin/app.css"] {
+                let r = raw(
+                    p.addr(),
+                    &format!(
+                        "{m} {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ),
+                );
+                assert!(r.starts_with("HTTP/1.1 405"), "{m} {path}: {r}");
+            }
+        }
+        assert!(raw_get(&p, "/admin/other").starts_with("HTTP/1.1 401"));
+        assert!(raw_get(&p, "/admin/").starts_with("HTTP/1.1 401"));
+        assert_eq!(
+            call(
+                "PUT",
+                &format!("http://{}", p.addr()),
+                "/api/v1/admin/config",
+                None
+            )
+            .0,
+            401
+        );
+    }
+
+    #[test]
+    fn static_pages_are_404_when_admin_is_disabled() {
+        let fx = Fx::new("pages-off");
+        let mut loaded = Config::load_with_overlay(&fx.base("", ""), false).unwrap();
+        loaded.effective.admin.enabled = false;
+        let (p, _base) = start(loaded, 200);
+        for path in ["/admin", "/admin/app.js", "/admin/app.css"] {
+            assert!(raw_get(&p, path).starts_with("HTTP/1.1 404"), "{path}");
+        }
+    }
+
+    /// 埋め込んだページの安全な書き方の検査(docs/admin-web/design.md「ブラウザ」)。
+    #[test]
+    fn page_sources_avoid_unsafe_patterns() {
+        for bad in [
+            "innerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+            "outerHTML",
+            "eval(",
+            "new Function",
+            "localStorage",
+            "<a ",
+            "href",
+        ] {
+            assert!(!APP_JS.contains(bad), "app.js に {bad} がある");
+        }
+        // 外部への通信先・外部の資源を書かない
+        for bad in ["http://", "https://", "@import", "url("] {
+            assert!(!APP_CSS.contains(bad), "app.css に {bad} がある");
+        }
+        // index.html: script は src つきだけ、style 属性・イベント属性・インラインの style は無い
+        let html = INDEX_HTML.to_ascii_lowercase();
+        assert!(!html.contains("<style"));
+        assert!(!html.contains(" style="));
+        for tag in html.split("<script").skip(1) {
+            let open = &tag[..tag.find('>').unwrap()];
+            assert!(
+                open.contains("src=\"/admin/app.js\""),
+                "インラインの script: {open}"
+            );
+            let close = tag.find("</script>").unwrap();
+            assert!(tag[tag.find('>').unwrap() + 1..close].trim().is_empty());
+        }
+        let mut rest = html.as_str();
+        while let Some(i) = rest.find('<') {
+            rest = &rest[i + 1..];
+            let end = rest.find('>').unwrap();
+            let tag = &rest[..end];
+            for w in tag.split_whitespace().skip(1) {
+                assert!(!w.starts_with("on"), "イベント属性: <{tag}>");
+            }
+        }
+        assert!(html.contains("type=\"password\""));
+        assert!(html.contains("autocomplete=\"off\""));
+        assert!(html.contains("<link rel=\"stylesheet\" href=\"/admin/app.css\">"));
+        assert!(html.contains("<title>miharashi 管理</title>"));
+        // 実在の自宅の情報を書かない(例は 192.0.2.x と example.test だけ)
+        for text in [INDEX_HTML, APP_JS, APP_CSS] {
+            assert!(!text.contains("192.168."));
+            assert!(!text.contains("10.0."));
+        }
     }
 
     // ---- PUT /api/v1/admin/config(T3) ----

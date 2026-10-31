@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Miharashi 管理</title>
+<link rel="stylesheet" href="/admin/app.css">
+<script src="/admin/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <h1>Miharashi 管理</h1>
+  <button type="button" id="logout" hidden>ログアウト</button>
+</header>
+
+<div id="status" class="band info" role="status" hidden></div>
+
+<!-- 1. ログイン -->
+<section id="login-section">
+  <h2>ログイン</h2>
+  <form id="login-form">
+    <label for="token">管理トークン</label>
+    <input type="password" id="token" autocomplete="off" spellcheck="false">
+    <button type="submit" id="login-button" class="primary">ログイン</button>
+  </form>
+  <p class="note">トークンはこのタブの中だけに置きます(タブを閉じると消えます)。</p>
+</section>
+
+<main id="main" hidden>
+  <!-- 2. 稼働 -->
+  <section id="running-section">
+    <h2>稼働</h2>
+    <div id="overlay-error" class="band error" hidden></div>
+    <dl class="kv">
+      <dt>ホスト</dt><dd id="v-host"></dd>
+      <dt>バージョン</dt><dd id="v-version"></dd>
+      <dt>起動からの時間</dt><dd id="v-uptime"></dd>
+      <dt>今の画面</dt><dd id="v-screen"></dd>
+      <dt>設定ファイルの更新</dt><dd id="v-config-modified"></dd>
+    </dl>
+  </section>
+
+  <!-- 3. 接続先と画面 -->
+  <section id="config-section">
+    <h2>接続先と画面</h2>
+    <div id="stale" class="band warn" hidden>
+      <span>別の場所で上書きが変わった。読み直す</span>
+      <button type="button" id="reload">読み直す</button>
+    </div>
+    <form id="config-form">
+      <div id="items"></div>
+      <div class="actions">
+        <button type="submit" id="save" class="primary">保存</button>
+      </div>
+    </form>
+    <div id="save-result" class="band info" hidden></div>
+  </section>
+
+  <!-- 4. 再起動 -->
+  <section id="restart-section">
+    <h2>再起動</h2>
+    <p id="pending-note" class="note"></p>
+    <button type="button" id="restart">再起動して反映</button>
+    <p id="restart-reason" class="note"></p>
+    <div id="restart-result" class="band info" hidden></div>
+  </section>
+
+  <!-- 5. 取得元 -->
+  <section id="feeds-section">
+    <h2>取得元</h2>
+    <table>
+      <thead><tr><th>取得元</th><th>状態</th><th>最後に取得</th><th>エラー</th></tr></thead>
+      <tbody id="feeds"></tbody>
+    </table>
+  </section>
+
+  <!-- 6. トークン -->
+  <section id="tokens-section">
+    <h2>トークン</h2>
+    <table>
+      <thead><tr><th>用途</th><th>パス</th><th>状態</th></tr></thead>
+      <tbody id="tokens"></tbody>
+    </table>
+    <p class="note">値は表示しません。ファイルの有無と権限だけを見ています。</p>
+  </section>
+</main>
+</body>
+</html>
