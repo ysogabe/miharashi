@@ -13,6 +13,6 @@
 | T4 | 取得元とトークンの状態: `KioskApp::admin_sources`、`FeedReport` の変換(対応表)、GEOFRAME の last_ok、航空機の last_error、`check_token_file`、エラー文の切り詰め | AC15(単体), AC16 | T2 | full | 完了 | a285759 | 0963c5e, b43ec81 | Sol 必須 2(HA トークンの特例(オーケストレータの指示の誤り)、GEOFRAME の last_ok)→修正、再レビューで指摘なし。据え置き: overview の overlay.error に TOML エラー本文(持ち主だけが見る・設定に秘密なし) |
 | T5 | ページ: admin/ の index.html・app.js・app.css、静的配信とヘッダー(CSP ほか)、ログイン・稼働・項目(dirty/世代/readonly/使えるホスト)・保存・再起動(boot_failed で無効)・取得元・トークン、Page Visibility、textContent のみ | AC1(ヘッダー), AC22(app.js の文字列検査) | T3, T4 | full | 完了 | ba23b75 | c8d3947, 9eaf96a, 872fdb2 | Sol 3 回。r1 必須 2(保存中の編集が消える、効いている値の表示)、r2 必須 1(読み直しの応答が保存中のフォームを有効化)、r3 指摘なし。実機の確認は T7 |
 | T6 | スクリプトと文書: miharashi-t3-token の関数/main 分離と `config-get`、install.sh の admin.token、USAGE の「管理ページ」節、panel/DESIGN.md §5.2、docs/README.md の索引、example.toml 最終形 | AC17(スクリプト側), AC18 | T1 | full | 完了 | 0e3aa39 | 15d4b85, c0314a8 | Sol 必須 1(テストの後始末の検証漏れ)→修正、再レビューで指摘なし |
-| T7 | 実機の確認(自分で): 本番に入れて AC10・AC11・AC13・AC15・AC19・AC20・AC26 と全画面の回帰確認。本番反映は auto mode で拒否されたらユーザーに依頼 | AC1(実機), AC10, AC11, AC13, AC15, AC19, AC20, AC26 | T5, T6 | manual | 未着手 | | | |
+| T7 | 実機の確認(自分で): 本番に入れて AC10・AC11・AC13・AC15・AC19・AC20・AC26 と全画面の回帰確認。本番反映は auto mode で拒否されたらユーザーに依頼 | AC1(実機), AC10, AC11, AC13, AC15, AC19, AC20, AC26 | T5, T6 | manual | 実装中 | daccd690a2c9ca6aab32a898133197dd58d9987a | | |
 
 AC24(R19)・AC23(R18)・AC25(R20)は T8(あると良い)で、時間があれば T7 の前に足す。AC27(例示用アドレスだけ)は全体のレビューで確かめる。
