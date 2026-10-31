@@ -227,7 +227,7 @@ impl Config {
 - 印のファイル(`admin.boot`、`overlay_file` と同じディレクトリ):
   - **書く時機**: `run` サブコマンドで、上書きが効いた(`report.applied` が空でない)状態で `load_with_overlay` が返ったら、**`main` がすぐに書く**(表示の初期化、`app::kiosk`、DRM・GL の初期化より前)。上書きで有効にした画面(cube・vrm・agents)の初期化はこれらの中で失敗するので、実行ループに入ってから書くのでは遅い。SIGTERM・SIGINT のハンドラーの登録(今は `runtime.rs:470-473`)は、印を書く前に `main` へ移す(登録前に `systemctl stop` が来ると既定の動作で死んで印が残るため)。
   - **中身**: 1 行の JSON `{"pid": n, "boot_id": "<\/proc/sys/kernel/random/boot_id>", "generation": "<起動時の上書きの世代>", "started_at": "..."}`。
-  - **消す時機**: 実行ループが 60 秒動いたら消す。正常終了の経路(SIGTERM・SIGINT、キーの quit、`max_seconds`、管理ページの再起動)でも消す。描画エラーでの終了、`kill -9`、初期化の途中の失敗では残る。
+  - **消す時機**: 印を書いた時点から 60 秒たったら実行ループが消す(初期化に時間が掛かっても、起点は印を書いた時点)。正常終了の経路(SIGTERM・SIGINT、キーの quit、`max_seconds`、管理ページの再起動)でも消す。描画エラーでの終了、`kill -9`、初期化の途中の失敗では残る。
   - **判定**(`load_with_overlay`): 印があっても、(1) `boot_id` が今の起動と違う(電源断・再起動のあと)か、(2) `pid` のプロセスがまだ生きている(上書きで問題なく起動した直後の 60 秒間に `check-config`・`config-get`・`next` の計算が見た)なら、失敗とは見ない。それ以外は「上書きで起動した直後に終了した(原因が上書きとは限らない)」として上書きを無視し、`report.error_kind = boot_failed`、`report.boot_failed_generation = 印の generation` にする。
   - **書けないとき**: 印を書けなければ(ディレクトリに書けない・ディスクがいっぱい)、上書きを無視して設定ファイルだけで起動し、`report.error` に理由を入れる(印なしで上書きを使うと、落ちる上書きでまた systemd が止まる)。
   - **消す・書くのは `run` だけ**(`consume_marker = true`)。`check-config`・`config-get`・`png`・`bench`・`demo-video`・`kms-info` などは印を見るだけで、消しも書きもしない(`consume_marker = false`)。管理ページ由来の再起動は起動から 120 秒たたないと受け付けないので、誤って外すことはない。
@@ -349,7 +349,7 @@ JavaScript はフレームワークを使わず、`fetch` と DOM 操作だけ�
 ### 実行ループと App
 
 - `PanelInput::Restart` を足す。`runtime.rs:678-695` の受け取りで `restart = true` にし、`for` の後で `break "管理ページからの再起動"`。終了処理は既存(`:816-845`)のまま、終了コード 0。
-- `runtime::run` は `LoadedConfig` を受け取る(`cfg` は `effective`)。印は `main` が `load_with_overlay` の直後に書き(上の「印のファイル」)、実行ループが 60 秒後と正常終了の経路で消す。`Panel::spawn` に `LoadedConfig`(base・report・base_path)、`started: Instant`、`app.admin_sources()` を渡す。
+- `runtime::run` は `LoadedConfig` を受け取る(`cfg` は `effective`)。印は `main` が `load_with_overlay` の直後に書き(上の「印のファイル」)、実行ループが、印を書いた時点から 60 秒後と、正常終了の経路で消す。`Panel::spawn` に `LoadedConfig`(base・report・base_path)、`started: Instant`、`app.admin_sources()` を渡す。
 - `App` トレイト(`screen.rs`)に `fn admin_sources(&self) -> AdminSources { AdminSources::default() }` を足す。`KioskApp`(`app.rs`)が、各画面が持つ `env::Shared`、`weather::Shared`、`disaster::HomeShared`、写真の状態、`aircraft::Shared`、T3 のスナップショットの参照を `Option` で詰めて返す。参照は読むだけ。
 - `AdminSources` と `FeedReport` の型は `panel.rs` に置く(`app.rs` が依存する向きは今の `panel_view` と同じ)。
 
