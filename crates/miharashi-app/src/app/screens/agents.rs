@@ -1593,12 +1593,6 @@ impl Screen for AgentScreen {
     }
     fn stats(&self, out: &mut Vec<(&'static str, String)>) {
         out.push(("agents", self.entries.len().to_string()));
-        for server in &self.servers {
-            out.push((
-                "agents/server",
-                format!("{} {}", server.id, server.entries.len()),
-            ));
-        }
     }
 }
 
@@ -1805,6 +1799,18 @@ fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine,
                 100.0,
                 20.0,
                 [143, 163, 183, 255],
+            );
+        }
+        // 盤面に入りきらず、カードを出していないスレッド(1 台でも件数を隠さない)。
+        let hidden = h.hidden.get(&servers[0].id).copied().unwrap_or(0);
+        if hidden > 0 {
+            text.draw(
+                canvas,
+                &format!("未表示 {hidden}"),
+                760.0,
+                100.0,
+                23.0,
+                AMBER,
             );
         }
     } else {

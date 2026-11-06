@@ -698,3 +698,47 @@ fn four_servers_render_on_one_screen_at_several_sizes_without_panicking() {
         }
     }
 }
+
+/// 1 台だけの構成でも、盤面に入りきらないスレッドは件数を隠さず「未表示 N」として見出しに出す。
+/// (接続別の欄は 2 台以上のときだけなので、1 台用の見出しにも出す。)
+#[test]
+fn a_single_server_still_reports_its_hidden_threads() {
+    let now = Instant::now();
+    let entries: Vec<AgentEntry> = (0..60)
+        .map(|i| entry("p", &format!("t{i}"), AgentState::Running, None))
+        .collect();
+    let world = vec![server("primary", "primary", Poll::new(entries, now))];
+    let mut s = AgentScreen::new((1280, 720), false, 30);
+    s.sync_all(&world, now);
+    s.ensure_board();
+    let hidden = s.hidden_by_server();
+    let hidden_primary = hidden[&s.servers[0].id];
+    let shown = s.board.cards.len();
+    assert!(hidden_primary > 0, "小さい盤面では入りきらない");
+    assert_eq!(shown + hidden_primary, 60, "表示 + 未表示 = 候補");
+    // 見出しに「未表示」が描かれる(件数が 0 の同じ入力とは、その欄の画素が違う)。
+    let mut text = miharashi_render::TextEngine::new("Noto Sans CJK JP");
+    let draw = |hidden: &HashMap<ServerId, usize>, text: &mut miharashi_render::TextEngine| {
+        let mut canvas = Canvas::new(1280, 720);
+        draw_background(
+            &mut canvas,
+            text,
+            &HeaderInput {
+                servers: &s.servers,
+                hidden,
+                groups: &s.arrangement.groups,
+                board: &s.board,
+                scale: s.scale(),
+                overflow: 0,
+                now,
+                stale_secs: 30,
+                wall: SystemTime::UNIX_EPOCH,
+            },
+        );
+        canvas.pixmap.data().to_vec()
+    };
+    let with = draw(&hidden, &mut text);
+    let none: HashMap<ServerId, usize> = [(s.servers[0].id.clone(), 0)].into_iter().collect();
+    let without = draw(&none, &mut text);
+    assert_ne!(with, without, "未表示の件数が見出しに出る");
+}
