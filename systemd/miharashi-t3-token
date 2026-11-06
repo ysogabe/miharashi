@@ -22,6 +22,7 @@
 #   wait  (既定) 1〜5 を続けて行う。
 #   defer 1〜4 だけ行い、新しいセッション ID(秘密ではない)を表示して終わる。古いセッションは失効させない。
 #   only  失効だけ行う。T3_TOKEN_KEEP_ID に残すセッション ID(defer が表示したもの)を渡す。待たない。
+#         T3_TOKEN_LABEL は発行時と同じ値を必ず付ける(省略すると既定のラベルのセッションを失効させる)。
 #         URL・token_file は要らない。受け取った側で新しい token の取得成功を確かめてから実行する。
 # 関数の定義と本処理(main)は分けてある。直接実行されたときだけ main を呼ぶ(systemd/test-miharashi-t3-token.sh は source して関数を呼ぶ)。
 set -eu
@@ -188,7 +189,7 @@ main() {
 
     # 5. 同じラベルの古いセッションを失効させる(今回作ったもの以外)
     if [[ "$REVOKE_MODE" == defer ]]; then
-        log "新しいセッション ID は $keep_id です。古いセッションはまだ失効させていません(受け取った側で新しい token の取得成功を確かめてから T3_TOKEN_REVOKE_MODE=only T3_TOKEN_KEEP_ID=$keep_id で失効させます)"
+        log "新しいセッション ID は $keep_id です。古いセッションはまだ失効させていません(受け取った側で新しい token の取得成功を確かめてから T3_TOKEN_REVOKE_MODE=only T3_TOKEN_LABEL=$LABEL T3_TOKEN_KEEP_ID=$keep_id で失効させます。T3_TOKEN_LABEL を付けないと既定のラベルのセッションを失効させます)"
         return 0
     fi
     sleep "$REVOKE_WAIT"

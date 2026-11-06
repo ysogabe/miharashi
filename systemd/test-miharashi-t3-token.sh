@@ -190,6 +190,8 @@ check "defer: token_file は置き換わる" "NEWTOKEN-0123456789" "$(cat "$toke
 if grep -q 'auth session list' "$called" || grep -q 'auth session revoke' "$called"; then ng "defer: 失効の処理まで進んだ: $(cat "$called")"; else ok "defer: 古いセッションを失効させない"; fi
 if grep -q 'new-session' "$tmp/out"; then ok "defer: 新しいセッション ID を表示する"; else ng "defer: セッション ID が出ていない: $(cat "$tmp/out")"; fi
 if grep -q 'NEWTOKEN' "$tmp/out" "$tmp/err"; then ng "defer: 出力に token が出た"; else ok "defer: 出力に token は出ない"; fi
+# 失効の案内は、発行時と同じラベルを付けた形で出す(付け忘れると既定ラベル=primary のセッションを失効させる)
+if grep -q 'T3_TOKEN_REVOKE_MODE=only T3_TOKEN_LABEL=[^ ]* T3_TOKEN_KEEP_ID=new-session' "$tmp/out" "$tmp/err"; then ok "defer: 失効の案内にラベルを含める"; else ng "defer: 失効の案内にラベルがない: $(cat "$tmp/out" "$tmp/err")"; fi
 # defer でも確認に失敗したら置き換えない(従来と同じ)
 echo OLDTOKEN >"$token"
 : >"$called"

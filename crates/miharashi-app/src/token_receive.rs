@@ -15,8 +15,19 @@
 //! 順序: 設定から対象を決める → 置き先ディレクトリを検査 → 入力を読む(リンクを追跡せず、FD で検査・8192 バイト・1 行)
 //! → 他の接続・用途と同じ値でないか → 対象の T3 に問い合わせる(まず認証なしの環境情報、次にその token で一覧 API。
 //! リダイレクトは追跡しない)→ 同じディレクトリの一時ファイル(0600)に書いて原子的に置き換える →
-//! 置いたファイルを worker と同じ規則で読み直す。どこで失敗しても、それまでの token_file は変えない。
+//! 置いたファイルを worker と同じ規則で読み直す。入れ替えより前の失敗では、それまでの token_file は変えない
+//! (保存する形が worker の規則に収まるかも入れ替え前に確かめる)。入れ替えのあとの読み直しだけが失敗した
+//! ときは、token_file は新しい token に替わっている(`installed-unchecked`。旧 token には戻さない)。
 //! token の値は引数・環境変数・ログ・エラーに出さない。
+//!
+//! 受け取り元のファイルは消さない(`--from-file` でも)。成功後にパスで消すと、そのパスの途中のディレクトリが
+//! 確認の最中に別の場所へのリンクに差し替えられていた場合、別のファイルを受取役の権限で消してしまう。
+//! 受け取り済みの送り出し側のファイルの後始末は、そのファイルを作った配送役が自分の信頼境界(自分の
+//! ディレクトリ FD を基準に)で行う。
+//!
+//! 別の用途・接続の token との比較(`compare_with_other`)は、その相手が実際に使われるときの読み方に合わせて
+//! リンクを追跡して読む。比較できなかったときは、token を送る前に止める(「意図的な欠落」=ファイルまたは
+//! 途中のディレクトリが存在しない `ENOENT` だけは比較なしとして進む)。
 //!
 //! 限界: 一覧 API が 200 を返すことまでは確かめるが、token の権限(orchestration:read だけ)は
 //! 受取側からは確かめられない(権限が広い token でも 200 になる)。権限は発行側(miharashi-t3-token と同じ検査)で確認する。
@@ -66,6 +77,8 @@ pub enum ReceiveError {
     SourceInDestinationDir,
     BadToken(TokenFileError),
     DuplicateToken(String),
+    /// 別の用途・接続の token と比べられなかった(存在しない以外の理由)。名前と理由。値は含まない。
+    CompareFailed(String, String),
     BadUrl(String),
     EnvironmentMismatch,
     Unreachable(String),
@@ -73,6 +86,8 @@ pub enum ReceiveError {
     Forbidden,
     Rejected(String),
     Install(String),
+    /// 入れ替えは済んだが、置いたあとの読み直しで不備が見つかった。token_file は新しい token に替わっている。
+    InstalledUnchecked(String),
 }
 
 impl ReceiveError {
@@ -88,6 +103,7 @@ impl ReceiveError {
             Self::SourceInDestinationDir => "source-in-destination-dir",
             Self::BadToken(_) => "bad-token",
             Self::DuplicateToken(_) => "duplicate-token",
+            Self::CompareFailed(..) => "compare-failed",
             Self::BadUrl(_) => "bad-url",
             Self::EnvironmentMismatch => "environment-mismatch",
             Self::Unreachable(_) => "unreachable",
@@ -95,6 +111,7 @@ impl ReceiveError {
             Self::Forbidden => "forbidden-403",
             Self::Rejected(_) => "rejected",
             Self::Install(_) => "install-failed",
+            Self::InstalledUnchecked(_) => "installed-unchecked",
         }
     }
 }
@@ -128,6 +145,10 @@ impl std::fmt::Display for ReceiveError {
                 f,
                 "{code}: 受け取った token が別の用途({other})の token と同じです。置きません"
             ),
+            Self::CompareFailed(name, why) => write!(
+                f,
+                "{code}: 別の用途({name})の token と比べられませんでした: {why}。token は送っていません(ファイルが存在しない場合だけは比較なしで進みます。読める権限にするか、実行ユーザーを合わせてください)"
+            ),
             Self::BadUrl(why) => write!(f, "{code}: 接続先 URL が使えません: {why}"),
             Self::EnvironmentMismatch => write!(
                 f,
@@ -147,6 +168,10 @@ impl std::fmt::Display for ReceiveError {
                 f,
                 "{code}: 置けませんでした(それまでの token_file は変えていません): {why}"
             ),
+            Self::InstalledUnchecked(why) => write!(
+                f,
+                "{code}: token_file は新しい token に入れ替わりましたが、置いたあとの検査で不備を見つけました(旧 token には戻していません。ファイルの所有者・権限・内容を確かめてください): {why}"
+            ),
         }
     }
 }
@@ -155,7 +180,6 @@ impl std::fmt::Display for ReceiveError {
 pub struct Outcome {
     pub server_id: String,
     pub environment_id: Option<String>,
-    pub source_removed: Option<bool>,
 }
 
 /// 受取の本体。`others` は、受け取る値と同じであってはならない別の用途の token_file(名前, パス)。
@@ -174,21 +198,17 @@ pub fn receive(
 
     let dest = Dest::open(&server.token_file, req.euid)?;
 
-    let (bytes, source_path) = match req.source {
-        Source::Stream(r) => (
-            token_file::read_bounded(r).map_err(ReceiveError::SourceUnsafe)?,
-            None,
-        ),
+    let bytes = match req.source {
+        Source::Stream(r) => token_file::read_bounded(r).map_err(ReceiveError::SourceUnsafe)?,
         Source::File {
             path,
             expect_uid,
             expect_gid,
-        } => (
-            read_source_file(&path, expect_uid, expect_gid, &dest)?,
-            Some(path),
-        ),
+        } => read_source_file(&path, expect_uid, expect_gid, &dest)?,
     };
     let token = token_file::parse_token(&bytes).map_err(ReceiveError::BadToken)?;
+    // 保存する形(token + 改行)が worker の規則に収まらなければ、ネットワークにも出さず置き先にも触れない
+    stored_form(&token).map_err(ReceiveError::BadToken)?;
 
     // 別の接続・用途の token をここに置かない(取り違えて別のサーバーへ送るのを防ぐ)
     for (name, path) in servers
@@ -197,7 +217,9 @@ pub fn receive(
         .map(|s| (format!("接続 {}", s.id), s.token_file.as_str()))
         .chain(others.iter().map(|(n, p)| (n.clone(), p.as_str())))
     {
-        if token_file::read_private_token(path, req.euid, req.egid).is_ok_and(|t| t == token) {
+        if compare_with_other(path, &token)
+            .map_err(|why| ReceiveError::CompareFailed(name.clone(), why))?
+        {
             return Err(ReceiveError::DuplicateToken(name));
         }
     }
@@ -228,16 +250,60 @@ pub fn receive(
                 "置いた内容が読み戻しと違います".into(),
             ));
         }
-        Err(e) => return Err(ReceiveError::Install(format!("置いたあとの検査: {e}"))),
+        Err(e) => return Err(ReceiveError::InstalledUnchecked(e.to_string())),
     }
 
-    // 受取用のファイルは用が済んだら消す(消せなくても token_file は置けている)
-    let source_removed = source_path.map(|p| std::fs::remove_file(p).is_ok());
     Ok(Outcome {
         server_id: server.id.clone(),
         environment_id: probe.environment_id,
-        source_removed,
     })
+}
+
+/// 保存する形(token + 改行)。worker が token_file を読むときと同じ規則(8192 バイト以内・1 語)で
+/// 読み戻せることを、書く前に確かめる。読み込み側は改行込みで 8192 バイトまでなので、改行なしで
+/// 8192 バイトの token は保存すると 8193 バイトになり、置いたあとに読めなくなる。
+fn stored_form(token: &str) -> Result<Vec<u8>, TokenFileError> {
+    let mut bytes = Vec::with_capacity(token.len() + 1);
+    bytes.extend_from_slice(token.as_bytes());
+    bytes.push(b'\n');
+    let back = token_file::read_bounded(std::io::Cursor::new(&bytes))?;
+    if token_file::parse_token(&back)? != token {
+        return Err(TokenFileError::BadFormat);
+    }
+    Ok(bytes)
+}
+
+/// 別の用途・接続の token ファイルが、受け取った token と同じ値か。それぞれの用途が実際にファイルを
+/// 開くのと同じく、リンクを追跡して読む(パネル・Home Assistant の token_file はリンクでも使える。
+/// 厳しい読み方だけで比べると、リンクのトークンを「読めない=別の値」として見逃す)。
+/// 前後の空白を落として比べる。
+///
+/// - ファイルまたは途中のディレクトリが存在しない(`ENOENT`。ぶら下がったリンクを含む)だけは
+///   「まだ置かれていない」として `Ok(false)`。
+/// - それ以外で比べられないとき(権限・通常のファイルではない・大きすぎる・リンクの循環・`ENOTDIR`・I/O
+///   エラー)は `Err(理由)`。呼び出し側は token を送る前に止める。
+fn compare_with_other(path: &str, token: &str) -> Result<bool, String> {
+    if path.contains('\0') {
+        return Err("パスが不正です".into());
+    }
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(false),
+        Err(e) => return Err(format!("{path} を開けません: {e}")),
+    };
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("{path} を調べられません: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err(format!("{path} が通常のファイルではありません"));
+    }
+    let bytes = token_file::read_bounded(&file)
+        .map_err(|e| format!("{path} を読めません: {}", e.message()))?;
+    Ok(bytes.trim_ascii() == token.as_bytes())
 }
 
 /// 受取用のファイルを読む。リンクを追跡せず開き、開いた FD で検査してから読む。
@@ -330,6 +396,9 @@ impl Dest {
     /// 同じディレクトリに 0600 の一時ファイルを作って書き、`rename` で入れ替える。失敗したら一時ファイルを消す。
     fn install(&self, token: &str) -> Result<(), ReceiveError> {
         let fail = |w: String| ReceiveError::Install(w);
+        // 入れ替える前に、保存する形が worker に読めることを確かめる(読めない形で旧 token を消さない)
+        let stored =
+            stored_form(token).map_err(|e| fail(format!("保存する形が規則に合いません: {e}")))?;
         let dirfd = self.dir.as_raw_fd();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -358,8 +427,7 @@ impl Dest {
         let written = (|| -> std::io::Result<()> {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            file.write_all(token.as_bytes())?;
-            file.write_all(b"\n")?;
+            file.write_all(&stored)?;
             file.sync_all()
         })();
         drop(file);
@@ -417,6 +485,7 @@ pub fn run(args: Vec<String>) -> i32 {
         eprintln!("t3-token-receive: --server が要ります\n{USAGE}");
         return 2;
     };
+    let from_file_used = from_file.is_some();
     let source = match (stdin, from_file, uid) {
         (true, None, None) if gid.is_none() => Source::Stream(Box::new(std::io::stdin())),
         (false, Some(path), Some(expect_uid)) => Source::File {
@@ -465,9 +534,9 @@ pub fn run(args: Vec<String>) -> i32 {
                 o.server_id,
                 o.environment_id.as_deref().unwrap_or("不明")
             );
-            if o.source_removed == Some(false) {
+            if from_file_used {
                 eprintln!(
-                    "t3-token-receive: 警告: 受け取り元のファイルを消せませんでした。手で消してください"
+                    "t3-token-receive: 受け取り元のファイルは消していません。配送役が自分の側で消してください(まだ有効な token です)"
                 );
             }
             0
@@ -541,6 +610,22 @@ mod tests {
     }
     impl Mock {
         fn new(env_id: &'static str, accepts: &'static str, behavior: Behavior) -> Self {
+            Self::build(env_id, accepts, behavior, None)
+        }
+        /// 一覧 API の要求を受けたとき(token の確認の最中)に `hook` を実行する mock。
+        fn with_hook(
+            env_id: &'static str,
+            accepts: &'static str,
+            hook: impl Fn() + Send + Sync + 'static,
+        ) -> Self {
+            Self::build(env_id, accepts, Behavior::Normal, Some(Arc::new(hook)))
+        }
+        fn build(
+            env_id: &'static str,
+            accepts: &'static str,
+            behavior: Behavior,
+            hook: Option<Arc<dyn Fn() + Send + Sync>>,
+        ) -> Self {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let port = listener.local_addr().unwrap().port();
             let log: Arc<Mutex<Vec<(String, String)>>> = Default::default();
@@ -549,6 +634,7 @@ mod tests {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { continue };
                     let l = l.clone();
+                    let hook = hook.clone();
                     std::thread::spawn(move || {
                         let mut reader = BufReader::new(stream.try_clone().unwrap());
                         let mut first = String::new();
@@ -579,6 +665,13 @@ mod tests {
                                 r#"{{"orchestrationProtocolVersion":2,"environmentId":"{env_id}"}}"#
                             );
                             reply(&mut stream, "200 OK", &body);
+                        } else if let Some(h) = hook.as_ref() {
+                            h();
+                            reply(
+                                &mut stream,
+                                "200 OK",
+                                r#"{"schemaVersion":2,"snapshotSequence":1,"projects":[],"threads":[],"archivedThreads":[]}"#,
+                            );
                         } else if let Behavior::RedirectTo(p) = behavior {
                             let _ = write!(
                                 stream,
@@ -844,8 +937,8 @@ mod tests {
         // 正常: 受け取ったあと、受取用のファイルは消える
         let ok = write(&src("ok"), &format!("{GOOD}\n"), 0o600);
         let out = receive(fx.file_req(&ok), &fx.servers, &[]).unwrap();
-        assert_eq!(out.source_removed, Some(true));
-        assert!(!src("ok").exists());
+        assert_eq!(out.server_id, "container");
+        assert!(src("ok").exists(), "受取ツールは受け取り元を消さない");
         assert_eq!(fx.dest_text().as_deref(), Some(&*format!("{GOOD}\n")));
         let installed = fx.dest_text();
         let calls = container.total();
@@ -933,6 +1026,245 @@ mod tests {
         assert_eq!(fx.dest_text(), installed);
         assert_eq!(container.total(), calls);
         assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn receive_never_deletes_files_and_an_ancestor_swap_cannot_make_it_delete_another_file() {
+        // 共有側の祖先ディレクトリ(share)を、確認の最中に別のディレクトリへのリンクに差し替える。
+        // 受取ツールは受け取り元を一切消さないので、差し替えた先の同じ名前のファイルも残る。
+        let d = Dir::new("swap");
+        let state = d.sub("state");
+        let share = d.sub("share");
+        let inbox = share.join("inbox");
+        std::fs::create_dir(&inbox).unwrap();
+        std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let src = write(&inbox.join("tok"), &format!("{GOOD}\n"), 0o600);
+        // 差し替え先: 同じ相対パスに「ホスト側の別のファイル」がある
+        let other = d.sub("other");
+        let other_inbox = other.join("inbox");
+        std::fs::create_dir(&other_inbox).unwrap();
+        let victim = write(&other_inbox.join("tok"), "victim-content\n", 0o600);
+        let (share_c, share_moved, other_c) =
+            (share.clone(), d.0.join("share.orig"), other.clone());
+        let container = Mock::with_hook("env-container", GOOD, move || {
+            std::fs::rename(&share_c, &share_moved).unwrap();
+            symlink(&other_c, &share_c).unwrap();
+        });
+        let servers = vec![AgentServer {
+            id: "container".into(),
+            label: "container".into(),
+            url: container.url.clone(),
+            token_file: Dir::s(&state.join("container.token")),
+        }];
+        let (u, g) = ids();
+        let req = Request {
+            server_id: "container".into(),
+            source: Source::File {
+                path: src.clone(),
+                expect_uid: u,
+                expect_gid: None,
+            },
+            expect_environment_id: None,
+            euid: u,
+            egid: g,
+        };
+        receive(req, &servers, &[]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "victim-content\n",
+            "差し替え先のファイルは消えない"
+        );
+        // 受け取り元(差し替え前の実体)も消さない。消すのは配送役の仕事
+        assert!(d.0.join("share.orig/inbox/tok").exists());
+    }
+
+    #[test]
+    fn a_comparison_that_cannot_be_made_stops_before_any_token_is_sent() {
+        let container = Mock::new("env-container", GOOD, Behavior::Normal);
+        let fx = Fx::new("cmpfail", "http://127.0.0.1:9", &container.url);
+        write(&fx.dest(), "old-token-0123456789\n", 0o600);
+        let old = fx.dest_text();
+        let others_for = |p: &str| [("操作パネル".to_string(), p.to_string())];
+
+        // リンクで置かれた同じ値(パネル・HA はリンクのトークンを使える)は重複として見つける
+        let real = write(&fx.d.0.join("panel-real"), &format!("{GOOD}\n"), 0o600);
+        let link = Dir::s(&fx.dest_dir.join("panel.token"));
+        symlink(&real, &link).unwrap();
+        let err = receive(fx.req(GOOD), &fx.servers, &others_for(&link)).unwrap_err();
+        assert!(
+            matches!(&err, ReceiveError::DuplicateToken(n) if n == "操作パネル"),
+            "{err:?}"
+        );
+        // 別の接続の token_file がリンクでも同じ
+        let mut servers = fx.servers.clone();
+        servers.push(AgentServer {
+            id: "third".into(),
+            label: "third".into(),
+            url: "http://127.0.0.1:9".into(),
+            token_file: link.clone(),
+        });
+        let err = receive(fx.req(GOOD), &servers, &[]).unwrap_err();
+        assert!(
+            matches!(&err, ReceiveError::DuplicateToken(n) if n.contains("third")),
+            "{err:?}"
+        );
+
+        // 比べられない: ディレクトリ・FIFO・大きすぎる・リンクの循環・ファイルの下のパス・読めない権限
+        let dir_path = Dir::s(&fx.d.sub("is-a-dir"));
+        let fifo = Dir::s(&fx.d.0.join("a-fifo"));
+        let c = CString::new(fifo.clone()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let big = write(&fx.d.0.join("big"), &"a".repeat(9000), 0o600);
+        let loop_a = Dir::s(&fx.d.0.join("loop-a"));
+        let loop_b = Dir::s(&fx.d.0.join("loop-b"));
+        symlink(&loop_b, &loop_a).unwrap();
+        symlink(&loop_a, &loop_b).unwrap();
+        let under_file = Dir::s(&fx.d.0.join("panel-real").join("x.token"));
+        let mut cases = vec![
+            ("dir", dir_path),
+            ("fifo", fifo),
+            ("big", big),
+            ("loop", loop_a),
+            ("under-file", under_file),
+        ];
+        let unreadable = write(&fx.d.0.join("noread"), "other-token-0123456789\n", 0o000);
+        if unsafe { libc::geteuid() } != 0 {
+            cases.push(("no-permission", unreadable));
+        }
+        for (name, path) in &cases {
+            let err = receive(fx.req(GOOD), &fx.servers, &others_for(path)).unwrap_err();
+            assert!(
+                matches!(err, ReceiveError::CompareFailed(..)),
+                "{name}: {err:?}"
+            );
+            assert!(!err.to_string().contains(GOOD), "{name}");
+        }
+        // 比較できない相手が 1 つでもあれば、別の相手が先に重複でなくても止まる(順序に依らない)
+        let ok_other = write(&fx.d.0.join("fine"), "unrelated-token-0123456789\n", 0o600);
+        let both = [
+            ("健全".to_string(), ok_other.clone()),
+            ("壊れ".to_string(), cases[0].1.clone()),
+        ];
+        assert!(matches!(
+            receive(fx.req(GOOD), &fx.servers, &both).unwrap_err(),
+            ReceiveError::CompareFailed(..)
+        ));
+        assert_eq!(
+            container.total(),
+            0,
+            "token も環境の問い合わせも送っていない"
+        );
+        assert_eq!(fx.dest_text(), old, "旧 token は変わらない");
+        assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn an_intentionally_absent_comparison_file_does_not_block_receiving() {
+        let container = Mock::new("env-container", GOOD, Behavior::Normal);
+        let fx = Fx::new("cmpabsent", "http://127.0.0.1:9", &container.url);
+        let dangling = Dir::s(&fx.d.0.join("dangling"));
+        symlink(fx.d.0.join("nowhere"), &dangling).unwrap();
+        let others = [
+            // 未配置のトークン
+            (
+                "操作パネル".to_string(),
+                Dir::s(&fx.d.0.join("panel.token")),
+            ),
+            // 親ディレクトリごと無い(ベースの既定設定: /etc/miharashi/ が無い環境)
+            (
+                "管理ページ".to_string(),
+                Dir::s(&fx.d.0.join("no/such/admin.token")),
+            ),
+            // ぶら下がったリンク
+            ("Home Assistant".to_string(), dangling),
+        ];
+        receive(fx.req(GOOD), &fx.servers, &others).unwrap();
+        assert_eq!(fx.dest_text().as_deref(), Some(&*format!("{GOOD}\n")));
+        // 別の値の token(権限が緩い・空白付きなど、他の用途の流儀)は重複ではなく、止めもしない
+        let other_val = write(
+            &fx.d.0.join("ha-token"),
+            "  unrelated-token-0123456789 \n",
+            0o644,
+        );
+        let others = [("Home Assistant".to_string(), other_val)];
+        receive(fx.req(GOOD), &fx.servers, &others).unwrap();
+        // 余白付きの同じ値は重複
+        let same = write(&fx.d.0.join("ha-token2"), &format!("  {GOOD} \n"), 0o644);
+        let others = [("Home Assistant".to_string(), same)];
+        assert!(matches!(
+            receive(fx.req(GOOD), &fx.servers, &others).unwrap_err(),
+            ReceiveError::DuplicateToken(_)
+        ));
+    }
+
+    #[test]
+    fn the_stored_form_with_its_newline_must_fit_the_workers_limit() {
+        // 保存すると token + 改行。改行込みで 8192 バイトまで(8191 文字まで)
+        let container = Mock::new("env-container", GOOD, Behavior::Normal);
+        let fx = Fx::new("limit", "http://127.0.0.1:9", &container.url);
+        write(&fx.dest(), "old-token-0123456789\n", 0o600);
+        let old = fx.dest_text();
+        // 改行なし 8192 バイト: 読み込みは通るが、保存すると 8193 バイトになる(入れ替え前に断る)
+        // 改行あり 8193 バイト: 読み込みの段階で大きすぎる
+        for (body, want) in [
+            (
+                "a".repeat(8192),
+                ReceiveError::BadToken(TokenFileError::TooLarge),
+            ),
+            (
+                format!("{}\n", "a".repeat(8192)),
+                ReceiveError::SourceUnsafe(TokenFileError::TooLarge),
+            ),
+        ] {
+            let err = receive(fx.req(&body), &fx.servers, &[]).unwrap_err();
+            assert_eq!(err, want, "{} bytes", body.len());
+            assert!(!err.to_string().contains("へ入れ替わ"));
+            assert_eq!(fx.dest_text(), old, "旧 token を失わない");
+            assert!(fx.leftovers().is_empty());
+        }
+        assert_eq!(container.total(), 0, "ネットワークにも出ない");
+        // install 単体でも、入れ替え前に断って旧 token を保つ
+        let (u, g) = ids();
+        let dest = Dest::open(&Dir::s(&fx.dest()), u).unwrap();
+        let err = dest.install(&"a".repeat(8192)).unwrap_err();
+        assert!(matches!(err, ReceiveError::Install(_)), "{err:?}");
+        assert_eq!(fx.dest_text(), old);
+        assert!(fx.leftovers().is_empty());
+        // 境界: 8191 文字は置けて、worker と同じ読み方で読み戻せる(改行込みで 8192 バイト)
+        let max = "a".repeat(8191);
+        dest.install(&max).unwrap();
+        assert_eq!(std::fs::metadata(fx.dest()).unwrap().len(), 8192);
+        assert_eq!(
+            token_file::read_private_token(&Dir::s(&fx.dest()), u, g).unwrap(),
+            max
+        );
+        // 受取の全体でも 8191 文字(改行なし・あり)が通る。mock は長い Authorization を受け取れるものを使う
+        let long_ok: &'static str = Box::leak(max.clone().into_boxed_str());
+        let container = Mock::new("env-container", long_ok, Behavior::Normal);
+        let fx2 = Fx::new("limit2", "http://127.0.0.1:9", &container.url);
+        receive(fx2.req(&max), &fx2.servers, &[]).unwrap();
+        assert_eq!(
+            token_file::read_private_token(&Dir::s(&fx2.dest()), u, g).unwrap(),
+            max
+        );
+    }
+
+    #[test]
+    fn a_failed_check_after_the_swap_does_not_claim_the_old_token_is_kept() {
+        let e = ReceiveError::InstalledUnchecked("読めません".into());
+        let m = e.to_string();
+        assert_eq!(e.code(), "installed-unchecked");
+        assert!(
+            m.contains("入れ替わりました") && m.contains("戻していません"),
+            "{m}"
+        );
+        assert!(!m.contains("変えていません"), "{m}");
+        // 入れ替え前の失敗は従来どおり「変えていません」
+        assert!(
+            ReceiveError::Install("x".into())
+                .to_string()
+                .contains("変えていません")
+        );
     }
 
     #[test]
