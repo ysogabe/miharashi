@@ -174,6 +174,10 @@ pub struct AgentSnapshot {
     pub entries: Arc<[AgentEntry]>,
     pub changes: Arc<[AgentChange]>,
     pub connection: AgentConnection,
+    /// 最後に取得に成功したときに使った token_file の世代(秘密を含まない。`token_file::revision`)。
+    /// 失敗では更新しない。配送役が管理 API(`feeds[].token_revision`)でこれを読み、新しく配置した世代で
+    /// 稼働中の worker が取得できたことを確かめてから古いセッションを失効させる。
+    pub token_revision: Option<String>,
     pub last_success: Option<SystemTime>,
     pub last_success_mono: Option<Instant>,
     pub change_cursor: u64,
@@ -380,6 +384,7 @@ fn worker(cfg: ConfigAgents, server_id: ServerId, shared: Shared) {
     let endpoint = format!("{base}/api/orchestration/shell");
     let descriptor_endpoint = format!("{base}/.well-known/t3/environment");
     let mut token = String::new();
+    let mut token_revision = String::new();
     let mut token_fingerprint = 0u64;
     let mut auth_blocked = false;
     let mut last_token_check = Instant::now() - Duration::from_secs(30);
@@ -403,13 +408,14 @@ fn worker(cfg: ConfigAgents, server_id: ServerId, shared: Shared) {
         {
             last_token_check = Instant::now();
             match read_token(&cfg.token_file) {
-                Ok(next) => {
+                Ok((next, next_revision)) => {
                     let next_fingerprint = fingerprint(&next);
                     if !auth_retry_allowed(auth_blocked, token_fingerprint, next_fingerprint) {
                         next_poll = Instant::now() + Duration::from_secs(30);
                         continue;
                     }
                     token = next;
+                    token_revision = next_revision;
                     token_fingerprint = next_fingerprint;
                     auth_blocked = false;
                 }
@@ -441,7 +447,7 @@ fn worker(cfg: ConfigAgents, server_id: ServerId, shared: Shared) {
             Ok(remote) => {
                 let had_success = shared.read().map(|s| s.synchronized).unwrap_or(false);
                 let is_resync = had_success && !was_connected;
-                install_snapshot(&shared, &server_id, remote, is_resync);
+                install_snapshot(&shared, &server_id, remote, is_resync, &token_revision);
                 was_connected = true;
                 backoff = 5;
                 next_poll = Instant::now() + Duration::from_secs(cfg.poll_secs);
@@ -503,6 +509,7 @@ fn install_snapshot(
     server_id: &ServerId,
     mut remote: RemoteSnapshot,
     resync: bool,
+    token_revision: &str,
 ) {
     let now_wall = SystemTime::now();
     let now_mono = Instant::now();
@@ -557,6 +564,9 @@ fn install_snapshot(
         current.entries = remote.entries.into();
         current.changes = changes.into();
         current.connection = AgentConnection::Live;
+        // 取得に成功した token の世代。失敗では更新しない(最後に成功した世代のまま)ので、
+        // 「新しい世代で成功した」ことの証拠は成功したときにだけ書き換わる。
+        current.token_revision = Some(token_revision.to_string());
         current.last_success = Some(now_wall);
         current.last_success_mono = Some(now_mono);
         current.synchronized = true;
@@ -1181,8 +1191,9 @@ fn auth_retry_allowed(blocked: bool, previous_fingerprint: u64, next_fingerprint
 
 /// worker が使う token の読み込み。リンクを追跡せず、開いた FD で通常ファイル・所有者・権限・サイズ・1 行の
 /// 形式を検査してから読む(`token_file` モジュール)。エラーには値を含めない。
-fn read_token(path: &str) -> Result<String, String> {
-    crate::token_file::read_private_token(path, effective_uid(), effective_gid())
+/// 戻りは (token, token_file の世代)。世代は秘密を含まず、`install_snapshot` が「取得に成功した token の世代」として残す。
+fn read_token(path: &str) -> Result<(String, String), String> {
+    crate::token_file::read_private_token_with_revision(path, effective_uid(), effective_gid())
         .map_err(|e| e.message().to_string())
 }
 
@@ -1731,7 +1742,7 @@ mod tests {
             1,
         ))
         .unwrap();
-        install_snapshot(&shared, &sid(), remote, false);
+        install_snapshot(&shared, &sid(), remote, false, "r1.test");
         assert!(shared.read().unwrap().changes.is_empty());
         let remote = parse_shell(&shell(
             vec![
@@ -1741,7 +1752,7 @@ mod tests {
             2,
         ))
         .unwrap();
-        install_snapshot(&shared, &sid(), remote, true);
+        install_snapshot(&shared, &sid(), remote, true, "r1.test");
         assert!(shared.read().unwrap().changes.is_empty());
         assert_eq!(shared.read().unwrap().resync_generation, 1);
     }
@@ -1889,7 +1900,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("miharashi-t3-token-{}", std::process::id()));
         fs::write(&path, "test-token\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(read_token(path.to_str().unwrap()).unwrap(), "test-token");
+        assert_eq!(read_token(path.to_str().unwrap()).unwrap().0, "test-token");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read_token(path.to_str().unwrap()).is_err());
         fs::remove_file(path).unwrap();
@@ -2017,6 +2028,61 @@ mod tests {
         )
     }
 
+    /// 稼働中の worker は、取得に成功した token_file の世代を残す。ファイルを差し替えても、worker がそれを
+    /// 読み直して取得に成功するまでは古い世代のまま(古い世代での成功を、新しい世代での成功と取り違えない)。
+    /// 世代は秘密を含まず、token の値ではなくファイルの実体から作る。
+    #[cfg(unix)]
+    #[test]
+    fn worker_keeps_the_revision_of_the_token_file_it_last_succeeded_with() {
+        use std::os::unix::fs::PermissionsExt;
+        let t3 = mock_t3("token-rev", vec![mock_thread("t1", "running", "now")]);
+        let path = token_file("rev", "token-rev");
+        let cfg = ConfigAgents {
+            enabled: true,
+            url: t3.url.clone(),
+            token_file: path.clone(),
+            poll_secs: 1,
+            timeout_secs: 2,
+            stale_secs: 30,
+            recent_hours: 24,
+            extra_servers: Vec::new(),
+            rotation_state_dir: String::new(),
+        };
+        let connections = start(&cfg);
+        let shared = connections[0].shared.clone();
+        wait_for("取得に成功する", 10, || {
+            shared.read().unwrap().connection == AgentConnection::Live
+        });
+        let (euid, egid) = (effective_uid(), effective_gid());
+        let (_, on_disk) =
+            crate::token_file::read_private_token_with_revision(&path, euid, egid).unwrap();
+        let first = shared.read().unwrap().token_revision.clone();
+        assert_eq!(first.as_deref(), Some(on_disk.as_str()));
+        assert!(!first.as_deref().unwrap().contains("token-rev"));
+        // 新しい実体に差し替える(受取ツールと同じ。同じ名前に別の inode を rename で置く)
+        let replacement = format!("{path}.new");
+        fs::write(&replacement, "token-rev\n").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::rename(&replacement, &path).unwrap();
+        let (_, replaced) =
+            crate::token_file::read_private_token_with_revision(&path, euid, egid).unwrap();
+        assert_ne!(replaced, on_disk, "差し替えると世代が変わる");
+        // worker は次の読み直し(30 秒ごと)まで古い token_file のまま取得を続ける。その成功は古い世代のまま
+        let sequence = shared.read().unwrap().sequence;
+        t3.sequence.store(
+            sequence.unwrap_or(0) + 5,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        wait_for("古い token_file のまま取得が続く", 10, || {
+            shared.read().unwrap().sequence != sequence
+        });
+        let after = shared.read().unwrap().clone();
+        assert_eq!(after.connection, AgentConnection::Live);
+        assert_eq!(after.token_revision.as_deref(), Some(on_disk.as_str()));
+        assert_ne!(after.token_revision.as_deref(), Some(replaced.as_str()));
+    }
+
     /// 独立した 2 台: 片方の遅延(timeout)・401・復帰の間も、もう片方の取得は止まらず、
     /// それぞれ自分の token だけで認証し、同じ thread / project ID でも接続ごとに別のスレッドとして届く。
     #[cfg(unix)]
@@ -2039,6 +2105,7 @@ mod tests {
                 url: b.url.clone(),
                 token_file: token_file("b", "token-b"),
             }],
+            rotation_state_dir: String::new(),
         };
         let connections = start(&cfg);
         assert_eq!(connections.len(), 2);
@@ -2224,6 +2291,7 @@ mod tests {
                     token_file: link.to_str().unwrap().to_string(),
                 },
             ],
+            rotation_state_dir: String::new(),
         };
         let mut provider = AgentProvider::new(start(&cfg));
         let mut world = World::default();
@@ -2316,12 +2384,14 @@ mod tests {
             &id,
             remote("e1", vec![mock_thread("a", "running", "now")], 1),
             false,
+            "r1.test",
         );
         install_snapshot(
             &shared,
             &id,
             remote("e1", vec![mock_thread("a", "waiting", "now")], 2),
             false,
+            "r1.test",
         );
         assert_eq!(shared.read().unwrap().changes.len(), 1);
         // 同じ environment_id なら履歴を引き継ぐ。変わったら、変更通知を出さず世代を進める。
@@ -2331,6 +2401,7 @@ mod tests {
             &id,
             remote("e2", vec![mock_thread("b", "running", "now")], 3),
             false,
+            "r1.test",
         );
         let s = shared.read().unwrap();
         assert_eq!(s.resync_generation, generation + 1);

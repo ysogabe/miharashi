@@ -20,8 +20,9 @@ ExecStart=@BINDIR@/miharashi-t3-remote-token
 # 状態ファイル(秘密なし)とロック。T3R_STATE_DIR が無ければ systemd が渡す STATE_DIRECTORY を使う。
 StateDirectory=miharashi-t3-remote-token
 StateDirectoryMode=0700
-# 排他・発行・確認・待機(既定 70 秒)・失効の合計より十分長く。超えたら止め、受取の前なら今回の新しいセッションを失効させる。
-TimeoutStartSec=10min
+# 排他・発行・確認・稼働中の worker の観測待ち(T3R_WORKER_WAIT。既定 600 秒)・失効の合計より十分長く。超えたら止め、
+# 発行の途中・受取の前なら今回の新しいセッションを失効させる(受取に渡したあとは新旧とも失効させない)。
+TimeoutStartSec=25min
 KillMode=mixed
 TimeoutStopSec=60
 

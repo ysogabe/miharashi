@@ -26,6 +26,7 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 mod admin;
 mod feeds;
+mod rotation;
 
 /// `/api/v1/status` の形を変えたら上げる。パネルはこれを見て古い形を読み分ける。
 const SCHEMA_VERSION: u32 = 1;
@@ -174,6 +175,10 @@ pub struct FeedReport {
     /// 最後に成功した時刻(RFC3339)
     pub last_ok: Option<String>,
     pub error: Option<String>,
+    /// T3 の接続だけ: 最後に取得に成功したときに worker が使った token_file の世代(秘密を含まない)。
+    /// 配送役が、新しく配置した世代で稼働中の worker が取得できたことを確かめるのに使う。他の取得元では出ない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_revision: Option<String>,
 }
 
 /// トークンファイルの状態(管理ページの `tokens[].state`)。

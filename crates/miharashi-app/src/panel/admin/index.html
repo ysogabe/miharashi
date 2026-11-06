@@ -78,10 +78,10 @@
   <section id="tokens-section">
     <h2>トークン</h2>
     <table>
-      <thead><tr><th>用途</th><th>パス</th><th>状態</th><th>ファイルの更新</th></tr></thead>
+      <thead><tr><th>用途</th><th>パス</th><th>状態</th><th>ファイルの更新</th><th>更新の結果</th></tr></thead>
       <tbody id="tokens"></tbody>
     </table>
-    <p class="note">値は表示しません。ファイルの有無・権限・形式と更新時刻だけを見ています。T3 は接続ごとに 1 行です。取得元の「失敗中・認証が必要」とは別の確認です(token が正常でも、T3 が拒否すれば取得元は「認証が必要」になります)。</p>
+    <p class="note">値は表示しません。ファイルの有無・権限・形式と更新時刻だけを見ています。「更新の結果」は追加先の T3 の token を更新する配送役(設定の rotation_state_dir)が残した結果で、token が正常でも更新に失敗していれば出ます(「—」は未設定)。T3 は接続ごとに 1 行です。取得元の「失敗中・認証が必要」とは別の確認です(token が正常でも、T3 が拒否すれば取得元は「認証が必要」になります)。</p>
   </section>
 </main>
 </body>

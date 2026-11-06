@@ -51,6 +51,16 @@ const TOKEN_STATES = {
   bad_format: ["形式が不正", "failing"],
 };
 
+// 追加先の T3 の token 配送役の結果(tokens[].rotation.status)。token が正常でも更新が失敗していれば、ここで分かる
+const ROTATION_STATES = {
+  ok: ["更新できた", "ok"],
+  running: ["更新中", "warn"],
+  attention: ["要調査", "failing"],
+  failed: ["更新に失敗", "failing"],
+  stale: ["更新が止まっている", "failing"],
+  unreadable: ["結果を読めない", "failing"],
+};
+
 const $ = (id) => document.getElementById(id);
 
 const state = {
@@ -330,6 +340,21 @@ function renderFeeds(feeds) {
   }
 }
 
+// 配送役の結果。無い(未設定・primary)ときは「—」。文字列はすべて textContent で出す(HTML として解釈させない)
+function rotationCell(r) {
+  if (r === null || r === undefined || typeof r !== "object") return el("td", "—");
+  const td = stateCell(ROTATION_STATES, r.status);
+  const parts = [];
+  if (typeof r.result === "string" && r.status !== "ok") parts.push(clip(r.result));
+  if (typeof r.exit_code === "number" && r.exit_code !== 0) parts.push("コード " + r.exit_code);
+  if (r.cleanup_pending === true) parts.push("発行したセッションが残っている可能性");
+  if (typeof r.remaining_old === "number" && r.remaining_old > 0) parts.push("古いセッション " + r.remaining_old + " 件");
+  if (typeof r.finished_at === "string") parts.push(formatTime(r.finished_at));
+  if (typeof r.detail === "string" && r.detail !== "") parts.push(clip(r.detail));
+  if (parts.length) td.append(el("div", parts.join(" / "), "err"));
+  return td;
+}
+
 function renderTokens(tokens) {
   const body = $("tokens");
   body.replaceChildren();
@@ -340,6 +365,7 @@ function renderTokens(tokens) {
     tr.append(el("td", t.path || "", "path"));
     tr.append(stateCell(TOKEN_STATES, t.state));
     tr.append(el("td", formatTime(t.modified_at)));
+    tr.append(rotationCell(t.rotation));
     body.append(tr);
   }
 }

@@ -65,6 +65,7 @@ fn report(
         state,
         last_ok: last_ok.map(rfc3339),
         error: error.map(clip_error),
+        token_revision: None,
     }
 }
 
@@ -126,6 +127,7 @@ pub(super) fn from_agent_connection(
 ) -> Vec<FeedReport> {
     let mut r = from_agents(s);
     (r.id, r.label) = agent_identity(server_id, label);
+    r.token_revision = s.token_revision.clone();
     vec![r]
 }
 

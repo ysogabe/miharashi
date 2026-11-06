@@ -4,7 +4,9 @@
   cargo build -p miharashi-app && python3 -I systemd/test_miharashi_t3_remote_token.py
 
 本物の `miharashi t3-token-receive`(受取)と `miharashi agents-check`(実際の worker)を使い、
-T3 Server と lxc / t3 CLI だけを一時ディレクトリの偽物に差し替える。本物の T3 にも LXC にも触れない。
+T3 Server と lxc / t3 CLI、および稼働中の miharashi の管理 API(`FakeAdmin`。稼働中の worker が最後の取得に使った
+token_file の世代を `feeds[agents:<id>].token_revision` で報告する契約だけを再現)を偽物に差し替える。本物の T3 にも LXC にも触れない。
+管理 API の契約(世代の形・feeds への出し方)は Rust 側のテスト(panel/admin.rs、agents.rs)が実物で確かめている。
 アドレスは 127.0.0.1 の一時ポートだけ。MIHARASHI_BIN で miharashi の場所を変えられる(既定 target/debug/miharashi)。
 """
 import importlib.machinery
@@ -126,6 +128,88 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(404, "{}")
 
 
+def revision_of(path):
+    """受取ツール・worker と同じ式の token_file の世代(src/token_file.rs の `revision`)。"""
+    st = os.stat(path)
+    return "r1.%d.%d.%d.%d.%d" % (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+
+
+class FakeAdmin(ThreadingHTTPServer):
+    """偽の管理 API(GET /api/v1/admin/overview)。稼働中の worker の振る舞いを `mode` で再現する。
+
+    follow        : 置かれた token_file の世代で取得できている(worker が読み直した後)
+    stale         : 古い世代のまま(worker はまだ新しい token_file を読み直していない)。`switch_after` 回目の要求以降は follow
+    delayed       : 最初の要求から `delay` 秒たつまで古い世代、そのあと follow(poll_secs が長い worker)
+    never         : ずっと古い世代
+    not_live      : 新しい世代を報告するが、接続は正常ではない(retrying)
+    no_revision   : 世代を報告しない(古い miharashi)
+    missing       : 接続の取得元が出ていない
+    """
+
+    daemon_threads = True
+
+    def __init__(self, token_file, admin_token):
+        super().__init__(("127.0.0.1", 0), AdminHandler)
+        self.token_file = token_file
+        self.admin_token = admin_token
+        self.mode = "follow"
+        self.old_revision = "r1.1.1.1.1.1"
+        self.switch_after = 0
+        self.delay = 0.0
+        self.requests = 0
+        self.first_at = None
+        self.seen_auth = []
+        self.on_request = None  # (served_revision) -> None。要求ごとに呼ぶ(失効の有無を観測するため)
+        threading.Thread(target=self.serve_forever, daemon=True).start()
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.server_address[1]}"
+
+    def feed(self):
+        self.requests += 1
+        if self.first_at is None:
+            self.first_at = time.monotonic()
+        mode = self.mode
+        if mode == "delayed":
+            mode = "follow" if time.monotonic() - self.first_at >= self.delay else "never"
+        if mode == "stale":
+            mode = "follow" if self.requests > self.switch_after else "never"
+        if mode == "missing":
+            return None, None
+        feed = {"id": "agents:container", "label": "T3(container)", "state": "ok", "last_ok": "2026-01-01T00:00:00+09:00", "error": None}
+        revision = self.old_revision if mode == "never" else revision_of(self.token_file)
+        if mode == "not_live":
+            feed.update(state="failing", error="再接続中")
+        if mode != "no_revision":
+            feed["token_revision"] = revision
+        return feed, revision
+
+
+class AdminHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        srv = self.server
+        srv.seen_auth.append(self.headers.get("Authorization", ""))
+        if self.path != "/api/v1/admin/overview" or self.headers.get("Authorization") != "Bearer " + srv.admin_token:
+            data, code = b"{}", 401
+        else:
+            feed, revision = srv.feed()
+            feeds = [{"id": "agents", "label": "T3(エージェント)", "state": "ok", "token_revision": "r1.9.9.9.9.9"}]
+            if feed is not None:
+                feeds.append(feed)
+            data, code = json.dumps({"schema_version": 1, "feeds": feeds}).encode(), 200
+            if srv.on_request:
+                srv.on_request(revision)
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
 MOCK_T3_CLI = r'''#!/usr/bin/env python3
 import json, os, sys, time, urllib.request, urllib.error
 cfg = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "mock.json")))
@@ -204,6 +288,13 @@ class Base(unittest.TestCase):
         self.dest.mkdir(mode=0o700)
         self.token_file = self.dest / "container.token"
         self.state = self.d / "state"
+        self.admin_token = "admin-secret-" + "z" * 20 + str(os.getpid())
+        self.admin_token_file = self.d / "admin.token"
+        self.admin_token_file.write_text(self.admin_token + "\n")
+        self.admin_token_file.chmod(0o600)
+        self.admin = FakeAdmin(str(self.token_file), self.admin_token)
+        self.addCleanup(self.admin.server_close)
+        self.addCleanup(self.admin.shutdown)
         self.config = self.d / "config.toml"
         self.config.write_text(
             '[agents]\nenabled=true\nurl="http://127.0.0.1:9"\ntoken_file="%s"\n'
@@ -217,7 +308,8 @@ class Base(unittest.TestCase):
             "T3R_LXC_REMOTE": "lab", "T3R_LXC_CONTAINER": "t3box", "T3R_CONTAINER_USER": "ubuntu",
             "T3R_T3_CLI": str(self.cli), "T3R_LXC_BIN": str(self.lxc), "T3R_MIHARASHI_BIN": MIHARASHI,
             "T3R_STATE_DIR": str(self.state), "T3R_EXEC_TIMEOUT": "10", "T3R_RECEIVE_TIMEOUT": "20",
-            "T3R_VERIFY_TIMEOUT": "6", "T3R_REVOKE_GRACE": "0",
+            "T3R_VERIFY_TIMEOUT": "6", "T3R_ADMIN_URL": self.admin.url, "T3R_ADMIN_TOKEN_FILE": str(self.admin_token_file),
+            "T3R_WORKER_WAIT": "20", "T3R_ADMIN_POLL": "1", "T3R_ADMIN_TIMEOUT": "5",
         }
         # 既存の状態: 古い専用セッション 2 本(token_file は古い方)、primary の既定ラベル、広い権限の別のセッション
         self.old1, self.old1_token = self.srv.add(self.LABEL)
@@ -245,8 +337,9 @@ class Base(unittest.TestCase):
         for c in self.calls():
             blobs += [json.dumps(c["argv"]), json.dumps(c["env"])]
         for p in self.d.rglob("*"):
-            if p.is_file() and p != self.token_file and p.name != "calls.log":
+            if p.is_file() and p not in (self.token_file, self.admin_token_file) and p.name != "calls.log":
                 blobs.append(p.read_text(errors="replace"))
+        secrets = [*secrets, self.admin_token]  # 管理トークンも、HTTP ヘッダー以外のどこにも出ない
         for secret in secrets:
             for blob in blobs:
                 self.assertNotIn(secret, blob)
@@ -370,56 +463,200 @@ class RotationTests(Base):
         self.assertIn(self.old2, self.srv.sessions)
         self.assertEqual(self.state_json()["result"], "revoke-skipped")
 
-    def test_receive_wrapper_cases(self):
-        def wrapper(body):
-            w = self.d / "miharashi-wrapper"
-            w.write_text("#!/bin/sh\n" + body)
-            w.chmod(0o755)
-            return {"T3R_MIHARASHI_BIN": str(w)}
+    def wrapper(self, body, name="miharashi-wrapper"):
+        """T3R_MIHARASHI_BIN に差し込む偽の miharashi。`REAL` は本物の miharashi。t3-token-receive 以外もこれを通る。"""
+        w = self.d / name
+        w.write_text(f'#!/bin/sh\nREAL={shlex.quote(MIHARASHI)}\nif [ "$1" != t3-token-receive ]; then exec "$REAL" "$@"; fi\n' + body)
+        w.chmod(0o755)
+        return {"T3R_MIHARASHI_BIN": str(w)}
 
-        # 置き換え後の確認失敗: 失効しない
-        env = wrapper("cat >/dev/null; echo 't3-token-receive: installed-unchecked: x' >&2; exit 1\n")
+    def drop_new_sessions(self):
+        for sid in [i for i in self.srv.labelled(self.LABEL) if i not in (self.old1, self.old2)]:
+            self.srv.sessions.pop(sid)
+
+    def test_receive_wrapper_cases(self):
+        # 置き換え後の確認失敗(古い受取ツールの形: 終了コード 1 + 標準エラーの目印): 失効しない
+        env = self.wrapper("cat >/dev/null; echo 't3-token-receive: installed-unchecked: x' >&2; exit 1\n")
         result = self.run_script(extra_env=env)
         self.assertEqual(result.returncode, 3, result.stdout)
         self.assertEqual(len(self.srv.labelled(self.LABEL)), 3)
         self.assertEqual(self.state_json()["result"], "installed-unchecked")
         # 受取がタイムアウト: 新旧どちらも失効しない
-        for sid in [i for i in self.srv.labelled(self.LABEL) if i not in (self.old1, self.old2)]:
-            self.srv.sessions.pop(sid)
-        env = wrapper("exec sleep 30\n")
+        self.drop_new_sessions()
+        env = self.wrapper("exec sleep 30\n")
         result = self.run_script(extra_env={**env, "T3R_RECEIVE_TIMEOUT": "1"})
         self.assertEqual(result.returncode, 3, result.stdout)
         self.assertEqual(len(self.srv.labelled(self.LABEL)), 3)
         self.assertEqual(self.state_json()["result"], "receive-timeout")
         # 受取が token を標準エラーに出してしまっても、出力・状態には出さない
-        for sid in [i for i in self.srv.labelled(self.LABEL) if i not in (self.old1, self.old2)]:
-            self.srv.sessions.pop(sid)
-        env = wrapper("tee /dev/stderr >/dev/null; exit 1\n")
+        self.drop_new_sessions()
+        env = self.wrapper("tee /dev/stderr >/dev/null; exit 1\n")
         result = self.run_script(extra_env=env)
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("tok-", result.stdout + result.stderr + json.dumps(self.state_json()))
         self.assertIn("<redacted>", result.stdout)
 
-    def test_sigterm_during_grace_leaves_both_valid(self):
-        proc = subprocess.Popen([sys.executable, "-I", str(SCRIPT)], env={**self.env, "T3R_REVOKE_GRACE": "30"}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        deadline = time.time() + 40
-        while time.time() < deadline:
-            try:
-                if self.state_json()["stage"] == "grace":
-                    break
-            except (OSError, ValueError):
-                pass
-            time.sleep(0.2)
-        else:
-            proc.kill()
-            self.fail("grace に入らなかった")
+    def test_receive_killed_by_a_signal_after_the_swap_keeps_new_and_old(self):
+        """本物の受取が置き換えを終えたあとでシグナルを受けた(負の戻りコード)。置き換え済みかもしれないので、
+        配置済みの新しい token を失効させない(旧も)。標準エラーは見ない。"""
+        for sig, name in (("KILL", "SIGKILL"), ("TERM", "SIGTERM")):
+            with self.subTest(sig=sig):
+                self.drop_new_sessions()
+                self.token_file.write_text(self.old2_token + "\n")
+                env = self.wrapper(f'"$REAL" "$@"\nkill -{sig} $$\n')
+                result = self.run_script(extra_env=env)
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                new = [i for i in self.srv.labelled(self.LABEL) if i not in (self.old1, self.old2)]
+                self.assertEqual(len(new), 1, "新しいセッションを失効させていない")
+                new_token = self.srv.sessions[new[0]]["token"]
+                self.assertEqual(self.token_file.read_text(), new_token + "\n", "配置済みの新しい token がある")
+                self.assertEqual(self.srv.status(new_token), 200, "配置済みの token は有効なまま")
+                self.assertEqual(self.srv.status(self.old2_token), 200, "旧も失効させない")
+                st = self.state_json()
+                self.assertEqual((st["result"], st["exit_code"]), ("receive-signal", 3), name)
+                self.assertFalse(any(c["argv"][2:3] == ["revoke"] for c in self.calls() if c["kind"] == "t3"), "どのセッションも失効させない")
+                self.secrets_everywhere(result, [new_token])
+                self.log.unlink(missing_ok=True)
+
+    def test_unexpected_receive_exit_code_is_unknown_and_keeps_both(self):
+        env = self.wrapper('"$REAL" "$@"; exit 101\n')  # panic などの想定外の終了コード(置き換えの前後が不明)
+        result = self.run_script(extra_env=env)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertEqual(len(self.srv.labelled(self.LABEL)), 3)
+        self.assertEqual(self.state_json()["result"], "receive-unknown")
+
+    def test_a_receiver_without_revision_output_never_revokes(self):
+        env = self.wrapper('"$REAL" "$@" >/dev/null\n')  # 古い受取ツール: 置くが世代を返さない
+        result = self.run_script(extra_env=env)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertEqual(len(self.srv.labelled(self.LABEL)), 3)
+        self.assertEqual(self.state_json()["result"], "revision-unknown")
+
+    def test_installed_unchecked_is_decided_by_the_exit_code_even_after_long_warnings(self):
+        """先行する警告が長くて、短縮した表示では目印が切れても、置き換え後の失敗を置き換え前と取り違えない。"""
+        noise = "x" * 3000
+        line = "t3-token-receive: installed-unchecked: 置いた内容が読み戻しと違います"
+        # 新しい受取ツールの形: 専用の終了コード 3(標準エラーに目印が無くても判定できる)
+        for body in (
+            f'cat >/dev/null; echo "warn: {noise}" >&2; echo "{line}" >&2; exit 3\n',
+            f'cat >/dev/null; echo "warn: {noise}" >&2; echo "unrelated" >&2; exit 3\n',
+            # 古い受取ツールの形: 終了コード 1 + 長い先行警告 + 目印(標準エラー全体で判定する)
+            f'cat >/dev/null; echo "warn: {noise}" >&2; echo "{line}" >&2; exit 1\n',
+        ):
+            with self.subTest(body=body[:60]):
+                self.drop_new_sessions()
+                result = self.run_script(extra_env=self.wrapper(body))
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertEqual(len(self.srv.labelled(self.LABEL)), 3, "新旧とも失効させない")
+                self.assertEqual(self.state_json()["result"], "installed-unchecked")
+                self.assertLessEqual(len(self.state_json()["detail"]), 300)
+                self.assertNotIn(noise, result.stdout, "表示は短縮する")
+
+    def test_a_long_warning_before_a_pre_swap_failure_is_not_taken_for_installed(self):
+        noise = "x" * 3000
+        body = f'cat >/dev/null; echo "warn: {noise}" >&2; echo "t3-token-receive: unauthorized-401: 拒否" >&2; exit 1\n'
+        result = self.run_script(extra_env=self.wrapper(body))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.srv.labelled(self.LABEL), sorted([self.old1, self.old2]), "新しいセッションだけを失効させた")
+        self.assertEqual(self.state_json()["result"], "receive-failed")
+        self.assertIn("unauthorized-401", result.stdout, "表示は先行する警告ではなく診断行")
+
+    def test_sigterm_during_worker_wait_leaves_both_valid(self):
+        self.admin.mode = "never"
+        proc = subprocess.Popen([sys.executable, "-I", str(SCRIPT)], env={**self.env, "T3R_WORKER_WAIT": "60"}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.wait_for_stage("worker", proc)
         proc.send_signal(signal.SIGTERM)
         out, err = proc.communicate(timeout=20)
-        self.assertEqual(proc.returncode, 1, out + err)
+        self.assertEqual(proc.returncode, 3, out + err)
         self.assertEqual(len(self.srv.labelled(self.LABEL)), 3, "中断しても新旧を失効させない(token_file は新しい token)")
         new = [i for i in self.srv.labelled(self.LABEL) if i not in (self.old1, self.old2)][0]
         self.assertEqual(self.token_file.read_text(), self.srv.sessions[new]["token"] + "\n")
         self.assertEqual(self.state_json()["result"], "interrupted")
+
+    def wait_for_stage(self, stage, proc, seconds=40):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            try:
+                if self.state_json()["stage"] == stage:
+                    return
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.2)
+        proc.kill()
+        self.fail(f"{stage} に入らなかった")
+
+    # ---- 失効の条件: 稼働中の worker が、配置した世代で取得に成功したと観測できたときだけ
+
+    def test_an_old_revision_success_never_revokes_and_only_the_new_revision_does(self):
+        """worker がまだ古い token_file で取得している間(古い世代で成功・接続は正常)は、何度見ても失効させない。
+        新しい世代で成功したと観測できた後にだけ失効させる。"""
+        self.admin.mode = "stale"
+        self.admin.switch_after = 4
+        seen = []
+        self.admin.on_request = lambda revision: seen.append((revision, len(self.srv.labelled(self.LABEL))))
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        seen = seen[1:]  # 最初の 1 回は発行前の事前確認(古いセッション 2 本だけ)
+        old_phase = [n for rev, n in seen if rev == self.admin.old_revision]
+        self.assertGreaterEqual(len(old_phase), 3, seen)
+        self.assertTrue(all(n == 3 for n in old_phase), f"古い世代の間は新旧とも残す: {seen}")
+        new = self.srv.labelled(self.LABEL)
+        self.assertEqual(len(new), 1, "新しい世代で成功を観測したので古いものを失効させた")
+        self.assertEqual(self.token_file.read_text(), self.srv.sessions[new[0]]["token"] + "\n")
+        self.assertEqual(self.state_json()["result"], "ok")
+        self.secrets_everywhere(result, [self.srv.sessions[new[0]]["token"]])
+        # 管理トークンは HTTP ヘッダーだけに載った(要求のたびに正しい値)
+        self.assertTrue(self.admin.seen_auth and all(a == "Bearer " + self.admin_token for a in self.admin.seen_auth))
+
+    def test_no_fixed_wait_a_slow_worker_is_waited_for_not_guessed(self):
+        """poll_secs が長い worker は、新しい世代で取得するまで時間がかかる。固定の待ち時間(旧 70 秒)で失効させず、観測するまで待つ。"""
+        self.admin.mode = "delayed"
+        self.admin.delay = 5.0
+        seen = []
+        self.admin.on_request = lambda revision: seen.append((time.monotonic(), revision, len(self.srv.labelled(self.LABEL))))
+        started = time.monotonic()
+        result = self.run_script(extra_env={"T3R_WORKER_WAIT": "30"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertGreaterEqual(time.monotonic() - started, 5.0)
+        self.assertTrue(all(n == 3 for _, rev, n in seen[1:] if rev == self.admin.old_revision), seen)
+        self.assertEqual(len(self.srv.labelled(self.LABEL)), 1)
+
+    def test_a_worker_that_never_reports_the_new_revision_leaves_both_valid(self):
+        for mode, why in (("never", "古い世代のまま"), ("not_live", "接続が正常ではない"), ("no_revision", "世代を報告しない")):
+            with self.subTest(mode=mode, why=why):
+                self.drop_new_sessions()
+                self.token_file.write_text(self.old2_token + "\n")
+                self.admin.mode = mode
+                result = self.run_script(extra_env={"T3R_WORKER_WAIT": "3"})
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertEqual(len(self.srv.labelled(self.LABEL)), 3, "観測できないので新旧とも失効させない")
+                new = [i for i in self.srv.labelled(self.LABEL) if i not in (self.old1, self.old2)][0]
+                self.assertEqual(self.token_file.read_text(), self.srv.sessions[new]["token"] + "\n")
+                st = self.state_json()
+                self.assertEqual((st["result"], st["exit_code"], st["stage"]), ("worker-unconfirmed", 3, "worker"))
+                self.assertEqual(self.srv.status(self.old2_token), 200)
+
+    def test_admin_api_must_be_usable_before_anything_is_issued(self):
+        cases = {
+            "unreachable": ({"T3R_ADMIN_URL": "http://127.0.0.1:9"}, 1, "admin-unavailable"),
+            "wrong-token": (None, 1, "admin-unavailable"),
+            "no-connection": (None, 1, "admin-no-connection"),
+        }
+        for name, (env, code, kind) in cases.items():
+            with self.subTest(name=name):
+                self.log.unlink(missing_ok=True)
+                self.admin.mode = "follow"
+                if name == "wrong-token":
+                    self.admin_token_file.write_text("a-different-admin-token-0123456789\n")
+                    self.admin_token_file.chmod(0o600)
+                if name == "no-connection":
+                    self.admin.mode = "missing"
+                result = self.run_script(extra_env=env)
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                self.assertEqual(self.state_json()["result"], kind)
+                self.assertEqual(self.calls(), [], "観測できない状態では、コンテナに何も発行しない")
+                self.assertEqual(self.token_file.read_text(), self.old2_token + "\n")
+                self.admin_token_file.write_text(self.admin_token + "\n")
 
 
 class FailureAndSafetyTests(Base):
@@ -478,7 +715,21 @@ class FailureAndSafetyTests(Base):
             {"T3R_TOKEN_TTL": "30d --scope x"},
             {"T3R_EXEC_MODE": "sh"},
             {"T3R_EXEC_TIMEOUT": "0"},
-            {"T3R_REVOKE_GRACE": "-1"},
+            {"T3R_WORKER_WAIT": "0"},
+            {"T3R_ADMIN_POLL": "0"},
+            {"T3R_ADMIN_URL": ""},
+            {"T3R_ADMIN_URL": "http://example.com:8095"},
+            {"T3R_ADMIN_URL": "http://localhost.evil.test:8095"},
+            {"T3R_ADMIN_URL": "http://user:pw@127.0.0.1:8095"},
+            {"T3R_ADMIN_URL": "http://127.0.0.1:8095/api/v1/admin/overview"},
+            {"T3R_ADMIN_URL": "http://127.0.0.1:8095/?token=x"},
+            {"T3R_ADMIN_URL": "http://127.0.0.1:8095 --evil"},
+            {"T3R_ADMIN_URL": "ftp://127.0.0.1:8095"},
+            {"T3R_ADMIN_URL": "http://127.0.0.1:99999"},
+            {"T3R_ADMIN_TOKEN_FILE": ""},
+            {"T3R_ADMIN_TOKEN_FILE": "relative.token"},
+            {"T3R_ADMIN_TOKEN_FILE": "/x/../etc/token"},
+            {"T3R_ADMIN_TOKEN_FILE": "/x y"},
             {"T3R_CONFIG": "relative.toml"},
             {"T3R_STATE_DIR": "relative"},
         ]
@@ -489,6 +740,106 @@ class FailureAndSafetyTests(Base):
         self.assertEqual(self.calls(), [], "設定の誤りでは lxc を一度も実行しない")
         direct_missing = self.run_script(extra_env={"T3R_EXEC_MODE": "direct", "T3R_CONTAINER_USER": "1000"})
         self.assertEqual(direct_missing.returncode, 2)
+
+    def test_admin_token_file_must_meet_the_same_rules_as_miharashi(self):
+        """管理トークンのファイル: リンク・権限が緩い・他人所有・形式の誤りは、発行の前に止める(終了コード 2)。値は出さない。"""
+        good = self.admin_token_file.read_text()
+        bad = {}
+        loose = self.d / "loose.token"
+        loose.write_text(good)
+        loose.chmod(0o644)
+        bad["loose"] = str(loose)
+        real = self.d / "real.token"
+        real.write_text(good)
+        real.chmod(0o600)
+        link = self.d / "link.token"
+        link.symlink_to(real)
+        bad["symlink"] = str(link)
+        short = self.d / "short.token"
+        short.write_text("short\n")
+        short.chmod(0o600)
+        bad["short"] = str(short)
+        multi = self.d / "multi.token"
+        multi.write_text(good + good)
+        multi.chmod(0o600)
+        bad["multiline"] = str(multi)
+        bad["missing"] = str(self.d / "nothing.token")
+        bad["directory"] = str(self.d)
+        for name, path in bad.items():
+            with self.subTest(name=name):
+                self.log.unlink(missing_ok=True)
+                result = self.run_script(extra_env={"T3R_ADMIN_TOKEN_FILE": path})
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(self.calls(), [], "発行の前に止まる")
+                self.assertNotIn(self.admin_token, result.stdout + result.stderr + json.dumps(self.state_json()))
+        self.assertEqual(self.admin.seen_auth, [], "危険なファイルの値は管理 API に送られない")
+
+    def test_sigterm_while_issuing_revokes_the_session_whose_response_was_lost(self):
+        """発行コマンドの実行中(T3 側ではセッションが作られたが応答はまだ)に SIGTERM: 応答喪失と同じく、増えたセッションを失効させる。"""
+        self.srv.flags["hang_issue_after_create"] = True
+        proc = subprocess.Popen([sys.executable, "-I", str(SCRIPT)], env={**self.env, "T3R_EXEC_TIMEOUT": "40"}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.time() + 30
+        while time.time() < deadline and len(self.srv.labelled(self.LABEL)) < 3:
+            time.sleep(0.1)
+        self.assertEqual(len(self.srv.labelled(self.LABEL)), 3, "セッションが作られた(応答はまだ)")
+        self.assertEqual(self.state_json()["stage"], "issue")
+        self.srv.flags.pop("hang_issue_after_create")  # 後始末の一覧・失効は応答する
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 1, out + err)
+        self.assertEqual(self.srv.labelled(self.LABEL), sorted([self.old1, self.old2]), "増えたセッションを失効させた")
+        self.assertEqual(self.token_file.read_text(), self.old2_token + "\n")
+        st = self.state_json()
+        self.assertEqual((st["result"], st["cleanup_pending"]), ("interrupted", False))
+
+    def test_sigterm_while_issuing_records_a_possible_leftover_when_cleanup_cannot_run(self):
+        self.srv.flags["hang_issue_after_create"] = True
+        proc = subprocess.Popen([sys.executable, "-I", str(SCRIPT)], env={**self.env, "T3R_EXEC_TIMEOUT": "4"}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.time() + 30
+        while time.time() < deadline and len(self.srv.labelled(self.LABEL)) < 3:
+            time.sleep(0.1)
+        self.assertEqual(len(self.srv.labelled(self.LABEL)), 3)
+        self.srv.flags["hang_list"] = True  # 後始末の一覧が取れない(コンテナの CLI が固まる)
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=40)
+        self.assertEqual(proc.returncode, 1, out + err)
+        st = self.state_json()
+        self.assertEqual((st["result"], st["cleanup_pending"]), ("interrupted", True), "残存の可能性を状態に残す")
+        self.assertEqual(st["remaining_old"], ["確認できず"])
+        self.assertEqual(len(self.srv.labelled(self.LABEL)), 3, "失効できていない(次の実行が同じラベルの残りをまとめて失効させる)")
+        # 次の実行が回復する
+        self.srv.flags.pop("hang_list")
+        self.srv.flags.pop("hang_issue_after_create")
+        again = self.run_script()
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(len(self.srv.labelled(self.LABEL)), 1)
+        self.assertFalse(self.state_json()["cleanup_pending"])
+
+    def test_issue_timeout_with_unlistable_cleanup_marks_a_possible_leftover(self):
+        self.srv.flags["hang_issue_after_create"] = True
+        marker = self.d / "issued"
+        wrapper = self.d / "t3-wrapper2"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f'if [ "$3" = list ] && [ -e {marker} ]; then echo boom >&2; exit 1; fi\n'
+            f'if [ "$3" = issue ]; then touch {marker}; fi\n'
+            f'exec {self.cli} "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        result = self.run_script(extra_env={"T3R_T3_CLI": str(wrapper), "T3R_EXEC_TIMEOUT": "3"})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        st = self.state_json()
+        self.assertEqual((st["result"], st["cleanup_pending"]), ("issue-failed", True))
+
+    def test_admin_url_rules(self):
+        mod = load_module()
+        ok = {"http://127.0.0.1:8095": ("http", "127.0.0.1", 8095), "http://localhost:8095/": ("http", "localhost", 8095), "http://[::1]:8095": ("http", "::1", 8095),
+              "https://kiosk.example.test": ("https", "kiosk.example.test", 443), "http://192.0.2.30": ("http", "192.0.2.30", 80)}
+        for url, want in ok.items():
+            self.assertEqual(mod.parse_admin_url(url), want, url)
+        for url in ["http://kiosk.example.test:8095", "http://127.0.0.1:8095/x", "http://u@127.0.0.1", "http://127.0.0.1?x=1", "http://127.0.0.1#f", "gopher://127.0.0.1", "http://", "http://127.0.0.1:0x50"]:
+            with self.assertRaises(mod.Fail, msg=url):
+                mod.parse_admin_url(url)
 
     def test_check_config_and_status(self):
         ok = self.run_script("--check-config")

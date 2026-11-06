@@ -129,9 +129,39 @@ pub fn check_owner_and_mode(meta: &Metadata, euid: u32, egid: u32) -> Result<(),
 /// token ファイルを検査して読む。順序: リンクを追跡せず開く → FD の `fstat` で通常ファイル・所有者・権限
 /// → FD から 8192 バイトまで読む → 1 行の形式。
 pub fn read_private_token(path: &str, euid: u32, egid: u32) -> Result<String, TokenFileError> {
+    read_private_token_with_revision(path, euid, egid).map(|(token, _)| token)
+}
+
+/// `read_private_token` と同じ検査・読み方で、読んだ FD の世代(`revision`)も返す。世代は token と同じ FD の
+/// `fstat` から作るので、「この世代のファイルから、この token を読んだ」と言える(読んだあとの差し替えと混ざらない)。
+pub fn read_private_token_with_revision(
+    path: &str,
+    euid: u32,
+    egid: u32,
+) -> Result<(String, String), TokenFileError> {
     let (file, meta) = open_regular_nofollow(path)?;
     check_owner_and_mode(&meta, euid, egid)?;
-    parse_token(&read_bounded(&file)?)
+    let token = parse_token(&read_bounded(&file)?)?;
+    Ok((token, revision(&meta)))
+}
+
+/// token ファイルの世代: 「どのファイルの実体か」を表す、秘密を含まない短い文字列
+/// `r1.<dev>.<ino>.<mtime_ns>.<ctime_ns>.<size>`(10 進)。
+///
+/// 受取ツールが置いたファイルの世代(標準出力に出す)と、起動中の worker が最後の取得に使った token_file の
+/// 世代(管理 API の `feeds[].token_revision`)を比べて、「配置した新しい token で、稼働中の worker が
+/// 取得できた」ことを確かめるのに使う。token の値・ハッシュは使わない。入れ替えは新しい inode の `rename` なので、
+/// 置くたびに inode・時刻が変わる。判定は一致したときだけ「確認できた」とし、食い違えば確認できない側(安全側)に倒れる。
+pub fn revision(meta: &Metadata) -> String {
+    let ns = |s: i64, n: i64| i128::from(s) * 1_000_000_000 + i128::from(n);
+    format!(
+        "r1.{}.{}.{}.{}.{}",
+        meta.dev(),
+        meta.ino(),
+        ns(meta.mtime(), meta.mtime_nsec()),
+        ns(meta.ctime(), meta.ctime_nsec()),
+        meta.len()
+    )
 }
 
 #[cfg(test)]

@@ -974,6 +974,11 @@ pub struct ConfigAgents {
     /// 追加で監視する T3 Server(`[[agents.extra_servers]]`)。省略・空なら従来どおり `url` / `token_file` の 1 台だけ。
     /// 既存の `url` / `token_file` は常に server_id = `primary` の 1 台目(管理ページ・`config-get`・トークン更新の対象)。
     pub extra_servers: Vec<ConfigAgentServer>,
+    /// 追加先の token 配送役(`systemd/miharashi-t3-remote-token`)の状態ディレクトリ(絶対パス。省略 = 空 = 取り込まない)。
+    /// 管理ページが `<この場所>/<接続 id>.state.json`(秘密を含まない配送結果)を読み取り専用で取り込み、
+    /// token が正常でも更新に失敗している接続を接続別に表示する。`primary` には使わない。
+    /// 管理ページの上書きの対象にはならない(設定ファイルでだけ変える)。
+    pub rotation_state_dir: String,
 }
 
 /// 監視する接続の総数の上限(`[agents]` の `primary` を含む)。
@@ -1333,6 +1338,7 @@ impl Default for ConfigAgents {
             stale_secs: 30,
             recent_hours: 24,
             extra_servers: Vec::new(),
+            rotation_state_dir: String::new(),
         }
     }
 }
@@ -1862,6 +1868,19 @@ impl Config {
             }
         }
         validate_extra_servers(self)?;
+        let state_dir = &self.agents.rotation_state_dir;
+        if !state_dir.is_empty()
+            && (!is_plain_path_text(state_dir)
+                || !Path::new(state_dir).is_absolute()
+                || Path::new(state_dir)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir)))
+        {
+            return Err(
+                "agents.rotation_state_dir は絶対パス(制御文字・.. なし。省略すると配送結果を取り込まない)"
+                    .into(),
+            );
+        }
         if self.agents.enabled {
             crate::agents::check_url(&self.agents.url).map_err(|e| format!("agents.url: {e}"))?;
             if self.agents.token_file.is_empty()
@@ -3609,6 +3628,28 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(c.agents.servers()[1].token_file, written);
+    }
+
+    /// 配送役の状態ディレクトリ(省略可)。絶対パスだけ。省略した設定・旧設定はそのまま読める。
+    #[test]
+    fn rotation_state_dir_is_optional_and_must_be_an_absolute_plain_path() {
+        assert_eq!(ms_ok("").agents.rotation_state_dir, "");
+        let ok = |dir: &str| {
+            Config::parse(&format!(
+                "[agents]\nenabled = true\nurl = \"http://192.0.2.10:3773\"\ntoken_file = \"/var/lib/miharashi/t3-agent.token\"\nrotation_state_dir = \"{dir}\"\n"
+            ))
+        };
+        assert_eq!(
+            ok("/var/lib/miharashi-t3-remote-token")
+                .unwrap()
+                .agents
+                .rotation_state_dir,
+            "/var/lib/miharashi-t3-remote-token"
+        );
+        for bad in ["relative/dir", "/var/lib/../x", "/var/lib/x\\ty"] {
+            let e = ok(bad).unwrap_err();
+            assert!(e.contains("rotation_state_dir"), "{bad:?}: {e}");
+        }
     }
 
     #[test]

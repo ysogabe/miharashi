@@ -315,6 +315,7 @@ JSON の応答(既存のパネル API を含む)にも `X-Content-Type-Options: 
 - `allowed_hosts` の照合: ホストは `ureq::http::Uri::host()` で 1 回だけ取り出し、`check_url` の判定と照合の両方に同じ値を使う(取り出し方を 2 通りにしない)。IP アドレスは `IpAddr` に直して比べる(`2001:db8:0::1` と `2001:db8::1` は同じ)。ホスト名は小文字にそろえて完全一致(末尾のドット・末尾一致・ワイルドカードは無い)。ポートは明示されていなければ scheme の既定ポート。表記ゆれ(IPv4 の先頭 0、IPv4 射影、ゾーン ID)はすべて「一致しない」側に倒れる。
 - 照合の相手に、プログラムの既定値(`ConfigAgents::default()` の url、`config.rs:495`)は**使わない**。設定ファイルに `[agents] url` が書かれていないときは `allowed_hosts` だけで照合する。`load_with_overlay` は base の生の TOML から `agents.url` の有無を見て `base_agents_url` を決め、`LoadedConfig` に持たせる(PUT でも同じ値を使う)。
 - 照合は origin 単位(scheme・host・port)。「同じホストの別のポート」も `allowed_hosts` に `host:port` で書かないと通らない。理由: 許可ホスト上の一般ユーザーが高いポートで待ち受ければトークンを受け取れるため。設定ファイルの agents.url が https なら、管理ページからは https だけ(`allowed_hosts` に書いても http には変えられない。管理トークンを盗聴できる人は T3 のトークンも盗聴できてしまう)。
+- 複数 T3 接続(docs/t3-agent-multi-server)で足した、省略できる項目(足すだけで `schema_version` は変えない): `feeds[]` の T3 接続(`agents` / `agents:<id>`)の `token_revision`(最後に取得に成功したときに worker が使った token_file の世代。秘密を含まない。他の取得元には出ない)と、`tokens[]` の追加先の接続の `rotation`(token 配送役の結果。設定の `agents.rotation_state_dir` に状態があるときだけ)。形・信頼境界は [token-delivery.md](../t3-agent-multi-server/token-delivery.md)。
 - `feeds[].error` と `overlay.error` は 200 文字で切り、URL のクエリは落とす。外部サービスの応答本文はそのまま入れない(既存の `error_summary` と同じ短い要約)。
 - `feeds[].state` と各取得元の対応:
 

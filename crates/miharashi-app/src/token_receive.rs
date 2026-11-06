@@ -20,6 +20,12 @@
 //! ときは、token_file は新しい token に替わっている(`installed-unchecked`。旧 token には戻さない)。
 //! token の値は引数・環境変数・ログ・エラーに出さない。
 //!
+//! 終了コード: 0 = 置いた(標準出力に `revision <世代>` を 1 行。秘密を含まない token_file の世代で、
+//! 稼働中の worker が最後の取得に使った世代と比べるのに使う)/ 1 = 受け取りの失敗(**置き換える前**。
+//! 旧 token と token_file は変わらない)/ 2 = 使い方の誤り(同じく何も置いていない)/
+//! 3 = `installed-unchecked`(置き換えのあとの不備。token_file は**新しい token に替わっている**)。
+//! 1・2・3 以外(シグナルでの終了・panic の 101 など)は結果不明として扱うこと。
+//!
 //! 受け取り元のファイルは消さない(`--from-file` でも)。成功後にパスで消すと、そのパスの途中のディレクトリが
 //! 確認の最中に別の場所へのリンクに差し替えられていた場合、別のファイルを受取役の権限で消してしまう。
 //! 受け取り済みの送り出し側のファイルの後始末は、そのファイルを作った配送役が自分の信頼境界(自分の
@@ -180,6 +186,9 @@ impl std::fmt::Display for ReceiveError {
 pub struct Outcome {
     pub server_id: String,
     pub environment_id: Option<String>,
+    /// 置いた token_file の世代(`token_file::revision`。秘密を含まない)。配送役が、稼働中の worker が
+    /// この世代の token で取得できたかを確かめるのに使う。
+    pub revision: String,
 }
 
 /// 受取の本体。`others` は、受け取る値と同じであってはならない別の用途の token_file(名前, パス)。
@@ -243,19 +252,24 @@ pub fn receive(
     dest.install(&token)?;
 
     // 置いたものを、worker と同じ規則で読み直す(所有者・権限・形式)
-    match token_file::read_private_token(&server.token_file, req.euid, req.egid) {
-        Ok(t) if t == token => {}
+    let revision = match token_file::read_private_token_with_revision(
+        &server.token_file,
+        req.euid,
+        req.egid,
+    ) {
+        Ok((t, revision)) if t == token => revision,
         Ok(_) => {
             return Err(ReceiveError::InstalledUnchecked(
                 "置いた内容が読み戻しと違います".into(),
             ));
         }
         Err(e) => return Err(ReceiveError::InstalledUnchecked(e.to_string())),
-    }
+    };
 
     Ok(Outcome {
         server_id: server.id.clone(),
         environment_id: probe.environment_id,
+        revision,
     })
 }
 
@@ -449,6 +463,23 @@ impl Dest {
     }
 }
 
+/// 終了コード。`EXIT_FAILED`(1)と使い方の誤り(2。`run` が直接返す)は、**token_file を置き換える前**に止まったこと
+/// (旧 token と token_file は変わらない)を表す。`EXIT_INSTALLED_UNCHECKED`(3)は置き換えのあとの不備
+/// (token_file は新しい token に替わっている)。それ以外の値(シグナルでの終了・panic の 101 など)は結果不明。
+pub const EXIT_OK: i32 = 0;
+pub const EXIT_FAILED: i32 = 1;
+pub const EXIT_INSTALLED_UNCHECKED: i32 = 3;
+
+/// 失敗の終了コード。置き換えのあとの不備は専用のコード: 配送役は文面の一致ではなくこのコードで
+/// 「token_file はもう新しい token に替わっている」と判断する(先行する警告が長くて目印が切れても取り違えない)。
+pub fn exit_code(e: &ReceiveError) -> i32 {
+    if matches!(e, ReceiveError::InstalledUnchecked(_)) {
+        EXIT_INSTALLED_UNCHECKED
+    } else {
+        EXIT_FAILED
+    }
+}
+
 const USAGE: &str = "使い方: miharashi t3-token-receive --server <id> (--stdin | --from-file <絶対パス> --expect-uid <N> [--expect-gid <N>]) [--expect-environment-id <ID>] [--config FILE]";
 
 /// コマンドライン。成功なら 0、受け取りの失敗は 1、使い方の誤りは 2。
@@ -541,11 +572,13 @@ pub fn run(args: Vec<String>) -> i32 {
                     "t3-token-receive: 受け取り元のファイルは消していません。配送役が自分の側で消してください(まだ有効な token です)"
                 );
             }
-            0
+            // 機械が読む出力は標準出力に 1 行だけ(秘密を含まない世代)。診断の文は標準エラー。
+            println!("revision {}", o.revision);
+            EXIT_OK
         }
         Err(e) => {
             eprintln!("t3-token-receive: {e}");
-            1
+            exit_code(&e)
         }
     }
 }
@@ -806,10 +839,27 @@ mod tests {
             container.shell_requests(),
             [format!("authorization: Bearer {GOOD}")]
         );
-        // 置いたファイルを worker と同じ読み方で読める
-        assert_eq!(
-            token_file::read_private_token(&Dir::s(&fx.dest()), ids().0, ids().1).unwrap(),
-            GOOD
+        // 置いたファイルを worker と同じ読み方で読める。受取が返す世代は worker が同じファイルから読む世代と一致し、
+        // 秘密(token)を含まない
+        let (token, worker_revision) =
+            token_file::read_private_token_with_revision(&Dir::s(&fx.dest()), ids().0, ids().1)
+                .unwrap();
+        assert_eq!(token, GOOD);
+        assert_eq!(out.revision, worker_revision);
+        assert!(out.revision.starts_with("r1."));
+        assert!(!out.revision.contains(GOOD));
+    }
+
+    /// 置き直すたびに世代が変わる(古い世代の成功を、新しい世代の成功と取り違えない)。
+    #[test]
+    fn each_installation_has_a_new_revision() {
+        let container = Mock::new("env-container", GOOD, Behavior::Normal);
+        let fx = Fx::new("rev", "http://127.0.0.1:9", &container.url);
+        let first = receive(fx.req(&format!("{GOOD}\n")), &fx.servers, &[]).unwrap();
+        let second = receive(fx.req(&format!("{GOOD}\n")), &fx.servers, &[]).unwrap();
+        assert_ne!(
+            first.revision, second.revision,
+            "同じ内容を置き直しても世代は変わる"
         );
     }
 
@@ -1389,6 +1439,21 @@ mod tests {
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(reader.join().unwrap() > 0);
+    }
+
+    /// 置き換えのあとの不備だけが専用の終了コード(3)。置き換え前の失敗はすべて 1。
+    #[test]
+    fn only_a_failure_after_the_swap_has_the_dedicated_exit_code() {
+        assert_eq!(exit_code(&ReceiveError::InstalledUnchecked("x".into())), 3);
+        for before_swap in [
+            ReceiveError::Unauthorized,
+            ReceiveError::EnvironmentMismatch,
+            ReceiveError::Install("x".into()),
+            ReceiveError::DuplicateToken("x".into()),
+            ReceiveError::Unreachable("x".into()),
+        ] {
+            assert_eq!(exit_code(&before_swap), 1, "{before_swap:?}");
+        }
     }
 
     #[test]
