@@ -96,6 +96,35 @@ MIHARASHI_BIN=$tmp/miharashi-old
 check "(c) config-get が失敗したときも sed" "http://192.0.2.10:3773" "$(resolve)"
 if grep -q '失敗したので' "$tmp/warn"; then ok "(c) 失敗の警告が出る"; else ng "(c) 失敗の警告が出ていない"; fi
 
+# 複数サーバー(agents.extra_servers)の設定があっても、フォールバックの sed は primary([agents] の url / token_file)だけを読む
+MIHARASHI_BIN=$tmp/none/miharashi
+cp "$tmp/config.toml" "$tmp/config.single.toml"
+cat >>"$tmp/config.toml" <<EOT
+
+[[agents.extra_servers]]
+id = "container"
+url = "http://192.0.2.11:3773"
+token_file = "$tmp/state/t3-container.token"
+EOT
+check "(e) 追加先があっても sed は primary の url" "http://192.0.2.10:3773" "$(resolve)"
+check "(e) 追加先があっても sed は primary の token_file" "$tmp/state/t3-agent.token" "$(resolve_token_file 2>/dev/null)"
+# 追加配列が [agents] より前にあっても、[agents] の範囲だけを読む
+{
+    printf '[[agents.extra_servers]]\nid = "container"\nurl = "http://192.0.2.11:3773"\ntoken_file = "%s/state/t3-container.token"\n\n' "$tmp"
+    cat "$tmp/config.single.toml"
+} >"$tmp/config.reordered.toml"
+check "(e) 追加配列が先にあっても sed は primary の url" "http://192.0.2.10:3773" "$(MIHARASHI_CONFIG=$tmp/config.reordered.toml resolve)"
+check "(e) 追加配列が先にあっても sed は primary の token_file" "$tmp/state/t3-agent.token" "$(MIHARASHI_CONFIG=$tmp/config.reordered.toml resolve_token_file 2>/dev/null)"
+# 追加先の url を primary と取り違えない(1 行形式の extra_servers でも [agents] 内の url にならない)
+{
+    cat "$tmp/config.single.toml"
+    printf 'extra_servers = [{ id = "c", url = "http://192.0.2.12:3773", token_file = "/x" }]\n'
+} >"$tmp/config.inline.toml"
+check "(e) 1 行形式の追加先でも sed は primary の url" "http://192.0.2.10:3773" "$(MIHARASHI_CONFIG=$tmp/config.inline.toml resolve)"
+cp "$tmp/config.single.toml" "$tmp/config.toml"
+rm -f "$called"
+MIHARASHI_BIN=$tmp/miharashi
+
 if [[ -e "$called" ]]; then ng "(d) t3 か curl が呼ばれた: $(cat "$called")"; else ok "(d) resolve_url は t3 と curl を呼ばない"; fi
 
 # --- AC18: 確認に失敗したらトークンを置き換えない ---

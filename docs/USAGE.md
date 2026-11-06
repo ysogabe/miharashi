@@ -224,6 +224,36 @@ t3 auth session list                               # ラベル miharashi-agent-m
 - スクリプトは T3 の URL と `token_file` を `miharashi config-get agents.url` などで取ります(管理ページで変えた URL が、次回起動の値として反映されます。[管理ページ](#管理ページブラウザ)を参照)。`/usr/local/bin/miharashi` が無いときは、警告を出して設定ファイルを直接読みます。関数のテストは `bash systemd/test-miharashi-t3-token.sh`(T3 にはつながず、`cargo test` からも呼びません)。
 - T3 を別のマシンで動かしているときは自動更新を使えません。T3 のマシンで `t3 auth session issue --scope orchestration:read --ttl 30d --label miharashi-agent-monitor --token-only` を実行し、出たトークンを `token_file` に 0600(実行ユーザー)で置き、30 日以内に同じことを繰り返します。古いセッションは `t3 auth session list` で探し、`t3 auth session revoke <ID>` で失効させます。
 
+#### 複数の T3 Server を登録する(`[[agents.extra_servers]]`)
+
+T3 Server が複数あるときは、既存の `url` / `token_file`(server_id は `primary`)を変えずに、`[[agents.extra_servers]]` を足します。省略するか `extra_servers = []` なら今までどおり 1 台です。`primary` を含めて合計 4 台(追加は 3 台)までです。追加先は設定ファイルだけで書き、管理ページからは変えられません。
+
+```toml
+[agents]
+enabled = true
+url = "http://192.0.2.10:3773"
+token_file = "/var/lib/miharashi/t3-agent.token"
+
+[[agents.extra_servers]]
+id = "container"
+label = "コンテナ"
+url = "http://192.0.2.11:3773"
+token_file = "/var/lib/miharashi/t3-container.token"
+```
+
+| キー | 規則 |
+|---|---|
+| `id` | 1〜64 文字の ASCII 英数字・`-`・`_`。大文字小文字を区別せず一意。`primary` は使えません |
+| `label` | 省略すると `id`。指定するなら前後の空白を除いて 1〜32 文字。制御文字・双方向制御文字は不可。接続間(`primary` の表示名 `primary` を含む)で一意で、別の接続の `id` とも同じにできません |
+| `url` | `[agents] url` と同じ規則(origin だけ。平文 HTTP は IP アドレスか localhost)。`primary` や他の追加先と同じ接続先(scheme・host・port)は不可 |
+| `token_file` | 絶対パス。`primary`・他の追加先・`[panel]`・`[admin]`・`[home_assistant]` の `token_file` と同じファイル(シンボリックリンク・ハードリンク経由を含む)は不可 |
+
+設定が規則に合わないと、起動時と `miharashi check-config` が理由を出して失敗します(`agents.enabled = false` でも追加先は検査します)。戻すときは `[[agents.extra_servers]]` を外して再起動します。
+
+- `miharashi config-get agents.url` / `agents.token_file` は従来どおり `primary` の値を返します。`miharashi-t3-token.timer` が更新するのは `primary` の `token_file` だけで、追加先の token は更新しません。追加先の token は、その T3 Server で `orchestration:read` だけの token を発行し、`token_file` に 0600 で置いてください(自動更新の経路は別途設計します)。
+- 各追加先は自分の `url` と `token_file` だけを使います。別の接続先へ token は送りません。
+- この版では、設定の登録と検証までが入っています。追加先に実際につなぎ、同じ Agent 画面に表示する処理は、同じ設計の後続の実装で入ります(それまでは追加先を書いても接続しません)。
+
 取得は専用 worker が `GET /api/orchestration/shell` を 5 秒ごとに行い、接続時に環境情報を `GET /.well-known/t3/environment` で取得します。画面は一覧の状態だけを表示し、会話本文や承認内容は取得しません。認証が失効した場合は 401 / 403 を区別して表示し、token ファイルが変更されたときに再試行します。
 
 ### 操作パネル(Echo Show 5)をつなぐ

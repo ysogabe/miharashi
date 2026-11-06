@@ -1326,6 +1326,28 @@ mod tests {
         (dir, base)
     }
 
+    /// 複数 T3 Server(agents.extra_servers)の設定があっても、config-get は従来どおり primary の url / token_file を返す。
+    /// 追加先のキーは持たない(トークン更新スクリプトが追加先を取り違えない)。
+    #[test]
+    fn config_get_keeps_returning_primary_with_extra_servers() {
+        let base_text = "[agents]\nurl = \"http://192.0.2.30:3773\"\ntoken_file = \"/var/lib/miharashi/t3-agent.token\"\n\n[[agents.extra_servers]]\nid = \"container\"\nurl = \"http://192.0.2.31:3773\"\ntoken_file = \"/var/lib/miharashi/t3-container.token\"\n";
+        let (_dir, base) = config_dir("extra-servers", base_text, None);
+        assert_eq!(
+            config_get(Some(&base), "agents.url"),
+            Ok("http://192.0.2.30:3773".to_string())
+        );
+        assert_eq!(
+            config_get(Some(&base), "agents.token_file"),
+            Ok("/var/lib/miharashi/t3-agent.token".to_string())
+        );
+        for key in ["agents.extra_servers", "agents.extra_servers.url"] {
+            assert!(matches!(
+                config_get(Some(&base), key),
+                Err(ConfigGetError::UnknownKey(_))
+            ));
+        }
+    }
+
     /// AC17: config-get は起動時と同じ規則の値を出す。印には触らない。
     #[test]
     fn config_get_follows_the_startup_rules() {
