@@ -103,19 +103,10 @@ pub fn read_bounded(source: impl Read) -> Result<Vec<u8>, TokenFileError> {
 }
 
 /// 読んだバイト列を token にする。前後の空白(末尾の改行を含む)は落とし、残りは ASCII の印字文字
-/// (0x21〜0x7e)だけの 1 語でなければならない。`KEY=value` のような設定行は token とみなさない
-/// (`=` は末尾の base64 の詰め文字としてだけ許す)。`KEY=value` のような設定行は token とみなさない
-/// (`=` は末尾の base64 の詰め文字としてだけ許す)。
+/// (0x21〜0x7e)だけの 1 語でなければならない(空白を含む設定行や複数行は token とみなさない)。
 pub fn parse_token(bytes: &[u8]) -> Result<String, TokenFileError> {
     let trimmed = bytes.trim_ascii();
     if trimmed.is_empty() || !trimmed.iter().all(|b| (0x21..=0x7e).contains(b)) {
-        return Err(TokenFileError::BadFormat);
-    }
-    let body_len = trimmed
-        .iter()
-        .rposition(|&b| b != b'=')
-        .map_or(0, |i| i + 1);
-    if trimmed[..body_len].contains(&b'=') {
         return Err(TokenFileError::BadFormat);
     }
     // 上の検査で ASCII だけと分かっている
@@ -279,7 +270,6 @@ mod tests {
             ("two", b"tok1\ntok2\n"),
             ("space", b"Bearer tok\n"),
             ("kv", b"TOKEN = abc\n"),
-            ("kv2", b"TOKEN=abc\n"),
             ("tab", b"to\tk\n"),
             ("nul", b"to\0k\n"),
             ("utf8", "トークン\n".as_bytes()),

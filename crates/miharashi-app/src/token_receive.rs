@@ -818,7 +818,7 @@ mod tests {
         for (name, body) in [
             ("empty", String::new()),
             ("two lines", "a-token\nb-token\n".to_string()),
-            ("kv", "TOKEN=abc\n".to_string()),
+            ("kv", "TOKEN = abc\n".to_string()),
             ("bearer", format!("Bearer {GOOD}\n")),
         ] {
             let err = receive(fx.req(&body), &fx.servers, &[]).unwrap_err();

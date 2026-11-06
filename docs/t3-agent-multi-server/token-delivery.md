@@ -65,7 +65,7 @@ miharashi t3-token-receive --server <id> \
 | 置き先 | `--server` の id を `[[agents.extra_servers]]` から引き、その `token_file` に置く。コマンドラインでパスや URL は受け取らない(取り違えない)。`primary` は断る |
 | 入力(どちらか 1 つ) | `--stdin`: 配送側が標準入力へ流す(共有ファイルの所有者に依存しない。経路は T4 で決める)。`--from-file`: ホスト側の受取用ディレクトリに届いたファイル。`--expect-uid` は必須(想像で決めず実機の値を明示)。ファイルは受け取りに成功したら消す |
 | 秘密を渡さない | token は引数・環境変数に載せない(stdin かファイルで渡す) |
-| 検査(入力) | リンクを追跡せず開く(`O_NOFOLLOW`)・FIFO で固まらない(`O_NONBLOCK`)・開いた FD の `fstat` で通常ファイル・所有者(`--expect-uid`)・権限(所有者以外に権限がない)・ハードリンクなし・置き先と別のディレクトリ → 同じ FD から 8192 バイトまで読む → 空白・制御文字・非 ASCII を含まない 1 語(`KEY=value` 形式や複数行は不可) |
+| 検査(入力) | リンクを追跡せず開く(`O_NOFOLLOW`)・FIFO で固まらない(`O_NONBLOCK`)・開いた FD の `fstat` で通常ファイル・所有者(`--expect-uid`)・権限(所有者以外に権限がない)・ハードリンクなし・置き先と別のディレクトリ → 同じ FD から 8192 バイトまで読む → 空白・制御文字・非 ASCII を含まない 1 語(複数行や、空白を含む設定行は不可) |
 | 検査(置き先) | `token_file` は絶対パスで、ディレクトリはリンクや `..` を含まない正規の形。ディレクトリは実行ユーザー所有で、所有者以外に書き込み権限がない(0700 / 0750)。ディレクトリは `O_DIRECTORY\|O_NOFOLLOW` で開いた FD を基準に作成・置き換える。置き先のファイル名がリンクなら、リンク先を書き換えずリンクごと置き換える |
 | 取り違え防止 | 他の接続・`[panel]` / `[admin]` / `[home_assistant]` の token と同じ値なら置かない。対象の T3 には先に認証なしで環境情報を取り、`--expect-environment-id` と違えば token を送らない。リダイレクトは追跡しない。URL は worker と同じ `check_url`(平文 HTTP は IP か localhost のみ) |
 | 確認 | 受け取った token で `GET /api/orchestration/shell` が 200 になることを、**ホストから**確かめてから置く。401 / 403 / 302 / 接続失敗は置かない |
@@ -83,7 +83,7 @@ miharashi t3-token-receive --server <id> \
 | `unknown-server` / `primary-refused` | `--server` が設定にない / primary | 設定の `[[agents.extra_servers]]` の id |
 | `bad-destination` | 置き先のディレクトリが安全でない(所有者・権限・リンク・存在) | ディレクトリを 0700、実行ユーザー所有、リンクなしの絶対パスに |
 | `source-unsafe` / `source-owner` / `source-mode` / `source-hardlink` / `source-in-destination-dir` | 受け取り元がリンク・特殊ファイル・大きすぎる・所有者違い・権限が緩い・ハードリンク・置き先と同じディレクトリ | 配送側の書き方、`--expect-uid` の値 |
-| `bad-token` | 空・複数行・空白を含む・設定行の形式 | 発行側の出力(token だけを 1 行で) |
+| `bad-token` | 空・複数行・空白を含む | 発行側の出力(token だけを 1 行で) |
 | `duplicate-token` | 他の接続・用途と同じ値 | 配送の取り違え(primary の token を送っていないか) |
 | `bad-url` / `unreachable` | 接続先 URL が不正 / 届かない | ホストから対象への到達性(T4 で固定アドレスと待受を確認) |
 | `environment-mismatch` | 接続先の environmentId が期待と違う(token は送っていない) | 接続先が別のサーバーになっていないか(IP の再割り当て) |

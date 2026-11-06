@@ -95,13 +95,22 @@ struct Ctx {
 /// 管理トークンのファイルを読む。`agents::read_token` と同じ厳しい規則: 実行ユーザーの 0600、または
 /// root:実行グループの 0640。16 文字以上で 1 行。`euid` / `egid` は実行ユーザーとグループ。
 fn read_admin_token(path: &str, euid: u32, egid: u32) -> Result<String, String> {
-    // T3 の token と同じ読み方(リンクを追跡しない・開いた FD で検査・8192 バイトまで・1 行)
-    let token = crate::token_file::read_private_token(path, euid, egid)
-        .map_err(|e| format!("{path}: {}", e.message()))?;
+    use crate::token_file::{check_owner_and_mode, open_regular_nofollow, read_bounded};
+    // 開き方と検査は T3 の token と同じ(リンクを追跡しない・開いた FD で通常ファイル・所有者・権限・8192 バイトまで)。
+    // 中身の形式は従来のまま(前後の空白を落とし、16 文字以上で 1 行)。
+    let (file, meta) =
+        open_regular_nofollow(path).map_err(|e| format!("{path}: {}", e.message()))?;
+    check_owner_and_mode(&meta, euid, egid).map_err(|e| format!("{path}: {}", e.message()))?;
+    let bytes = read_bounded(&file).map_err(|e| format!("{path}: {}", e.message()))?;
+    let text = String::from_utf8(bytes).map_err(|_| format!("{path}: 読めない文字がある"))?;
+    let token = text.trim();
     if token.len() < 16 {
         return Err(format!("{path}: トークンが短い(16 文字以上)"));
     }
-    Ok(token)
+    if token.contains(['\r', '\n']) {
+        return Err(format!("{path}: トークンは 1 行で書く"));
+    }
+    Ok(token.to_string())
 }
 
 /// `[admin]` が有効なら管理トークンを読み、管理ワーカーを起こす。管理トークンが規則を満たさない、
