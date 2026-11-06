@@ -142,9 +142,9 @@
 # 各接続は別の token_file を使う(primary・他の追加先・panel・admin・home_assistant の token_file と共有できない)。
 # また miharashi-t3-token が更新するのは primary の token_file だけ。追加先の token は別の手順で置く(docs/USAGE.md)。
 # id: 1〜64 文字の ASCII 英数字・-・_(大文字小文字を区別せず一意。primary は予約)
-# label: 画面に出す名前。省略すると id。指定するなら前後の空白を除いて 1〜32 文字、制御文字・双方向制御文字は不可、接続間で一意
+# label: 画面に出す名前。省略すると id。指定するなら前後の空白を除いて 1〜32 文字、制御文字・双方向制御文字は不可、label どうしで一意(別の接続の id と同じでもよい)
 # url: 平文 http は IP か localhost だけ(primary と同じ規則)。primary や他の追加先と同じ接続先は不可
-# token_file: 絶対パス
+# token_file: 絶対パス(書いたまま使う)。リンクや .. を OS と同じに解いて同じファイルになるものは共有不可
 # [[agents.extra_servers]]
 # id = "container"
 # label = "コンテナ"

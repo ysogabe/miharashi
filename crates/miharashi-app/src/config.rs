@@ -994,7 +994,8 @@ pub struct ConfigAgentServer {
     pub label: Option<String>,
     /// この接続の T3 の origin(`[agents] url` と同じ規則。平文 http は IP か localhost だけ)
     pub url: String,
-    /// この接続だけの bearer を 1 行で書いたファイル(絶対パス。他の接続・パネル・管理・Home Assistant と共有しない)
+    /// この接続だけの bearer を 1 行で書いたファイル(絶対パス。書いたまま使い、字面の正規化はしない。
+    /// 他の接続・パネル・管理・Home Assistant と同じファイル(リンクや `..` を実体に解いて同じになる場合を含む)は不可)
     pub token_file: String,
 }
 
@@ -1338,7 +1339,8 @@ impl Default for ConfigAgents {
 
 impl ConfigAgents {
     /// 監視する接続の一覧(検証済みの設定から作る)。先頭は常に `primary`(`url` / `token_file`)。
-    /// 追加の接続は label の省略を id で埋め、label の前後の空白を落とし、token_file を絶対パスの字面に正規化する。
+    /// 追加の接続は label の省略を id で埋め、label の前後の空白を落とす。token_file は書いたまま渡す
+    /// (`..` やシンボリックリンクの意味を変えないよう、字面の正規化はしない。比較は検証側が実体を解いて行う)。
     pub fn servers(&self) -> Vec<AgentServer> {
         let mut v = Vec::with_capacity(1 + self.extra_servers.len());
         v.push(AgentServer {
@@ -1355,8 +1357,7 @@ impl ConfigAgents {
                     .as_deref()
                     .map_or_else(|| e.id.clone(), |l| l.trim().to_string()),
                 url: e.url.clone(),
-                token_file: normalize_abs_path(&e.token_file)
-                    .map_or_else(|| e.token_file.clone(), |p| p.display().to_string()),
+                token_file: e.token_file.clone(),
             });
         }
         v
@@ -1373,31 +1374,75 @@ fn is_forbidden_label_char(c: char) -> bool {
         )
 }
 
-/// 絶対パスの字面を正規化する(`.` と `//` を畳み、`..` を解く)。相対パス・NUL・制御文字を含むなら None。
-fn normalize_abs_path(path: &str) -> Option<PathBuf> {
+/// 設定に書いたパスとして使える文字列か(空・NUL・制御文字は不可)。
+fn is_plain_path_text(path: &str) -> bool {
+    !path.is_empty() && !path.chars().any(char::is_control)
+}
+
+/// 比べるためにパスを OS と同じ意味で解く。相対パスはプロセスの cwd 基準にし、既にあるシンボリックリンクは
+/// たどってから `..` を畳む(`/bin/../x` は `/bin` がリンクならリンク先の親の `x`)。まだ無い部分は字面で畳む
+/// (`.` と `//` と `..`)ので、未作成ファイルの字面の重複も見つけられる。
+/// 設定の値そのものは変えない(実行にはこの結果ではなく書いたままのパスを渡す)。
+/// 使えない文字を含む、cwd が分からない相対パス、リンクが深すぎる、のとき None。
+fn resolve_path_os_like(path: &str) -> Option<PathBuf> {
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
     use std::path::Component;
-    if path.chars().any(char::is_control) {
+    const MAX_LINKS: usize = 40;
+    if !is_plain_path_text(path) {
         return None;
     }
     let p = Path::new(path);
-    if !p.is_absolute() {
-        return None;
-    }
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(p)
+    };
     let mut out = PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::RootDir | Component::Prefix(_) => out.push(c.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
+    let mut todo: VecDeque<OsString> = VecDeque::new();
+    fn push_components(todo: &mut VecDeque<OsString>, out: &mut PathBuf, p: &Path) {
+        let mut names = Vec::new();
+        for c in p.components() {
+            match c {
+                Component::RootDir | Component::Prefix(_) => {
+                    out.clear();
+                    out.push(c.as_os_str());
+                    names.clear();
+                }
+                Component::CurDir => {}
+                Component::ParentDir => names.push(OsString::from("..")),
+                Component::Normal(n) => names.push(n.to_os_string()),
             }
-            Component::Normal(n) => out.push(n),
+        }
+        for n in names.into_iter().rev() {
+            todo.push_front(n);
+        }
+    }
+    push_components(&mut todo, &mut out, &abs);
+    let mut links = 0;
+    while let Some(name) = todo.pop_front() {
+        if name == ".." {
+            out.pop();
+            continue;
+        }
+        let cand = out.join(&name);
+        match std::fs::symlink_metadata(&cand) {
+            Ok(m) if m.file_type().is_symlink() => {
+                links += 1;
+                if links > MAX_LINKS {
+                    return None;
+                }
+                let target = std::fs::read_link(&cand).ok()?;
+                // 相対のリンクはリンクがあるディレクトリ(out)基準、絶対のリンクは根から
+                push_components(&mut todo, &mut out, &target);
+            }
+            _ => out = cand,
         }
     }
     Some(out)
 }
 
-/// 実体を確認できるときの同一ファイル判定の材料(シンボリックリンク・ハードリンクをたどる)。
+/// 実体を確認できるときの同一ファイル判定の材料(ハードリンクを同じものとして扱う)。
 fn file_identity(path: &Path) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
@@ -1412,26 +1457,16 @@ fn file_identity(path: &Path) -> Option<(u64, u64)> {
     }
 }
 
-/// 親ディレクトリだけ実体に直した形(ファイル自体がまだ無くても、ディレクトリのリンクを越えて比べられる)。
-fn canonical_form(path: &Path) -> PathBuf {
-    if let Ok(c) = std::fs::canonicalize(path) {
-        return c;
-    }
-    match (
-        path.parent().and_then(|p| std::fs::canonicalize(p).ok()),
-        path.file_name(),
-    ) {
-        (Some(dir), Some(name)) => dir.join(name),
-        _ => path.to_path_buf(),
-    }
-}
-
-/// 2 つの token_file が同じファイルを指すか(字面・実体のパス・inode のどれかが一致)。
-fn same_token_file(a: &Path, b: &Path) -> bool {
-    if a == b || canonical_form(a) == canonical_form(b) {
+/// 2 つの token_file が同じファイルを指すか。どちらも OS と同じ意味で解いた(cwd 基準・リンクをたどった)
+/// パスが一致するか、実体の inode が一致するとき。解けない側があれば、書いた字面が一致するときだけ同じ。
+fn same_token_file(a: &str, b: &str) -> bool {
+    if a == b {
         return true;
     }
-    matches!((file_identity(a), file_identity(b)), (Some(x), Some(y)) if x == y)
+    let (Some(ra), Some(rb)) = (resolve_path_os_like(a), resolve_path_os_like(b)) else {
+        return false;
+    };
+    ra == rb || matches!((file_identity(&ra), file_identity(&rb)), (Some(x), Some(y)) if x == y)
 }
 
 /// `agents.extra_servers` の検査。追加が無ければ何もしない。
@@ -1452,7 +1487,6 @@ fn validate_extra_servers(c: &Config) -> Result<(), String> {
     let primary_origin = parse_url_strict("agents.url", &c.agents.url)
         .ok()
         .map(|(_, o)| o);
-    let primary_token = normalize_abs_path(&c.agents.token_file);
     // 他のサービスの token_file(これと共有してはいけない)
     let others = [
         ("panel.token_file", &c.panel.token_file),
@@ -1500,25 +1534,23 @@ fn validate_extra_servers(c: &Config) -> Result<(), String> {
                 "{at}.url は agents.url({PRIMARY_SERVER_ID})と同じ接続先(同じ T3 を二重に監視しない)"
             ));
         }
-        let Some(path) = normalize_abs_path(&e.token_file) else {
+        // 追加先は絶対パスだけ(相対パスは cwd しだいで別のファイルになる)。値は書いたまま使い、比較にだけ実体を解く。
+        let path = e.token_file.as_str();
+        if !is_plain_path_text(path) || !Path::new(path).is_absolute() {
             return Err(format!("{at}.token_file は絶対パス(制御文字なし)"));
-        };
-        if path.file_name().is_none() {
+        }
+        if Path::new(path).file_name().is_none()
+            || resolve_path_os_like(path).is_some_and(|r| r.file_name().is_none())
+        {
             return Err(format!("{at}.token_file がファイルを指していない"));
         }
-        if primary_token
-            .as_deref()
-            .is_some_and(|p| same_token_file(p, &path))
-            || c.agents.token_file == e.token_file
-        {
+        if same_token_file(&c.agents.token_file, path) {
             return Err(format!(
                 "{at}.token_file が agents.token_file({PRIMARY_SERVER_ID})と同じファイル(接続ごとに別の token_file にする)"
             ));
         }
         for (name, other) in others {
-            if let Some(op) = normalize_abs_path(other)
-                && same_token_file(&op, &path)
-            {
+            if same_token_file(other, path) {
                 return Err(format!(
                     "{at}.token_file が {name} と同じファイル(他の用途の token と共有しない)"
                 ));
@@ -1535,26 +1567,19 @@ fn validate_extra_servers(c: &Config) -> Result<(), String> {
             if parse_url_strict("url", &f.url).is_ok_and(|(_, fo)| fo == origin) {
                 return Err(format!("{at}.url が {prev}.url と同じ接続先"));
             }
-            if normalize_abs_path(&f.token_file).is_some_and(|fp| same_token_file(&fp, &path)) {
+            if same_token_file(&f.token_file, path) {
                 return Err(format!(
                     "{at}.token_file が {prev}.token_file と同じファイル"
                 ));
             }
         }
     }
-    // label は id と同じ規則(大文字小文字なし)で、primary を含む全接続の間で一意。他の接続の id とも重ならない(混同を防ぐ)。
+    // label は primary を含む全接続の間で一意(大文字小文字なし)。label 同士だけを比べ、別の接続の id とは重なってよい。
     for (i, a) in servers.iter().enumerate() {
-        for (j, b) in servers.iter().enumerate() {
-            let ci = a.label.to_lowercase();
-            if i < j && ci == b.label.to_lowercase() {
+        for b in &servers[i + 1..] {
+            if a.label.to_lowercase() == b.label.to_lowercase() {
                 return Err(format!(
                     "接続の label が重複({:?})。接続ごとに別の名前にする",
-                    a.label
-                ));
-            }
-            if i != j && ci == b.id.to_lowercase() {
-                return Err(format!(
-                    "接続の label {:?} が別の接続の id と同じ(混同するため不可)",
                     a.label
                 ));
             }
@@ -3172,7 +3197,7 @@ mod tests {
         let v = c.agents.servers();
         assert_eq!(v.len(), 3);
         assert_eq!(v[0].id, "primary");
-        // label 省略は id、指定は trim。token_file は絶対パスの字面に正規化。url は書いたまま
+        // label 省略は id、指定は trim。token_file と url は書いたまま(`..` やリンクの意味を変えない)
         assert_eq!(
             (v[1].id.as_str(), v[1].label.as_str()),
             ("container", "container")
@@ -3183,7 +3208,10 @@ mod tests {
             ("nas_2", "倉庫の T3")
         );
         assert_eq!(v[2].url, "https://T3.Example.test/");
-        assert_eq!(v[2].token_file, "/var/lib/miharashi/t3-nas.token");
+        assert_eq!(
+            v[2].token_file, "/var/lib//miharashi/./x/../t3-nas.token",
+            "実行に渡す token_file は字面を畳まない"
+        );
         // 合計 4 台(primary + 追加 3)まで通る
         let three = format!(
             "{}{}{}",
@@ -3291,9 +3319,11 @@ mod tests {
         two("one", "two").unwrap();
         assert!(two("one", " ONE ").unwrap_err().contains("label が重複"));
         assert!(two("primary", "x").unwrap_err().contains("label が重複"));
-        // label が別の接続の id と同じだと混同するので拒否
-        assert!(two("b", "x").unwrap_err().contains("id と同じ"));
-        // label 省略は id になるので、他の接続の label と重なれば同じく拒否
+        // label は label 同士だけ比べる。別の接続の id と同じでも通る(id=a,label=b と id=b,label=c など)
+        two("b", "c").unwrap();
+        two("b", "x").unwrap();
+        two("primary2", "A").unwrap();
+        // label 省略は id になるので、他の接続の label と重なれば拒否
         let mut c = ms_ok(&format!(
             "{}{}",
             ms_extra("a", "http://192.0.2.11:3773", "/var/lib/miharashi/a.token"),
@@ -3458,6 +3488,127 @@ mod tests {
         // 別のファイルは通る
         t.write("other.token", "y\n");
         cfg(&p("real.token"), &p("other.token")).unwrap();
+    }
+
+    /// 比較の材料にだけ使う相対パスは cwd 基準で解く(extra は絶対パス必須なので cwd を足した絶対形で書く)
+    #[test]
+    fn ac5_relative_existing_token_files_are_compared_from_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let abs = |n: &str| cwd.join(n).display().to_string();
+        let cfg = |primary: &str, extra: &str, panel: &str| {
+            Config::parse(&format!(
+                "[agents]\nurl = \"http://192.0.2.10:3773\"\ntoken_file = \"{primary}\"\n[panel]\ntoken_file = \"{panel}\"\n{}",
+                ms_extra("a", "http://192.0.2.11:3773", extra)
+            ))
+        };
+        // 既存側(primary / panel)が相対パスでも cwd 基準で同じなら拒否
+        let e = cfg("ms-rel.token", &abs("ms-rel.token"), "/srv/p.token").unwrap_err();
+        assert!(e.contains("agents.token_file"), "{e}");
+        let e = cfg(
+            "./sub/../ms-rel.token",
+            &abs("ms-rel.token"),
+            "/srv/p.token",
+        )
+        .unwrap_err();
+        assert!(e.contains("agents.token_file"), "{e}");
+        let e = cfg("/srv/x.token", &abs("ms-rel.token"), "ms-rel.token").unwrap_err();
+        assert!(e.contains("panel.token_file"), "{e}");
+        // 別のファイルなら通る
+        cfg("ms-rel.token", &abs("ms-rel-other.token"), "/srv/p.token").unwrap();
+        // 追加先の相対パスは従来どおり拒否(cwd しだいで別のファイルになる)
+        for bad in ["ms-rel.token", "./ms-rel.token", "../ms-rel.token"] {
+            let e = ms_err(&ms_extra("a", "http://192.0.2.11:3773", bad));
+            assert!(e.contains("絶対パス"), "{bad}: {e}");
+        }
+    }
+
+    /// `..` の前にシンボリックリンクがあるとき、字面で畳むと別のファイルになる(/bin -> usr/bin の `/bin/../share`)
+    #[test]
+    fn ac5_dotdot_after_symlink_is_resolved_like_the_os() {
+        let t = Tmp::new("ms-dotdot");
+        std::fs::create_dir_all(t.path("usr/bin")).unwrap();
+        std::fs::create_dir_all(t.path("usr/share")).unwrap();
+        std::fs::create_dir_all(t.path("share")).unwrap();
+        std::os::unix::fs::symlink("usr/bin", t.path("bin")).unwrap();
+        let p = |n: &str| t.path(n).display().to_string();
+        let cfg = |primary: &str, extra: &str| {
+            Config::parse(&format!(
+                "[agents]\nurl = \"http://192.0.2.10:3773\"\ntoken_file = \"{primary}\"\n{}",
+                ms_extra("a", "http://192.0.2.11:3773", extra)
+            ))
+        };
+        // primary は bin(リンク)の親の share = usr/share。字面で畳んだ <t>/share/t3.token とは別のファイル
+        let primary = format!("{}/bin/../share/t3.token", t.0.display());
+        let e = cfg(&primary, &p("usr/share/t3.token")).unwrap_err();
+        assert!(e.contains("agents.token_file"), "{e}");
+        // 字面で畳んだ形(リンクを無視した解釈)は別のファイルなので通る
+        cfg(&primary, &p("share/t3.token")).unwrap();
+        // extra 側に同じ形があっても同様
+        let extra = format!("{}/bin/../share/t3.token", t.0.display());
+        let e = cfg(&p("usr/share/t3.token"), &extra).unwrap_err();
+        assert!(e.contains("agents.token_file"), "{e}");
+        cfg(&p("share/t3.token"), &extra).unwrap();
+        // 相対リンクも、絶対リンクの先の `..` も OS と同じに解く
+        std::os::unix::fs::symlink(t.path("usr/bin"), t.path("abs-bin")).unwrap();
+        let e = cfg(
+            &format!("{}/abs-bin/../share/n.token", t.0.display()),
+            &p("usr/share/n.token"),
+        )
+        .unwrap_err();
+        assert!(e.contains("agents.token_file"), "{e}");
+        // 実行に渡す extra はリンクも .. も書いたまま
+        let c = cfg(&p("share/t3.token"), &extra).unwrap();
+        assert_eq!(c.agents.servers()[1].token_file, extra);
+        assert_eq!(c.agents.servers()[0].token_file, p("share/t3.token"));
+    }
+
+    /// まだ無いファイル: 字面の重複と、リンクした親ディレクトリ越しの重複の両方を検出し、別のファイルは通す
+    #[test]
+    fn ac5_missing_token_files_and_link_parents() {
+        let t = Tmp::new("ms-missing");
+        std::fs::create_dir_all(t.path("real")).unwrap();
+        std::os::unix::fs::symlink(t.path("real"), t.path("alias")).unwrap();
+        // 途中が存在しないパスも字面で畳んで比べる
+        std::os::unix::fs::symlink("real", t.path("rel-alias")).unwrap();
+        let p = |n: &str| t.path(n).display().to_string();
+        let cfg = |primary: &str, extra: &str| {
+            Config::parse(&format!(
+                "[agents]\nurl = \"http://192.0.2.10:3773\"\ntoken_file = \"{primary}\"\n{}",
+                ms_extra("a", "http://192.0.2.11:3773", extra)
+            ))
+        };
+        let same = |a: &str, b: &str| {
+            let e = cfg(a, b).unwrap_err();
+            assert!(e.contains("同じファイル"), "{a} / {b}: {e}");
+        };
+        same(&p("none/new.token"), &p("none//./new.token"));
+        same(&p("none/x/../new.token"), &p("none/new.token"));
+        same(&p("real/new.token"), &p("alias/new.token"));
+        same(&p("real/new.token"), &p("rel-alias/new.token"));
+        same(&p("alias/sub/../new.token"), &p("real/new.token"));
+        // ぶら下がった(先が無い)ファイルのリンクは、その先のファイルとして比べる
+        std::os::unix::fs::symlink(t.path("real/later.token"), t.path("dangling.token")).unwrap();
+        same(&p("dangling.token"), &p("real/later.token"));
+        // 親が別のディレクトリなら通る
+        std::fs::create_dir_all(t.path("other")).unwrap();
+        cfg(&p("real/new.token"), &p("other/new.token")).unwrap();
+        cfg(&p("real/new.token"), &p("alias/other.token")).unwrap();
+        // 追加どうし(リンク越し)
+        let e = Config::parse(&format!(
+            "{MS_PRIMARY}{}{}",
+            ms_extra("a", "http://192.0.2.11:3773", &p("real/z.token")),
+            ms_extra("b", "http://192.0.2.12:3773", &p("alias/z.token"))
+        ))
+        .unwrap_err();
+        assert!(e.contains("extra_servers[1].token_file"), "{e}");
+        // 実行に渡すパスは書いたまま(リンク名・.. をそのまま保つ)
+        let written = p("alias/sub/../z.token");
+        let c = Config::parse(&format!(
+            "{MS_PRIMARY}{}",
+            ms_extra("a", "http://192.0.2.11:3773", &written)
+        ))
+        .unwrap();
+        assert_eq!(c.agents.servers()[1].token_file, written);
     }
 
     #[test]

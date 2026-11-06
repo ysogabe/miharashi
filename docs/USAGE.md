@@ -244,9 +244,9 @@ token_file = "/var/lib/miharashi/t3-container.token"
 | キー | 規則 |
 |---|---|
 | `id` | 1〜64 文字の ASCII 英数字・`-`・`_`。大文字小文字を区別せず一意。`primary` は使えません |
-| `label` | 省略すると `id`。指定するなら前後の空白を除いて 1〜32 文字。制御文字・双方向制御文字は不可。接続間(`primary` の表示名 `primary` を含む)で一意で、別の接続の `id` とも同じにできません |
+| `label` | 省略すると `id`。指定するなら前後の空白を除いて 1〜32 文字。制御文字・双方向制御文字は不可。接続間(`primary` の表示名 `primary` を含む)で、大文字小文字を区別せず一意です(`label` どうしだけを比べます。別の接続の `id` と同じでも構いません) |
 | `url` | `[agents] url` と同じ規則(origin だけ。平文 HTTP は IP アドレスか localhost)。`primary` や他の追加先と同じ接続先(scheme・host・port)は不可 |
-| `token_file` | 絶対パス。`primary`・他の追加先・`[panel]`・`[admin]`・`[home_assistant]` の `token_file` と同じファイル(シンボリックリンク・ハードリンク経由を含む)は不可 |
+| `token_file` | 絶対パス(書いたとおりに使います。`..` やシンボリックリンクの意味は変えません)。`primary`・他の追加先・`[panel]`・`[admin]`・`[home_assistant]` の `token_file` と同じファイルは不可です。比べるときは OS と同じようにリンクをたどってから `..` を解き(既存側の相対パスはプロセスの作業ディレクトリ基準)、ハードリンクも同じファイルとして扱います。まだ無いファイルは、親ディレクトリの実体と名前で比べます |
 
 設定が規則に合わないと、起動時と `miharashi check-config` が理由を出して失敗します(`agents.enabled = false` でも追加先は検査します)。戻すときは `[[agents.extra_servers]]` を外して再起動します。
 

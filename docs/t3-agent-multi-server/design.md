@@ -94,7 +94,7 @@ ThreadKey=(server_id,thread_id)、ProjectKey=(server_id,project_id)を型とし�
 
 本番前に固定アドレスまたは証明書検証付きHTTPS名を確保し、待受/ファイアウォールで監視ホストからの到達だけを許す。DHCP再割当で別接続先へ秘密を送る構成は不可。証明書検証を無効化する設定は作らない。これらの環境整備は別途管理作業だが、確認完了を接続の前提とする。
 
-設定検証では正規化origin（scheme/host/effective port）の重複、token_fileの重複、panel/admin/home_assistantのtoken_fileとの共有も拒否する。パスは絶対パスへ正規化し、実体を確認できる場合は同一ファイルも検出する。受取先ディレクトリの保護とworkerのリンク拒否で後からの取り違えも防ぐ。表示文字列は設定labelもdescriptor由来labelも既存タイトルの無害化処理を共用し、制御文字・双方向制御文字を除去、上限を適用する。descriptor名を識別キーにはしない。
+設定検証では正規化origin（scheme/host/effective port）の重複、token_fileの重複、panel/admin/home_assistantのtoken_fileとの共有も拒否する。追加先のtoken_fileは絶対パス必須で、書いたまま実行に渡す（字面の正規化で`..`やシンボリックリンクの意味を変えない）。比較は別に行い、既存側の相対パスはcwd基準、リンクをたどってから`..`を解き、未作成部分は字面で畳み、実体を確認できる場合はinode（ハードリンク）でも同一ファイルを検出する。labelの一意性はlabel同士だけで見る。受取先ディレクトリの保護とworkerのリンク拒否で後からの取り違えも防ぐ。表示文字列は設定labelもdescriptor由来labelも既存タイトルの無害化処理を共用し、制御文字・双方向制御文字を除去、上限を適用する。descriptor名を識別キーにはしない。
 
 environment_id変更の検出は現行workerのdescriptor再取得時（再接続時）に行う。常時の検出を保証しない。文書・ログに実IPや秘密を記録しない方針を維持し、画面の診断情報は必要な接続識別情報のみ表示し、エラー文字列に認証情報が混入しないよう整形する。
 
