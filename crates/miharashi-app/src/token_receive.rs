@@ -246,7 +246,7 @@ pub fn receive(
     match token_file::read_private_token(&server.token_file, req.euid, req.egid) {
         Ok(t) if t == token => {}
         Ok(_) => {
-            return Err(ReceiveError::Install(
+            return Err(ReceiveError::InstalledUnchecked(
                 "置いた内容が読み戻しと違います".into(),
             ));
         }
@@ -303,7 +303,9 @@ fn compare_with_other(path: &str, token: &str) -> Result<bool, String> {
     }
     let bytes = token_file::read_bounded(&file)
         .map_err(|e| format!("{path} を読めません: {}", e.message()))?;
-    Ok(bytes.trim_ascii() == token.as_bytes())
+    let value = std::str::from_utf8(&bytes)
+        .map_err(|_| format!("{path} の内容を UTF-8 として読めません"))?;
+    Ok(value.trim() == token)
 }
 
 /// 受取用のファイルを読む。リンクを追跡せず開き、開いた FD で検査してから読む。
@@ -1095,6 +1097,20 @@ mod tests {
             matches!(&err, ReceiveError::DuplicateToken(n) if n == "操作パネル"),
             "{err:?}"
         );
+        // 既存の各用途は String::trim で Unicode 空白も除く。同じ値を送らない。
+        for padding in ["\u{a0}", "\u{2003}", "\u{3000}"] {
+            write(
+                &fx.d.0.join("panel-real"),
+                &format!("{padding}{GOOD}{padding}\n"),
+                0o600,
+            );
+            let err = receive(fx.req(GOOD), &fx.servers, &others_for(&link)).unwrap_err();
+            assert!(matches!(err, ReceiveError::DuplicateToken(_)), "{err:?}");
+        }
+        std::fs::write(&real, [0xff, 0xfe]).unwrap();
+        let err = receive(fx.req(GOOD), &fx.servers, &others_for(&link)).unwrap_err();
+        assert!(matches!(err, ReceiveError::CompareFailed(..)), "{err:?}");
+        write(&fx.d.0.join("panel-real"), &format!("{GOOD}\n"), 0o600);
         // 別の接続の token_file がリンクでも同じ
         let mut servers = fx.servers.clone();
         servers.push(AgentServer {
