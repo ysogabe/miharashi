@@ -368,7 +368,7 @@ mod gpu {
         struct AgentFeed(crate::agents::AgentSnapshot);
         impl Provider for AgentFeed {
             fn update(&mut self, world: &mut World) {
-                world.agents = self.0.clone();
+                world.agents = crate::agents::ServerSnapshot::primary(self.0.clone());
             }
         }
         let (dir, p) = super::super::tests::test_photo();

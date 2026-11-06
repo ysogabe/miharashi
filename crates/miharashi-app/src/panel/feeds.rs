@@ -60,8 +60,8 @@ fn report(
     error: Option<&str>,
 ) -> FeedReport {
     FeedReport {
-        id,
-        label,
+        id: id.into(),
+        label: label.into(),
         state,
         last_ok: last_ok.map(rfc3339),
         error: error.map(clip_error),
@@ -108,6 +108,20 @@ pub(super) fn from_aircraft(h: &Health) -> FeedReport {
     report("aircraft", "tar1090(航空機)", state, h.last_ok, error)
 }
 
+/// 1 接続ぶん。`primary` は従来どおり id `agents`・名前 `T3(エージェント)`、追加の接続は `agents:<id>`・`T3(<label>)`。
+pub(super) fn from_agent_connection(
+    server_id: &str,
+    label: &str,
+    s: &AgentSnapshot,
+) -> Vec<FeedReport> {
+    let mut r = from_agents(s);
+    if server_id != crate::config::PRIMARY_SERVER_ID {
+        r.id = format!("agents:{server_id}");
+        r.label = format!("T3({label})");
+    }
+    vec![r]
+}
+
 pub(super) fn from_agents(s: &AgentSnapshot) -> FeedReport {
     let state = match s.connection {
         AgentConnection::Connecting => FeedState::Connecting,
@@ -136,7 +150,7 @@ impl AdminSources {
         const HA: (&str, &str) = ("home_assistant", "Home Assistant(室内)");
         const WEATHER: (&str, &str) = ("weather", "気象庁(予報)");
         const DISASTER: (&str, &str) = ("disaster", "気象庁(警報)");
-        vec![
+        [
             match &self.geoframe {
                 Ok(l) => from_link(&l.lock().map(|g| g.clone()).unwrap_or_default()),
                 Err(why) => not_running("geoframe", "GEOFRAME(写真)", why),
@@ -169,11 +183,23 @@ impl AdminSources {
                 Ok(h) => from_aircraft(&h.lock().map(|g| g.clone()).unwrap_or_default()),
                 Err(why) => not_running("aircraft", "tar1090(航空機)", why),
             },
-            match &self.agents {
-                Ok(a) => from_agents(&a.read().map(|g| g.clone()).unwrap_or_default()),
-                Err(why) => not_running("agents", "T3(エージェント)", why),
-            },
         ]
+        .into_iter()
+        .chain(match &self.agents {
+            // 接続ごとに 1 件(primary は従来の id)。ロックは接続ごとに写す間だけ。
+            Ok(connections) => connections
+                .iter()
+                .flat_map(|c| {
+                    from_agent_connection(
+                        &c.server_id,
+                        &c.label,
+                        &c.shared.read().map(|g| g.clone()).unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            Err(why) => vec![not_running("agents", "T3(エージェント)", why)],
+        })
+        .collect()
     }
 }
 
@@ -264,7 +290,10 @@ mod tests {
     #[test]
     fn geoframe_maps_online_retrying_and_before_the_first_fetch() {
         let r = from_link(&Link::default());
-        assert_eq!((r.id, r.state), ("geoframe", FeedState::Connecting));
+        assert_eq!(
+            (r.id.as_str(), r.state),
+            ("geoframe", FeedState::Connecting)
+        );
         let ok = Link {
             last_ok: Some(at("2026-10-30T10:40:12+09:00")),
             status: Some(Photo::Online),
@@ -344,6 +373,44 @@ mod tests {
     }
 
     #[test]
+    fn each_agent_connection_gets_its_own_feed_report() {
+        let conn = |id: &str, label: &str, connection| crate::agents::Connection {
+            server_id: id.into(),
+            label: label.into(),
+            shared: Arc::new(RwLock::new(AgentSnapshot {
+                connection,
+                error_summary: Some(format!("{id} の状態")),
+                ..AgentSnapshot::default()
+            })),
+        };
+        let s = AdminSources {
+            agents: Ok(vec![
+                conn("primary", "primary", AgentConnection::Live),
+                conn(
+                    "container",
+                    "コンテナ",
+                    AgentConnection::AuthenticationRequired,
+                ),
+            ]),
+            ..AdminSources::default()
+        };
+        let feeds = s.feeds();
+        assert_eq!(feeds.len(), 7, "接続が 1 台増えると 1 件増える");
+        let by = |id: &str| feeds.iter().find(|f| f.id == id).unwrap();
+        assert_eq!(
+            (by("agents").state, by("agents").label.as_str()),
+            (FeedState::Ok, "T3(エージェント)")
+        );
+        assert_eq!(by("agents:container").state, FeedState::AuthRequired);
+        assert_eq!(by("agents:container").label, "T3(コンテナ)");
+        assert_eq!(
+            by("agents:container").error.as_deref(),
+            Some("container の状態")
+        );
+        assert_eq!(by("agents").error, None, "別の接続の状態は混ざらない");
+    }
+
+    #[test]
     fn sources_map_none_with_reason_to_not_running() {
         let feeds = AdminSources::default().feeds();
         assert_eq!(feeds.len(), 6);
@@ -354,11 +421,15 @@ mod tests {
         }
         let s = AdminSources {
             aircraft: Err("aircraft.enabled = false".into()),
-            agents: Ok(Arc::new(RwLock::new(AgentSnapshot {
-                connection: AgentConnection::AuthenticationRequired,
-                error_summary: Some("T3 token file を確認できません".into()),
-                ..AgentSnapshot::default()
-            }))),
+            agents: Ok(vec![crate::agents::Connection {
+                server_id: "primary".into(),
+                label: "primary".into(),
+                shared: Arc::new(RwLock::new(AgentSnapshot {
+                    connection: AgentConnection::AuthenticationRequired,
+                    error_summary: Some("T3 token file を確認できません".into()),
+                    ..AgentSnapshot::default()
+                })),
+            }]),
             home_assistant: Ok(Arc::new(Mutex::new(crate::env::EnvData::default()))),
             ..AdminSources::default()
         };

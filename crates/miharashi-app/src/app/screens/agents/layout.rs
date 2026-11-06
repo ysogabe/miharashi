@@ -4,7 +4,9 @@
 //! 列が足りないときは 1〜数件の枠を 1 列に縦に積み、それでも入らない列ではカードを重ねる。
 pub mod family;
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::hash::Hash;
 
 // 1920x1080 を 1.0 とした寸法。
 const CARD_H: f32 = 210.0;
@@ -59,18 +61,42 @@ pub struct Lane {
     pub cont: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Layout {
+/// スレッドの識別に使える型。画面は `ThreadKey`(接続とスレッド ID の組)を渡し、文字列を連結した ID は作らない。
+pub trait Id: Clone + Eq + Hash + std::fmt::Debug {}
+impl<T: Clone + Eq + Hash + std::fmt::Debug> Id for T {}
+
+#[derive(Clone, Debug)]
+pub struct Layout<K = String> {
     pub lanes: Vec<Lane>,
-    pub cards: HashMap<String, CardSlot>,
+    pub cards: HashMap<K, CardSlot>,
     /// 親子グループの枠(`family::plan_board` が作る。単独スレッドだけの配置では空)。
-    pub families: Vec<family::FamilyShape>,
+    pub families: Vec<family::FamilyShape<K>>,
     /// この配置を作ったときの scale。1 枚に収めるために、渡された scale より小さいことがある。
     /// 枠や見出しの寸法は、画面の scale ではなくこの値から求める(空の配置では 0)。
     pub scale: f32,
 }
 
-impl Layout {
+impl<K: Id> PartialEq for Layout<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.lanes == other.lanes
+            && self.cards == other.cards
+            && self.families == other.families
+            && self.scale == other.scale
+    }
+}
+
+impl<K> Default for Layout<K> {
+    fn default() -> Self {
+        Self {
+            lanes: Vec::new(),
+            cards: HashMap::new(),
+            families: Vec::new(),
+            scale: 0.0,
+        }
+    }
+}
+
+impl<K: Id> Layout<K> {
     /// 配置の scale。まだ配置が無い(0 の)ときは `fallback`。
     pub fn scale_or(&self, fallback: f32) -> f32 {
         if self.scale > 0.0 {
@@ -82,25 +108,29 @@ impl Layout {
 
     /// カードの置き場。カードが無い(「ほか N 件」にまとめた)スレッドは、親のカード、
     /// 親も無ければグループの見出しの位置を返す。ポップアップの元位置と戻り先に使う。
-    pub fn anchor(&self, id: &str) -> Option<Rect> {
+    pub fn anchor<Q>(&self, id: &Q) -> Option<Rect>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         if let Some(card) = self.cards.get(id) {
             return Some(card.rect);
         }
         let shape = self
             .families
             .iter()
-            .find(|f| f.hidden_ids.iter().any(|h| h == id))?;
+            .find(|f| f.hidden_ids.iter().any(|h| h.borrow() == id))?;
         shape
             .root
-            .as_deref()
-            .and_then(|root| self.cards.get(root))
+            .as_ref()
+            .and_then(|root| self.cards.get::<K>(root))
             .map(|c| c.rect)
             .or(Some(shape.head))
     }
 }
 
 /// `groups` は表示順に並んだプロジェクトごとのスレッド ID。各グループの中は重要な順。
-pub fn layout(area: Rect, scale: f32, groups: &[Vec<String>]) -> Layout {
+pub fn layout<K: Id>(area: Rect, scale: f32, groups: &[Vec<K>]) -> Layout<K> {
     let mut out = Layout {
         scale,
         ..Layout::default()
@@ -284,9 +314,9 @@ pub fn layout(area: Rect, scale: f32, groups: &[Vec<String>]) -> Layout {
 /// 全部が入る列は重要な順に上から並べ、`fill` なら縦に伸ばして列を埋める。
 /// 入らない列は静かなものを上に重ね、重要なものほど下の手前に全体を見せる。
 #[allow(clippy::too_many_arguments)]
-fn place_column(
-    cards: &mut HashMap<String, CardSlot>,
-    ids: &[String],
+fn place_column<K: Id>(
+    cards: &mut HashMap<K, CardSlot>,
+    ids: &[K],
     x: f32,
     top: f32,
     w: f32,

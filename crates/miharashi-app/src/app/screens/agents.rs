@@ -1,8 +1,13 @@
 //! 操作不要の T3 Agent カードボード。ボードは 1 枚で、スレッドはプロジェクトごとの枠にまとめる。
 mod layout;
+#[cfg(test)]
+mod multi_tests;
 
 use self::layout::family::{self, Node, Tier};
-use crate::agents::{AgentChangeKind, AgentConnection, AgentEntry, AgentSnapshot};
+use crate::agents::{
+    AgentChangeKind, AgentConnection, AgentEntry, AgentSnapshot, ChangeKey, ProjectKey, ServerId,
+    ServerSnapshot, ThreadKey,
+};
 use crate::screen::{Composite, Outcome, RenderContext, Screen, ScreenAction, ScreenId};
 use miharashi_render::agents as draw;
 use miharashi_render::{Canvas, Pixmap};
@@ -27,7 +32,9 @@ enum EventKind {
 
 #[derive(Clone, Debug)]
 struct QueuedEvent {
-    thread_id: String,
+    /// 通知の元になった変更。`AgentChange::id` は接続ごとの連番なので、接続と組で持つ。
+    change: ChangeKey,
+    key: ThreadKey,
     kind: EventKind,
     before: String,
     after: String,
@@ -96,8 +103,41 @@ impl PoseTween {
 /// 1 つのプロジェクトのスレッド。重要な順に並ぶ。
 #[derive(Clone)]
 struct Group {
+    /// 複数の接続を監視しているときは「接続名 / プロジェクト名」。
     label: String,
     entries: Vec<AgentEntry>,
+}
+
+/// 接続ごとの画面側の同期状態。カーソル・世代・stale・最後に見た取得結果は接続ごとに持ち、
+/// 全体の stale や合成した sequence は作らない(1 台の遅れや再同期が他の接続の通知を止めない)。
+struct ServerUiState {
+    id: ServerId,
+    label: String,
+    /// この接続で最後に見た `AgentChange::id`(比較は同じ接続の変更とだけ行う)。
+    cursor: u64,
+    generation: u64,
+    stale: bool,
+    observed_sync: bool,
+    duplicate_environment: bool,
+    last_snapshot: AgentSnapshot,
+    /// 今のスレッド(`server_id` はこの接続で付け直したもの)。
+    entries: Vec<AgentEntry>,
+}
+
+impl ServerUiState {
+    fn new(id: ServerId, label: String) -> Self {
+        Self {
+            id,
+            label,
+            cursor: 0,
+            generation: 0,
+            stale: false,
+            observed_sync: false,
+            duplicate_environment: false,
+            last_snapshot: AgentSnapshot::default(),
+            entries: Vec::new(),
+        }
+    }
 }
 
 /// 表示するスレッドを、プロジェクトごとの親子グループにまとめたもの。
@@ -106,25 +146,28 @@ struct Group {
 struct Arrangement {
     groups: Vec<Group>,
     /// `groups` と同じ順のプロジェクトごとに、親子グループ(重要な順)。
-    families: Vec<Vec<family::Family>>,
+    families: Vec<Vec<family::Family<ThreadKey>>>,
 }
 
 pub struct AgentScreen {
     size: (u32, u32),
     stale_secs: u64,
     gpu: bool,
-    surfaces: HashMap<String, Arc<Pixmap>>,
-    revisions: HashMap<String, u64>,
-    content_keys: HashMap<String, String>,
-    entry_keys: HashMap<String, String>,
+    /// 接続の順(設定の順)。接続の追加・消滅は `sync_all` が扱う。
+    servers: Vec<ServerUiState>,
+    // 以下のキャッシュは、すべて接続とスレッド(プロジェクト)の組で引く。
+    surfaces: HashMap<ThreadKey, Arc<Pixmap>>,
+    revisions: HashMap<ThreadKey, u64>,
+    content_keys: HashMap<ThreadKey, String>,
+    entry_keys: HashMap<ThreadKey, String>,
     /// 初めて見た順。並びの最後の決め手と、表示中スレッドの集合を兼ねる。
-    seen: HashMap<String, u64>,
-    project_seen: HashMap<String, u64>,
+    seen: HashMap<ThreadKey, u64>,
+    project_seen: HashMap<ProjectKey, u64>,
     next_seen: u64,
-    last_activity: HashMap<String, Instant>,
-    poses: HashMap<String, PoseTween>,
+    last_activity: HashMap<ThreadKey, Instant>,
+    poses: HashMap<ThreadKey, PoseTween>,
     /// いま表示している配置(常に 1 枚)。
-    board: layout::Layout,
+    board: layout::Layout<ThreadKey>,
     arrangement: Arrangement,
     /// 親子グループの枠・接続線に使う単色の面(色ごとに 1 枚を使い回す)。
     solids: HashMap<[u8; 4], (u64, Arc<Pixmap>)>,
@@ -137,15 +180,11 @@ pub struct AgentScreen {
     /// 配置(`plan_board`)を作り直した回数。テストで、変わっていないときに作り直さないことを確かめる。
     #[cfg(test)]
     replans: usize,
-    goal_notified: HashMap<String, Instant>,
-    stale: bool,
+    goal_notified: HashMap<ThreadKey, Instant>,
     overflow_updates: usize,
     queue: VecDeque<QueuedEvent>,
-    pending_new: HashSet<String>,
+    pending_new: HashSet<ThreadKey>,
     focus: Option<Focus>,
-    change_cursor: u64,
-    resync_generation: u64,
-    observed_sync: bool,
     presentable: bool,
     paused_at: Option<Instant>,
     background: Option<Pixmap>,
@@ -153,10 +192,11 @@ pub struct AgentScreen {
     scene_cards: Vec<draw::AgentCardSurface>,
     scrim_alpha: f32,
     focus_card_id: Option<u64>,
-    id_map: HashMap<String, u64>,
+    id_map: HashMap<ThreadKey, u64>,
     text_dirty: bool,
+    /// 全接続のスレッド(接続の順に並べたもの)。
     entries: Vec<AgentEntry>,
-    last_snapshot: AgentSnapshot,
+    entries_dirty: bool,
     last_now: Instant,
     header_due: Instant,
     /// 壁時計を固定する(`png` の fixture 用。None なら `World::wall`)
@@ -171,6 +211,7 @@ impl AgentScreen {
             size,
             stale_secs,
             gpu,
+            servers: Vec::new(),
             surfaces: HashMap::new(),
             revisions: HashMap::new(),
             content_keys: HashMap::new(),
@@ -189,13 +230,9 @@ impl AgentScreen {
             #[cfg(test)]
             replans: 0,
             goal_notified: HashMap::new(),
-            stale: false,
             overflow_updates: 0,
             queue: VecDeque::new(),
             focus: None,
-            change_cursor: 0,
-            resync_generation: 0,
-            observed_sync: false,
             presentable: true,
             paused_at: None,
             background: None,
@@ -206,8 +243,8 @@ impl AgentScreen {
             id_map: HashMap::new(),
             text_dirty: true,
             entries: Vec::new(),
+            entries_dirty: false,
             pending_new: HashSet::new(),
-            last_snapshot: AgentSnapshot::default(),
             last_now: Instant::now(),
             header_due: Instant::now() + Duration::from_secs(1),
             fixed_wall: None,
@@ -227,110 +264,218 @@ impl AgentScreen {
             .unwrap_or_else(SystemTime::now)
     }
 
-    fn sync(&mut self, snap: &AgentSnapshot, now: Instant) -> bool {
+    /// 複数の接続を監視していて、接続名をカード・見出し・通知に出すか。1 台だけ(旧設定)の表示は変えない。
+    fn multi(&self) -> bool {
+        self.servers.len() > 1
+    }
+
+    fn server_index(&self, id: &ServerId) -> Option<usize> {
+        self.servers.iter().position(|s| &s.id == id)
+    }
+
+    /// その接続が stale(取得が `stale_secs` を超えて止まっている)か。
+    fn is_stale(&self, id: &ServerId) -> bool {
+        self.server_index(id).is_some_and(|i| self.servers[i].stale)
+    }
+
+    fn server_label<'a>(&'a self, id: &'a ServerId) -> &'a str {
+        self.server_index(id)
+            .map_or(id.as_ref(), |i| self.servers[i].label.as_str())
+    }
+
+    /// 全接続の取得結果を取り込む。接続ごとに独立して処理し、1 台の失敗・遅れ・再同期が他の接続の
+    /// カードや通知を止めない。
+    fn sync_all(&mut self, world: &[ServerSnapshot], now: Instant) -> bool {
         // A large time step can skip over the frame that normally ends a focus.
         // Settle it before processing new changes so a same-thread update is queued
         // as its own event instead of being merged into an already-expired focus.
         let mut redraw = self.finish_expired_focus(now);
-        let was_stale = self.stale;
-        let entries_same = Arc::ptr_eq(&snap.entries, &self.last_snapshot.entries);
-        let changes_same = Arc::ptr_eq(&snap.changes, &self.last_snapshot.changes);
-        let meta_changed = snap.connection != self.last_snapshot.connection
-            || snap.last_success != self.last_snapshot.last_success
-            || snap.environment_id != self.last_snapshot.environment_id
-            || snap.environment_label != self.last_snapshot.environment_label
-            || snap.error_summary != self.last_snapshot.error_summary;
+        // World から消えた接続の状態とキャッシュを捨てる。
+        let gone: Vec<ServerId> = self
+            .servers
+            .iter()
+            .filter(|s| !world.iter().any(|w| w.server_id == s.id))
+            .map(|s| s.id.clone())
+            .collect();
+        for id in gone {
+            self.purge_server(&id);
+            self.servers.retain(|s| s.id != id);
+            self.entries_dirty = true;
+            self.board_dirty = true;
+            self.background_dirty = true;
+            redraw = true;
+        }
+        let order_before: Vec<ServerId> = self.servers.iter().map(|s| s.id.clone()).collect();
+        for server in world {
+            if self.server_index(&server.server_id).is_none() {
+                self.servers.push(ServerUiState::new(
+                    server.server_id.clone(),
+                    server.label.clone(),
+                ));
+                self.background_dirty = true;
+                self.board_dirty = true;
+                redraw = true;
+            }
+            redraw |= self.sync_server(server, now);
+        }
+        // 接続の並びは World の順(設定の順)に合わせる。
+        self.servers.sort_by_key(|s| {
+            world
+                .iter()
+                .position(|w| w.server_id == s.id)
+                .unwrap_or(usize::MAX)
+        });
+        let order_after: Vec<&ServerId> = self.servers.iter().map(|s| &s.id).collect();
+        if order_before.iter().ne(order_after.iter().copied()) {
+            self.entries_dirty = true;
+            self.board_dirty = true;
+            self.background_dirty = true;
+            redraw = true;
+        }
+        // 全接続のスレッドは、どこかの接続の中身が変わったときだけ組み直す(毎フレームは複製しない)。
+        if self.entries_dirty {
+            self.entries_dirty = false;
+            self.entries = self
+                .servers
+                .iter()
+                .flat_map(|s| s.entries.iter().cloned())
+                .collect();
+        }
+        redraw
+    }
+
+    /// 1 つの接続の取得結果を取り込む。
+    fn sync_server(&mut self, server: &ServerSnapshot, now: Instant) -> bool {
+        let sid = server.server_id.clone();
+        let snap = &server.snapshot;
+        let idx = self.server_index(&sid).expect("server registered");
+        let mut redraw = false;
+        let mut prev = std::mem::take(&mut self.servers[idx].last_snapshot);
+        // 接続名・重複接続の表示が変わった。
+        if self.servers[idx].label != server.label
+            || self.servers[idx].duplicate_environment != server.duplicate_environment
+        {
+            self.servers[idx].label = server.label.clone();
+            self.servers[idx].duplicate_environment = server.duplicate_environment;
+            self.background_dirty = true;
+            self.board_dirty = true;
+            redraw = true;
+        }
+        // 再接続で取り直した descriptor の environment_id が変わった(別の T3 に入れ替わった)。
+        // この接続の履歴とカードを捨て、別環境の古い表示が混ざらないようにする。
+        if matches!(
+            (&prev.environment_id, &snap.environment_id),
+            (Some(old), Some(new)) if old != new
+        ) {
+            self.purge_server(&sid);
+            self.servers[idx].entries.clear();
+            self.entries_dirty = true;
+            self.servers[idx].observed_sync = false;
+            self.servers[idx].generation = snap.resync_generation;
+            self.servers[idx].cursor = snap.change_cursor;
+            prev = AgentSnapshot::default();
+            self.board_dirty = true;
+            self.background_dirty = true;
+            redraw = true;
+        }
+        let was_stale = self.servers[idx].stale;
+        let entries_same = Arc::ptr_eq(&snap.entries, &prev.entries);
+        let changes_same = Arc::ptr_eq(&snap.changes, &prev.changes);
+        let meta_changed = snap.connection != prev.connection
+            || snap.last_success != prev.last_success
+            || snap.environment_id != prev.environment_id
+            || snap.environment_label != prev.environment_label
+            || snap.error_summary != prev.error_summary;
         if meta_changed {
             self.background_dirty = true;
             redraw = true;
         }
-        let generation_changed = self.resync_generation != snap.resync_generation;
+        let generation_changed = self.servers[idx].generation != snap.resync_generation;
         if generation_changed {
-            self.resync_generation = snap.resync_generation;
-            self.queue.clear();
-            self.pending_new.clear();
-            self.focus = None;
-            self.change_cursor = snap.change_cursor;
+            self.servers[idx].generation = snap.resync_generation;
+            self.drop_notices_of(&sid);
+            self.servers[idx].cursor = snap.change_cursor;
             self.background_dirty = true;
             redraw = true;
         }
         let now_stale = snap.last_success_mono.is_some_and(|t| {
             now.saturating_duration_since(t) > Duration::from_secs(self.stale_secs)
         });
-        if now_stale != self.stale {
-            if now_stale {
-                self.queue.clear();
-                self.pending_new.clear();
-                self.focus = None;
-                self.scrim_alpha = 0.0;
-            } else {
-                self.queue.clear();
-                self.pending_new.clear();
-                self.focus = None;
-                self.change_cursor = snap.change_cursor;
+        if now_stale != was_stale {
+            // stale になった接続の通知だけを止める。戻ったときも、その間の変更は静かに受け入れる。
+            self.drop_notices_of(&sid);
+            if !now_stale {
+                self.servers[idx].cursor = snap.change_cursor;
             }
-            self.stale = now_stale;
+            self.servers[idx].stale = now_stale;
             self.background_dirty = true;
             redraw = true;
         }
-        let sync_marker_changed = snap.synchronized != self.last_snapshot.synchronized
-            || snap.change_cursor != self.last_snapshot.change_cursor;
+        let stale_now = self.servers[idx].stale;
+        let sync_marker_changed =
+            snap.synchronized != prev.synchronized || snap.change_cursor != prev.change_cursor;
         if entries_same
             && changes_same
             && !generation_changed
             && !sync_marker_changed
-            && was_stale == self.stale
+            && was_stale == stale_now
         {
-            self.last_snapshot = snap.clone();
+            self.servers[idx].last_snapshot = snap.clone();
             return redraw;
         }
-        let current_ids: std::collections::HashSet<&str> =
+        let current_ids: HashSet<&str> =
             snap.entries.iter().map(|e| e.thread_id.as_str()).collect();
+        let mine = |key: &ThreadKey| key.server == sid;
         if let Some(f) = &self.focus
-            && !current_ids.contains(f.event.thread_id.as_str())
+            && mine(&f.event.key)
+            && !current_ids.contains(f.event.key.thread.as_str())
         {
             self.focus = None;
             self.scrim_alpha = 0.0;
             redraw = true;
         }
         self.queue
-            .retain(|e| current_ids.contains(e.thread_id.as_str()));
+            .retain(|e| !mine(&e.key) || current_ids.contains(e.key.thread.as_str()));
         self.pending_new
-            .retain(|id| current_ids.contains(id.as_str()));
-        let entries = snap.entries.to_vec();
+            .retain(|k| !mine(k) || current_ids.contains(k.thread.as_str()));
+        let entries: Vec<AgentEntry> = snap
+            .entries
+            .iter()
+            .map(|e| {
+                let mut e = e.clone();
+                // 接続は ServerSnapshot が決める(entry に付いた値には頼らない)。
+                e.server_id = sid.clone();
+                e
+            })
+            .collect();
         for entry in &entries {
-            if !self.project_seen.contains_key(&entry.project_id) {
-                self.project_seen
-                    .insert(entry.project_id.clone(), self.next_seen);
+            let project = entry.project_key();
+            if !self.project_seen.contains_key(&project) {
+                self.project_seen.insert(project, self.next_seen);
                 self.next_seen += 1;
             }
-            if !self.seen.contains_key(&entry.thread_id) {
-                self.seen.insert(entry.thread_id.clone(), self.next_seen);
+            let key = entry.key();
+            if !self.seen.contains_key(&key) {
+                self.seen.insert(key.clone(), self.next_seen);
                 self.next_seen += 1;
-                self.last_activity.insert(entry.thread_id.clone(), now);
-                self.id_map.insert(
-                    entry.thread_id.clone(),
-                    stable_id(&format!(
-                        "{}:{}",
-                        snap.environment_id.as_deref().unwrap_or("t3"),
-                        entry.thread_id
-                    )),
-                );
+                self.last_activity.insert(key.clone(), now);
+                self.id_map.insert(key.clone(), stable_key(&key));
                 self.background_dirty = true;
                 redraw = true;
             }
         }
         for entry in &entries {
             let key = content_key(entry);
-            if self.entry_keys.get(&entry.thread_id) != Some(&key) {
-                self.entry_keys.insert(entry.thread_id.clone(), key);
+            let thread = entry.key();
+            if self.entry_keys.get(&thread) != Some(&key) {
+                self.entry_keys.insert(thread, key);
                 redraw = true;
             }
         }
-        let removed: Vec<String> = self
+        let removed: Vec<ThreadKey> = self
             .seen
             .keys()
-            .filter(|id| !current_ids.contains(id.as_str()))
+            .filter(|k| mine(k) && !current_ids.contains(k.thread.as_str()))
             .cloned()
             .collect();
         let live_projects = entries
@@ -338,35 +483,31 @@ impl AgentScreen {
             .map(|e| e.project_id.as_str())
             .collect::<HashSet<_>>();
         self.project_seen
-            .retain(|id, _| live_projects.contains(id.as_str()));
-        for id in removed {
-            self.seen.remove(&id);
-            self.surfaces.remove(&id);
-            self.content_keys.remove(&id);
-            self.entry_keys.remove(&id);
-            self.last_activity.remove(&id);
-            self.poses.remove(&id);
-            self.goal_notified.remove(&id);
-            self.id_map.remove(&id);
-            self.pending_new.remove(&id);
+            .retain(|k, _| k.server != sid || live_projects.contains(k.project.as_str()));
+        for key in removed {
+            self.forget_thread(&key);
             self.background_dirty = true;
             redraw = true;
         }
-        let fresh_sync = snap.synchronized && !self.observed_sync;
+        let fresh_sync = snap.synchronized && !self.servers[idx].observed_sync;
         if fresh_sync {
-            self.observed_sync = true;
-            self.change_cursor = snap.change_cursor;
+            self.servers[idx].observed_sync = true;
+            self.servers[idx].cursor = snap.change_cursor;
         }
         if !snap.synchronized {
-            self.observed_sync = false;
+            self.servers[idx].observed_sync = false;
         }
-        if !generation_changed && !fresh_sync && !(was_stale && !self.stale) && !changes_same {
-            let previous_cursor = self.change_cursor;
+        if !generation_changed && !fresh_sync && !(was_stale && !stale_now) && !changes_same {
+            let previous_cursor = self.servers[idx].cursor;
             for change in snap.changes.iter().filter(|c| c.id > previous_cursor) {
-                self.change_cursor = self.change_cursor.max(change.id);
-                self.last_activity.insert(change.thread_id.clone(), now);
+                self.servers[idx].cursor = self.servers[idx].cursor.max(change.id);
+                let key = ThreadKey {
+                    server: sid.clone(),
+                    thread: change.thread_id.clone(),
+                };
+                self.last_activity.insert(key.clone(), now);
                 if self.presentable
-                    && !self.stale
+                    && !stale_now
                     && let Some(entry) = entries.iter().find(|e| e.thread_id == change.thread_id)
                 {
                     let kind = if change.kind == AgentChangeKind::New {
@@ -375,12 +516,12 @@ impl AgentScreen {
                         EventKind::Changed
                     };
                     if change.kind == AgentChangeKind::Goal {
-                        if self.goal_notified.get(&change.thread_id).is_some_and(|t| {
+                        if self.goal_notified.get(&key).is_some_and(|t| {
                             now.saturating_duration_since(*t) < Duration::from_secs(15)
                         }) {
                             continue;
                         }
-                        self.goal_notified.insert(change.thread_id.clone(), now);
+                        self.goal_notified.insert(key.clone(), now);
                     }
                     let before = describe_change(
                         change.before_state,
@@ -409,7 +550,11 @@ impl AgentScreen {
                         1
                     };
                     self.enqueue(QueuedEvent {
-                        thread_id: change.thread_id.clone(),
+                        change: ChangeKey {
+                            server: sid.clone(),
+                            id: change.id,
+                        },
+                        key,
                         kind,
                         before,
                         after,
@@ -421,11 +566,12 @@ impl AgentScreen {
                 redraw = true;
             }
         } else {
-            self.change_cursor = self.change_cursor.max(snap.change_cursor);
+            self.servers[idx].cursor = self.servers[idx].cursor.max(snap.change_cursor);
         }
-        self.entries = entries;
+        self.servers[idx].entries = entries;
+        self.entries_dirty = true;
         self.board_dirty = true;
-        self.last_snapshot = snap.clone();
+        self.servers[idx].last_snapshot = snap.clone();
         if redraw {
             self.background_dirty = true;
             self.text_dirty = true;
@@ -433,18 +579,66 @@ impl AgentScreen {
         redraw
     }
 
+    /// その接続の通知(待ち行列・出し待ちの新着・表示中)を捨てる。他の接続の通知には触れない。
+    fn drop_notices_of(&mut self, sid: &ServerId) {
+        self.queue.retain(|e| &e.key.server != sid);
+        self.pending_new.retain(|k| &k.server != sid);
+        if self
+            .focus
+            .as_ref()
+            .is_some_and(|f| &f.event.key.server == sid)
+        {
+            self.focus = None;
+            self.scrim_alpha = 0.0;
+            self.focus_card_id = None;
+        }
+    }
+
+    /// 1 スレッドぶんのキャッシュを捨てる。
+    fn forget_thread(&mut self, key: &ThreadKey) {
+        self.seen.remove(key);
+        self.surfaces.remove(key);
+        self.revisions.remove(key);
+        self.content_keys.remove(key);
+        self.entry_keys.remove(key);
+        self.last_activity.remove(key);
+        self.poses.remove(key);
+        self.goal_notified.remove(key);
+        self.id_map.remove(key);
+        self.pending_new.remove(key);
+    }
+
+    /// その接続のスレッド・プロジェクトのキャッシュと通知をすべて捨てる(環境の入れ替わり、接続の消滅)。
+    fn purge_server(&mut self, sid: &ServerId) {
+        self.drop_notices_of(sid);
+        let keep = |k: &ThreadKey| &k.server != sid;
+        self.seen.retain(|k, _| keep(k));
+        self.surfaces.retain(|k, _| keep(k));
+        self.revisions.retain(|k, _| keep(k));
+        self.content_keys.retain(|k, _| keep(k));
+        self.entry_keys.retain(|k, _| keep(k));
+        self.last_activity.retain(|k, _| keep(k));
+        self.poses.retain(|k, _| keep(k));
+        self.goal_notified.retain(|k, _| keep(k));
+        self.id_map.retain(|k, _| keep(k));
+        self.project_seen.retain(|k, _| &k.server != sid);
+    }
+
+    /// 1 台だけの `AgentSnapshot` を `primary` として取り込む(単一接続の旧来の呼び方。テスト用)。
+    #[cfg(test)]
+    fn sync(&mut self, snap: &AgentSnapshot, now: Instant) -> bool {
+        self.sync_all(&ServerSnapshot::primary(snap.clone()), now)
+    }
+
     fn enqueue(&mut self, event: QueuedEvent) {
         if event.kind == EventKind::New {
-            self.pending_new.insert(event.thread_id.clone());
+            self.pending_new.insert(event.key.clone());
         }
-        if self.queue.iter().any(|q| q.thread_id == event.thread_id) {
-            if let Some(q) = self
-                .queue
-                .iter_mut()
-                .find(|q| q.thread_id == event.thread_id)
-            {
+        if self.queue.iter().any(|q| q.key == event.key) {
+            if let Some(q) = self.queue.iter_mut().find(|q| q.key == event.key) {
                 q.after = event.after;
                 q.observed_at = event.observed_at;
+                q.change = event.change;
                 if event.kind == EventKind::New {
                     q.kind = EventKind::New;
                 }
@@ -452,16 +646,17 @@ impl AgentScreen {
         } else if self
             .focus
             .as_ref()
-            .is_some_and(|f| f.event.thread_id == event.thread_id)
+            .is_some_and(|f| f.event.key == event.key)
         {
             if let Some(f) = self.focus.as_mut() {
                 f.event.after = event.after;
                 f.event.observed_at = event.observed_at;
+                f.event.change = event.change;
             }
         } else if self.queue.len() < MAX_QUEUE {
             self.queue.push_back(event);
         } else {
-            self.pending_new.remove(&event.thread_id);
+            self.pending_new.remove(&event.key);
             self.overflow_updates += 1;
             self.background_dirty = true;
         }
@@ -488,7 +683,12 @@ impl AgentScreen {
     }
 
     /// 要確認、実行中、最近動いたもの、T3 の更新時刻、初めて見た順。
-    fn rank(&self, a: &AgentEntry, b: &AgentEntry) -> std::cmp::Ordering {
+    /// 同順位の接続間の公平化はしない(`seen` の順で安定して決まる)。
+    fn rank(
+        &self,
+        a: (&ThreadKey, &AgentEntry),
+        b: (&ThreadKey, &AgentEntry),
+    ) -> std::cmp::Ordering {
         let tier = |e: &AgentEntry| {
             if attention(e) {
                 0
@@ -498,48 +698,43 @@ impl AgentScreen {
                 2
             }
         };
-        tier(a)
-            .cmp(&tier(b))
+        tier(a.1)
+            .cmp(&tier(b.1))
             .then_with(|| {
                 self.last_activity
-                    .get(&b.thread_id)
-                    .cmp(&self.last_activity.get(&a.thread_id))
+                    .get(b.0)
+                    .cmp(&self.last_activity.get(a.0))
             })
-            .then_with(|| b.updated_at.cmp(&a.updated_at))
-            .then_with(|| {
-                self.seen
-                    .get(&a.thread_id)
-                    .cmp(&self.seen.get(&b.thread_id))
-            })
+            .then_with(|| b.1.updated_at.cmp(&a.1.updated_at))
+            .then_with(|| self.seen.get(a.0).cmp(&self.seen.get(b.0)))
     }
 
     /// 親子グループにまとめ、プロジェクトを初めて見た順に並べる。各枠の中は重要な順。
     /// 子は親のプロジェクトの枠に入り、親が一覧に無い子は親ごとの「親情報なし」の組になる。
+    /// 親子・プロジェクトは同じ接続の中だけで結ぶ(別の接続の同じ ID とは別物)。
     fn arrange(&self) -> Arrangement {
-        let mut sorted: Vec<&AgentEntry> = self.entries.iter().collect();
-        sorted.sort_by(|a, b| self.rank(a, b));
-        let nodes: Vec<Node> = sorted
+        let mut keyed: Vec<(ThreadKey, &AgentEntry)> =
+            self.entries.iter().map(|e| (e.key(), e)).collect();
+        keyed.sort_by(|a, b| self.rank((&a.0, a.1), (&b.0, b.1)));
+        let sorted: Vec<&AgentEntry> = keyed.iter().map(|(_, e)| *e).collect();
+        let nodes: Vec<Node<ThreadKey>> = keyed
             .iter()
-            .map(|e| Node {
-                id: e.thread_id.clone(),
-                parent: e.parent_thread_id.clone(),
+            .map(|(key, e)| Node {
+                id: key.clone(),
+                parent: e.parent_key(),
                 tier: tier_of(e),
             })
             .collect();
-        let mut projects: Vec<(u64, &str, Vec<family::Family>)> = Vec::new();
+        let multi = self.multi();
+        let mut projects: Vec<(u64, ProjectKey, Vec<family::Family<ThreadKey>>)> = Vec::new();
         for f in family::build_families(&nodes) {
             let lead = sorted[f.lead];
-            match projects
-                .iter_mut()
-                .find(|(_, id, _)| *id == lead.project_id)
-            {
+            let project = lead.project_key();
+            match projects.iter_mut().find(|(_, id, _)| *id == project) {
                 Some((_, _, v)) => v.push(f),
                 None => projects.push((
-                    self.project_seen
-                        .get(&lead.project_id)
-                        .copied()
-                        .unwrap_or(u64::MAX),
-                    &lead.project_id,
+                    self.project_seen.get(&project).copied().unwrap_or(u64::MAX),
+                    project,
                     vec![f],
                 )),
             }
@@ -552,10 +747,15 @@ impl AgentScreen {
                 .flat_map(|f| f.members.iter().map(|m| m.rank))
                 .collect();
             ranks.sort_unstable();
-            let first = sorted.iter().find(|e| e.project_id == id);
-            let label = match first {
+            let first = sorted.iter().find(|e| e.project_key() == id);
+            let name = match first {
                 Some(e) if !e.project_title.is_empty() => e.project_title.clone(),
-                _ => short(id),
+                _ => short(&id.project),
+            };
+            let label = if multi {
+                format!("{} / {name}", self.server_label(&id.server))
+            } else {
+                name
             };
             out.groups.push(Group {
                 label,
@@ -603,38 +803,118 @@ impl AgentScreen {
             self.replans += 1;
         }
         self.planned = true;
-        let board = family::plan_board(self.board_area(), self.scale(), &self.arrangement.families);
+        let board = self.plan_with_capacity();
         if board != self.board {
             self.board = board;
             self.background_dirty = true;
         }
     }
 
+    /// 配置する。盤面に入りきらず、一部のスレッドが「どこにも置かれない」ときは、重要でない単独スレッドから
+    /// 計画の対象を外して計画し直す(容量の小さい盤面で、重要でないカードが重要なカードの代わりに残らない)。
+    /// 親子グループの「ほか N 件」に回したスレッドは置き場(anchor)を持つので、置かれたものとして数える。
+    /// 外したスレッドは盤面にカードを持たず、接続別の「未表示」に数える。
+    fn plan_with_capacity(&self) -> layout::Layout<ThreadKey> {
+        let area = self.board_area();
+        let scale = self.scale();
+        let all = &self.arrangement.families;
+        let mut board = family::plan_board(area, scale, all);
+        // 外してよいのは単独のスレッド(枠のない組)だけ。重要でない順(rank の大きい順)に外す。
+        let mut singles: Vec<(usize, (usize, usize))> = all
+            .iter()
+            .enumerate()
+            .flat_map(|(p, fams)| {
+                fams.iter()
+                    .enumerate()
+                    .filter(|(_, f)| !f.framed())
+                    .map(move |(i, f)| (f.best(), (p, i)))
+            })
+            .collect();
+        singles.sort_unstable_by(|a, b| b.cmp(a));
+        let lost = |board: &layout::Layout<ThreadKey>, kept: &[Vec<family::Family<ThreadKey>>]| {
+            let hidden: HashSet<&ThreadKey> = board
+                .families
+                .iter()
+                .flat_map(|f| f.hidden_ids.iter())
+                .collect();
+            kept.iter()
+                .flatten()
+                .flat_map(|f| f.members.iter())
+                .filter(|m| !board.cards.contains_key(&m.id) && !hidden.contains(&m.id))
+                .count()
+        };
+        let mut dropped = 0usize;
+        let mut kept: Vec<Vec<family::Family<ThreadKey>>> = Vec::new();
+        for _ in 0..16 {
+            let missing = lost(&board, if dropped == 0 { all } else { &kept });
+            if missing == 0 || dropped >= singles.len() {
+                break;
+            }
+            dropped = (dropped + missing).min(singles.len());
+            let gone: HashSet<(usize, usize)> =
+                singles[..dropped].iter().map(|(_, at)| *at).collect();
+            kept = all
+                .iter()
+                .enumerate()
+                .map(|(p, fams)| {
+                    fams.iter()
+                        .enumerate()
+                        .filter(|(i, _)| !gone.contains(&(p, *i)))
+                        .map(|(_, f)| f.clone())
+                        .collect()
+                })
+                .collect();
+            board = family::plan_board(area, scale, &kept);
+        }
+        board
+    }
+
     #[cfg(test)]
-    fn layout(&self, arrangement: &Arrangement) -> layout::Layout {
+    fn layout(&self, arrangement: &Arrangement) -> layout::Layout<ThreadKey> {
         family::plan_board(self.board_area(), self.scale(), &arrangement.families)
+    }
+
+    /// 接続ごとの、配置に入りきらず盤面にカードが無いスレッドの数(「未表示」)。
+    /// 表示しているカード数 + 未表示の数は、その接続の候補数(`entries`)と一致する。
+    fn hidden_by_server(&self) -> HashMap<ServerId, usize> {
+        let mut out: HashMap<ServerId, usize> = HashMap::new();
+        for server in &self.servers {
+            let hidden = server
+                .entries
+                .iter()
+                .filter(|e| !self.board.cards.contains_key(&e.key()))
+                .count();
+            out.insert(server.id.clone(), hidden);
+        }
+        out
     }
 
     fn activate_event(&mut self, now: Instant) -> bool {
         if self.focus.is_some() || !self.presentable {
             return false;
         }
-        let mut stale = Vec::new();
+        // 古くなった通知は、接続ごとに 1 件へまとめる(別の接続の通知とは混ぜない)。
         let wall = self.wall();
+        let mut stale_by_server: Vec<(ServerId, Vec<usize>)> = Vec::new();
         for (i, e) in self.queue.iter().enumerate() {
-            if self.seen.contains_key(&e.thread_id)
+            if self.seen.contains_key(&e.key)
                 && wall.duration_since(e.observed_at).unwrap_or_default() > MAX_AGE_SECS
             {
-                stale.push(i);
+                match stale_by_server
+                    .iter_mut()
+                    .find(|(id, _)| *id == e.key.server)
+                {
+                    Some((_, v)) => v.push(i),
+                    None => stale_by_server.push((e.key.server.clone(), vec![i])),
+                }
             }
         }
-        if !stale.is_empty() {
+        let mut aggregates = Vec::new();
+        let mut removed = Vec::new();
+        for (_, stale) in &stale_by_server {
             let count = stale.len();
             let last = *stale.last().unwrap();
-            let mut aggregate = self.queue.remove(last).unwrap();
-            for i in stale.into_iter().rev().skip(1) {
-                self.queue.remove(i);
-            }
+            let mut aggregate = self.queue[last].clone();
             aggregate.before = "前回取得以降".into();
             aggregate.after = if count > 1 {
                 format!("ほか {} 件更新", count)
@@ -642,24 +922,34 @@ impl AgentScreen {
                 "更新内容をまとめました".into()
             };
             aggregate.priority = 1;
-            self.queue.push_front(aggregate);
+            aggregates.push(aggregate);
+            removed.extend(stale.iter().copied());
             self.overflow_updates = self
                 .overflow_updates
                 .saturating_add(count.saturating_sub(1));
+        }
+        if !aggregates.is_empty() {
+            removed.sort_unstable();
+            for i in removed.into_iter().rev() {
+                self.queue.remove(i);
+            }
+            for aggregate in aggregates.into_iter().rev() {
+                self.queue.push_front(aggregate);
+            }
             self.background_dirty = true;
         }
         self.ensure_board();
         // 置き場が無いスレッドの変更は、キューを詰まらせないよう捨てる。
         let board = &self.board;
-        let placed = |id: &str| board.anchor(id).is_some();
-        let gone: Vec<String> = self
+        let placed = |key: &ThreadKey| board.anchor(key).is_some();
+        let gone: Vec<ThreadKey> = self
             .queue
             .iter()
-            .filter(|e| !placed(&e.thread_id))
-            .map(|e| e.thread_id.clone())
+            .filter(|e| !placed(&e.key))
+            .map(|e| e.key.clone())
             .collect();
         if !gone.is_empty() {
-            self.queue.retain(|e| !gone.contains(&e.thread_id));
+            self.queue.retain(|e| !gone.contains(&e.key));
             for id in &gone {
                 self.pending_new.remove(id);
             }
@@ -672,7 +962,7 @@ impl AgentScreen {
             .max_by_key(|(i, e)| {
                 (
                     e.priority,
-                    board.anchor(&e.thread_id).is_some(),
+                    board.anchor(&e.key).is_some(),
                     std::cmp::Reverse(*i),
                 )
             })
@@ -681,11 +971,11 @@ impl AgentScreen {
         let Some(event) = self.queue.remove(pos) else {
             return false;
         };
-        self.pending_new.remove(&event.thread_id);
+        self.pending_new.remove(&event.key);
         let urgent = self
             .entries
             .iter()
-            .find(|e| e.thread_id == event.thread_id)
+            .find(|e| e.key() == event.key)
             .is_some_and(attention);
         self.focus = Some(Focus {
             event,
@@ -696,8 +986,9 @@ impl AgentScreen {
         true
     }
 
+    /// 通知を進める。stale の接続の通知は `sync_server` が捨てるので、ここでは健全な接続の通知だけが残る。
     fn advance(&mut self, now: Instant) -> bool {
-        if !self.presentable || self.stale {
+        if !self.presentable {
             return false;
         }
         let mut redraw = false;
@@ -729,7 +1020,6 @@ impl AgentScreen {
     }
 
     fn render_scene(&mut self, ctx: &mut RenderContext<'_>, composite_cpu: bool) {
-        let snap = self.last_snapshot.clone();
         let now = self.last_now;
         self.ensure_board();
         // 毎フレーム全スレッドを複製しないよう、描いている間だけ借りる。
@@ -737,44 +1027,47 @@ impl AgentScreen {
         // ポップアップの間は配置(対象のカードと戻り先)を前のまま保つので、`groups` は古いことがある。
         // 描く中身は今の一覧から ID で引き直し、一覧から消えたスレッドは描く対象から外す。
         let entries = std::mem::take(&mut self.entries);
-        let current: HashMap<&str, &AgentEntry> =
-            entries.iter().map(|e| (e.thread_id.as_str(), e)).collect();
+        let current: HashMap<ThreadKey, &AgentEntry> =
+            entries.iter().map(|e| (e.key(), e)).collect();
         if self.background_dirty || self.background.is_none() {
             let mut bg = Canvas::new(self.size.0, self.size.1);
+            let hidden = self.hidden_by_server();
             draw_background(
                 &mut bg,
                 ctx.text,
-                &snap,
-                &groups,
-                &self.board,
-                self.scale(),
-                self.overflow_updates,
-                now,
-                self.stale_secs,
-                self.wall(),
+                &HeaderInput {
+                    servers: &self.servers,
+                    hidden: &hidden,
+                    groups: &groups,
+                    board: &self.board,
+                    scale: self.scale(),
+                    overflow: self.overflow_updates,
+                    now,
+                    stale_secs: self.stale_secs,
+                    wall: self.wall(),
+                },
             );
             self.background = Some(bg.pixmap);
             self.background_dirty = false;
         }
         let focus = self.focus.clone();
         let scale = self.scale();
-        let mut shown = HashSet::new();
+        let mut shown: HashSet<ThreadKey> = HashSet::new();
         let mut cards = Vec::new();
-        let mut homes: HashMap<String, layout::Rect> = HashMap::new();
+        let mut homes: HashMap<ThreadKey, layout::Rect> = HashMap::new();
         for placed_entry in groups.iter().flat_map(|g| &g.entries) {
-            let Some(&entry) = current.get(placed_entry.thread_id.as_str()) else {
+            let key = placed_entry.key();
+            let Some(&entry) = current.get(&key) else {
                 continue;
             };
-            let Some(&stable) = self.id_map.get(&entry.thread_id) else {
+            let Some(&stable) = self.id_map.get(&key) else {
                 continue;
             };
-            let is_focus = focus
-                .as_ref()
-                .is_some_and(|f| f.event.thread_id == entry.thread_id);
-            let slot = match self.board.cards.get(&entry.thread_id).copied() {
+            let is_focus = focus.as_ref().is_some_and(|f| f.event.key == key);
+            let slot = match self.board.cards.get(&key).copied() {
                 Some(slot) => slot,
                 // 「ほか N 件」にまとめた子の変更は、親のカード(親も見えなければ見出し)を元位置にして出す。
-                None if is_focus => match self.board.anchor(&entry.thread_id) {
+                None if is_focus => match self.board.anchor(&key) {
                     Some(rect) => layout::CardSlot {
                         rect,
                         mode: layout::CardMode::Full,
@@ -791,20 +1084,24 @@ impl AgentScreen {
             if !is_focus && (r.x >= sw || r.y >= sh || r.x + r.w <= 0.0 || r.y + r.h <= 0.0) {
                 continue;
             }
-            if self.pending_new.contains(&entry.thread_id) && !is_focus {
+            if self.pending_new.contains(&key) && !is_focus {
                 continue;
             }
-            shown.insert(entry.thread_id.clone());
+            shown.insert(key.clone());
             let target = draw::AgentPose {
                 x: slot.rect.x,
                 y: slot.rect.y,
                 width: slot.rect.w,
                 height: slot.rect.h,
-                alpha: if self.stale { 0.65 } else { 1.0 },
+                alpha: if self.is_stale(&key.server) {
+                    0.65
+                } else {
+                    1.0
+                },
             };
-            let home = self.tween_pose(&entry.thread_id, target, now);
+            let home = self.tween_pose(&key, target, now);
             homes.insert(
-                entry.thread_id.clone(),
+                key.clone(),
                 layout::Rect {
                     x: home.x,
                     y: home.y,
@@ -870,24 +1167,19 @@ impl AgentScreen {
                     format!("{} → {}", f.event.before, f.event.after)
                 };
                 let content = self.content(entry, now, Some(summary), false, true);
-                self.ensure_surface(&entry.thread_id, &content, (focus_w, focus_h), ctx.text);
+                self.ensure_surface(&key, &content, (focus_w, focus_h), ctx.text);
             } else {
                 let compact = slot.mode == layout::CardMode::Strip;
                 let mut content = self.content(entry, now, None, compact, false);
                 content.one_line = slot.mode == layout::CardMode::Row;
-                self.ensure_surface(
-                    &entry.thread_id,
-                    &content,
-                    (slot.rect.w, slot.rect.h),
-                    ctx.text,
-                );
+                self.ensure_surface(&key, &content, (slot.rect.w, slot.rect.h), ctx.text);
             }
-            cards.push((entry.thread_id.clone(), stable, pose, (is_focus, slot.z)));
+            cards.push((key, stable, pose, (is_focus, slot.z)));
         }
         drop(current);
         self.entries = entries;
-        self.surfaces.retain(|id, _| shown.contains(id));
-        self.content_keys.retain(|id, _| shown.contains(id));
+        self.surfaces.retain(|key, _| shown.contains(key));
+        self.content_keys.retain(|key, _| shown.contains(key));
         let placed = &self.board.cards;
         self.poses.retain(|id, _| placed.contains_key(id));
         if focus.is_none() {
@@ -906,7 +1198,7 @@ impl AgentScreen {
                 pose,
             });
         }
-        self.id_map.retain(|id, _| self.seen.contains_key(id));
+        self.id_map.retain(|key, _| self.seen.contains_key(key));
         self.arrangement.groups = groups;
         let scene = draw::AgentScene {
             size: self.size,
@@ -925,18 +1217,14 @@ impl AgentScreen {
     /// 背景には焼かない。カードより先(下)に描く。
     fn decor_layers(
         &mut self,
-        homes: &HashMap<String, layout::Rect>,
+        homes: &HashMap<ThreadKey, layout::Rect>,
         text: &mut miharashi_render::TextEngine,
     ) -> Vec<draw::AgentCardSurface> {
         // 枠や見出しの寸法は、配置を作ったときの scale(1 枚に収めるために小さいことがある)に合わせる。
         let s = self.board.scale_or(self.scale());
-        let alpha = if self.stale { 0.65 } else { 1.0 };
-        let by_id: HashMap<&str, &AgentEntry> = self
-            .entries
-            .iter()
-            .map(|e| (e.thread_id.as_str(), e))
-            .collect();
-        let pose = |id: &str| homes.get(id).copied();
+        let by_id: HashMap<ThreadKey, &AgentEntry> =
+            self.entries.iter().map(|e| (e.key(), e)).collect();
+        let pose = |id: &ThreadKey| homes.get(id).copied();
         let views: Vec<_> = self
             .board
             .families
@@ -950,10 +1238,19 @@ impl AgentScreen {
                         .iter()
                         .map(|m| &m.id)
                         .chain(&shape.hidden_ids)
-                        .filter(|id| Some(id.as_str()) != shape.root.as_deref())
-                        .filter_map(|id| by_id.get(id.as_str()).copied()),
+                        .filter(|id| Some(*id) != shape.root.as_ref())
+                        .filter_map(|id| by_id.get(id).copied()),
                 );
+                // 枠は 1 つの接続の中の親子なので、先頭のメンバーの接続の stale で薄くする。
+                let frame_alpha = shape.members.first().map_or(1.0, |m| {
+                    if self.is_stale(&m.id.server) {
+                        0.65
+                    } else {
+                        1.0
+                    }
+                });
                 (
+                    frame_alpha,
                     format!("{}:{}:{}", shape.project, shape.family, shape.piece),
                     layout::family::decor(shape, s, &pose),
                     family_heading(fam, shape, &by_id),
@@ -966,7 +1263,7 @@ impl AgentScreen {
         let mut out = Vec::new();
         let mut used = HashSet::new();
         let edge_w = 2.0 * s;
-        for (key, d, heading, badge, hidden, hidden_attention) in views {
+        for (alpha, key, d, heading, badge, hidden, hidden_attention) in views {
             let edge = if badge.is_some() {
                 FRAME_EDGE_ALERT
             } else {
@@ -1051,8 +1348,13 @@ impl AgentScreen {
         out
     }
 
-    fn tween_pose(&mut self, id: &str, target: draw::AgentPose, now: Instant) -> draw::AgentPose {
-        let tween = self.poses.entry(id.to_string()).or_insert(PoseTween {
+    fn tween_pose(
+        &mut self,
+        id: &ThreadKey,
+        target: draw::AgentPose,
+        now: Instant,
+    ) -> draw::AgentPose {
+        let tween = self.poses.entry(id.clone()).or_insert(PoseTween {
             from: target,
             to: target,
             started: now,
@@ -1069,7 +1371,7 @@ impl AgentScreen {
 
     fn ensure_surface(
         &mut self,
-        id: &str,
+        id: &ThreadKey,
         content: &draw::AgentCardContent,
         size: (f32, f32),
         text: &mut miharashi_render::TextEngine,
@@ -1085,13 +1387,11 @@ impl AgentScreen {
             size.1
         );
         if self.content_keys.get(id) != Some(&key) || !self.surfaces.contains_key(id) {
-            let rev = self.revisions.entry(id.to_string()).or_insert(0);
+            let rev = self.revisions.entry(id.clone()).or_insert(0);
             *rev = rev.wrapping_add(1);
-            self.content_keys.insert(id.to_string(), key);
-            self.surfaces.insert(
-                id.to_string(),
-                Arc::new(draw::render_card(content, size, text)),
-            );
+            self.content_keys.insert(id.clone(), key);
+            self.surfaces
+                .insert(id.clone(), Arc::new(draw::render_card(content, size, text)));
         }
     }
 
@@ -1124,10 +1424,11 @@ impl AgentScreen {
         } else {
             state.label().into()
         };
-        if self.stale {
+        // 取得が止まっている接続のカードは、古い旨を明記する(その接続の通知は出さない)。
+        if self.is_stale(&e.server_id) {
             detail = format!("前回取得時 · {detail}");
         }
-        let active = self.last_activity.get(&e.thread_id).copied().unwrap_or(now);
+        let active = self.last_activity.get(&e.key()).copied().unwrap_or(now);
         let secs = now.saturating_duration_since(active).as_secs();
         let age = Some(if secs < 60 {
             "1分未満".into()
@@ -1137,10 +1438,23 @@ impl AgentScreen {
             format!("{}時間", secs / 3600)
         });
         draw::AgentCardContent {
-            project: match (focused, e.project_title.is_empty()) {
-                (false, _) => String::new(),
-                (true, true) => short(&e.project_id),
-                (true, false) => e.project_title.clone(),
+            // 複数の接続を監視しているときは、盤面のカードに接続名、通知のカードに「接続名 / プロジェクト」を出す。
+            project: {
+                let project = match (focused, e.project_title.is_empty()) {
+                    (false, _) => String::new(),
+                    (true, true) => short(&e.project_id),
+                    (true, false) => e.project_title.clone(),
+                };
+                if self.multi() {
+                    let server = self.server_label(&e.server_id);
+                    if project.is_empty() {
+                        server.to_string()
+                    } else {
+                        format!("{server} / {project}")
+                    }
+                } else {
+                    project
+                }
             },
             title: if e.title.is_empty() {
                 "無題".into()
@@ -1196,7 +1510,10 @@ impl Screen for AgentScreen {
             self.pending_new.clear();
             self.focus = None;
             self.paused_at = None;
-            self.change_cursor = self.last_snapshot.change_cursor;
+            // 非表示の間の変更は通知にしない(接続ごとに、いまのカーソルまで進める)。
+            for server in &mut self.servers {
+                server.cursor = server.last_snapshot.change_cursor;
+            }
             self.background_dirty = true;
         }
         self.presentable = can_present;
@@ -1204,7 +1521,7 @@ impl Screen for AgentScreen {
     fn tick(&mut self, world: &crate::screen::World, now: Instant) -> bool {
         self.last_now = now;
         self.world_wall = world.wall.map(SystemTime::from);
-        let mut redraw = self.sync(&world.agents, now);
+        let mut redraw = self.sync_all(&world.agents, now);
         redraw |= self.advance(now);
         self.ensure_board();
         // Land each finished move on an exact frame, and keep drawing while any card moves.
@@ -1276,41 +1593,189 @@ impl Screen for AgentScreen {
     }
     fn stats(&self, out: &mut Vec<(&'static str, String)>) {
         out.push(("agents", self.entries.len().to_string()));
+        for server in &self.servers {
+            out.push((
+                "agents/server",
+                format!("{} {}", server.id, server.entries.len()),
+            ));
+        }
     }
 }
 
-// These values form one frame-local header/status rendering context; keeping
-// them explicit here makes the renderer's inputs easy to audit at its call site.
-#[allow(clippy::too_many_arguments)]
-fn draw_background(
-    canvas: &mut Canvas,
-    text: &mut miharashi_render::TextEngine,
-    snap: &AgentSnapshot,
-    groups: &[Group],
-    board: &layout::Layout,
+/// 背景(見出し・接続別の状態・件数・プロジェクトの枠)を描くための、1 フレームぶんの入力。
+struct HeaderInput<'a> {
+    servers: &'a [ServerUiState],
+    /// 接続ごとの、配置に入りきらず盤面に出していないスレッドの数。
+    hidden: &'a HashMap<ServerId, usize>,
+    groups: &'a [Group],
+    board: &'a layout::Layout<ThreadKey>,
     scale: f32,
     overflow: usize,
     now: Instant,
     stale_secs: u64,
     wall: SystemTime,
+}
+
+const GREEN: [u8; 4] = [103, 217, 173, 255];
+const RED: [u8; 4] = [255, 127, 140, 255];
+
+fn is_stale_at(snap: &AgentSnapshot, now: Instant, stale_secs: u64) -> bool {
+    snap.last_success_mono
+        .is_some_and(|t| now.saturating_duration_since(t) > Duration::from_secs(stale_secs))
+}
+
+/// 接続の状態の文言と色。`short` は接続別の見出し(幅が狭い)用の短い文言。
+fn connection_status(snap: &AgentSnapshot, stale: bool, short: bool) -> (&'static str, [u8; 4]) {
+    let pick = |long: &'static str, brief: &'static str| if short { brief } else { long };
+    match snap.connection {
+        AgentConnection::Live if !stale => ("LIVE", GREEN),
+        AgentConnection::Connecting => (pick("接続しています", "接続中"), MUTED),
+        AgentConnection::AuthenticationRequired => (pick("認証が必要", "認証要"), AMBER),
+        AgentConnection::Forbidden => (pick("閲覧権限がありません", "権限なし"), RED),
+        AgentConnection::ApiError => (pick("T3 API を確認してください", "API異常"), RED),
+        _ if stale => ("STALE", AMBER),
+        _ => (pick("再接続中", "再接続"), AMBER),
+    }
+}
+
+/// 接続別の欄の中の文字の並び(左端からの距離)。
+#[derive(Debug, Clone, PartialEq)]
+struct ChipLayout {
+    size: f32,
+    name: String,
+    status_x: f32,
+    count_x: f32,
+    hidden_x: Option<f32>,
+    /// 最後の文字の右端。欄の幅に収まる。
+    end_x: f32,
+}
+
+/// 状態・件数・未表示が欄に収まる大きさを決め、残りの幅に接続名を省略して入れる。
+/// 欄が狭いほど接続名から削り、状態・件数・未表示は(文字を小さくしても)必ず残す。
+fn chip_layout(
+    text: &mut miharashi_render::TextEngine,
+    label: &str,
+    status: &str,
+    count: &str,
+    hidden: Option<&str>,
+    chip_w: f32,
+    fs: f32,
+) -> ChipLayout {
+    let gap = 10.0 * fs;
+    let room = chip_w - 12.0 * fs;
+    let mut size = 23.0 * fs;
+    let tail_w = |text: &mut miharashi_render::TextEngine, size: f32| {
+        text.measure(status, size)
+            + gap
+            + text.measure(count, size)
+            + hidden.map_or(0.0, |t| gap + text.measure(t, size))
+    };
+    while size > 11.0 && tail_w(text, size) + gap + size * 1.5 > room {
+        size *= 0.92;
+    }
+    let tail = tail_w(text, size);
+    let name = fit_header_label(label, (room - tail - gap).max(size), size);
+    let status_x = text.measure(&name, size) + gap;
+    let count_x = status_x + text.measure(status, size) + gap;
+    let after_count = count_x + text.measure(count, size);
+    let hidden_x = hidden.map(|_| after_count + gap);
+    let end_x = hidden.map_or(after_count, |t| after_count + gap + text.measure(t, size));
+    ChipLayout {
+        size,
+        name,
+        status_x,
+        count_x,
+        hidden_x,
+        end_x,
+    }
+}
+
+/// 複数の接続の状態を、画面の幅を等分した欄に並べる。接続名は幅が足りなければ省略するが、
+/// 状態・件数・未表示の件数は必ず残す。
+fn draw_server_chips(
+    canvas: &mut Canvas,
+    text: &mut miharashi_render::TextEngine,
+    h: &HeaderInput,
 ) {
-    // プロジェクトの見出しは、配置を作ったときの scale に合わせる。
-    let scale = board.scale_or(scale);
     let w = canvas.width() as f32;
-    let h = canvas.height() as f32;
+    let n = h.servers.len().max(1);
+    let chip_w = (w - 64.0) / n as f32;
+    let fs = (w / 1920.0).clamp(0.6, 1.0);
+    for (i, st) in h.servers.iter().enumerate() {
+        let x = 32.0 + i as f32 * chip_w;
+        let snap = &st.last_snapshot;
+        let stale = is_stale_at(snap, h.now, h.stale_secs);
+        let (status, color) = connection_status(snap, stale, true);
+        let count = if snap.synchronized {
+            format!("{}件", snap.entries.len())
+        } else {
+            "--件".into()
+        };
+        let hidden = h.hidden.get(&st.id).copied().unwrap_or(0);
+        let hidden_text = (hidden > 0).then(|| format!("未表示 {hidden}"));
+        let l = chip_layout(
+            text,
+            &st.label,
+            status,
+            &count,
+            hidden_text.as_deref(),
+            chip_w,
+            fs,
+        );
+        text.draw(canvas, &l.name, x, 98.0, l.size, [223, 231, 240, 255]);
+        text.draw(canvas, status, x + l.status_x, 98.0, l.size, color);
+        text.draw(canvas, &count, x + l.count_x, 98.0, l.size, MUTED);
+        if let (Some(t), Some(hx)) = (&hidden_text, l.hidden_x) {
+            text.draw(canvas, t, x + hx, 98.0, l.size, AMBER);
+        }
+        // 2 行目: 最終取得の時刻と、重複接続の警告。
+        let mut sub = snap
+            .last_success
+            .map(|at| {
+                format!(
+                    "最終取得 {}",
+                    chrono::DateTime::<chrono::Local>::from(at).format("%H:%M:%S")
+                )
+            })
+            .unwrap_or_default();
+        if st.duplicate_environment {
+            if !sub.is_empty() {
+                sub.push_str(" · ");
+            }
+            sub.push_str("環境が重複");
+        }
+        if !sub.is_empty() {
+            let size = 18.0 * fs;
+            let sub = fit_header_label(&sub, chip_w - 12.0 * fs, size);
+            text.draw(canvas, &sub, x, 134.0, size, MUTED);
+        }
+    }
+}
+
+fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine, h: &HeaderInput) {
+    // プロジェクトの見出しは、配置を作ったときの scale に合わせる。
+    let board = h.board;
+    let groups = h.groups;
+    let scale = board.scale_or(h.scale);
+    let w = canvas.width() as f32;
+    let hgt = canvas.height() as f32;
+    // まだ接続が World に届いていないときも、1 台ぶんの「接続しています」を出す。
+    let placeholder = [ServerUiState::new(
+        crate::config::PRIMARY_SERVER_ID.into(),
+        crate::config::PRIMARY_SERVER_ID.into(),
+    )];
+    let servers: &[ServerUiState] = if h.servers.is_empty() {
+        &placeholder
+    } else {
+        h.servers
+    };
+    let h = &HeaderInput { servers, ..*h };
     canvas.clear(miharashi_render::canvas::rgba(8, 12, 20, 255));
     text.draw(canvas, "T3 AGENTS", 32.0, 24.0, 36.0, [223, 231, 240, 255]);
     text.draw(canvas, "OVERVIEW", 280.0, 28.0, 25.0, [64, 200, 255, 255]);
-    let env = snap
-        .environment_label
-        .as_deref()
-        .or(snap.environment_id.as_deref())
-        .unwrap_or("T3");
-    let env = fit_header_label(env, 236.0, 24.0);
-    text.draw(canvas, &env, 32.0, 100.0, 24.0, [223, 231, 240, 255]);
     text.draw_right(
         canvas,
-        &chrono::DateTime::<chrono::Local>::from(wall)
+        &chrono::DateTime::<chrono::Local>::from(h.wall)
             .format("%Y/%m/%d %H:%M:%S")
             .to_string(),
         w - 32.0,
@@ -1318,35 +1783,42 @@ fn draw_background(
         22.0,
         [143, 163, 183, 255],
     );
-    let stale = snap
-        .last_success_mono
-        .is_some_and(|t| now.saturating_duration_since(t) > Duration::from_secs(stale_secs));
-    let (status, color) = match snap.connection {
-        AgentConnection::Live if !stale => ("LIVE", [103, 217, 173, 255]),
-        AgentConnection::Connecting => ("接続しています", [143, 163, 183, 255]),
-        AgentConnection::AuthenticationRequired => ("認証が必要", [255, 188, 102, 255]),
-        AgentConnection::Forbidden => ("閲覧権限がありません", [255, 127, 140, 255]),
-        AgentConnection::ApiError => ("T3 API を確認してください", [255, 127, 140, 255]),
-        _ if stale => ("STALE", [255, 188, 102, 255]),
-        _ => ("再接続中", [255, 188, 102, 255]),
-    };
-    text.draw(canvas, status, 285.0, 100.0, 23.0, color);
-    if let Some(at) = snap.last_success {
-        let time = chrono::DateTime::<chrono::Local>::from(at).format("%H:%M:%S");
-        text.draw(
-            canvas,
-            &format!("最終取得 {time}"),
-            520.0,
-            100.0,
-            20.0,
-            [143, 163, 183, 255],
-        );
+    if servers.len() == 1 {
+        // 1 台だけ(旧設定)の見出しは従来のまま。
+        let snap = &servers[0].last_snapshot;
+        let env = snap
+            .environment_label
+            .as_deref()
+            .or(snap.environment_id.as_deref())
+            .unwrap_or("T3");
+        let env = fit_header_label(env, 236.0, 24.0);
+        text.draw(canvas, &env, 32.0, 100.0, 24.0, [223, 231, 240, 255]);
+        let stale = is_stale_at(snap, h.now, h.stale_secs);
+        let (status, color) = connection_status(snap, stale, false);
+        text.draw(canvas, status, 285.0, 100.0, 23.0, color);
+        if let Some(at) = snap.last_success {
+            let time = chrono::DateTime::<chrono::Local>::from(at).format("%H:%M:%S");
+            text.draw(
+                canvas,
+                &format!("最終取得 {time}"),
+                520.0,
+                100.0,
+                20.0,
+                [143, 163, 183, 255],
+            );
+        }
+    } else {
+        draw_server_chips(canvas, text, h);
     }
+    // 件数は全接続の合計(接続別の件数は上の欄に出している)。
+    let all: Vec<&AgentEntry> = servers
+        .iter()
+        .flat_map(|s| s.last_snapshot.entries.iter())
+        .collect();
     let counts = [
         (
             "実行中",
-            snap.entries
-                .iter()
+            all.iter()
                 .filter(|e| {
                     matches!(
                         e.state,
@@ -1360,8 +1832,7 @@ fn draw_background(
         ),
         (
             "承認待ち",
-            snap.entries
-                .iter()
+            all.iter()
                 .filter(|e| {
                     e.has_pending_approvals || e.state == crate::agents::AgentState::Approval
                 })
@@ -1370,8 +1841,7 @@ fn draw_background(
         ),
         (
             "入力・計画",
-            snap.entries
-                .iter()
+            all.iter()
                 .filter(|e| {
                     e.has_pending_user_input
                         || e.has_actionable_proposed_plan
@@ -1385,24 +1855,21 @@ fn draw_background(
         ),
         (
             "異常",
-            snap.entries
-                .iter()
+            all.iter()
                 .filter(|e| e.state == crate::agents::AgentState::Error)
                 .count(),
             [255, 127, 140, 255],
         ),
         (
             "応答完了",
-            snap.entries
-                .iter()
+            all.iter()
                 .filter(|e| e.state == crate::agents::AgentState::Completed)
                 .count(),
             [103, 217, 173, 255],
         ),
         (
             "その他",
-            snap.entries
-                .iter()
+            all.iter()
                 .filter(|e| {
                     matches!(
                         e.state,
@@ -1421,26 +1888,27 @@ fn draw_background(
         text.draw(canvas, &format!("{label} {count}"), x, 174.0, 20.0, color);
         x += 175.0;
     }
-    let total = snap.entries.len();
-    let mut count = if snap.synchronized {
+    let total = all.len();
+    let synchronized = servers.iter().any(|s| s.last_snapshot.synchronized);
+    let mut count = if synchronized {
         format!("{total} スレッド · {} プロジェクト", groups.len())
     } else {
         "-- スレッド".into()
     };
-    let urgent = snap.entries.iter().filter(|e| attention(e)).count();
+    let urgent = all.iter().filter(|e| attention(e)).count();
     if urgent > 0 {
         count.push_str(&format!(" · 要確認 {urgent} 件"));
     }
-    if overflow > 0 {
-        count.push_str(&format!(" · ほか {overflow} 件更新"));
+    if h.overflow > 0 {
+        count.push_str(&format!(" · ほか {} 件更新", h.overflow));
     }
     text.draw_right(canvas, &count, w - 32.0, 174.0, 21.0, [143, 163, 183, 255]);
-    if snap.synchronized && total == 0 {
+    if servers.iter().all(|s| s.last_snapshot.synchronized) && total == 0 {
         text.draw(
             canvas,
             "対象のスレッドはありません",
             w * 0.5 - 190.0,
-            h * 0.53,
+            hgt * 0.53,
             28.0,
             [143, 163, 183, 255],
         );
@@ -1546,7 +2014,7 @@ fn draw_background(
         canvas,
         "自動表示 · 対応は手元の T3 で",
         32.0,
-        h - 28.0,
+        hgt - 28.0,
         20.0,
         [143, 163, 183, 255],
     );
@@ -1559,7 +2027,7 @@ fn draw_background(
     );
     canvas.fill_rect(
         0.0,
-        h - 72.0,
+        hgt - 72.0,
         w,
         1.0,
         miharashi_render::canvas::rgba(48, 67, 87, 255),
@@ -1678,11 +2146,11 @@ fn child_attention_label<'a>(children: impl Iterator<Item = &'a AgentEntry>) -> 
 
 /// 親子グループの枠の見出し。親が一覧に無い子は「親のタイトルの子」、タイトルも無ければ「親情報なし」。
 fn family_heading(
-    f: &family::Family,
-    shape: &layout::family::FamilyShape,
-    entries: &HashMap<&str, &AgentEntry>,
+    f: &family::Family<ThreadKey>,
+    shape: &layout::family::FamilyShape<ThreadKey>,
+    entries: &HashMap<ThreadKey, &AgentEntry>,
 ) -> String {
-    let title_of = |id: &str| {
+    let title_of = |id: &ThreadKey| {
         entries
             .get(id)
             .map(|e| e.title.as_str())
@@ -1694,8 +2162,8 @@ fn family_heading(
         let parent_title = f
             .members
             .iter()
-            .filter_map(|m| entries.get(m.id.as_str()))
-            .filter(|e| e.parent_thread_id.as_deref() == f.orphan_of.as_deref())
+            .filter_map(|m| entries.get(&m.id))
+            .filter(|e| e.parent_key().as_ref() == f.orphan_of.as_ref())
             .find_map(|e| e.parent_title.as_deref().filter(|t| !t.is_empty()));
         return match (parent_title, shape.continued) {
             (Some(t), false) => format!("{t}の子"),
@@ -1713,6 +2181,17 @@ fn family_heading(
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+/// スレッドの描画用 ID。接続とスレッド ID を長さ付きで混ぜるので、区切り文字の紛れで別のスレッドと衝突しない。
+fn stable_key(key: &ThreadKey) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for part in [key.server.as_bytes(), key.thread.as_bytes()] {
+        for b in (part.len() as u64).to_le_bytes().iter().chain(part) {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    h.max(1)
 }
 fn stable_id(s: &str) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
@@ -1867,6 +2346,19 @@ mod tests {
     use super::*;
     use crate::agents::{AgentChange, AgentChangeKind, AgentState};
     use std::time::UNIX_EPOCH;
+    /// 旧来の 1 台構成(`primary`)のスレッドの鍵。
+    fn k(id: &str) -> ThreadKey {
+        ThreadKey {
+            server: "primary".into(),
+            thread: id.into(),
+        }
+    }
+    fn ck() -> ChangeKey {
+        ChangeKey {
+            server: "primary".into(),
+            id: 0,
+        }
+    }
     fn entry(id: &str, state: AgentState) -> AgentEntry {
         AgentEntry {
             thread_id: id.into(),
@@ -1903,7 +2395,7 @@ mod tests {
             ..Default::default()
         };
         s.sync(&a, now);
-        let slot = s.seen["b"];
+        let slot = s.seen[&k("b")];
         a.entries = vec![
             entry("a", AgentState::Running),
             entry("c", AgentState::Idle),
@@ -1911,7 +2403,7 @@ mod tests {
         ]
         .into();
         s.sync(&a, now);
-        assert_eq!(s.seen["b"], slot);
+        assert_eq!(s.seen[&k("b")], slot);
     }
     #[test]
     fn same_thread_changes_coalesce_and_focus_is_single() {
@@ -1924,7 +2416,8 @@ mod tests {
         };
         s.sync(&snap, now);
         s.enqueue(QueuedEvent {
-            thread_id: "a".into(),
+            change: ck(),
+            key: k("a"),
             kind: EventKind::Changed,
             before: "待機".into(),
             after: "実行中".into(),
@@ -1932,7 +2425,8 @@ mod tests {
             priority: 1,
         });
         s.enqueue(QueuedEvent {
-            thread_id: "a".into(),
+            change: ck(),
+            key: k("a"),
             kind: EventKind::Changed,
             before: "待機".into(),
             after: "承認待ち".into(),
@@ -1957,7 +2451,8 @@ mod tests {
         };
         s.sync(&initial, now);
         s.enqueue(QueuedEvent {
-            thread_id: "a".into(),
+            change: ck(),
+            key: k("a"),
             kind: EventKind::New,
             before: "新しく検出".into(),
             after: "実行中".into(),
@@ -1972,6 +2467,7 @@ mod tests {
         let changed = AgentSnapshot {
             entries: vec![updated].into(),
             changes: vec![AgentChange {
+                server_id: "primary".into(),
                 id: 1,
                 thread_id: "a".into(),
                 kind: AgentChangeKind::State,
@@ -1995,7 +2491,7 @@ mod tests {
         assert_eq!(s.queue[0].kind, EventKind::Changed);
         assert!(s.advance(change_time + Duration::from_millis(1)));
         assert_eq!(
-            s.focus.as_ref().map(|f| f.event.thread_id.as_str()),
+            s.focus.as_ref().map(|f| f.event.key.thread.as_str()),
             Some("a")
         );
         assert_eq!(s.focus.as_ref().unwrap().event.kind, EventKind::Changed);
@@ -2018,6 +2514,7 @@ mod tests {
         let now = Instant::now();
         let mut s = AgentScreen::new((1920, 1080), false, 30);
         let change = AgentChange {
+            server_id: "primary".into(),
             id: 1,
             thread_id: "a".into(),
             kind: AgentChangeKind::New,
@@ -2064,7 +2561,7 @@ mod tests {
         let board = s.layout(&s.arrange());
         assert_eq!(board.cards.len(), 13);
         let lane_of = |id: &str| {
-            let x = board.cards[id].rect.x;
+            let x = board.cards[&k(id)].rect.x;
             board
                 .lanes
                 .iter()
@@ -2084,7 +2581,7 @@ mod tests {
             .into();
         s.sync(&snap, now);
         assert_eq!(s.seen.len(), 13);
-        assert!((0..6).all(|i| !s.seen.contains_key(&format!("a{i}"))));
+        assert!((0..6).all(|i| !s.seen.contains_key(&k(&format!("a{i}")))));
         assert_eq!(s.layout(&s.arrange()).cards.len(), 13);
     }
     #[test]
@@ -2104,7 +2601,7 @@ mod tests {
         };
         s.sync(&snap, now);
         s.last_activity
-            .insert("done".into(), now + Duration::from_secs(5));
+            .insert(k("done"), now + Duration::from_secs(5));
         let order = s.groups()[0]
             .entries
             .iter()
@@ -2127,12 +2624,12 @@ mod tests {
         stale.connection = crate::agents::AgentConnection::Retrying;
         stale.last_success_mono = Some(now - Duration::from_secs(31));
         s.sync(&stale, now);
-        assert!(s.stale);
+        assert!(s.servers[0].stale);
         let mut live = stale;
         live.connection = crate::agents::AgentConnection::Live;
         live.last_success_mono = Some(now + Duration::from_secs(3));
         s.sync(&live, now + Duration::from_secs(3));
-        assert!(!s.stale);
+        assert!(!s.servers[0].stale);
         assert!(s.queue.is_empty());
         assert!(s.focus.is_none());
     }
@@ -2147,7 +2644,8 @@ mod tests {
         };
         s.sync(&snap, now);
         s.enqueue(QueuedEvent {
-            thread_id: "a".into(),
+            change: ck(),
+            key: k("a"),
             kind: EventKind::New,
             before: "新しく検出".into(),
             after: "実行中".into(),
@@ -2179,19 +2677,19 @@ mod tests {
         s.sync(&snap, now);
         let rev = {
             render_for_test(&mut s, &snap, now);
-            s.revisions["t0"]
+            s.revisions[&k("t0")]
         };
-        let surface = s.surfaces["t0"].clone();
+        let surface = s.surfaces[&k("t0")].clone();
         render_for_test(&mut s, &snap, now);
-        assert_eq!(s.revisions["t0"], rev);
-        assert!(Arc::ptr_eq(&s.surfaces["t0"], &surface));
+        assert_eq!(s.revisions[&k("t0")], rev);
+        assert!(Arc::ptr_eq(&s.surfaces[&k("t0")], &surface));
         assert_eq!(s.surfaces.len(), s.board.cards.len());
 
         snap.entries = entries[..3].to_vec().into();
         s.sync(&snap, now + Duration::from_secs(1));
         render_for_test(&mut s, &snap, now + Duration::from_secs(1));
         assert_eq!(s.surfaces.len(), 3);
-        assert!(!s.surfaces.contains_key("t5"));
+        assert!(!s.surfaces.contains_key(&k("t5")));
     }
     #[test]
     fn change_descriptions_keep_goal_and_title_differences() {
@@ -2216,7 +2714,7 @@ mod tests {
     ) -> Vec<draw::AgentCardSurface> {
         screen.last_now = now;
         let world = crate::screen::World {
-            agents: snap.clone(),
+            agents: ServerSnapshot::primary(snap.clone()),
             ..Default::default()
         };
         let mut canvas = Canvas::new(screen.size.0, screen.size.1);
@@ -2344,7 +2842,8 @@ mod tests {
         };
         screen.sync(&snap, now);
         screen.enqueue(QueuedEvent {
-            thread_id: "existing".into(),
+            change: ck(),
+            key: k("existing"),
             kind: EventKind::Changed,
             before: "待機".into(),
             after: "実行中".into(),
@@ -2353,7 +2852,8 @@ mod tests {
         });
         assert!(screen.activate_event(now));
         screen.enqueue(QueuedEvent {
-            thread_id: "new-a".into(),
+            change: ck(),
+            key: k("new-a"),
             kind: EventKind::New,
             before: "新しく検出".into(),
             after: "実行中".into(),
@@ -2361,7 +2861,8 @@ mod tests {
             priority: 2,
         });
         screen.enqueue(QueuedEvent {
-            thread_id: "new-b".into(),
+            change: ck(),
+            key: k("new-b"),
             kind: EventKind::New,
             before: "新しく検出".into(),
             after: "待機".into(),
@@ -2371,16 +2872,18 @@ mod tests {
 
         let first = render_for_test(&mut screen, &snap, now);
         let visible_ids = first.iter().map(|card| card.id).collect::<HashSet<_>>();
-        assert!(visible_ids.contains(&screen.id_map["existing"]));
-        assert!(!visible_ids.contains(&screen.id_map["new-a"]));
-        assert!(!visible_ids.contains(&screen.id_map["new-b"]));
-        assert!(screen.pending_new.contains("new-a") && screen.pending_new.contains("new-b"));
+        assert!(visible_ids.contains(&screen.id_map[&k("existing")]));
+        assert!(!visible_ids.contains(&screen.id_map[&k("new-a")]));
+        assert!(!visible_ids.contains(&screen.id_map[&k("new-b")]));
+        assert!(
+            screen.pending_new.contains(&k("new-a")) && screen.pending_new.contains(&k("new-b"))
+        );
 
         let done = now + Duration::from_secs(6);
         assert!(screen.advance(done));
         assert!(screen.advance(done + Duration::from_millis(1)));
         assert_eq!(
-            screen.focus.as_ref().map(|f| f.event.thread_id.as_str()),
+            screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
             Some("new-a")
         );
         let during_intro = render_for_test(&mut screen, &snap, done + Duration::from_millis(1));
@@ -2388,10 +2891,10 @@ mod tests {
             .iter()
             .map(|card| card.id)
             .collect::<HashSet<_>>();
-        assert!(ids.contains(&screen.id_map["new-a"]));
-        assert!(!ids.contains(&screen.id_map["new-b"]));
-        assert!(!screen.pending_new.contains("new-a"));
-        assert!(screen.pending_new.contains("new-b"));
+        assert!(ids.contains(&screen.id_map[&k("new-a")]));
+        assert!(!ids.contains(&screen.id_map[&k("new-b")]));
+        assert!(!screen.pending_new.contains(&k("new-a")));
+        assert!(screen.pending_new.contains(&k("new-b")));
     }
 
     #[test]
@@ -2409,7 +2912,7 @@ mod tests {
         };
         screen.sync(&snap, now);
         let before = render_for_test(&mut screen, &snap, now);
-        let b_id = screen.id_map["b"];
+        let b_id = screen.id_map[&k("b")];
         let pose = |cards: &[draw::AgentCardSurface]| {
             cards.iter().find(|card| card.id == b_id).unwrap().pose
         };
@@ -2418,7 +2921,7 @@ mod tests {
         entries[1].state = AgentState::Approval;
         snap.entries = entries.into();
         let world = crate::screen::World {
-            agents: snap.clone(),
+            agents: ServerSnapshot::primary(snap.clone()),
             ..Default::default()
         };
         screen.tick(&world, now + Duration::from_secs(1));
@@ -2445,12 +2948,12 @@ mod tests {
         let mut text = miharashi_render::TextEngine::new("Noto Sans CJK JP");
         let e = entry("a", AgentState::Idle);
         let full = screen.content(&e, now, None, false, false);
-        screen.ensure_surface("a", &full, (400.0, 210.0), &mut text);
-        let (rev, surface) = (screen.revisions["a"], screen.surfaces["a"].clone());
+        screen.ensure_surface(&k("a"), &full, (400.0, 210.0), &mut text);
+        let (rev, surface) = (screen.revisions[&k("a")], screen.surfaces[&k("a")].clone());
         let strip = screen.content(&e, now, None, true, false);
-        screen.ensure_surface("a", &strip, (400.0, 210.0), &mut text);
-        assert_ne!(screen.revisions["a"], rev);
-        assert!(!Arc::ptr_eq(&screen.surfaces["a"], &surface));
+        screen.ensure_surface(&k("a"), &strip, (400.0, 210.0), &mut text);
+        assert_ne!(screen.revisions[&k("a")], rev);
+        assert!(!Arc::ptr_eq(&screen.surfaces[&k("a")], &surface));
     }
 
     #[test]
@@ -2489,7 +2992,8 @@ mod tests {
         screen.sync(&snap, now);
         for e in entries.iter().take(MAX_QUEUE + 1) {
             screen.enqueue(QueuedEvent {
-                thread_id: e.thread_id.clone(),
+                change: ck(),
+                key: k(&e.thread_id),
                 kind: EventKind::New,
                 before: "新しく検出".into(),
                 after: "待機".into(),
@@ -2498,7 +3002,7 @@ mod tests {
             });
         }
         assert_eq!(screen.queue.len(), MAX_QUEUE);
-        let overflow_id = format!("n{}", MAX_QUEUE);
+        let overflow_id = k(&format!("n{}", MAX_QUEUE));
         assert!(!screen.pending_new.contains(&overflow_id));
         let cards = render_for_test(&mut screen, &snap, now);
         assert!(
@@ -2507,11 +3011,11 @@ mod tests {
                 .any(|card| card.id == screen.id_map[&overflow_id])
         );
 
-        let removed = entries[0].thread_id.clone();
+        let removed = k(&entries[0].thread_id);
         screen.pending_new.insert(removed.clone());
         let remaining = entries
             .iter()
-            .filter(|e| e.thread_id != removed)
+            .filter(|e| k(&e.thread_id) != removed)
             .cloned()
             .collect::<Vec<_>>();
         let updated = AgentSnapshot {
@@ -2520,7 +3024,7 @@ mod tests {
         };
         screen.sync(&updated, now + Duration::from_secs(1));
         assert!(!screen.pending_new.contains(&removed));
-        assert!(screen.queue.iter().all(|event| event.thread_id != removed));
+        assert!(screen.queue.iter().all(|event| event.key != removed));
     }
 
     fn child(id: &str, parent: &str, state: AgentState) -> AgentEntry {
@@ -2546,7 +3050,8 @@ mod tests {
     }
     fn change_event(id: &str, kind: EventKind) -> QueuedEvent {
         QueuedEvent {
-            thread_id: id.into(),
+            change: ck(),
+            key: k(id),
             kind,
             before: "待機".into(),
             after: "実行中".into(),
@@ -2588,8 +3093,8 @@ mod tests {
         assert_eq!(arr.groups[0].entries.len(), 2);
         assert_eq!(arr.families[0].len(), 1);
         let board = &s.layout(&arr);
-        assert_eq!(board.cards["boss"].depth, 0);
-        assert_eq!(board.cards["kid"].depth, 1);
+        assert_eq!(board.cards[&k("boss")].depth, 0);
+        assert_eq!(board.cards[&k("kid")].depth, 1);
     }
 
     #[test]
@@ -2630,11 +3135,8 @@ mod tests {
             now,
         );
         s.ensure_board();
-        let by_id: HashMap<&str, &AgentEntry> = s
-            .entries
-            .iter()
-            .map(|e| (e.thread_id.as_str(), e))
-            .collect();
+        let by_id: HashMap<ThreadKey, &AgentEntry> =
+            s.entries.iter().map(|e| (e.key(), e)).collect();
         let mut headings: Vec<String> = s
             .board
             .families
@@ -2672,7 +3174,7 @@ mod tests {
         });
         let snap = snapshot_of(entries);
         let world = crate::screen::World {
-            agents: snap.clone(),
+            agents: ServerSnapshot::primary(snap.clone()),
             ..Default::default()
         };
         let t1 = now + Duration::from_secs(1);
@@ -2688,7 +3190,7 @@ mod tests {
         let card_y = |cards: &[draw::AgentCardSurface]| {
             cards
                 .iter()
-                .find(|c| c.id == s.id_map["boss"])
+                .find(|c| c.id == s.id_map[&k("boss")])
                 .unwrap()
                 .pose
                 .y
@@ -2712,15 +3214,15 @@ mod tests {
             .next()
             .expect("子が集約される");
         assert!(!s.board.cards.contains_key(&hidden));
-        s.enqueue(change_event(&hidden, EventKind::New));
+        s.enqueue(change_event(&hidden.thread, EventKind::New));
         s.enqueue(change_event("run", EventKind::Changed));
         assert!(s.pending_new.contains(&hidden));
         assert!(s.activate_event(now));
         // 優先度が同じなら先に入ったもの。集約された子でも詰まらない。
-        assert_eq!(s.focus.as_ref().unwrap().event.thread_id, hidden);
+        assert_eq!(s.focus.as_ref().unwrap().event.key, hidden);
         assert!(!s.pending_new.contains(&hidden));
         let anchor = s.board.anchor(&hidden).unwrap();
-        assert_eq!(anchor, s.board.cards["boss"].rect);
+        assert_eq!(anchor, s.board.cards[&k("boss")].rect);
         let intro = render_for_test(&mut s, &snap, now + Duration::from_millis(300));
         assert!(
             intro.iter().any(|c| c.id == s.id_map[&hidden]),
@@ -2733,7 +3235,7 @@ mod tests {
         let after = render_for_test(&mut s, &snap, later);
         assert!(after.iter().all(|c| c.id != s.id_map[&hidden]));
         assert!(s.advance(later + Duration::from_millis(1)));
-        assert_eq!(s.focus.as_ref().unwrap().event.thread_id, "run");
+        assert_eq!(s.focus.as_ref().unwrap().event.key.thread, "run");
     }
 
     /// LP の動画に使う筋書き(親子グループの見本 + 子 1 人)は、縮めも重ねもせず、ふつうの大きさで 1 枚に収まる。
@@ -2769,7 +3271,7 @@ mod tests {
         let mut s = AgentScreen::new((1920, 1080), false, 30);
         let snap = snapshot_of(nine_families());
         let world = crate::screen::World {
-            agents: snap.clone(),
+            agents: ServerSnapshot::primary(snap.clone()),
             ..Default::default()
         };
         s.tick(&world, now);
@@ -2786,7 +3288,7 @@ mod tests {
         let t2 = now + Duration::from_secs(120);
         s.tick(&world, t2);
         assert!(s.focus.is_some());
-        assert!(s.board.anchor("g0").is_some());
+        assert!(s.board.anchor(&k("g0")).is_some());
         s.tick(&world, t2 + Duration::from_secs(4));
         s.tick(&world, t2 + Duration::from_secs(8));
         assert!(s.focus.is_none());
@@ -2794,7 +3296,7 @@ mod tests {
         // 収まる盤面は、縮めない。
         let mut single = AgentScreen::new((1920, 1080), false, 30);
         let one = crate::screen::World {
-            agents: snapshot_of(big_family(2)),
+            agents: ServerSnapshot::primary(snapshot_of(big_family(2))),
             ..Default::default()
         };
         single.tick(&one, now);
@@ -2809,20 +3311,20 @@ mod tests {
         s.sync(&snap, now);
         s.ensure_board();
         for target in ["g0", "g4c2", "g8c0"] {
-            assert!(s.board.anchor(target).is_some(), "{target}");
+            assert!(s.board.anchor(&k(target)).is_some(), "{target}");
         }
         s.enqueue(change_event("g8c2", EventKind::New));
         assert!(s.activate_event(now));
         let cards = render_for_test(&mut s, &snap, now + Duration::from_millis(300));
-        assert!(cards.iter().any(|c| c.id == s.id_map["g8c2"]));
+        assert!(cards.iter().any(|c| c.id == s.id_map[&k("g8c2")]));
         // 置き場が無いスレッドのイベントはキューに残らない。
         s.focus = None;
         s.enqueue(change_event("nobody", EventKind::New));
         s.queue.clear();
         s.enqueue(change_event("nobody", EventKind::New));
-        s.pending_new.insert("nobody".into());
+        s.pending_new.insert(k("nobody"));
         assert!(!s.activate_event(now));
-        assert!(s.queue.is_empty() && !s.pending_new.contains("nobody"));
+        assert!(s.queue.is_empty() && !s.pending_new.contains(&k("nobody")));
     }
 
     /// 親子グループが多い盤面で、ポップアップ中に別の組が要確認になって順位が変わっても、
@@ -2833,12 +3335,12 @@ mod tests {
         let mut s = AgentScreen::new((1920, 1080), false, 30);
         let entries = nine_families();
         let world = |entries: Vec<AgentEntry>| crate::screen::World {
-            agents: snapshot_of(entries),
+            agents: ServerSnapshot::primary(snapshot_of(entries)),
             ..Default::default()
         };
         s.tick(&world(entries.clone()), now);
         let target = "g5c1".to_string();
-        assert!(s.board.anchor(&target).is_some());
+        assert!(s.board.anchor(&k(&target)).is_some());
         s.enqueue(change_event(&target, EventKind::Changed));
         assert!(s.activate_event(now));
         let replans = s.replans;
@@ -2854,14 +3356,14 @@ mod tests {
         let mid = render_for_test(&mut s, &snapshot_of(moved.clone()), t);
         assert!(s.focus.is_some());
         assert_eq!(s.replans, replans, "ポップアップの間は作り直さない");
-        assert!(s.board.anchor(&target).is_some());
-        assert!(mid.iter().any(|c| c.id == s.id_map[&target]));
+        assert!(s.board.anchor(&k(&target)).is_some());
+        assert!(mid.iter().any(|c| c.id == s.id_map[&k(&target)]));
         // 終わったあとに反映される: 要確認の組が最初に来る(組の並びは変わるが、全員が今の配置にある)。
         let later = now + Duration::from_secs(8);
         s.tick(&world(moved), later);
         assert!(s.focus.is_none());
         assert_eq!(s.replans, replans + 1);
-        assert!(s.board.cards.contains_key("g0c0") && s.board.cards.contains_key(&target));
+        assert!(s.board.cards.contains_key(&k("g0c0")) && s.board.cards.contains_key(&k(&target)));
     }
 
     /// ポップアップの間は配置(対象のカードと戻り先)を前のまま保つので、その間に別のスレッドが一覧から消えても、
@@ -2872,7 +3374,7 @@ mod tests {
         let mut s = AgentScreen::new((1920, 1080), false, 30);
         let entries = nine_families();
         let world = |entries: Vec<AgentEntry>| crate::screen::World {
-            agents: snapshot_of(entries),
+            agents: ServerSnapshot::primary(snapshot_of(entries)),
             ..Default::default()
         };
         s.tick(&world(entries.clone()), now);
@@ -2884,13 +3386,13 @@ mod tests {
             .board
             .cards
             .keys()
-            .find(|id| id.contains('c') && **id != target)
+            .find(|id| id.thread.contains('c') && id.thread != target)
             .unwrap()
             .clone();
         let gone_card = s.id_map[&gone];
         let remaining: Vec<AgentEntry> = entries
             .iter()
-            .filter(|e| e.thread_id != gone)
+            .filter(|e| k(&e.thread_id) != gone)
             .cloned()
             .collect();
         let t = now + Duration::from_secs(1);
@@ -2900,7 +3402,10 @@ mod tests {
         for step in [1u64, 2, 3] {
             let at = now + Duration::from_secs(step);
             let cards = render_for_test(&mut s, &snapshot_of(remaining.clone()), at);
-            assert!(cards.iter().any(|c| c.id == s.id_map[&target]), "{step}");
+            assert!(
+                cards.iter().any(|c| c.id == s.id_map[&k(&target)]),
+                "{step}"
+            );
             assert!(cards.iter().all(|c| c.id != gone_card), "{step}");
         }
         // 終わったあとに作り直され、消えたスレッドはどこにも無い。
@@ -2915,7 +3420,7 @@ mod tests {
                 .groups
                 .iter()
                 .flat_map(|g| &g.entries)
-                .all(|e| e.thread_id != gone)
+                .all(|e| e.key() != gone)
         );
     }
 
@@ -2926,15 +3431,15 @@ mod tests {
         let mut s = AgentScreen::new((1920, 1080), false, 30);
         let entries = nine_families();
         let world = |entries: Vec<AgentEntry>| crate::screen::World {
-            agents: snapshot_of(entries),
+            agents: ServerSnapshot::primary(snapshot_of(entries)),
             ..Default::default()
         };
         s.tick(&world(entries.clone()), now);
         s.enqueue(change_event("g0c1", EventKind::Changed));
         s.enqueue(change_event("g1c1", EventKind::Changed));
         assert!(s.activate_event(now));
-        assert_eq!(s.focus.as_ref().unwrap().event.thread_id, "g0c1");
-        let gone_card = s.id_map["g0c1"];
+        assert_eq!(s.focus.as_ref().unwrap().event.key.thread, "g0c1");
+        let gone_card = s.id_map[&k("g0c1")];
         let remaining: Vec<AgentEntry> = entries
             .iter()
             .filter(|e| e.thread_id != "g0c1")
@@ -2942,11 +3447,11 @@ mod tests {
             .collect();
         let t = now + Duration::from_secs(1);
         s.tick(&world(remaining.clone()), t);
-        assert_eq!(s.focus.as_ref().unwrap().event.thread_id, "g1c1");
+        assert_eq!(s.focus.as_ref().unwrap().event.key.thread, "g1c1");
         let cards = render_for_test(&mut s, &snapshot_of(remaining.clone()), t);
-        assert!(cards.iter().any(|c| c.id == s.id_map["g1c1"]));
+        assert!(cards.iter().any(|c| c.id == s.id_map[&k("g1c1")]));
         assert!(cards.iter().all(|c| c.id != gone_card));
-        assert!(s.board.anchor("g0c1").is_none());
+        assert!(s.board.anchor(&k("g0c1")).is_none());
         // 最後のイベントの対象が消えても、キューは空になるだけで落ちない。
         let remaining: Vec<AgentEntry> = remaining
             .into_iter()
@@ -3011,11 +3516,11 @@ mod tests {
         let snap = snapshot_of(big_family(1));
         s.sync(&snap, now);
         s.ensure_board();
-        s.board.cards.get_mut("run").unwrap().rect.x = 5000.0;
+        s.board.cards.get_mut(&k("run")).unwrap().rect.x = 5000.0;
         let cards = render_for_test(&mut s, &snap, now);
-        assert!(cards.iter().all(|c| c.id != s.id_map["run"]));
-        assert!(!s.surfaces.contains_key("run"));
-        assert!(s.surfaces.contains_key("boss"));
+        assert!(cards.iter().all(|c| c.id != s.id_map[&k("run")]));
+        assert!(!s.surfaces.contains_key(&k("run")));
+        assert!(s.surfaces.contains_key(&k("boss")));
     }
 
     /// 親 1 + 承認待ちの子 `n` 人を 3 つのプロジェクトに分けた取得(GLES の上限を超える)。
@@ -3086,7 +3591,7 @@ mod tests {
             .board
             .cards
             .keys()
-            .filter(|id| id.contains('a'))
+            .filter(|id| id.thread.contains('a'))
             .map(|id| s.id_map[id])
             .collect();
         assert!(!placed.is_empty());

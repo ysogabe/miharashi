@@ -471,7 +471,7 @@ fn png_with(cli: Cli, open: &OpenGles) -> Result<(), String> {
         vrm_gles_fixtures(check, &cfg, &cli, size, &out, fixture_wall())?;
     }
     println!(
-        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,room,room-offline,room-empty,refresh-glitch,refresh-return,scene-notice,agents-overview,agents-busy,agents-new-*,agents-changed-*,agents-stale,agents-empty}}.png ({}x{})",
+        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,room,room-offline,room-empty,refresh-glitch,refresh-return,scene-notice,agents-overview,agents-busy,agents-new-*,agents-changed-*,agents-stale,agents-empty,agents-multi-two,agents-multi-stale,agents-multi-four}}.png ({}x{})",
         out.display(),
         size.0,
         size.1
@@ -640,7 +640,7 @@ fn vrm_gles_fixtures(
     struct Feed(std::rc::Rc<std::cell::RefCell<agents::AgentSnapshot>>);
     impl Provider for Feed {
         fn update(&mut self, world: &mut World) {
-            world.agents = self.0.borrow().clone();
+            world.agents = agents::ServerSnapshot::primary(self.0.borrow().clone());
         }
     }
 

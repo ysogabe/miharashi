@@ -168,8 +168,8 @@ pub enum FeedState {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct FeedReport {
-    pub id: &'static str,
-    pub label: &'static str,
+    pub id: String,
+    pub label: String,
     pub state: FeedState,
     /// 最後に成功した時刻(RFC3339)
     pub last_ok: Option<String>,
@@ -199,7 +199,8 @@ pub struct AdminSources {
     /// 警報。room 画面とは無関係(`[alerts] disaster` と HA の url で決まる)
     pub disaster: Source<crate::disaster::HomeShared>,
     pub aircraft: Source<crate::aircraft::HealthShared>,
-    pub agents: Source<crate::agents::Shared>,
+    /// 接続(`primary` と `extra_servers`)ごとの取得状態。
+    pub agents: Source<Vec<crate::agents::Connection>>,
 }
 
 impl Default for AdminSources {

@@ -198,10 +198,13 @@ pub fn render_card(content: &AgentCardContent, size: (u32, u32), text: &mut Text
     }
     let mut x = left;
     if !content.project.is_empty() {
-        let room = (inner - age_w - text.measure(label, row) - 40.0 * s).max(40.0);
-        let project = fit_text(text, &content.project, row, room);
-        text.draw(&mut canvas, &project, x, top, row, muted);
-        x += text.measure(&project, row) + 16.0 * s;
+        let room = inner - age_w - text.measure(label, row) - 40.0 * s;
+        // 幅が足りないカード(列が多い盤面)では、状態と経過時間を優先して名前を省く(重ねて描かない)。
+        if room >= 56.0 * s {
+            let project = fit_text(text, &content.project, row, room);
+            text.draw(&mut canvas, &project, x, top, row, muted);
+            x += text.measure(&project, row) + 16.0 * s;
+        }
     }
     text.draw(&mut canvas, label, x, top, row, state_color);
     if content.compact {

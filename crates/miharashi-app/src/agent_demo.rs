@@ -1,6 +1,7 @@
 //! AgentScreen を仮時計で動かす、外部接続なしの連番 PNG デモ。
 use crate::agents::{
     AgentChange, AgentChangeKind, AgentConnection, AgentEntry, AgentSnapshot, AgentState,
+    ServerSnapshot,
 };
 use crate::app::screens::agents::AgentScreen;
 use crate::config::Config;
@@ -16,6 +17,7 @@ fn entry(id: &str, title: &str, state: AgentState) -> AgentEntry {
 
 fn project_entry(project: &str, id: &str, title: &str, state: AgentState) -> AgentEntry {
     AgentEntry {
+        server_id: crate::config::PRIMARY_SERVER_ID.into(),
         thread_id: id.into(),
         project_id: format!("demo-{project}"),
         project_title: format!("仮データ / {project}"),
@@ -74,6 +76,7 @@ fn new_thread_snapshot(base: &AgentSnapshot, wall: SystemTime, mono: Instant) ->
     snapshot.last_success = Some(wall);
     snapshot.last_success_mono = Some(mono);
     snapshot.changes = vec![AgentChange {
+        server_id: crate::config::PRIMARY_SERVER_ID.into(),
         id: 1,
         thread_id: new.thread_id.clone(),
         kind: AgentChangeKind::New,
@@ -103,6 +106,7 @@ fn changed_snapshot(base: &AgentSnapshot, wall: SystemTime, mono: Instant) -> Ag
     snapshot.last_success = Some(wall);
     snapshot.last_success_mono = Some(mono);
     snapshot.changes = vec![AgentChange {
+        server_id: crate::config::PRIMARY_SERVER_ID.into(),
         id: 2,
         thread_id: "demo-new".into(),
         kind: AgentChangeKind::State,
@@ -132,6 +136,7 @@ fn completed_snapshot(base: &AgentSnapshot, wall: SystemTime, mono: Instant) -> 
     snapshot.last_success = Some(wall);
     snapshot.last_success_mono = Some(mono);
     snapshot.changes = vec![AgentChange {
+        server_id: crate::config::PRIMARY_SERVER_ID.into(),
         id: 2,
         thread_id: "demo-new".into(),
         kind: AgentChangeKind::State,
@@ -422,6 +427,7 @@ fn collapsed_child_snapshot(
         last_success: Some(wall + at),
         last_success_mono: Some(mono + at),
         changes: vec![AgentChange {
+            server_id: crate::config::PRIMARY_SERVER_ID.into(),
             id: base.change_cursor + 1,
             thread_id: id.into(),
             kind: AgentChangeKind::State,
@@ -549,7 +555,7 @@ pub fn write_fixtures(
     let base = Instant::now();
     let (initial, fresh, changed) = fixture_snapshots(wall, base);
     let mut world = World {
-        agents: initial,
+        agents: ServerSnapshot::primary(initial),
         ..World::default()
     };
     let mut screen = AgentScreen::new(size, false, stale_secs);
@@ -564,7 +570,7 @@ pub fn write_fixtures(
         size,
     )?;
 
-    world.agents = fresh.clone();
+    world.agents = ServerSnapshot::primary(fresh.clone());
     let new_at = base + Duration::from_secs(1);
     for (i, seconds) in [0.0f32, 0.35, 0.75, 2.2, 3.8, 4.35].iter().enumerate() {
         save(
@@ -578,7 +584,7 @@ pub fn write_fixtures(
         )?;
     }
 
-    world.agents = changed.clone();
+    world.agents = ServerSnapshot::primary(changed.clone());
     let changed_at = base + Duration::from_secs(7);
     for (i, seconds) in [0.0f32, 0.35, 0.8, 3.0, 5.8].iter().enumerate() {
         save(
@@ -595,7 +601,7 @@ pub fn write_fixtures(
     let mut busy_screen = AgentScreen::new(size, false, stale_secs);
     busy_screen.on_enter(changed_at);
     let busy_world = World {
-        agents: busy_snapshot(&changed),
+        agents: ServerSnapshot::primary(busy_snapshot(&changed)),
         ..World::default()
     };
     save(
@@ -611,7 +617,7 @@ pub fn write_fixtures(
     let mut family_screen = AgentScreen::new(size, false, stale_secs);
     family_screen.on_enter(changed_at);
     let family_world = World {
-        agents: family_snapshot(&changed),
+        agents: ServerSnapshot::primary(family_snapshot(&changed)),
         ..World::default()
     };
     save(
@@ -629,7 +635,7 @@ pub fn write_fixtures(
     many_screen.on_enter(changed_at);
     let many = family_many_snapshot(&changed);
     let mut many_world = World {
-        agents: many.clone(),
+        agents: ServerSnapshot::primary(many.clone()),
         ..World::default()
     };
     save(
@@ -643,7 +649,8 @@ pub fn write_fixtures(
     )?;
     // 「ほか N 件」にまとめた子の変更は、親のカードを元位置にしてポップアップする。
     let hidden_id = "many-0-q13";
-    many_world.agents = collapsed_child_snapshot(&many, hidden_id, wall, changed_at);
+    many_world.agents =
+        ServerSnapshot::primary(collapsed_child_snapshot(&many, hidden_id, wall, changed_at));
     many_screen.on_enter(changed_at + Duration::from_secs(60));
     let pop_at = changed_at + Duration::from_secs(60);
     for (i, seconds) in [0.0f32, 0.35, 2.0].iter().enumerate() {
@@ -660,7 +667,7 @@ pub fn write_fixtures(
 
     let mut stale = changed.clone();
     stale.connection = AgentConnection::Retrying;
-    world.agents = stale;
+    world.agents = ServerSnapshot::primary(stale);
     save(
         &mut screen,
         &world,
@@ -677,7 +684,7 @@ pub fn write_fixtures(
     empty.connection = AgentConnection::Live;
     empty.last_success = Some(wall + Duration::from_secs(50));
     empty.last_success_mono = Some(changed_at + Duration::from_secs(50));
-    world.agents = empty;
+    world.agents = ServerSnapshot::primary(empty);
     save(
         &mut screen,
         &world,
@@ -686,7 +693,96 @@ pub fn write_fixtures(
         out,
         text,
         size,
-    )
+    )?;
+    write_multi_fixtures(out, size, text, stale_secs, wall, base)
+}
+
+/// 複数の T3 Server を 1 画面に出す見本(2 台・4 台、片方が止まっている、未表示あり)。
+/// 見本の接続名は仮のもので、実際の接続先とは関係ない。
+fn write_multi_fixtures(
+    out: &Path,
+    size: (u32, u32),
+    text: &mut TextEngine,
+    stale_secs: u64,
+    wall: SystemTime,
+    base: Instant,
+) -> Result<(), String> {
+    let (_, _, changed) = fixture_snapshots(wall, base);
+    // 2 台目は同じ thread / project の ID を別の中身で持つ(混ざらないことの見本)。
+    let mut second = changed.clone();
+    second.environment_id = Some("demo-second".into());
+    second.entries = second
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let mut e = e.clone();
+            e.state = [AgentState::Approval, AgentState::Input, AgentState::Running][i % 3];
+            e.has_pending_approvals = e.state == AgentState::Approval;
+            e.has_pending_user_input = e.state == AgentState::Input;
+            e
+        })
+        .collect::<Vec<_>>()
+        .into();
+    second.changes = Vec::new().into();
+    let mut shot = |name: &str, servers: Vec<ServerSnapshot>, size: (u32, u32), at: Instant| {
+        let world = World {
+            agents: servers,
+            wall: None,
+            ..World::default()
+        };
+        let mut screen = AgentScreen::new(size, false, stale_secs);
+        screen.on_enter(base);
+        screen.tick(&world, at);
+        let mut canvas = Canvas::new(size.0, size.1);
+        let mut context = RenderContext {
+            canvas: &mut canvas,
+            text,
+            world: &world,
+            covered: false,
+            force_overlay: true,
+        };
+        screen.render(&mut context);
+        canvas.save_png(&out.join(format!("{name}.png")))
+    };
+    let at = base + Duration::from_secs(8);
+    let mut first = changed.clone();
+    first.last_success_mono = Some(at);
+    second.last_success_mono = Some(at);
+    let two = vec![
+        ServerSnapshot::new("primary", "primary", first.clone()),
+        ServerSnapshot::new("container", "コンテナ", second.clone()),
+    ];
+    shot("agents-multi-two", two, size, at)?;
+    // 2 台目の取得が止まって stale_secs を超えた
+    let mut halted = second.clone();
+    halted.connection = AgentConnection::Retrying;
+    halted.last_success_mono = Some(base);
+    let late = base + Duration::from_secs(stale_secs + 10);
+    let mut first_live = first.clone();
+    first_live.last_success_mono = Some(late);
+    let two_halted = vec![
+        ServerSnapshot::new("primary", "primary", first_live),
+        ServerSnapshot::new("container", "コンテナ", halted),
+    ];
+    shot("agents-multi-stale", two_halted, size, late)?;
+    let mk = |i: usize, label: &str| {
+        let mut s = second.clone();
+        s.environment_id = Some(format!("demo-{i}"));
+        s.last_success_mono = Some(at);
+        ServerSnapshot::new(&format!("s{i}"), label, s)
+    };
+    let four = vec![
+        ServerSnapshot::new("primary", "primary", first),
+        mk(1, "コンテナ"),
+        mk(2, "とても長い名前の接続先(検証用の仮の名前)"),
+        {
+            let mut s = mk(3, "予備");
+            s.snapshot.connection = AgentConnection::AuthenticationRequired;
+            s
+        },
+    ];
+    shot("agents-multi-four", four, size, at)
 }
 
 /// `--out` に frame-000000.png 形式で連番を出す。fps は仮時計の刻みにだけ使い、通信しない。
@@ -731,7 +827,7 @@ pub fn render_sequence(
         let elapsed = Duration::from_secs_f64(index as f64 / f64::from(fps));
         let now = base + elapsed;
         world.wall = Some(wall + chrono::Duration::from_std(elapsed).unwrap_or_default());
-        world.agents = scenario.at(elapsed);
+        world.agents = ServerSnapshot::primary(scenario.at(elapsed));
         screen.tick(&world, now);
         let mut canvas = Canvas::new(size.0, size.1);
         let mut context = RenderContext {

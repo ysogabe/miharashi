@@ -93,9 +93,10 @@ struct AgentsProvider {
 
 impl Provider for AgentsProvider {
     fn update(&mut self, world: &mut World) {
-        world.agents = self
-            .scenario
-            .at(Duration::from_nanos(self.elapsed_ns.get()));
+        world.agents = crate::agents::ServerSnapshot::primary(
+            self.scenario
+                .at(Duration::from_nanos(self.elapsed_ns.get())),
+        );
     }
 }
 

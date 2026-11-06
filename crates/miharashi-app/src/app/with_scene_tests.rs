@@ -488,7 +488,7 @@ fn agent_focus_aims_the_head_and_photo_does_not() {
     let wall = std::time::SystemTime::now();
     let (initial, fresh, _) = crate::agent_demo::fixture_snapshots(wall, base);
     let mut world = World {
-        agents: initial,
+        agents: crate::agents::ServerSnapshot::primary(initial),
         ..World::default()
     };
     let mut s = WithScene::new(
@@ -516,7 +516,7 @@ fn agent_focus_aims_the_head_and_photo_does_not() {
     };
     assert!(step(&mut s, &world, 0));
     assert!(s.input().aim.is_none(), "フォーカスがなければ向けない");
-    world.agents = fresh;
+    world.agents = crate::agents::ServerSnapshot::primary(fresh);
     let mut max_look = 0.0f32;
     for k in 10..=32 {
         assert!(step(&mut s, &world, 100 * k));
@@ -738,7 +738,7 @@ fn aim_clock_does_not_run_while_hidden() {
     let (initial, fresh, _) =
         crate::agent_demo::fixture_snapshots(std::time::SystemTime::now(), base);
     let mut world = World {
-        agents: initial,
+        agents: crate::agents::ServerSnapshot::primary(initial),
         ..World::default()
     };
     let mut s = WithScene::new(
@@ -765,7 +765,7 @@ fn aim_clock_does_not_run_while_hidden() {
         s.input().aim.map_or(0.0, |a| a.look)
     };
     step(&mut s, &world, 0);
-    world.agents = fresh;
+    world.agents = crate::agents::ServerSnapshot::primary(fresh);
     // 重みが増え始めた(まだ小さい)ところで見えなくなる
     let mut ms = 1000;
     let mut look = 0.0;

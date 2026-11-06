@@ -1279,7 +1279,11 @@ mod tests {
             geoframe: Ok(link),
             home_assistant: Ok(env),
             aircraft: Err("aircraft.enabled = false".into()),
-            agents: Ok(agents),
+            agents: Ok(vec![crate::agents::Connection {
+                server_id: "primary".into(),
+                label: "primary".into(),
+                shared: agents,
+            }]),
             ..AdminSources::default()
         };
         let (_p, base) = start_with(loaded, 200, sources);
