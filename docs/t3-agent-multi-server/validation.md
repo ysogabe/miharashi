@@ -54,3 +54,14 @@ PREFLIGHT OK repo=/home/hermes/.t3/worktrees/miharashi/t3-026f8469 head=96b6e984
 ```text
 PREFLIGHT OK repo=/home/hermes/.t3/worktrees/miharashi/t3-026f8469 head=3ea92f058f7c0fa6749ea575c056888f60e9001c base=origin/main files=43
 ```
+
+## 本番反映（2026-11-07、ユーザー承認済み）
+- 3b4dcb8のreleaseバイナリ・追加接続設定・配送役service/timerを導入。旧バイナリ/設定/対象unit有無をroot専用領域に退避済み（場所は実機の作業記録に保持）。
+- キオスク再起動後NRestarts=0、active。既存primaryと追加接続のfeeds/tokenがともにok。
+- 配送役を本番で2回実行し、稼働workerの新世代取得を観測後に旧専用セッション1件を失効。管理APIの接続別更新結果はok、終了0、残り0。
+- 既存primary timerと追加接続の週次timerをともにenabledで確認。追加timerの次回予定を確認（周期実行自体は将来）。
+- 実KMSフレームをVAAPI経由で1枚だけ取得し、1枚のagents画面でprimary/追加接続がともにLIVE、番号付きカードと通知が同じページ内に表示されることを確認。画像はローカルだけに保持しPRへ添付しない。スレッドの本文・タイトルを文書に転記しない。
+- VRMは既存本番設定で無効。実モデルを有効にした最終合成確認は行っていない。既存LAN接続・待受・ファイアウォールは変更していない。
+- 本番での意図的な更新失敗表示試験は未実施。自動承認レビューが「具体的な障害注入と本番状態変更への明示承認なし」として拒否したため、実行せず、通常更新確認だけを継続した。失敗表示はmock/一時環境で検証済み。本番で行う場合は別途明示承認が必要。
+
+移行後に既存primaryの通常token更新serviceも手動実行し、終了0・旧専用セッション1件失効・その後も両workerがokであることを管理APIから確認した。
