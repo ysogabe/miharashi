@@ -102,3 +102,8 @@ environment_id変更の検出は現行workerのdescriptor再取得時（再接�
 
 ## 実機調査後の方針更新
 既存LXCリモートから対象コンテナへ到達し、固定LANアドレス・T3 v0.1.7・protocol 2を確認。ユーザーは既存LAN接続の維持を指定したため、ネットワークの公開範囲を狭める変更は行わない。短時間のorchestration:readセッションで受取/GET/ローテーション/旧token失効/環境ID不一致拒否を実サーバー確認し、試験セッションは失効済み。実IP・実環境IDは公開文書には含めない。
+
+## T4 の設計調整(配送役・診断コマンド)
+- 配送は共有ディレクトリではなく、管理用の配送役(`systemd/miharashi-t3-remote-token`)が既存の LXC リモートでコンテナ内の `t3` CLI を実行し、token をパイプで受取ツール(`--stdin`)へ流す。キオスクのユーザーに新しい lxc 権限は付与しない(配送役は既存の LXC クライアント設定を持つユーザーで動かす)。詳細・限界は [token-delivery.md](token-delivery.md)。
+- 「worker 側が新 token で取得できた」の確認には、新しい診断コマンド `miharashi agents-check` を追加した(実際の worker を画面なしで動かす)。T3 の `lastConnectedAt` はベアラー token の一覧 API では更新されず、管理ページが無効な環境もあるため、確認の根拠にしない。`agents::start` は `start_selected` に分け、診断が接続を選べるようにした(`start` の動作は変えていない)。
+- 古いセッションの失効は、同じ専用ラベルかつ権限が `orchestration:read` だけのものに限る。primary の既定ラベルは配送役の設定で拒否する。

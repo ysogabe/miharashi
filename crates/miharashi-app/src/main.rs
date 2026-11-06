@@ -2,6 +2,7 @@
 //! `bench`(CPU 描画のベースライン)、`bench-gpu`(重い描画の GPU ベンチマーク)。
 mod agent_demo;
 mod agents;
+mod agents_check;
 mod aircraft;
 mod album;
 mod app;
@@ -1095,6 +1096,10 @@ fn main() -> Result<(), String> {
     if cmd == "t3-token-receive" {
         std::process::exit(token_receive::run(rest));
     }
+    // 診断用: 画面を使わず、実際の worker で T3 への接続だけを確かめる(専用の引数。終了コード 0 / 1 / 2)
+    if cmd == "agents-check" {
+        std::process::exit(agents_check::run(rest));
+    }
     let cli = parse_cli(rest)?;
     match cmd.as_str() {
         "run" => run(cli),
@@ -1136,7 +1141,7 @@ fn main() -> Result<(), String> {
             }
         }
         other => Err(format!(
-            "unknown command {other}(run / png / agents-demo / demo-video / intro-video / agents-intro-video / bench / bench-gpu / bench-scene / bench-metrics / kms-info / check-config / config-get / t3-token-receive)"
+            "unknown command {other}(run / png / agents-demo / demo-video / intro-video / agents-intro-video / bench / bench-gpu / bench-scene / bench-metrics / kms-info / check-config / config-get / t3-token-receive / agents-check)"
         )),
     }
 }

@@ -1,6 +1,6 @@
 # T3 token の配送と更新(追加先の T3 Server)
 
-状態: T3(オフラインで確かめられる範囲)まで実装済み。配送の接続方法・UID/GID・実際のコンテナでの動作は、実機の試験(tasks.md の T4)で決める。この文書の例のアドレス・パスは例示用(`192.0.2.x`、`/var/lib/miharashi/...`)で、実環境の値ではない。
+状態: 受取ツール(T3)・配送役 `miharashi-t3-remote-token`・診断コマンド `miharashi agents-check`(T4)まで実装済み。実機(コンテナ・実サーバー)でローテーションと同時 2 接続を確認した(結果は [validation.md](validation.md))。**本番への導入(unit/timer の配置、設定の追記、再起動)は未実施**で、手順は末尾の「配送役の導入」。この文書の例のアドレス・パスは例示用(`192.0.2.x`、`/var/lib/miharashi/...`)で、実環境の値ではない。
 関連: [PRD](prd.md) / [設計](design.md)(「安全面とコンテナの接続」「安全面レビュー反映」)/ [既存 primary の更新](../DESIGN-t3-token.md)
 
 ## 何を解決するか
@@ -18,7 +18,7 @@
  ① 発行+権限確認+一覧 API の確認           ③ 受取ツール(miharashi t3-token-receive)
     (miharashi-t3-token,                      検査 → 対象 T3 に問い合わせ → 原子的に置く
      T3_TOKEN_REVOKE_MODE=defer)              ↓
- ② 配送(経路は T4 で決める) ───────────→  ホスト専用ディレクトリの token_file(worker が読む)
+ ② 配送(lxc exec + パイプ。下の「配送役」) ───────────→  ホスト専用ディレクトリの token_file(worker が読む)
                                             ↓ 30 秒以内に worker が読み直す
  ⑤ 古い token を失効  ←──────────────  ④ ホストで取得成功を確認(管理ページ・feeds)
     (T3_TOKEN_REVOKE_MODE=only)
@@ -36,7 +36,7 @@
 
 primary の timer・unit は変更していない(既定は `wait`)。`bash systemd/test-miharashi-t3-token.sh` が `defer` / `only` も含めて確かめる。
 
-発行側(コンテナ内)での実行例(実環境のパスは T4 で決める。トークンは引数・環境変数・ログに出さない):
+発行側(コンテナ内)での実行例(**T4 の実機では、この方式ではなく配送役がコンテナの t3 CLI を直接呼ぶ**。下の「配送役」。以下は `miharashi-t3-token` を `defer`/`only` で使う場合の参考。トークンは引数・環境変数・ログに出さない):
 
 ```bash
 # ① コンテナ内、T3 を動かしているユーザーで。置き先はコンテナ内の「送り出し用」ディレクトリ(例示)
@@ -63,7 +63,7 @@ miharashi t3-token-receive --server <id> \
 | 項目 | 内容 |
 |---|---|
 | 置き先 | `--server` の id を `[[agents.extra_servers]]` から引き、その `token_file` に置く。コマンドラインでパスや URL は受け取らない(取り違えない)。`primary` は断る |
-| 入力(どちらか 1 つ) | `--stdin`: 配送側が標準入力へ流す(共有ファイルの所有者に依存しない。経路は T4 で決める)。`--from-file`: ホスト側の受取用ディレクトリに届いたファイル。`--expect-uid` は必須(想像で決めず実機の値を明示)。**受取ツールは受け取り元のファイルを消さない**(下の「受け取り元の後始末」) |
+| 入力(どちらか 1 つ) | `--stdin`: 配送側が標準入力へ流す(共有ファイルの所有者に依存しない。T4 の配送役はこちらを使う)。`--from-file`: ホスト側の受取用ディレクトリに届いたファイル。`--expect-uid` は必須(想像で決めず実機の値を明示)。**受取ツールは受け取り元のファイルを消さない**(下の「受け取り元の後始末」) |
 | 秘密を渡さない | token は引数・環境変数に載せない(stdin かファイルで渡す) |
 | 検査(入力) | リンクを追跡せず開く(`O_NOFOLLOW`)・FIFO で固まらない(`O_NONBLOCK`)・開いた FD の `fstat` で通常ファイル・所有者(`--expect-uid`)・権限(所有者以外に権限がない)・ハードリンクなし・置き先と別のディレクトリ → 同じ FD から 8192 バイトまで読む → 空白・制御文字・非 ASCII を含まない 1 語(複数行や、空白を含む設定行は不可) |
 | 検査(置き先) | `token_file` は絶対パスで、ディレクトリはリンクや `..` を含まない正規の形。ディレクトリは実行ユーザー所有で、所有者以外に書き込み権限がない(0700 / 0750)。ディレクトリは `O_DIRECTORY\|O_NOFOLLOW` で開いた FD を基準に作成・置き換える。置き先のファイル名がリンクなら、リンク先を書き換えずリンクごと置き換える |
@@ -113,7 +113,7 @@ miharashi t3-token-receive --server <id> \
 - 後始末を要らなくする `--stdin` を勧める(ファイルが残らない)。`--from-file` の場合は、受取用ディレクトリを配送役だけが書ける場所にし、配送役の側で消す。
 - 受取ツールは `--from-file` が成功したとき、消していないことを stderr に 1 行出す。
 
-## ローテーションの手順(運用)
+## ローテーションの手順(運用。手動で行う場合。自動化した配送役は下の「配送役」)
 
 前提: 新旧どちらの token でも、手順中は worker が止まらない(旧 token は失効するまで有効)。値を端末に表示・貼り付けしない。
 
@@ -127,14 +127,63 @@ miharashi t3-token-receive --server <id> \
 
 失敗時: 手順 3 が置換前に失敗したら旧 token が残るので、原因を直して手順 2 からやり直す(新しい token はコンテナ側に未使用のまま残るので、やり直す前に手順 1 を再実行してよい。同じラベルの古いものは手順 5 でまとめて失効する)。手順 4 で取得が失敗したら、旧 token はまだ有効なので、手順 5 を実行せず原因を調べる。
 
-## 実機(T4)で決める・確かめること
+## 配送役 `miharashi-t3-remote-token`(T4)
 
-この文書とコードは次を**決めていない**。実環境の値を想像で設定しない。
+既存の LXC リモートの権限で、コンテナ内の t3 CLI を実行する**管理用の配送役**。`systemd/miharashi-t3-remote-token`(Python 3)と、unit/timer のテンプレート `miharashi-t3-remote-token@.service` / `@.timer`(インスタンス名 = 接続 id)、設定例 `miharashi-t3-remote-token.env.example`。
 
-- 配送の接続方法(コンテナ → ホストの経路。`--stdin` で流す方式か、受取用ディレクトリ経由か)と、その認可の範囲。キオスク実行ユーザーに広い lxc 権限を与えない。
-- 非特権コンテナの UID/GID の変換後の値(`--expect-uid` / `--expect-gid`)、受取用ディレクトリの所有者・権限。
-- 追加先の固定アドレスまたは証明書検証付き HTTPS 名、待受とファイアウォール、T3 のバージョン(v0.1.0 以降)、`--expect-environment-id` の値。
-- 受取ツールの実行の仕方(unit / timer / 配送側からの呼び出し)と更新の周期、失敗の通知。この PR には具体的な unit を含めない。
-- 実際のコンテナで、手順 1〜6 を通しで 1 回行い、取得の継続・旧 token の失効後の継続・更新失敗の表示を確かめる(確認前は本番対応済みとしない)。
+### 決めたこと(T4 の設計調整)
 
-`installed-unchecked` は置換後の検査失敗を示し、新tokenへ入れ替わっているため旧tokenが残る保証はない。この場合は旧セッションを失効せず、管理ページの取得状態と配置ファイルを確認して復旧する。
+| 項目 | 決定 |
+|---|---|
+| 配送の経路 | `lxc exec`(既存のリモート)でコンテナ内の `t3 auth session issue` を実行し、標準出力で受けた JSON から token を取り出して、**パイプ(標準入力)で** `miharashi t3-token-receive --stdin` へ流す。共有ディレクトリ・`--from-file` は使わない(UID/GID の変換値も要らない)。token は引数・環境変数・ログ・一時ファイルに出さず、受取のあとバッファを 0 で潰す |
+| 権限 | 新しい lxc 権限は付与しない。配送役は**既存の LXC クライアント設定を持つユーザー**(実機ではキオスクと同じ一般ユーザー)で動かす。受取ツールが置く token_file をキオスクの worker が読めるよう、所有者を同じにする必要があるため。限界: 同じユーザーなので、キオスクのプロセスも原理的には `~/.config/lxc` を読める(unit では配送役側だけが使う。権限を分けたい場合は別ユーザーにして、token_file を `root:<キオスクのグループ> 0640` で置く運用が要るが、この PR では扱わない) |
+| コンテナ内の実行 | `exec_mode=su`(既定): `lxc exec -T -n <remote>:<container> -- su - <user> -c '<各語を引用した 1 本の文字列>'`。`exec_mode=direct`: `--user/--group/--env HOME=/--cwd` でシェルを通さず直接実行。どちらも実機で動作確認。値は実行前に厳格な正規表現で検証する(`;`・空白・`$()`・先頭 `-`・`..` などは設定の誤りとして拒否) |
+| t3 CLI の引数 | 実機の `--help`(v0.1.7)で確認: `auth session issue [--scope <s>] [--ttl <t>] [--label <l>] [--json]`、`auth session list --json`、`auth session revoke <session-id>` |
+| 検証ゲート | 実際の worker のコードを使う `miharashi agents-check --server <id> --expect-environment <id>=<environmentId>` が、**置いた token_file を worker と同じ読み方(リンク拒否・所有者・権限・1 語)で読み**、同じ取得処理で成功することを確かめる。管理ページの `lastConnectedAt` は使えない(実機で、ベアラー token による一覧 API では更新されないことを確認) |
+| 失効の対象 | 同じラベルで、**権限が `orchestration:read` だけ**のベアラー token のセッションだけ。ラベルが他の権限のセッションと衝突していれば、発行する前に止める。primary の既定ラベル(`miharashi-agent-monitor`)は使えない。primary の token・設定・既存の timer には触れない(`config-get agents.url` も使わない) |
+| 診断コマンド | `miharashi agents-check` は画面・DRM・パネルを起動せず(ディスプレイを占有しない)、選んだ接続の worker だけを別プロセスで動かして、接続ごとの状態を 1 行ずつ出す。`--watch` で状態の変化を観察できる。起動中の miharashi には影響しない |
+
+### 手順と失敗時の扱い
+
+1. 排他ロック(状態ディレクトリの `<id>.lock`)。取れなければ何もせず終了コード 75。
+2. コンテナで `session list`: ラベルが専用か確認(他の権限のセッションがあれば終了コード 2)。
+3. `session issue --scope orchestration:read --label <専用ラベル> [--ttl ..] --json`: 返った権限が `["orchestration:read"]` だけで、token が 1 語の形式であること。違えば**今作ったセッションを失効**して失敗。応答を受け取れない(タイムアウト・不正)ときも、同じラベルで増えたセッションを失効する。
+4. 受取(`--stdin`): 受取ツールがホストから対象の T3 に問い合わせ、環境 ID を照合し、token_file を原子的に置き換える。
+   - 置換前の失敗(環境 ID の違い・401・複製 token など): 旧 token と token_file は変わらないので、**今作ったセッションを失効**して終了コード 1。
+   - `installed-unchecked`(置換後の読み直しの失敗)・受取のタイムアウト(置換されたか不明): **新旧どちらも失効しない**。終了コード 3(要調査)。
+5. `agents-check`(実 worker で取得): 失敗なら**古いセッションを失効しない**。終了コード 3。
+6. 起動中の miharashi の worker が token_file を読み直す時間(`T3R_REVOKE_GRACE`、既定 70 秒 > 30 秒ごとの読み直し)を待つ。
+7. 一覧を取り直し(失敗なら失効せず終了コード 4)、新しいセッションが一覧にあることを確かめてから、同じラベル・読み取り権限だけの古いセッションを失効。もう一度一覧して残りがないことを確かめる。残れば終了コード 4(新しい token は有効。次の実行が同じラベルの残りをまとめて失効させる)。
+
+中断(SIGTERM/SIGINT、systemd のタイムアウト): 受取に渡す前なら今作ったセッションを失効、それ以降は失効しない。子プロセス(lxc・受取・確認)は個別のタイムアウトでグループごと止める。状態は `<状態ディレクトリ>/<id>.state.json`(0600、秘密なし。結果・段階・新しいセッション ID・失効したセッション・残り・短い理由)に残り、`miharashi-t3-remote-token --status` で読める。終了コード 0 以外は unit が failed になるので、`systemctl --failed` や状況画面の failed ユニット数で気づける。
+
+終了コード: 0 完了 / 1 失敗(旧 token と token_file は変わらない)/ 2 設定・使い方の誤り(何も実行していない)/ 3 token_file は新しい token に替わったが確認が終わっていない(要調査・何も失効していない)/ 4 更新は成功したが古いセッションが残っている / 75 別の実行が動いている。
+
+### 限界(正直に)
+
+- 起動中の miharashi の worker が新しい token を使い始めたことを、配送役は**直接は観測しない**。`agents-check` は同じコードの別プロセスで、置いた token_file からの取得成功を確かめる。起動中の worker は `token_file` を 30 秒ごとに読み直し、401 を受けても読み直して復帰する(実機の同時 2 接続の試験で、失効後に新しい token へ自動復帰することを確認)ので、古い token を失効させたあとも止まらないが、運用では管理ページの「トークン」表(`modified_at`)と取得状態(`agents:<id>`)で確かめる。
+- 失効の確認は新旧の token での GET ではなく、コンテナの一覧(`session list`)でセッションが無くなったことで行う(古い token の値は配送役が保持しないため)。実機試験では、試験用の古い token で 401 になることを別に確かめた。
+- 配送役は `/etc/miharashi/config.toml` を読む。管理ページの上書き(overlay)で `extra_servers` は変えられないが、`agents.url` などは上書きされうる。受取・確認は上書きを含む「次回起動の値」で動く。
+
+## 配送役の導入(この PR では実施しない)
+
+root で実施する本番作業。**途中でキオスク(`miharashi.service`)を再起動するのは、設定に `[[agents.extra_servers]]` を足した最後の 1 回だけ**で、ユーザーの確認を取ってから行う。
+
+1. 新しい `miharashi`(`agents-check` を含む)を入れる。キオスクの入れ替えは別の手順(通常の本番反映)で、再起動を伴う。
+2. スクリプトと unit を置く(`systemd/install.sh` には入れていない):
+   ```bash
+   sudo install -m 0755 systemd/miharashi-t3-remote-token /usr/local/bin/miharashi-t3-remote-token
+   sed -e 's|@USER@|<キオスクの実行ユーザー>|' -e 's|@BINDIR@|/usr/local/bin|' systemd/miharashi-t3-remote-token@.service | sudo tee /etc/systemd/system/miharashi-t3-remote-token@.service >/dev/null
+   sudo install -m 0644 systemd/miharashi-t3-remote-token@.timer /etc/systemd/system/miharashi-t3-remote-token@.timer
+   ```
+3. 接続ごとの設定: `sudo install -d -m 0750 -o root -g <グループ> /etc/miharashi/t3-remote-token`、`miharashi-t3-remote-token.env.example` を `<id>.env`(root:<グループ> 0640)として置き、リモート名・コンテナ名・environmentId・ユーザー・CLI を書く。
+4. 設定ファイルに `[[agents.extra_servers]]`(`id` / `label` / `url` / `token_file`。token_file は実行ユーザー所有の 0700 ディレクトリ内、例 `/var/lib/miharashi/t3-<id>.token`)を足す。まだ miharashi は再起動しない。
+5. 手で 1 回: `systemctl start miharashi-t3-remote-token@<id>`、`journalctl -u ...`、`miharashi-t3-remote-token --status`(環境変数は env ファイルと同じ)。0 で終わり、`token_file` が置かれ、`miharashi agents-check --server <id> --expect-environment <id>=<environmentId>` が成功することを確かめる。
+6. miharashi を再起動(ユーザー確認後)。管理ページで `agents:<id>` が「正常」、トークン表が「正常」であること、Agent 画面に両方の接続が出ることを確認。
+7. `systemctl enable --now miharashi-t3-remote-token@<id>.timer`。primary の `miharashi-t3-token.timer` は変えない。
+8. 元に戻す: timer を止め、設定の `[[agents.extra_servers]]` を外して再起動。配送役が発行したセッションは、ラベルを指定してコンテナで `t3 auth session list` → `revoke`。
+
+## テスト
+
+- `cargo build -p miharashi-app && python3 -I systemd/test_miharashi_t3_remote_token.py`(18 件): 本物の受取ツールと実 worker(`agents-check`)に、偽の T3 Server・lxc・t3 CLI を組み合わせた結合テスト。ローテーション(su / direct)、発行コマンドの正確さ、権限が広いときの失効、受取失敗・環境 ID 違いでの旧 token 維持と新セッション失効、worker 確認の失敗で何も失効しない、失効の一部失敗と次の実行での回復、一覧失敗で失効しない、置換後の確認失敗・受取タイムアウト・token 出力の伏せ字、SIGTERM、二重実行(75)・タイムアウト・発行後の応答喪失の後始末、設定の注入拒否(21 通り)、引用の往復、primary に触れないこと、token が引数・環境変数・出力・状態・一時ファイルのどこにも残らないこと。
+- `cargo test -p miharashi-app`(`agents-check` の引数・判定を含む)、`bash systemd/test-miharashi-t3-token.sh`(既存の primary 用スクリプト。変更なし)。

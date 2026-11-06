@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+# 追加先の T3 Server(LXC コンテナ内など)の token を、読み取りだけの権限で発行し直し、監視ホストへ配送する。
+# 「管理用の配送役」。既存の LXC リモートの権限で、コンテナ内の t3 CLI を実行する。
+# 設計: docs/t3-agent-multi-server/token-delivery.md
+#
+# 手順(新しい token で取得できると確かめてから、同じラベルの古いセッションを失効させる):
+#   0. 排他ロックを取る(同じ接続の更新が重ならないようにする)。取れなければ何もせず終わる(終了コード 75)。
+#   1. コンテナで `t3 auth session list --json` を実行し、ラベルが専用か・前回の残りがないか確かめる。
+#   2. コンテナで `t3 auth session issue --scope orchestration:read --label <専用ラベル> --json` を実行する。
+#      返った権限が orchestration:read だけでなければ、そのセッションを失効させて止める。
+#   3. token をパイプ(標準入力)で `miharashi t3-token-receive --stdin` に流す。受取ツールが検査し、対象の T3 に
+#      ホストから問い合わせ、token_file を原子的に置き換える。token は引数・環境変数・ログ・一時ファイルに出さない。
+#   4. `miharashi agents-check`(実際の worker と同じコード)で、置いた token_file を使って取得できることを確かめる。
+#   5. 起動中の miharashi の worker が token_file を読み直す時間(30 秒ごと)を待つ。
+#   6. 同じラベルで、権限が orchestration:read だけの古いセッションを失効させる。一覧で消えたことを確かめる。
+#
+# 失敗時: 受取の前に失敗したら、今回作ったセッションを失効させる(古い token と token_file は変わらない)。
+# 受取の後(token_file が新しい token に替わった後)は、新旧どちらも失効させない(止めずに調べる)。
+# 古いセッションの失効に失敗した場合も新しい token は有効で、次の実行が同じラベルの残りをまとめて失効させる。
+#
+# 終了コード: 0 = 完了 / 1 = 失敗(古い token と token_file は変わらない)/ 2 = 設定・使い方の誤り(何も実行していない)/
+#   3 = token_file は新しい token に替わったが、確認まで終わっていない(要調査。何も失効させていない)/
+#   4 = 更新は成功したが、古いセッションを失効しきれていない(新しい token は有効。次の実行で再試行)/
+#   75 = 別の実行が動いている(何もしない)。
+#
+# 設定は環境変数(systemd の EnvironmentFile。秘密は含めない)。--check-config で確認、--status で前回の結果を見る:
+#   T3R_SERVER_ID            設定の [[agents.extra_servers]] の id(必須。primary は断る)
+#   T3R_EXPECT_ENVIRONMENT_ID 対象の T3 の environmentId(必須。受取と確認で、接続先の取り違えを防ぐ)
+#   T3R_CONFIG               miharashi の設定ファイル(必須。絶対パス)
+#   T3R_LXC_REMOTE / T3R_LXC_CONTAINER   既存の LXC リモート名とコンテナ名(必須)
+#   T3R_CONTAINER_USER       コンテナ内で t3 を動かすユーザー(必須。exec_mode=direct では数値の uid)
+#   T3R_T3_CLI               コンテナ内の t3 CLI の絶対パス(必須)
+#   T3R_LABEL                この接続専用のラベル(既定 miharashi-agent-monitor-<id>。primary の既定ラベルは使えない)
+#   T3R_LXC_BIN              lxc クライアント(既定 lxc。絶対パス推奨)
+#   T3R_EXEC_MODE            su(既定。`su - <user> -c <引用した 1 本の文字列>`)/ direct(`--user/--group/--env HOME/--cwd` で
+#                            直接実行。シェルを通さない。T3R_CONTAINER_GID と T3R_CONTAINER_HOME が要る)
+#   T3R_MIHARASHI_BIN        既定 /usr/local/bin/miharashi
+#   T3R_STATE_DIR            状態・ロックの置き場所(既定 $STATE_DIRECTORY、なければ ~/.local/state/miharashi-t3-remote-token)
+#   T3R_TOKEN_TTL            発行する token の期限(例 30d。省略すると T3 の既定)
+#   T3R_EXEC_TIMEOUT(60)/ T3R_RECEIVE_TIMEOUT(60)/ T3R_VERIFY_TIMEOUT(90)/ T3R_REVOKE_GRACE(70)  秒
+#
+# 既存の primary の更新(miharashi-t3-token と miharashi-t3-token.timer)は使わない・変えない。このスクリプトは
+# `config-get agents.url` や primary の token_file にも触れない。
+from __future__ import annotations
+
+import errno
+import fcntl
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+NAME = "miharashi-t3-remote-token"
+SCOPE = "orchestration:read"
+# primary(miharashi-t3-token)の既定ラベル。ここと同じラベルを使うと primary のセッションを失効させかねない。
+PRIMARY_DEFAULT_LABEL = "miharashi-agent-monitor"
+EX_OK, EX_FAIL, EX_CONFIG, EX_ATTENTION, EX_REVOKE_INCOMPLETE, EX_BUSY = 0, 1, 2, 3, 4, 75
+
+SERVER_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+ENV_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+LABEL_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+REMOTE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+CONTAINER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,62}")
+USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+NUM_RE = re.compile(r"[0-9]{1,10}")
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+TTL_RE = re.compile(r"[0-9]{1,6}[smhd]")
+ABS_PATH_RE = re.compile(r"/[A-Za-z0-9._+/-]{1,400}")
+# token の形(受取ツールと同じく空白・制御文字・非 ASCII を含まない 1 語、改行込みで 8192 バイト以内)
+TOKEN_RE = re.compile(r"[\x21-\x7e]{1,8191}")
+ENV_PASS = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "LXD_CONF", "LXD_SOCKET")
+
+
+class Fail(Exception):
+    """想定内の失敗。`code` は終了コード、`stage`/`kind` は状態ファイルと診断に残す短い名前(秘密は含めない)。"""
+
+    def __init__(self, message: str, code: int = EX_FAIL, kind: str = "failed"):
+        super().__init__(message)
+        self.code = code
+        self.kind = kind
+
+
+class Interrupted(Exception):
+    pass
+
+
+def log(message: str) -> None:
+    print(f"{NAME}: {message}", flush=True)
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------- 設定
+
+
+class Settings:
+    def __init__(self, env: dict[str, str]):
+        def need(key: str) -> str:
+            value = env.get(key, "")
+            if not value:
+                raise Fail(f"{key} が設定されていません", EX_CONFIG, "config")
+            return value
+
+        def check(key: str, value: str, pattern: re.Pattern, what: str) -> str:
+            if not pattern.fullmatch(value):
+                raise Fail(f"{key} が不正です({what})", EX_CONFIG, "config")
+            return value
+
+        self.server_id = check("T3R_SERVER_ID", need("T3R_SERVER_ID"), SERVER_ID_RE, "英数字・-・_ の 1〜64 文字")
+        if self.server_id == "primary":
+            raise Fail("T3R_SERVER_ID に primary は使えません(primary は miharashi-t3-token の担当)", EX_CONFIG, "config")
+        self.env_id = check("T3R_EXPECT_ENVIRONMENT_ID", need("T3R_EXPECT_ENVIRONMENT_ID"), ENV_ID_RE, "英数字・.・-・_")
+        self.label = check("T3R_LABEL", env.get("T3R_LABEL") or f"{PRIMARY_DEFAULT_LABEL}-{self.server_id}", LABEL_RE, "英数字・.・-・_ の 1〜64 文字")
+        if self.label == PRIMARY_DEFAULT_LABEL:
+            raise Fail(f"T3R_LABEL に primary の既定ラベル {PRIMARY_DEFAULT_LABEL} は使えません", EX_CONFIG, "config")
+        self.config = check("T3R_CONFIG", need("T3R_CONFIG"), ABS_PATH_RE, "絶対パス")
+        self.remote = check("T3R_LXC_REMOTE", need("T3R_LXC_REMOTE"), REMOTE_RE, "英数字・.・-・_")
+        self.container = check("T3R_LXC_CONTAINER", need("T3R_LXC_CONTAINER"), CONTAINER_RE, "英数字とハイフン")
+        self.cli = check("T3R_T3_CLI", need("T3R_T3_CLI"), ABS_PATH_RE, "絶対パス")
+        if any(part in ("..", ".") for part in self.cli.split("/")):
+            raise Fail("T3R_T3_CLI に . / .. は使えません", EX_CONFIG, "config")
+        lxc = env.get("T3R_LXC_BIN") or "lxc"
+        if not (ABS_PATH_RE.fullmatch(lxc) or re.fullmatch(r"[A-Za-z0-9._-]{1,64}", lxc)):
+            raise Fail("T3R_LXC_BIN が不正です", EX_CONFIG, "config")
+        self.lxc = lxc
+        self.mode = env.get("T3R_EXEC_MODE") or "su"
+        user = need("T3R_CONTAINER_USER")
+        if self.mode == "su":
+            self.user = check("T3R_CONTAINER_USER", user, USER_RE, "ユーザー名")
+            self.gid = self.home = ""
+        elif self.mode == "direct":
+            self.user = check("T3R_CONTAINER_USER", user, NUM_RE, "exec_mode=direct では数値の uid")
+            self.gid = check("T3R_CONTAINER_GID", need("T3R_CONTAINER_GID"), NUM_RE, "数値の gid")
+            self.home = check("T3R_CONTAINER_HOME", need("T3R_CONTAINER_HOME"), ABS_PATH_RE, "絶対パス")
+        else:
+            raise Fail("T3R_EXEC_MODE は su / direct のどちらか", EX_CONFIG, "config")
+        self.miharashi = env.get("T3R_MIHARASHI_BIN") or "/usr/local/bin/miharashi"
+        check("T3R_MIHARASHI_BIN", self.miharashi, ABS_PATH_RE, "絶対パス")
+        self.ttl = env.get("T3R_TOKEN_TTL") or ""
+        if self.ttl:
+            check("T3R_TOKEN_TTL", self.ttl, TTL_RE, "例 30d")
+        self.exec_timeout = self._secs(env, "T3R_EXEC_TIMEOUT", 60)
+        self.receive_timeout = self._secs(env, "T3R_RECEIVE_TIMEOUT", 60)
+        self.verify_timeout = self._secs(env, "T3R_VERIFY_TIMEOUT", 90)
+        self.revoke_grace = self._secs(env, "T3R_REVOKE_GRACE", 70, minimum=0)
+        state = env.get("T3R_STATE_DIR") or env.get("STATE_DIRECTORY") or os.path.join(os.path.expanduser("~"), ".local/state/miharashi-t3-remote-token")
+        self.state_dir = state.split(":")[0]
+        if not os.path.isabs(self.state_dir):
+            raise Fail("T3R_STATE_DIR は絶対パス", EX_CONFIG, "config")
+        self.env_pass = {k: env[k] for k in ENV_PASS if k in env}
+
+    @staticmethod
+    def _secs(env: dict[str, str], key: str, default: int, minimum: int = 1) -> int:
+        raw = env.get(key)
+        if raw is None or raw == "":
+            return default
+        if not re.fullmatch(r"[0-9]{1,5}", raw) or not (minimum <= int(raw) <= 3600):
+            raise Fail(f"{key} は {minimum}〜3600 秒", EX_CONFIG, "config")
+        return int(raw)
+
+    # コンテナ内で t3 CLI を動かす lxc の引数(token は含まない)。su では 1 本のシェル文字列を作るので、各語を引用する。
+    def remote_argv(self, args: list[str]) -> list[str]:
+        target = f"{self.remote}:{self.container}"
+        if self.mode == "su":
+            inner = " ".join(shlex.quote(a) for a in [self.cli, *args])
+            return [self.lxc, "exec", "-T", "-n", target, "--", "su", "-", self.user, "-c", inner]
+        return [
+            self.lxc, "exec", "-T", "-n", "--user", self.user, "--group", self.gid,
+            "--env", f"HOME={self.home}", "--cwd", self.home, target, "--", self.cli, *args,
+        ]
+
+
+# ---------------------------------------------------------------- 実行の補助
+
+
+def run(argv: list[str], env: dict[str, str], timeout: int, stdin_data: bytearray | None = None) -> tuple[int | None, bytes, bytes]:
+    """子プロセスを実行する。タイムアウトしたら子のグループごと止め、戻りコードは None。"""
+    proc = subprocess.Popen(
+        argv, env=env, stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(bytes(stdin_data) if stdin_data is not None else None, timeout=timeout)
+        return proc.returncode, out, err
+    except subprocess.TimeoutExpired:
+        kill_group(proc)
+        proc.communicate()
+        return None, b"", b""
+    except BaseException:
+        kill_group(proc)
+        raise
+
+
+def kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        proc.kill()
+
+
+def one_line(raw: bytes | str, secret: bytes | None = None, limit: int = 200) -> str:
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+    if secret:
+        text = text.replace(secret.decode("ascii", "replace"), "<redacted>")
+    return " ".join("".join(c if c.isprintable() else " " for c in text).split())[:limit]
+
+
+class Rotation:
+    def __init__(self, settings: Settings):
+        self.s = settings
+        self.env = settings.env_pass
+        self.state: dict = {
+            "server": settings.server_id, "label": settings.label, "started_at": now(), "finished_at": None,
+            "result": "running", "exit_code": None, "stage": "start", "new_session_id": None,
+            "revoked": [], "remaining_old": [], "detail": "",
+        }
+        self.token: bytearray | None = None
+        self.new_id: str | None = None
+        self.phase = "start"  # start / issued(受取の前)/ receiving(結果不明)/ installed / verified
+
+    # -- 状態ファイル(秘密は入れない)
+    def save(self, **updates) -> None:
+        self.state.update(updates)
+        path = os.path.join(self.s.state_dir, f"{self.s.server_id}.state.json")
+        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.state, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, path)
+        except OSError as e:
+            log(f"状態ファイルを書けません: {e.strerror}")
+
+    def wipe(self) -> None:
+        if self.token is not None:
+            for i in range(len(self.token)):
+                self.token[i] = 0
+            self.token = None
+
+    # -- コンテナ内の t3 CLI
+    def t3(self, args: list[str]) -> tuple[int | None, bytes, bytes]:
+        return run(self.s.remote_argv(args), self.env, self.s.exec_timeout)
+
+    def list_sessions(self) -> list[dict]:
+        rc, out, err = self.t3(["auth", "session", "list", "--json"])
+        if rc is None:
+            raise Fail("セッションの一覧がタイムアウトしました", EX_FAIL, "list-timeout")
+        if rc != 0:
+            raise Fail(f"セッションの一覧を取れません: {one_line(err)}", EX_FAIL, "list-failed")
+        try:
+            data = json.loads(out)
+            assert isinstance(data, list)
+            return [s for s in data if isinstance(s, dict) and isinstance(s.get("sessionId"), str)]
+        except (ValueError, AssertionError):
+            raise Fail("セッションの一覧が JSON の配列ではありません", EX_FAIL, "list-invalid")
+
+    def mine(self, sessions: list[dict]) -> list[dict]:
+        return [s for s in sessions if (s.get("client") or {}).get("label") == self.s.label]
+
+    @staticmethod
+    def is_read_only_bearer(s: dict) -> bool:
+        return s.get("scopes") == [SCOPE] and s.get("method") in (None, "bearer-access-token")
+
+    def revoke(self, session_id: str) -> bool:
+        if not SESSION_ID_RE.fullmatch(session_id):
+            return False
+        rc, _, _ = self.t3(["auth", "session", "revoke", session_id])
+        return rc == 0
+
+    def revoke_new_quietly(self, why: str) -> None:
+        """今回作ったセッションを失効させる(使わない token を残さない)。失敗は残りとして記録する。"""
+        if self.new_id and self.revoke(self.new_id):
+            log(f"今回作ったセッション {self.new_id} を失効させました({why})")
+            self.save(new_session_id=None, detail=why)
+        elif self.new_id:
+            log(f"今回作ったセッション {self.new_id} を失効できませんでした。次の実行が同じラベルの残りとして失効させます")
+            self.save(remaining_old=[self.new_id])
+
+    # -- 本体
+    def execute(self) -> int:
+        s = self.s
+        self.save(stage="list")
+        before = self.list_sessions()
+        collide = [x["sessionId"] for x in self.mine(before) if not self.is_read_only_bearer(x)]
+        if collide:
+            raise Fail(f"ラベル {s.label} に、読み取りだけではないセッションがあります。専用のラベルではないので止めます", EX_CONFIG, "label-collision")
+        before_ids = {x["sessionId"] for x in before}
+
+        self.save(stage="issue")
+        args = ["auth", "session", "issue", "--scope", SCOPE, "--label", s.label, "--json"]
+        if s.ttl:
+            args[5:5] = ["--ttl", s.ttl]
+        rc, out, err = self.t3(args)
+        if rc != 0:
+            # タイムアウト・失敗でも、T3 側でセッションが作られた可能性がある。作られていれば今すぐ失効させる。
+            self.cleanup_orphans(before_ids)
+            raise Fail(f"token を発行できません: {'タイムアウト' if rc is None else one_line(err)}", EX_FAIL, "issue-failed")
+        try:
+            issued = json.loads(out)
+            new_id = issued["sessionId"]
+            scopes = issued["scopes"]
+            token = issued["token"]
+            assert isinstance(new_id, str) and SESSION_ID_RE.fullmatch(new_id)
+        except (ValueError, KeyError, TypeError, AssertionError):
+            self.cleanup_orphans(before_ids)
+            raise Fail("発行の応答を読めません", EX_FAIL, "issue-invalid")
+        del out
+        self.new_id = new_id
+        self.phase = "issued"
+        self.save(stage="issued", new_session_id=new_id)
+        if scopes != [SCOPE]:
+            self.revoke_new_quietly("権限が orchestration:read だけではない")
+            raise Fail(f"発行された権限が {SCOPE} だけではありません(受け取った権限の数: {len(scopes) if isinstance(scopes, list) else '?'})。token は使いません", EX_FAIL, "bad-scope")
+        if not isinstance(token, str) or not TOKEN_RE.fullmatch(token):
+            self.revoke_new_quietly("token の形式が不正")
+            raise Fail("発行された token の形式が不正です。使いません", EX_FAIL, "bad-token")
+        self.token = bytearray(token.encode("ascii") + b"\n")
+        secret = token.encode("ascii")
+        del token, issued
+
+        # 受取(token はパイプで流す)
+        self.save(stage="receive")
+        self.phase = "receiving"
+        recv_argv = [s.miharashi, "t3-token-receive", "--config", s.config, "--server", s.server_id, "--stdin", "--expect-environment-id", s.env_id]
+        rc, _, err = run(recv_argv, self.env, s.receive_timeout, self.token)
+        self.wipe()
+        reason = one_line(err, secret)
+        if rc is None:
+            # 置き換えの途中で止めた(token_file は旧か新のどちらか。原子的な置き換えなので壊れてはいない)
+            raise Fail("受取がタイムアウトしました。token_file が新旧どちらか不明なので、どちらのセッションも失効させません", EX_ATTENTION, "receive-timeout")
+        if rc != 0:
+            if "installed-unchecked" in reason:
+                self.phase = "installed"
+                raise Fail(f"token_file は新しい token に替わりましたが、置いた後の確認に失敗しました。失効させません: {reason}", EX_ATTENTION, "installed-unchecked")
+            # 置き換えの前に失敗: token_file は変わっていない
+            self.phase = "issued"
+            self.revoke_new_quietly("受取に失敗")
+            raise Fail(f"受取に失敗しました(古い token は有効なまま): {reason}", EX_FAIL, "receive-failed")
+        self.phase = "installed"
+        log(f"token_file を新しい token に置き換えました(セッション {self.new_id})")
+
+        # 実際の worker のコードで、置いた token_file から取得できることを確かめる
+        self.save(stage="verify")
+        verify_argv = [s.miharashi, "agents-check", "--config", s.config, "--server", s.server_id,
+                       "--expect-environment", f"{s.server_id}={s.env_id}", "--timeout", str(s.verify_timeout)]
+        rc, out, err = run(verify_argv, self.env, s.verify_timeout + 30)
+        if rc != 0:
+            detail = one_line(out.splitlines()[-1] if out.strip() else err, secret)
+            raise Fail(f"worker による取得の確認に失敗しました。古いセッションは失効させません({detail})", EX_ATTENTION, "verify-failed")
+        self.phase = "verified"
+        log("worker と同じコードで、新しい token による取得に成功しました")
+
+        # 起動中の miharashi の worker が token_file を読み直す(30 秒ごと)のを待つ
+        if s.revoke_grace:
+            self.save(stage="grace")
+            log(f"起動中の worker が token_file を読み直すのを {s.revoke_grace} 秒待ちます")
+            time.sleep(s.revoke_grace)
+
+        # 古いセッションの失効
+        self.save(stage="revoke")
+        try:
+            current = self.list_sessions()
+        except Fail as e:
+            raise Fail(f"{e} 古いセッションは失効させていません。次の実行で失効させます", EX_REVOKE_INCOMPLETE, "revoke-skipped")
+        ids = {x["sessionId"] for x in current}
+        if self.new_id not in ids:
+            raise Fail("今回作ったセッションが一覧にありません。古いセッションは失効させません", EX_ATTENTION, "new-session-missing")
+        old = [x["sessionId"] for x in self.mine(current) if x["sessionId"] != self.new_id and self.is_read_only_bearer(x)]
+        revoked, failed = [], []
+        for sid in old:
+            (revoked if self.revoke(sid) else failed).append(sid)
+        try:
+            left = [x["sessionId"] for x in self.mine(self.list_sessions()) if x["sessionId"] != self.new_id and self.is_read_only_bearer(x)]
+        except Fail:
+            left = failed or ["確認できず"]
+        self.save(revoked=revoked, remaining_old=left)
+        log(f"古いセッションを {len(revoked)} 件失効させました(ラベル {s.label})")
+        if left:
+            raise Fail(f"古いセッションが {len(left)} 件残っています。新しい token は有効で、次の実行で再試行します", EX_REVOKE_INCOMPLETE, "revoke-incomplete")
+        return EX_OK
+
+    def cleanup_orphans(self, before_ids: set[str]) -> None:
+        """発行の応答を受け取れなかったとき、T3 に作られたかもしれない同じラベルの新しいセッションを失効させる。"""
+        try:
+            for x in self.mine(self.list_sessions()):
+                if x["sessionId"] not in before_ids and self.is_read_only_bearer(x):
+                    if self.revoke(x["sessionId"]):
+                        log(f"応答を受け取れなかった発行のセッション {x['sessionId']} を失効させました")
+        except Fail as e:
+            log(f"発行の後始末の一覧を取れませんでした: {e}。次の実行が同じラベルの残りを失効させます")
+
+    def abort_cleanup(self) -> None:
+        if self.phase == "issued":
+            self.revoke_new_quietly("中断")
+        self.wipe()
+
+
+# ---------------------------------------------------------------- 入口
+
+
+def lock_state(settings: Settings):
+    os.makedirs(settings.state_dir, mode=0o700, exist_ok=True)
+    os.chmod(settings.state_dir, 0o700)
+    fd = os.open(os.path.join(settings.state_dir, f"{settings.server_id}.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        os.close(fd)
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            return None
+        raise
+    return fd
+
+
+def describe(settings: Settings) -> None:
+    log(f"接続 {settings.server_id}: コンテナ {settings.remote}:{settings.container}(ユーザー {settings.user}、{settings.mode})、ラベル {settings.label}")
+    log("コンテナ内の実行例: " + shlex.join(settings.remote_argv(["auth", "session", "list", "--json"])))
+
+
+def main(argv: list[str], env: dict[str, str]) -> int:
+    os.umask(0o077)
+    mode = argv[0] if argv else "run"
+    if mode not in ("run", "--check-config", "--status"):
+        print(f"使い方: {NAME} [--check-config | --status]", file=sys.stderr)
+        return EX_CONFIG
+    try:
+        settings = Settings(env)
+    except Fail as e:
+        print(f"{NAME}: {e}", file=sys.stderr)
+        return e.code
+    if mode == "--check-config":
+        describe(settings)
+        return EX_OK
+    if mode == "--status":
+        path = os.path.join(settings.state_dir, f"{settings.server_id}.state.json")
+        try:
+            with open(path) as f:
+                print(f.read())
+            return EX_OK
+        except OSError:
+            print(f"{NAME}: 状態がまだありません({settings.server_id})", file=sys.stderr)
+            return EX_FAIL
+
+    try:
+        lock_fd = lock_state(settings)
+    except OSError as e:
+        print(f"{NAME}: 状態ディレクトリを使えません: {e.strerror}", file=sys.stderr)
+        return EX_CONFIG
+    if lock_fd is None:
+        log(f"接続 {settings.server_id} の別の実行が動いています。何もしません")
+        return EX_BUSY
+
+    rotation = Rotation(settings)
+
+    def on_signal(signum, _frame):
+        raise Interrupted(signal.Signals(signum).name)
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGHUP, on_signal)
+    code = EX_FAIL
+    try:
+        code = rotation.execute()
+        rotation.save(result="ok", exit_code=code, finished_at=now(), stage="done", detail="")
+        log("完了しました")
+    except Fail as e:
+        code = e.code
+        log(f"失敗({e.kind}): {e}")
+        rotation.save(result=e.kind, exit_code=code, finished_at=now(), detail=str(e)[:300])
+    except Interrupted as e:
+        code = EX_FAIL
+        log(f"中断されました({e})")
+        rotation.abort_cleanup()
+        rotation.save(result="interrupted", exit_code=code, finished_at=now(), detail=f"{e} で中断(stage={rotation.state['stage']}、phase={rotation.phase})")
+    except Exception as e:  # 想定外。値は出さず、種類だけ残す
+        code = EX_FAIL
+        log(f"想定外の失敗: {type(e).__name__}")
+        rotation.abort_cleanup()
+        rotation.save(result="error", exit_code=code, finished_at=now(), detail=type(e).__name__)
+    finally:
+        rotation.wipe()
+        os.close(lock_fd)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:], dict(os.environ)))

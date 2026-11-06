@@ -300,8 +300,15 @@ fn duplicate_environments(servers: &[ServerSnapshot]) -> Vec<ServerId> {
 /// `enabled` のときだけ呼び出す。接続(`primary` と `extra_servers`)ごとに worker を 1 本起動し、
 /// それぞれの共有値を設定の順に返す。
 pub fn start(cfg: &ConfigAgents) -> Vec<Connection> {
+    start_selected(cfg, None)
+}
+
+/// `start` と同じだが、`only` があればその id の接続だけを起動する(診断用の `agents-check`)。
+/// 設定の順は保つ。worker 本体は `start` と同じ関数なので、ここで確かめた動きは本番の worker と同じ。
+pub fn start_selected(cfg: &ConfigAgents, only: Option<&[String]>) -> Vec<Connection> {
     cfg.servers()
         .into_iter()
+        .filter(|server| only.is_none_or(|ids| ids.contains(&server.id)))
         .enumerate()
         .map(|(index, server)| {
             let shared = Arc::new(RwLock::new(AgentSnapshot::default()));
