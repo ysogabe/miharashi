@@ -44,3 +44,13 @@ PREFLIGHT OK repo=/home/hermes/.t3/worktrees/miharashi/t3-026f8469 head=96b6e984
 - **実環境の再現(一時のヘッドレス worker + 管理 API。本番の miharashi とは別プロセス・別ポート・一時ディレクトリの設定)**: 既存 LXC リモート経由・実コンテナ(T3 v0.1.7)に対し、専用の試験ラベル・期限 15 分で配送役を 2 回実行。ヘッドレスは `cargo test -p miharashi-app -- --ignored manual_headless_worker_with_admin_api`(本物の worker と本物の管理 API を 127.0.0.1 の一時ポートで立てる)。1 回目 終了コード 0(受取 → 事前確認 → 稼働中 worker の世代を管理 API で観測 → 古いセッション 0 件)。2 回目 終了コード 0(約 20 秒で稼働中 worker が新世代で取得したと観測してから、古いセッション 1 件を失効)。管理 API の取得元は `ok`・`token_revision` を報告、トークン表の「更新の結果」は `ok`(終了コード 0・残り 0)。試験セッションは終了後にすべて失効し、サーバーのセッション数は試験前の 8 件に戻った。本番の primary の token_file は未変更。値(token・環境 ID・IP)は記録していない。
 - **本番未導入のため未確認**: 実際のキオスク(`miharashi.service`)の worker と管理ページでの観測(本番は旧版で `token_revision` を報告しない)、`rotation_state_dir` を設定した本番の管理ページ表示、配送役 timer の週次実行、最終 GPU 合成での AC7、AC6 の「移行後の追加先 token 更新・再読み込み・更新失敗表示」の本番確認。上のヘッドレス再現は本番導入済みの確認の代わりにならない。
 
+
+## 最終レビュー（3ea92f0）
+- 通常レビュー(Sol)必須0。推奨の「未回収セッション情報の次回preflight失敗時の保持」は未採用。更新失敗そのものは表示される。未回収セッションは次の成功した実行で専用ラベルの範囲から回収される。診断詳細の持越しは改善余地として残す。
+- Opus security-review: High0/Medium0。候補0のため追加の誤検知確認なし。
+- 参考改善として発行失敗時のstderrは記録せず終了コードだけにし、管理APIの設定例をloopbackへ変更。
+- 本番未反映のためAC6の本番項目・AC7の実画面項目は未達/未確認。PRはdraftとし、完了扱いにしない。
+
+```text
+PREFLIGHT OK repo=/home/hermes/.t3/worktrees/miharashi/t3-026f8469 head=3ea92f058f7c0fa6749ea575c056888f60e9001c base=origin/main files=43
+```

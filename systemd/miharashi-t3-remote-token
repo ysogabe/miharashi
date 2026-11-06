@@ -498,7 +498,7 @@ class Rotation:
             # タイムアウト・失敗でも、T3 側でセッションが作られた可能性がある。作られていれば今すぐ失効させる。
             self.cleanup_orphans(self.before_ids)
             self.phase = "start"
-            raise Fail(f"token を発行できません: {'タイムアウト' if rc is None else one_line(err)}", EX_FAIL, "issue-failed")
+            raise Fail(f"token を発行できません: {'タイムアウト' if rc is None else f'終了コード {rc}'}", EX_FAIL, "issue-failed")
         try:
             issued = json.loads(out)
             new_id = issued["sessionId"]
