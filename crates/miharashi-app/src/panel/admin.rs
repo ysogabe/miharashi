@@ -5,8 +5,8 @@
 //! 今ある経路: `GET /api/v1/admin/overview`、`POST /api/v1/admin/restart`、`PUT /api/v1/admin/config`。
 //! 静的ファイル `/admin`、`/admin/app.js`、`/admin/app.css` も同じワーカーで返す(埋め込み。認証なし)。
 use super::{
-    AdminSources, HttpError, PanelInput, RateLimit, Reaper, Route, Shared, body_prefetched, error,
-    json_response, same_secret,
+    AdminSources, HttpError, PanelInput, RateLimit, Reaper, Route, Shared, TokenState,
+    body_prefetched, error, json_response, same_secret,
 };
 use crate::config::{
     self, Config, LoadedConfig, Overlay, OverlayErrorKind, overlay_generation, remove_boot_marker,
@@ -95,15 +95,14 @@ struct Ctx {
 /// 管理トークンのファイルを読む。`agents::read_token` と同じ厳しい規則: 実行ユーザーの 0600、または
 /// root:実行グループの 0640。16 文字以上で 1 行。`euid` / `egid` は実行ユーザーとグループ。
 fn read_admin_token(path: &str, euid: u32, egid: u32) -> Result<String, String> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
-    if !crate::agents::token_perms_ok(meta.mode(), meta.uid(), meta.gid(), euid, egid) {
-        return Err(format!(
-            "{path}: 所有者か権限が規則に合わない(権限 {:o})。実行ユーザーの 0600、または root:実行グループの 0640 にする",
-            meta.mode() & 0o777
-        ));
-    }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    use crate::token_file::{check_owner_and_mode, open_regular_nofollow, read_bounded};
+    // 開き方と検査は T3 の token と同じ(リンクを追跡しない・開いた FD で通常ファイル・所有者・権限・8192 バイトまで)。
+    // 中身の形式は従来のまま(前後の空白を落とし、16 文字以上で 1 行)。
+    let (file, meta) =
+        open_regular_nofollow(path).map_err(|e| format!("{path}: {}", e.message()))?;
+    check_owner_and_mode(&meta, euid, egid).map_err(|e| format!("{path}: {}", e.message()))?;
+    let bytes = read_bounded(&file).map_err(|e| format!("{path}: {}", e.message()))?;
+    let text = String::from_utf8(bytes).map_err(|_| format!("{path}: 読めない文字がある"))?;
     let token = text.trim();
     if token.len() < 16 {
         return Err(format!("{path}: トークンが短い(16 文字以上)"));
@@ -447,25 +446,57 @@ fn retry_after_s(started: Instant) -> u64 {
     left.as_secs() + u64::from(left.subsec_nanos() > 0)
 }
 
-/// overview の `tokens`。(id, 設定のパス)の 4 つを `check_token_file` で調べる。値は読まない。
+/// overview の `tokens`。HA・パネル・管理ページと、T3 の接続ごとの token_file(`primary` と `extra_servers`)を
+/// `check_token_file` / `check_agent_token_file` で調べる。値は返さない。
+/// 各要素は id・label・path・state・modified_at(更新が止まっていないかを見る目安。ファイルが無ければ null)。
+/// 追加先の接続は、`agents.rotation_state_dir` に配送役の結果があれば `rotation`(`panel/rotation.rs`)も付く。
+/// T3 の id は取得元(feeds)と同じ(`agents` と `agents:<id>`)。
 fn token_reports(cfg: &Config) -> Vec<Value> {
     let (uid, gid) = (
         crate::agents::effective_uid(),
         crate::agents::effective_gid(),
     );
-    [
-        ("home_assistant", &cfg.home_assistant.token_file),
-        ("agents", &cfg.agents.token_file),
-        ("panel", &cfg.panel.token_file),
-        ("admin", &cfg.admin.token_file),
-    ]
-    .into_iter()
-    .map(|(id, path)| {
-        // 取得が有効かどうかとは別に、ファイルそのものの状態を出す
+    let report = |id: &str, label: &str, path: &str, state: TokenState, link: bool| {
+        // リンクを追跡しない T3 の token は、リンク自体の時刻を見る
+        let modified = if link {
+            std::fs::symlink_metadata(path)
+        } else {
+            std::fs::metadata(path)
+        }
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|t| rfc3339(t.into()));
+        json!({"id": id, "label": label, "path": path, "state": state, "modified_at": modified})
+    };
+    let now = std::time::SystemTime::now();
+    let mut out = Vec::new();
+    // 取得が有効かどうかとは別に、ファイルそのものの状態を出す
+    out.push({
+        let path = &cfg.home_assistant.token_file;
         let state = super::feeds::check_token_file(path, uid, gid);
-        json!({"id": id, "path": path, "state": state})
-    })
-    .collect()
+        report("home_assistant", "Home Assistant", path, state, false)
+    });
+    for server in cfg.agents.servers() {
+        let (id, label) = super::feeds::agent_identity(&server.id, &server.label);
+        let state = super::feeds::check_agent_token_file(&server.token_file, uid, gid);
+        let mut row = report(&id, &label, &server.token_file, state, true);
+        // 追加先だけ: 配送役の結果(token が正常でも、更新が失敗していれば接続別に出す)。未設定・ファイルなしは出さない
+        if server.id != crate::config::PRIMARY_SERVER_ID
+            && let Some(rotation) =
+                super::rotation::report(&cfg.agents.rotation_state_dir, &server.id, uid, now)
+        {
+            row["rotation"] = rotation;
+        }
+        out.push(row);
+    }
+    for (id, label, path) in [
+        ("panel", "操作パネル", &cfg.panel.token_file),
+        ("admin", "管理ページ", &cfg.admin.token_file),
+    ] {
+        let state = super::feeds::check_token_file(path, uid, gid);
+        out.push(report(id, label, path, state, false));
+    }
+    out
 }
 
 /// `GET /api/v1/admin/overview` の本文。
@@ -1279,7 +1310,11 @@ mod tests {
             geoframe: Ok(link),
             home_assistant: Ok(env),
             aircraft: Err("aircraft.enabled = false".into()),
-            agents: Ok(agents),
+            agents: Ok(vec![crate::agents::Connection {
+                server_id: "primary".into(),
+                label: "primary".into(),
+                shared: agents,
+            }]),
             ..AdminSources::default()
         };
         let (_p, base) = start_with(loaded, 200, sources);
@@ -1316,6 +1351,424 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(t["state"], "missing");
+    }
+
+    /// 接続ごとの「取得の結果(feeds)」と「token ファイルの状態(tokens)」は別々に出る。
+    /// 取得が成功/401 でも token が正常/欠落とは限らず、その組み合わせがそのまま見える。
+    #[test]
+    fn overview_separates_fetch_state_from_token_state_for_each_connection() {
+        use crate::agents::{AgentConnection, Connection, Shared};
+        let fx = Fx::new("multi-feeds-tokens");
+        let d = fx.dir.display();
+        fx.token("t3.token", "primary-secret-0123456789", 0o600);
+        fx.token("t3-container.token", "container-secret-0123456789", 0o600);
+        // spare は token が無い。linked はリンク(追跡しない)。loose は権限が緩い
+        fx.token("real.token", "linked-secret-0123456789", 0o600);
+        std::os::unix::fs::symlink(fx.path("real.token"), fx.path("t3-linked.token")).unwrap();
+        let base_path = fx.base(
+            "",
+            &format!(
+                "[agents]\ntoken_file = \"{d}/t3.token\"\n\
+                 [[agents.extra_servers]]\nid = \"container\"\nlabel = \"コンテナ\"\nurl = \"http://192.0.2.31:3773\"\ntoken_file = \"{d}/t3-container.token\"\n\
+                 [[agents.extra_servers]]\nid = \"spare\"\nurl = \"http://192.0.2.32:3773\"\ntoken_file = \"{d}/t3-spare.token\"\n\
+                 [[agents.extra_servers]]\nid = \"linked\"\nurl = \"http://192.0.2.33:3773\"\ntoken_file = \"{d}/t3-linked.token\"\n"
+            ),
+        );
+        let loaded = Config::load_with_overlay(&base_path, false).unwrap();
+        assert_eq!(loaded.effective.agents.servers().len(), 4);
+        let shared = |c: AgentConnection, err: Option<&str>| {
+            let s = Shared::default();
+            s.write().unwrap().connection = c;
+            s.write().unwrap().error_summary = err.map(str::to_string);
+            s
+        };
+        let conn = |id: &str, label: &str, s: Shared| Connection {
+            server_id: id.into(),
+            label: label.into(),
+            shared: s,
+        };
+        let sources = AdminSources {
+            agents: Ok(vec![
+                // primary: 取得成功・token 正常
+                conn("primary", "primary", shared(AgentConnection::Live, None)),
+                // container: token は正常なのに T3 が 401
+                conn(
+                    "container",
+                    "コンテナ",
+                    shared(
+                        AgentConnection::AuthenticationRequired,
+                        Some("T3 が認証を拒否しました (401)"),
+                    ),
+                ),
+                // spare: token ファイルが無いので認証できない
+                conn(
+                    "spare",
+                    "spare",
+                    shared(
+                        AgentConnection::AuthenticationRequired,
+                        Some("token ファイルがありません"),
+                    ),
+                ),
+                conn(
+                    "linked",
+                    "linked",
+                    shared(AgentConnection::Connecting, None),
+                ),
+            ]),
+            ..AdminSources::default()
+        };
+        let (_p, base) = start_with(loaded, 200, sources);
+        let v = overview(&base);
+        let by = |list: &str, id: &str| {
+            v[list]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|x| x["id"] == id)
+                .unwrap_or_else(|| panic!("{list} に {id} がありません"))
+                .clone()
+        };
+        // 取得元(feeds): primary は従来の id、追加は agents:<id>
+        assert_eq!(by("feeds", "agents")["state"], "ok");
+        assert_eq!(by("feeds", "agents:container")["state"], "auth_required");
+        assert_eq!(by("feeds", "agents:container")["label"], "T3(コンテナ)");
+        assert_eq!(
+            by("feeds", "agents:container")["error"],
+            "T3 が認証を拒否しました (401)"
+        );
+        assert_eq!(by("feeds", "agents:spare")["state"], "auth_required");
+        assert_eq!(by("feeds", "agents:linked")["state"], "connecting");
+        // トークン(tokens): 同じ id で、取得の結果とは独立に出る
+        assert_eq!(by("tokens", "agents")["state"], "ok");
+        assert_eq!(by("tokens", "agents")["label"], "T3(エージェント)");
+        assert_eq!(by("tokens", "agents")["path"], format!("{d}/t3.token"));
+        assert!(
+            by("tokens", "agents")["modified_at"]
+                .as_str()
+                .unwrap()
+                .contains('T')
+        );
+        assert_eq!(
+            by("tokens", "agents:container")["state"],
+            "ok",
+            "token は正常。拒否しているのは T3 側(取得元の 401)"
+        );
+        assert_eq!(by("tokens", "agents:container")["label"], "T3(コンテナ)");
+        assert_eq!(by("tokens", "agents:spare")["state"], "missing");
+        assert_eq!(by("tokens", "agents:spare")["label"], "T3(spare)");
+        assert!(by("tokens", "agents:spare")["modified_at"].is_null());
+        assert_eq!(by("tokens", "agents:linked")["state"], "symlink");
+        // 並びは従来どおり(HA、T3 の各接続、パネル、管理)。1 接続 1 行
+        let ids: Vec<&str> = v["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "home_assistant",
+                "agents",
+                "agents:container",
+                "agents:spare",
+                "agents:linked",
+                "panel",
+                "admin"
+            ]
+        );
+        // どの値も返らない
+        let text = v.to_string();
+        for secret in ["primary-secret", "container-secret", "linked-secret"] {
+            assert!(!text.contains(secret), "{secret}");
+        }
+    }
+
+    /// 追加先の配送役が残した結果(秘密なし)を、接続 id ごとに取り込む。token ファイルも取得も正常な接続で
+    /// 更新が失敗していれば、その接続の行だけに失敗が出る。状態が無い接続・primary は従来どおり(rotation なし)。
+    /// 稼働中の worker が最後の取得に使った token_file の世代も、取得元(feeds)に接続別に出る。
+    #[test]
+    fn overview_shows_delivery_failures_and_worker_revisions_per_connection() {
+        use crate::agents::{AgentConnection, Connection, Shared};
+        let fx = Fx::new("rotation-per-connection");
+        let d = fx.dir.display();
+        fx.token("t3.token", "primary-secret-0123456789", 0o600);
+        fx.token("t3-container.token", "container-secret-0123456789", 0o600);
+        fx.token("t3-spare.token", "spare-secret-0123456789", 0o600);
+        fx.token("t3-quiet.token", "quiet-secret-0123456789", 0o600);
+        let rot = fx.path("rot");
+        std::fs::create_dir(&rot).unwrap();
+        std::fs::set_permissions(&rot, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let write_state = |id: &str, body: serde_json::Value| {
+            let p = rot.join(format!("{id}.state.json"));
+            std::fs::write(&p, body.to_string()).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        write_state(
+            "container",
+            json!({"server": "container", "started_at": now, "finished_at": now, "result": "worker-unconfirmed",
+                   "exit_code": 3, "stage": "worker", "remaining_old": [], "detail": "稼働中の worker が新しい token で取得できたか確認できません"}),
+        );
+        write_state(
+            "spare",
+            json!({"server": "spare", "started_at": now, "finished_at": now, "result": "ok", "exit_code": 0,
+                   "stage": "done", "remaining_old": [], "detail": ""}),
+        );
+        // quiet は状態ファイルがまだ無い(未設定扱い)
+        let base_path = fx.base(
+            "",
+            &format!(
+                "[agents]\ntoken_file = \"{d}/t3.token\"\nrotation_state_dir = \"{d}/rot\"\n\
+                 [[agents.extra_servers]]\nid = \"container\"\nurl = \"http://192.0.2.31:3773\"\ntoken_file = \"{d}/t3-container.token\"\n\
+                 [[agents.extra_servers]]\nid = \"spare\"\nurl = \"http://192.0.2.32:3773\"\ntoken_file = \"{d}/t3-spare.token\"\n\
+                 [[agents.extra_servers]]\nid = \"quiet\"\nurl = \"http://192.0.2.33:3773\"\ntoken_file = \"{d}/t3-quiet.token\"\n"
+            ),
+        );
+        let loaded = Config::load_with_overlay(&base_path, false).unwrap();
+        // 取得はどの接続も正常(Live)。token ファイルも正常。最後の取得に使った世代は接続ごとに違う
+        let shared = |rev: &str| {
+            let s = Shared::default();
+            s.write().unwrap().connection = AgentConnection::Live;
+            s.write().unwrap().token_revision = Some(rev.into());
+            s
+        };
+        let conn = |id: &str, rev: &str| Connection {
+            server_id: id.into(),
+            label: id.into(),
+            shared: shared(rev),
+        };
+        let sources = AdminSources {
+            agents: Ok(vec![
+                conn("primary", "r1.1.1.1.1.10"),
+                conn("container", "r1.2.2.2.2.20"),
+                conn("spare", "r1.3.3.3.3.30"),
+                conn("quiet", "r1.4.4.4.4.40"),
+            ]),
+            ..AdminSources::default()
+        };
+        let (_p, base) = start_with(loaded, 200, sources);
+        let v = overview(&base);
+        let by = |list: &str, id: &str| {
+            v[list]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|x| x["id"] == id)
+                .unwrap_or_else(|| panic!("{list} に {id} がありません"))
+                .clone()
+        };
+        // token も取得も正常なのに、container だけ更新に失敗している
+        assert_eq!(by("tokens", "agents:container")["state"], "ok");
+        assert_eq!(by("feeds", "agents:container")["state"], "ok");
+        let rotation = &by("tokens", "agents:container")["rotation"];
+        assert_eq!(rotation["status"], "attention");
+        assert_eq!(rotation["result"], "worker-unconfirmed");
+        assert_eq!(rotation["exit_code"], 3);
+        assert!(
+            rotation["detail"]
+                .as_str()
+                .unwrap()
+                .contains("確認できません"),
+            "{rotation}"
+        );
+        // 成功した接続は ok。状態の無い接続・primary には rotation が付かない(従来の形)
+        assert_eq!(by("tokens", "agents:spare")["rotation"]["status"], "ok");
+        assert!(by("tokens", "agents:quiet").get("rotation").is_none());
+        assert!(by("tokens", "agents").get("rotation").is_none());
+        // 他の接続の状態が混ざらない
+        assert_ne!(
+            by("tokens", "agents:container")["rotation"],
+            by("tokens", "agents:spare")["rotation"]
+        );
+        // worker が最後の取得に使った世代は接続別。取得元(feeds)にだけ出て、他の取得元には出ない
+        assert_eq!(by("feeds", "agents")["token_revision"], "r1.1.1.1.1.10");
+        assert_eq!(
+            by("feeds", "agents:container")["token_revision"],
+            "r1.2.2.2.2.20"
+        );
+        assert_eq!(
+            by("feeds", "agents:quiet")["token_revision"],
+            "r1.4.4.4.4.40"
+        );
+        assert!(by("feeds", "weather").get("token_revision").is_none());
+        // どの秘密(token の値)も返らない
+        let text = v.to_string();
+        for secret in [
+            "primary-secret",
+            "container-secret",
+            "spare-secret",
+            "quiet-secret",
+        ] {
+            assert!(!text.contains(secret), "{secret}");
+        }
+        // 状態ファイルが壊れた・危険な接続は「読めない」。ほかの接続の表示は変わらない
+        std::fs::write(rot.join("spare.state.json"), "{broken").unwrap();
+        let v = overview(&base);
+        let spare = v["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == "agents:spare")
+            .unwrap()
+            .clone();
+        assert_eq!(spare["rotation"]["status"], "unreadable");
+        assert_eq!(spare["state"], "ok", "token の状態とは別に出る");
+    }
+
+    /// 実際の worker(本物の取得処理)→ 管理 API(本物の HTTP)の一連: 取得に成功した token_file の世代が
+    /// `feeds[agents:<id>].token_revision` に出る。token_file を新しい実体に差し替えても、worker が読み直す(30 秒ごと)
+    /// までは取得に成功し続けるが世代は古いまま(新しい世代で成功したことにはならない)。値(token)はどこにも出ない。
+    #[test]
+    fn a_real_worker_reports_its_token_revision_through_the_real_admin_api() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let t3_url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut first = String::new();
+                    let _ = reader.read_line(&mut first);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                            break;
+                        }
+                    }
+                    let body = if first.contains("/.well-known/t3/environment") {
+                        json!({"orchestrationProtocolVersion": 2, "environmentId": "env-real"})
+                    } else {
+                        json!({"schemaVersion": 2, "snapshotSequence": 1, "projects": [], "threads": [], "archivedThreads": []})
+                    }
+                    .to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        let fx = Fx::new("real-worker-revision");
+        let d = fx.dir.display();
+        fx.token("t3.token", "primary-secret-0123456789", 0o600);
+        fx.token("t3-container.token", "real-secret-0123456789", 0o600);
+        let base_path = fx.base(
+            "",
+            &format!(
+                "[agents]\nenabled = true\ntoken_file = \"{d}/t3.token\"\nurl = \"http://192.0.2.99:3773\"\npoll_secs = 1\n\
+                 [[agents.extra_servers]]\nid = \"container\"\nurl = \"{t3_url}\"\ntoken_file = \"{d}/t3-container.token\"\n"
+            ),
+        );
+        let loaded = Config::load_with_overlay(&base_path, false).unwrap();
+        // 本物の worker を container だけ起動する(primary は起動しない)
+        let connections = crate::agents::start_selected(
+            &loaded.effective.agents,
+            Some(&["container".to_string()]),
+        );
+        let (_p, base) = start_with(
+            loaded,
+            200,
+            AdminSources {
+                agents: Ok(connections),
+                ..AdminSources::default()
+            },
+        );
+        let feed = |v: &Value| {
+            v["feeds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["id"] == "agents:container")
+                .unwrap()
+                .clone()
+        };
+        let end = Instant::now() + Duration::from_secs(15);
+        let first = loop {
+            let f = feed(&overview(&base));
+            if f["state"] == "ok" && f["token_revision"].is_string() {
+                break f;
+            }
+            assert!(Instant::now() < end, "worker が取得に成功しない: {f}");
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let (euid, egid) = (
+            crate::agents::effective_uid(),
+            crate::agents::effective_gid(),
+        );
+        let path = fx.path("t3-container.token");
+        let (_, on_disk) =
+            crate::token_file::read_private_token_with_revision(path.to_str().unwrap(), euid, egid)
+                .unwrap();
+        assert_eq!(
+            first["token_revision"], on_disk,
+            "worker が使った世代 = 今のファイルの世代"
+        );
+        // 受取ツールと同じ置き方(新しい実体を rename)。worker は次の読み直しまで古いファイルの token を使い続ける
+        std::thread::sleep(Duration::from_millis(20));
+        fx.token("t3-container.new", "real-secret-0123456789", 0o600);
+        std::fs::rename(fx.path("t3-container.new"), &path).unwrap();
+        let (_, replaced) =
+            crate::token_file::read_private_token_with_revision(path.to_str().unwrap(), euid, egid)
+                .unwrap();
+        assert_ne!(replaced, on_disk);
+        std::thread::sleep(Duration::from_millis(2500));
+        let after = feed(&overview(&base));
+        assert_eq!(after["state"], "ok", "取得は続いている");
+        assert_eq!(
+            after["token_revision"], on_disk,
+            "worker がまだ読み直していない間は、置き直した世代では成功していない"
+        );
+        assert_ne!(after["token_revision"], replaced);
+        let text = overview(&base).to_string();
+        assert!(!text.contains("real-secret") && !text.contains("primary-secret"));
+    }
+
+    /// 手動の実機確認用(通常のテストでは動かさない: `cargo test -p miharashi-app -- --ignored manual_headless`)。
+    /// 画面を使わず、指定した設定の `MIHARASHI_MANUAL_SERVER` の接続だけの本物の worker と、本物の管理 API を 127.0.0.1 の
+    /// 一時ポートで立てる。`MIHARASHI_MANUAL_URL_FILE` に管理 API の origin を書き、`MIHARASHI_MANUAL_STOP_FILE` ができたら終わる。
+    /// 配送役(`systemd/miharashi-t3-remote-token`)が稼働中の worker を観測して失効する流れを、本番の miharashi に触れずに
+    /// 再現するために使う(設定・token_file・管理トークンは一時ディレクトリのものを `MIHARASHI_MANUAL_CONFIG` で渡す)。
+    #[test]
+    #[ignore = "手動の実機確認用"]
+    fn manual_headless_worker_with_admin_api() {
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} が要ります"));
+        let config = PathBuf::from(var("MIHARASHI_MANUAL_CONFIG"));
+        let loaded = Config::load_with_overlay(&config, false).unwrap();
+        let connections = crate::agents::start_selected(
+            &loaded.effective.agents,
+            Some(&[var("MIHARASHI_MANUAL_SERVER")]),
+        );
+        let (_p, base) = start_with(
+            loaded,
+            200,
+            AdminSources {
+                agents: Ok(connections),
+                ..AdminSources::default()
+            },
+        );
+        std::fs::write(var("MIHARASHI_MANUAL_URL_FILE"), &base).unwrap();
+        let stop = var("MIHARASHI_MANUAL_STOP_FILE");
+        let end = Instant::now() + Duration::from_secs(1800);
+        while !std::path::Path::new(&stop).exists() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// 追加の接続が無い設定では、tokens は従来の 4 件・従来の id・従来の並び。
+    #[test]
+    fn tokens_without_extra_servers_keep_the_legacy_shape() {
+        let fx = Fx::new("tokens-legacy");
+        let cfg = Config::load_with_overlay(&fx.base("", ""), false)
+            .unwrap()
+            .effective;
+        let reports = token_reports(&cfg);
+        let ids: Vec<&str> = reports.iter().map(|t| t["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["home_assistant", "agents", "panel", "admin"]);
+        assert_eq!(reports[1]["path"], cfg.agents.token_file);
     }
 
     #[test]

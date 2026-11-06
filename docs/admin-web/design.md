@@ -299,10 +299,11 @@ JSON の応答(既存のパネル API を含む)にも `X-Content-Type-Options: 
     {"id": "agents", "label": "T3(エージェント)", "state": "auth_required", "last_ok": null, "error": "401"}
   ],
   "tokens": [
-    {"id": "home_assistant", "path": "/etc/miharashi/ha-token", "state": "ok"},
-    {"id": "agents", "path": "/var/lib/miharashi/t3-agent.token", "state": "missing"},
-    {"id": "panel", "path": "/etc/miharashi/panel.token", "state": "loose_permissions"},
-    {"id": "admin", "path": "/etc/miharashi/admin.token", "state": "ok"}
+    {"id": "home_assistant", "label": "Home Assistant", "path": "/etc/miharashi/ha-token", "state": "ok", "modified_at": "..."},
+    {"id": "agents", "label": "T3(エージェント)", "path": "/var/lib/miharashi/t3-agent.token", "state": "missing", "modified_at": null},
+    {"id": "agents:container", "label": "T3(コンテナ)", "path": "/var/lib/miharashi/t3-container.token", "state": "ok", "modified_at": "..."},
+    {"id": "panel", "label": "操作パネル", "path": "/etc/miharashi/panel.token", "state": "loose_permissions", "modified_at": "..."},
+    {"id": "admin", "label": "管理ページ", "path": "/etc/miharashi/admin.token", "state": "ok", "modified_at": "..."}
   ],
   "restart": {"allowed": true, "retry_after_s": 0, "requested": false},
   "generated_at": "2026-10-30T10:40:15+09:00"
@@ -314,6 +315,7 @@ JSON の応答(既存のパネル API を含む)にも `X-Content-Type-Options: 
 - `allowed_hosts` の照合: ホストは `ureq::http::Uri::host()` で 1 回だけ取り出し、`check_url` の判定と照合の両方に同じ値を使う(取り出し方を 2 通りにしない)。IP アドレスは `IpAddr` に直して比べる(`2001:db8:0::1` と `2001:db8::1` は同じ)。ホスト名は小文字にそろえて完全一致(末尾のドット・末尾一致・ワイルドカードは無い)。ポートは明示されていなければ scheme の既定ポート。表記ゆれ(IPv4 の先頭 0、IPv4 射影、ゾーン ID)はすべて「一致しない」側に倒れる。
 - 照合の相手に、プログラムの既定値(`ConfigAgents::default()` の url、`config.rs:495`)は**使わない**。設定ファイルに `[agents] url` が書かれていないときは `allowed_hosts` だけで照合する。`load_with_overlay` は base の生の TOML から `agents.url` の有無を見て `base_agents_url` を決め、`LoadedConfig` に持たせる(PUT でも同じ値を使う)。
 - 照合は origin 単位(scheme・host・port)。「同じホストの別のポート」も `allowed_hosts` に `host:port` で書かないと通らない。理由: 許可ホスト上の一般ユーザーが高いポートで待ち受ければトークンを受け取れるため。設定ファイルの agents.url が https なら、管理ページからは https だけ(`allowed_hosts` に書いても http には変えられない。管理トークンを盗聴できる人は T3 のトークンも盗聴できてしまう)。
+- 複数 T3 接続(docs/t3-agent-multi-server)で足した、省略できる項目(足すだけで `schema_version` は変えない): `feeds[]` の T3 接続(`agents` / `agents:<id>`)の `token_revision`(最後に取得に成功したときに worker が使った token_file の世代。秘密を含まない。他の取得元には出ない)と、`tokens[]` の追加先の接続の `rotation`(token 配送役の結果。設定の `agents.rotation_state_dir` に状態があるときだけ)。形・信頼境界は [token-delivery.md](../t3-agent-multi-server/token-delivery.md)。
 - `feeds[].error` と `overlay.error` は 200 文字で切り、URL のクエリは落とす。外部サービスの応答本文はそのまま入れない(既存の `error_summary` と同じ短い要約)。
 - `feeds[].state` と各取得元の対応:
 
@@ -328,7 +330,12 @@ JSON の応答(既存のパネル API を含む)にも `X-Content-Type-Options: 
 
 `AdminSources` の各参照は `Option` で、`None` は「取得が動いていない」を表す。理由は `AdminSources` を作る側(`KioskApp::admin_sources`)が決め、文字列で持つ(`"room.enabled = false"` など)。
 
-- `tokens[].state`: `ok` / `missing` / `unreadable`(`open` できない) / `wrong_owner` / `loose_permissions`。判定関数 `check_token_file(path, uid, gid) -> TokenState` は `agents.rs` の `read_token` と同じ規則で、中身は読まず `open` の成否と `metadata` だけを見る(値は出さない)。HA のトークンは今は検査していないので、`loose_permissions` は警告として出すだけで動きは変えない。管理トークン自体が不正なときは管理ページが無効なので、この表には出ない(journal で確かめる)。
+- `tokens[]` は HA・T3 の接続ごと・パネル・管理ページの順。T3 は接続ごとに 1 行で、`primary` は従来の id `agents`、`[[agents.extra_servers]]` の追加先は `agents:<id>`(取得元 `feeds[]` と同じ id なので、同じ接続の「取得の結果」と「token ファイルの状態」を突き合わせられる)。追加先の登録・編集は設定ファイルだけで、この API・ページからは変えられない。`label` は表示名(追加先は `T3(<設定の label>)`)で、ページはこれを優先して出す。`modified_at` は token ファイルの更新時刻(ファイルが無ければ `null`。自動更新が止まっていないかを見る目安)。
+- `tokens[].state`: `ok` / `missing` / `unreadable`(`open` できない) / `wrong_owner` / `loose_permissions` / `symlink` / `not_regular` / `bad_format`(最後の 3 つは T3 の接続だけ)。値は返さない。
+  - HA・パネル・管理ページ: `check_token_file(path, uid, gid)`。`open`(`O_NONBLOCK`。FIFO で固まらない)の成否と `fstat` だけを見て、規則は `agents::token_perms_ok`(実行ユーザーの 0600、または root:実行グループの 0640)。リンクは従来どおり追跡する。
+  - T3 の各接続: `check_agent_token_file`。worker が読むときと同じ `token_file::read_private_token`(リンクを追跡せず開く `O_NOFOLLOW`、開いた FD で通常ファイル・所有者・権限、8192 バイトまで、空白や制御文字を含まない 1 行)を通れば `ok`。リンクは `symlink`、FIFO・デバイス・ディレクトリは `not_regular`、空・複数行・大きすぎるものは `bad_format`。検査のために値は一瞬メモリに読むが、返さず、エラーにも入れない。
+  - 「取得元(feeds)」の `auth_required`(T3 が 401 を返した、または token ファイルを読めない)と「トークン(tokens)」の `ok` / `missing` は別の確認。token が正常でも T3 が拒否すれば取得元は `auth_required` になる。
+  - 管理トークン自体が不正なときは管理ページが無効なので、この表には出ない(journal で確かめる)。
 - `restart.retry_after_s` は起動から 120 秒に足りない秒数。`requested` は受け付けて終了待ちなら `true`。
 
 ### ページ(`/admin`)
@@ -342,7 +349,7 @@ JSON の応答(既存のパネル API を含む)にも `X-Content-Type-Options: 
    - 保存は、フォーム全体から `Overlay` の JSON を組み立て(未変更の項目もそのまま含める)、読み込んだときの `generation` を付けて `PUT`。`409` なら読み直しを促す。`400` ならエラー文をそのまま出す。
 4. **再起動**: 「再起動して反映」ボタン。`pending_restart` が `true` のときだけ強調。押すと確認を 1 回出し、`202` のあと「再起動中…」と出して 5 秒後から `overview` を取り直す(`uptime_s` が小さくなったら「再起動しました」)。`429` なら残り秒数。
 5. **取得元**: `feeds` の表(状態・最後に取得・エラー)。
-6. **トークン**: `tokens` の表(パス・状態)。値は出さない。
+6. **トークン**: `tokens` の表(用途・パス・状態・ファイルの更新)。T3 は接続ごとに 1 行。値は出さない。
 
 JavaScript はフレームワークを使わず、`fetch` と DOM 操作だけ。応答の文字列は必ず `textContent` で出し、`innerHTML`・`insertAdjacentHTML`・`document.write` は使わない(無いことをテストで文字列検査する)。URL をリンク(`<a href>`)にしない。エラー文は 300 文字で切る。定期更新は Page Visibility API でタブが見えているときだけ(平文でトークンが流れる回数を減らす)。文字は日本語。幅 400px 以上のスマートフォンでも読める簡単な CSS。
 

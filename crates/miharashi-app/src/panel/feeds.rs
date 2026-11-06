@@ -60,11 +60,12 @@ fn report(
     error: Option<&str>,
 ) -> FeedReport {
     FeedReport {
-        id,
-        label,
+        id: id.into(),
+        label: label.into(),
         state,
         last_ok: last_ok.map(rfc3339),
         error: error.map(clip_error),
+        token_revision: None,
     }
 }
 
@@ -108,6 +109,28 @@ pub(super) fn from_aircraft(h: &Health) -> FeedReport {
     report("aircraft", "tar1090(航空機)", state, h.last_ok, error)
 }
 
+/// 1 接続の管理ページ上の (id, 表示名)。`primary` は従来どおり id `agents`・名前 `T3(エージェント)`、
+/// 追加の接続は `agents:<id>`・`T3(<label>)`。取得元(feeds)とトークン(tokens)で同じ id を使い、行を突き合わせられる。
+pub(super) fn agent_identity(server_id: &str, label: &str) -> (String, String) {
+    if server_id == crate::config::PRIMARY_SERVER_ID {
+        ("agents".into(), "T3(エージェント)".into())
+    } else {
+        (format!("agents:{server_id}"), format!("T3({label})"))
+    }
+}
+
+/// 1 接続ぶんの取得元。
+pub(super) fn from_agent_connection(
+    server_id: &str,
+    label: &str,
+    s: &AgentSnapshot,
+) -> Vec<FeedReport> {
+    let mut r = from_agents(s);
+    (r.id, r.label) = agent_identity(server_id, label);
+    r.token_revision = s.token_revision.clone();
+    vec![r]
+}
+
 pub(super) fn from_agents(s: &AgentSnapshot) -> FeedReport {
     let state = match s.connection {
         AgentConnection::Connecting => FeedState::Connecting,
@@ -136,7 +159,7 @@ impl AdminSources {
         const HA: (&str, &str) = ("home_assistant", "Home Assistant(室内)");
         const WEATHER: (&str, &str) = ("weather", "気象庁(予報)");
         const DISASTER: (&str, &str) = ("disaster", "気象庁(警報)");
-        vec![
+        [
             match &self.geoframe {
                 Ok(l) => from_link(&l.lock().map(|g| g.clone()).unwrap_or_default()),
                 Err(why) => not_running("geoframe", "GEOFRAME(写真)", why),
@@ -169,22 +192,39 @@ impl AdminSources {
                 Ok(h) => from_aircraft(&h.lock().map(|g| g.clone()).unwrap_or_default()),
                 Err(why) => not_running("aircraft", "tar1090(航空機)", why),
             },
-            match &self.agents {
-                Ok(a) => from_agents(&a.read().map(|g| g.clone()).unwrap_or_default()),
-                Err(why) => not_running("agents", "T3(エージェント)", why),
-            },
         ]
+        .into_iter()
+        .chain(match &self.agents {
+            // 接続ごとに 1 件(primary は従来の id)。ロックは接続ごとに写す間だけ。
+            Ok(connections) => connections
+                .iter()
+                .flat_map(|c| {
+                    from_agent_connection(
+                        &c.server_id,
+                        &c.label,
+                        &c.shared.read().map(|g| g.clone()).unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            Err(why) => vec![not_running("agents", "T3(エージェント)", why)],
+        })
+        .collect()
     }
 }
 
-/// トークンファイルの状態。中身は読まず、`open` の成否と `metadata` だけを見る。
+/// トークンファイルの状態。中身は読まず、`open` の成否と `fstat` だけを見る(HA・パネル・管理ページ用)。
+/// FIFO で固まらないよう `O_NONBLOCK` で開く。リンクは従来どおり追跡する(それらの読み手が追跡するため)。
 /// 規則は `agents::token_perms_ok` と同じ(`uid` / `gid` は実行ユーザーとグループ。テストでは偽の値を渡す):
 /// 実行ユーザー所有の 0600、または root 所有でグループが実行グループの 0640。
 /// 所有者が規則の外なら `WrongOwner`。所有者は規則内で権限が規則に合わない(その他に読み取りがある、
 /// グループに読み取りがあるのに root 所有でない、など)なら `LoosePermissions`。
 pub(super) fn check_token_file(path: &str, uid: u32, gid: u32) -> TokenState {
-    use std::os::unix::fs::MetadataExt;
-    let file = match std::fs::File::open(path) {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
+        .open(path)
+    {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return TokenState::Missing,
         Err(_) => return TokenState::Unreadable,
@@ -203,6 +243,23 @@ pub(super) fn check_token_file(path: &str, uid: u32, gid: u32) -> TokenState {
         TokenState::LoosePermissions
     } else {
         TokenState::WrongOwner
+    }
+}
+
+/// T3 の接続の token ファイルの状態。worker が読むときと同じ検査(`token_file::read_private_token`:
+/// リンクを追跡しない・通常ファイル・所有者と権限・8192 バイト以下・1 行)を通ったら `Ok`。
+/// 値は検査のために一瞬だけメモリに読むが、返さず、エラーにも出さない。
+pub(super) fn check_agent_token_file(path: &str, uid: u32, gid: u32) -> TokenState {
+    use crate::token_file::TokenFileError as E;
+    match crate::token_file::read_private_token(path, uid, gid) {
+        Ok(_) => TokenState::Ok,
+        Err(E::Missing) => TokenState::Missing,
+        Err(E::Symlink) => TokenState::Symlink,
+        Err(E::NotRegular) => TokenState::NotRegular,
+        Err(E::Unreadable) => TokenState::Unreadable,
+        Err(E::WrongOwner) => TokenState::WrongOwner,
+        Err(E::LoosePermissions) => TokenState::LoosePermissions,
+        Err(E::TooLarge | E::BadFormat) => TokenState::BadFormat,
     }
 }
 
@@ -264,7 +321,10 @@ mod tests {
     #[test]
     fn geoframe_maps_online_retrying_and_before_the_first_fetch() {
         let r = from_link(&Link::default());
-        assert_eq!((r.id, r.state), ("geoframe", FeedState::Connecting));
+        assert_eq!(
+            (r.id.as_str(), r.state),
+            ("geoframe", FeedState::Connecting)
+        );
         let ok = Link {
             last_ok: Some(at("2026-10-30T10:40:12+09:00")),
             status: Some(Photo::Online),
@@ -344,6 +404,44 @@ mod tests {
     }
 
     #[test]
+    fn each_agent_connection_gets_its_own_feed_report() {
+        let conn = |id: &str, label: &str, connection| crate::agents::Connection {
+            server_id: id.into(),
+            label: label.into(),
+            shared: Arc::new(RwLock::new(AgentSnapshot {
+                connection,
+                error_summary: Some(format!("{id} の状態")),
+                ..AgentSnapshot::default()
+            })),
+        };
+        let s = AdminSources {
+            agents: Ok(vec![
+                conn("primary", "primary", AgentConnection::Live),
+                conn(
+                    "container",
+                    "コンテナ",
+                    AgentConnection::AuthenticationRequired,
+                ),
+            ]),
+            ..AdminSources::default()
+        };
+        let feeds = s.feeds();
+        assert_eq!(feeds.len(), 7, "接続が 1 台増えると 1 件増える");
+        let by = |id: &str| feeds.iter().find(|f| f.id == id).unwrap();
+        assert_eq!(
+            (by("agents").state, by("agents").label.as_str()),
+            (FeedState::Ok, "T3(エージェント)")
+        );
+        assert_eq!(by("agents:container").state, FeedState::AuthRequired);
+        assert_eq!(by("agents:container").label, "T3(コンテナ)");
+        assert_eq!(
+            by("agents:container").error.as_deref(),
+            Some("container の状態")
+        );
+        assert_eq!(by("agents").error, None, "別の接続の状態は混ざらない");
+    }
+
+    #[test]
     fn sources_map_none_with_reason_to_not_running() {
         let feeds = AdminSources::default().feeds();
         assert_eq!(feeds.len(), 6);
@@ -354,11 +452,15 @@ mod tests {
         }
         let s = AdminSources {
             aircraft: Err("aircraft.enabled = false".into()),
-            agents: Ok(Arc::new(RwLock::new(AgentSnapshot {
-                connection: AgentConnection::AuthenticationRequired,
-                error_summary: Some("T3 token file を確認できません".into()),
-                ..AgentSnapshot::default()
-            }))),
+            agents: Ok(vec![crate::agents::Connection {
+                server_id: "primary".into(),
+                label: "primary".into(),
+                shared: Arc::new(RwLock::new(AgentSnapshot {
+                    connection: AgentConnection::AuthenticationRequired,
+                    error_summary: Some("T3 token file を確認できません".into()),
+                    ..AgentSnapshot::default()
+                })),
+            }]),
             home_assistant: Ok(Arc::new(Mutex::new(crate::env::EnvData::default()))),
             ..AdminSources::default()
         };

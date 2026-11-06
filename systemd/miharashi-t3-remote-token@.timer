@@ -1,0 +1,14 @@
+[Unit]
+Description=Weekly renewal of the Miharashi token for the extra T3 server "%i"
+Documentation=https://github.com/ysogabe/miharashi/blob/main/docs/t3-agent-multi-server/token-delivery.md
+# インスタンス名は設定の [[agents.extra_servers]] の id。導入していない(token-delivery.md「配送役の導入」)。
+
+[Timer]
+# token は 30 日で切れる。primary と同じ週 1 回。primary の timer(weekly = 月曜 0 時)と重ならない曜日・時刻にする。
+OnCalendar=Wed *-*-* 03:00:00
+RandomizedDelaySec=1h
+# 電源が落ちていて逃した回は、次に起動したときに動かす。
+Persistent=true
+
+[Install]
+WantedBy=timers.target

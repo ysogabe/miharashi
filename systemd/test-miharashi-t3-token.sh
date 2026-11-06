@@ -96,6 +96,35 @@ MIHARASHI_BIN=$tmp/miharashi-old
 check "(c) config-get が失敗したときも sed" "http://192.0.2.10:3773" "$(resolve)"
 if grep -q '失敗したので' "$tmp/warn"; then ok "(c) 失敗の警告が出る"; else ng "(c) 失敗の警告が出ていない"; fi
 
+# 複数サーバー(agents.extra_servers)の設定があっても、フォールバックの sed は primary([agents] の url / token_file)だけを読む
+MIHARASHI_BIN=$tmp/none/miharashi
+cp "$tmp/config.toml" "$tmp/config.single.toml"
+cat >>"$tmp/config.toml" <<EOT
+
+[[agents.extra_servers]]
+id = "container"
+url = "http://192.0.2.11:3773"
+token_file = "$tmp/state/t3-container.token"
+EOT
+check "(e) 追加先があっても sed は primary の url" "http://192.0.2.10:3773" "$(resolve)"
+check "(e) 追加先があっても sed は primary の token_file" "$tmp/state/t3-agent.token" "$(resolve_token_file 2>/dev/null)"
+# 追加配列が [agents] より前にあっても、[agents] の範囲だけを読む
+{
+    printf '[[agents.extra_servers]]\nid = "container"\nurl = "http://192.0.2.11:3773"\ntoken_file = "%s/state/t3-container.token"\n\n' "$tmp"
+    cat "$tmp/config.single.toml"
+} >"$tmp/config.reordered.toml"
+check "(e) 追加配列が先にあっても sed は primary の url" "http://192.0.2.10:3773" "$(MIHARASHI_CONFIG=$tmp/config.reordered.toml resolve)"
+check "(e) 追加配列が先にあっても sed は primary の token_file" "$tmp/state/t3-agent.token" "$(MIHARASHI_CONFIG=$tmp/config.reordered.toml resolve_token_file 2>/dev/null)"
+# 追加先の url を primary と取り違えない(1 行形式の extra_servers でも [agents] 内の url にならない)
+{
+    cat "$tmp/config.single.toml"
+    printf 'extra_servers = [{ id = "c", url = "http://192.0.2.12:3773", token_file = "/x" }]\n'
+} >"$tmp/config.inline.toml"
+check "(e) 1 行形式の追加先でも sed は primary の url" "http://192.0.2.10:3773" "$(MIHARASHI_CONFIG=$tmp/config.inline.toml resolve)"
+cp "$tmp/config.single.toml" "$tmp/config.toml"
+rm -f "$called"
+MIHARASHI_BIN=$tmp/miharashi
+
 if [[ -e "$called" ]]; then ng "(d) t3 か curl が呼ばれた: $(cat "$called")"; else ok "(d) resolve_url は t3 と curl を呼ばない"; fi
 
 # --- AC18: 確認に失敗したらトークンを置き換えない ---
@@ -150,6 +179,41 @@ check "成功: token_file が置き換わる" "NEWTOKEN-0123456789" "$(cat "$tok
 check "成功: 権限は 0600" "600" "$(stat -c %a "$token")"
 if grep -q 'auth session revoke old-session' "$called"; then ok "成功: 古いセッションを失効させる"; else ng "成功: 古いセッションを失効させていない"; fi
 if grep -q 'revoke new-session' "$called"; then ng "成功: 新しいセッションを失効させた"; else ok "成功: 新しいセッションは残す"; fi
+
+# --- 段を分けた運用(T3_TOKEN_REVOKE_MODE): 別の場所で発行し、別のホストが受け取る場合 ---
+# defer: 1〜4 だけ行い、古いセッションは失効させない(受け取った側の確認前に失効させない)
+echo OLDTOKEN >"$token"
+: >"$called"
+REVOKE_MODE=defer CURL_STUB_MODE=ok run_main
+check "defer: main が通る" "0" "$?"
+check "defer: token_file は置き換わる" "NEWTOKEN-0123456789" "$(cat "$token")"
+if grep -q 'auth session list' "$called" || grep -q 'auth session revoke' "$called"; then ng "defer: 失効の処理まで進んだ: $(cat "$called")"; else ok "defer: 古いセッションを失効させない"; fi
+if grep -q 'new-session' "$tmp/out"; then ok "defer: 新しいセッション ID を表示する"; else ng "defer: セッション ID が出ていない: $(cat "$tmp/out")"; fi
+if grep -q 'NEWTOKEN' "$tmp/out" "$tmp/err"; then ng "defer: 出力に token が出た"; else ok "defer: 出力に token は出ない"; fi
+# 失効の案内は、発行時と同じラベルを付けた形で出す(付け忘れると既定ラベル=primary のセッションを失効させる)
+if grep -q 'T3_TOKEN_REVOKE_MODE=only T3_TOKEN_LABEL=[^ ]* T3_TOKEN_KEEP_ID=new-session' "$tmp/out" "$tmp/err"; then ok "defer: 失効の案内にラベルを含める"; else ng "defer: 失効の案内にラベルがない: $(cat "$tmp/out" "$tmp/err")"; fi
+# defer でも確認に失敗したら置き換えない(従来と同じ)
+echo OLDTOKEN >"$token"
+: >"$called"
+REVOKE_MODE=defer CURL_STUB_MODE=401 run_main
+check "defer: 401 では失敗する" "1" "$?"
+check "defer: 401 では token_file は変わらない" "OLDTOKEN" "$(cat "$token")"
+# only: 失効だけ。URL も token_file も使わず、待たない。残すセッション以外の同じラベルを失効させる
+: >"$called"
+REVOKE_MODE=only T3_TOKEN_KEEP_ID=new-session run_main
+check "only: main が通る" "0" "$?"
+if grep -q 'auth session revoke old-session' "$called"; then ok "only: 古いセッションを失効させる"; else ng "only: 失効させていない: $(cat "$called")"; fi
+if grep -q 'revoke new-session' "$called"; then ng "only: 残すセッションを失効させた"; else ok "only: 残すセッションは失効させない"; fi
+if grep -q '^curl' "$called" || grep -q 'auth session issue' "$called"; then ng "only: 発行や確認まで進んだ"; else ok "only: 発行も確認もしない"; fi
+check "only: token_file は変わらない" "OLDTOKEN" "$(cat "$token")"
+REVOKE_MODE=only T3_TOKEN_KEEP_ID= run_main
+check "only: 残すセッション ID が無ければ失敗する" "1" "$?"
+: >"$called"
+REVOKE_MODE=only T3_TOKEN_KEEP_ID=missing-session run_main
+check "only: 一覧に無いセッション ID なら失敗する" "1" "$?"
+if grep -q 'auth session revoke' "$called"; then ng "only: 一覧に無いのに失効させた"; else ok "only: 一覧に無ければ何も失効させない"; fi
+REVOKE_MODE=bogus run_main
+check "不正なモードは失敗する" "1" "$?"
 
 if ((fails > 0)); then
     echo "$fails 件失敗" >&2

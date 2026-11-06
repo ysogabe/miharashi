@@ -17,8 +17,8 @@
 //! 6. ただし GLES の合成の上限(面・テクスチャ)を超える枚数は 1 枚に出せないので、配置が上限を超えるときは
 //!    重要でない方(その他 → 実行中 → 要確認)から「ほか N 件」にまとめてやり直す(`plan_board`、`cut_order`)。
 use super::{
-    CARD_H, CardMode, CardSlot, GAP, LANE_FOOT, LANE_GAP, LANE_HEAD, LANE_PAD, Lane, Layout, MAX_W,
-    MIN_W, Rect, layout,
+    CARD_H, CardMode, CardSlot, GAP, Id, LANE_FOOT, LANE_GAP, LANE_HEAD, LANE_PAD, Lane, Layout,
+    MAX_W, MIN_W, Rect, layout,
 };
 use std::collections::HashMap;
 
@@ -45,16 +45,16 @@ pub enum Tier {
 
 /// `build_families` への入力。`nodes` は重要な順(先頭が最重要)に並べて渡す。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Node {
-    pub id: String,
+pub struct Node<K = String> {
+    pub id: K,
     /// subagent の親スレッド ID(fork や親なしは None)。
-    pub parent: Option<String>,
+    pub parent: Option<K>,
     pub tier: Tier,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Member {
-    pub id: String,
+pub struct Member<K = String> {
+    pub id: K,
     /// 字下げの段。親 0、子 1、孫以降 2。
     pub depth: u8,
     pub tier: Tier,
@@ -68,23 +68,23 @@ pub struct Member {
 
 /// 親を先頭にした 1 組。単独スレッドは 1 人だけの組(枠も線も付けない)。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Family {
+pub struct Family<K = String> {
     /// 親を先頭に、子を重要な順に、孫は親の子の直後に並べた順。
-    pub members: Vec<Member>,
+    pub members: Vec<Member<K>>,
     /// 親が一覧に無い子の組。値は親の ID(`members` に親のカードは無い)。
-    pub orphan_of: Option<String>,
+    pub orphan_of: Option<K>,
     /// プロジェクトの枠を決めるスレッドの `nodes` での位置(親、親情報なしなら最も重要な子)。
     pub lead: usize,
     /// 1 行表示・集約の単位の数。
     pub units: usize,
     /// 表示の予算(`SurfaceBudget`)のために「ほか N 件」へ回したスレッドの ID。`build_families` は空で作り、
     /// `plan_board` が配置のためにだけ詰める。
-    pub cut_ids: Vec<String>,
+    pub cut_ids: Vec<K>,
     /// `cut_ids` のうち、要確認のスレッドの数。
     pub cut_attention: usize,
 }
 
-impl Family {
+impl<K: Id> Family<K> {
     /// 枠と接続線を付ける組か。
     pub fn framed(&self) -> bool {
         self.members.len() > 1 || self.orphan_of.is_some() || !self.cut_ids.is_empty()
@@ -98,7 +98,7 @@ impl Family {
             .unwrap_or(usize::MAX)
     }
     /// 親のカードの ID(親情報なしの組は None)。
-    pub fn root_id(&self) -> Option<&str> {
+    pub fn root_id(&self) -> Option<&K> {
         match (&self.orphan_of, self.members.first()) {
             (None, Some(m)) if m.depth == 0 => Some(&m.id),
             _ => None,
@@ -109,19 +109,19 @@ impl Family {
 /// 可視のスレッドを親子の組にする。組は最も重要なメンバーの順。
 /// 親が可視のスレッドの子は親と同じ組に入り(親の親も同様にたどる)、親が可視でない子は親ごとに
 /// 「親情報なし」の組にまとめる。親をたどって輪になっているときは、最も重要なスレッドを根にして輪を切る。
-pub fn build_families(nodes: &[Node]) -> Vec<Family> {
+pub fn build_families<K: Id>(nodes: &[Node<K>]) -> Vec<Family<K>> {
     let n = nodes.len();
-    let index: HashMap<&str, usize> = nodes
+    let index: HashMap<&K, usize> = nodes
         .iter()
         .enumerate()
-        .map(|(i, node)| (node.id.as_str(), i))
+        .map(|(i, node)| (&node.id, i))
         .collect();
     let mut parent: Vec<Option<usize>> = nodes
         .iter()
         .enumerate()
         .map(|(i, node)| {
             node.parent
-                .as_deref()
+                .as_ref()
                 .and_then(|p| index.get(p).copied())
                 .filter(|&p| p != i)
         })
@@ -156,23 +156,23 @@ pub fn build_families(nodes: &[Node]) -> Vec<Family> {
             children[*p].push(i);
         }
     }
-    let orphan_of = |i: usize| -> Option<&str> {
+    let orphan_of = |i: usize| -> Option<&K> {
         if parent[i].is_some() {
             return None;
         }
         nodes[i]
             .parent
-            .as_deref()
-            .filter(|p| *p != nodes[i].id && !index.contains_key(p))
+            .as_ref()
+            .filter(|p| **p != nodes[i].id && !index.contains_key(*p))
     };
 
     let mut families = Vec::new();
-    let mut orphans: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut orphans: Vec<(K, Vec<usize>)> = Vec::new();
     for (i, _) in parent.iter().enumerate().filter(|(_, p)| p.is_none()) {
         match orphan_of(i) {
             Some(p) => match orphans.iter_mut().find(|(id, _)| id == p) {
                 Some((_, v)) => v.push(i),
-                None => orphans.push((p.to_string(), vec![i])),
+                None => orphans.push((p.clone(), vec![i])),
             },
             None => families.push(make_family(nodes, &children, &[i], 0, None)),
         }
@@ -184,14 +184,14 @@ pub fn build_families(nodes: &[Node]) -> Vec<Family> {
     families
 }
 
-fn make_family(
-    nodes: &[Node],
+fn make_family<K: Id>(
+    nodes: &[Node<K>],
     children: &[Vec<usize>],
     roots: &[usize],
     first_depth: u8,
-    orphan_of: Option<String>,
-) -> Family {
-    let mut members: Vec<Member> = Vec::new();
+    orphan_of: Option<K>,
+) -> Family<K> {
+    let mut members: Vec<Member<K>> = Vec::new();
     // 深さ優先。子は重要な順(nodes の順)に並んでいる。
     let mut stack: Vec<(usize, u8, Option<usize>)> = roots
         .iter()
@@ -230,7 +230,7 @@ fn make_family(
 
 /// 静かな部分木(自分と子孫が全員 Quiet)に単位の番号を振り、単位の数を返す。親(深さ 0)は縮めも隠しもしない。
 /// 親が単位に入っていない静かな子から新しい単位を始め、その子孫は同じ単位に入る。
-fn assign_units(members: &mut [Member], orphan: bool) -> usize {
+fn assign_units<K: Id>(members: &mut [Member<K>], orphan: bool) -> usize {
     let mut quiet: Vec<bool> = members.iter().map(|m| m.tier == Tier::Quiet).collect();
     for m in (0..members.len()).rev() {
         if !quiet[m]
@@ -291,7 +291,7 @@ impl Ctx {
     fn overhead(&self) -> f32 {
         (FAM_PAD * 2.0 + FAM_HEAD) * self.s
     }
-    fn entry_h(&self, f: &Family, e: &Entry) -> f32 {
+    fn entry_h<K: Id>(&self, f: &Family<K>, e: &Entry) -> f32 {
         self.s
             * match e {
                 Entry::More(_) => MORE_LINE,
@@ -300,7 +300,7 @@ impl Ctx {
                 Entry::Member { .. } => CHILD_H,
             }
     }
-    fn piece_h(&self, f: &Family, framed: bool, entries: &[Entry]) -> f32 {
+    fn piece_h<K: Id>(&self, f: &Family<K>, framed: bool, entries: &[Entry]) -> f32 {
         let sum: f32 = entries.iter().map(|e| self.entry_h(f, e)).sum();
         if !framed {
             return sum;
@@ -311,7 +311,7 @@ impl Ctx {
 }
 
 /// 組の中身を、単位ごとの表示(カード・1 行・隠す)に従って並べる。
-fn entries_of(f: &Family, states: &[UnitState]) -> Vec<Entry> {
+fn entries_of<K: Id>(f: &Family<K>, states: &[UnitState]) -> Vec<Entry> {
     let mut out = Vec::with_capacity(f.members.len() + 1);
     let mut hidden = f.cut_ids.len();
     for (m, mem) in f.members.iter().enumerate() {
@@ -351,9 +351,9 @@ struct Packed {
     over: bool,
 }
 
-struct Packer<'a> {
+struct Packer<'a, K> {
     c: &'a Ctx,
-    fams: &'a [PageFam<'a>],
+    fams: &'a [PageFam<'a, K>],
     segs: Vec<Seg>,
     col: usize,
     y: f32,
@@ -363,7 +363,7 @@ struct Packer<'a> {
     over: bool,
 }
 
-impl<'a> Packer<'a> {
+impl<'a, K: Id> Packer<'a, K> {
     fn begin(&mut self, project: usize) {
         let cont = self.segs.iter().any(|s| s.project == project);
         self.segs.push(Seg {
@@ -496,15 +496,15 @@ impl<'a> Packer<'a> {
 }
 
 /// 配置する組。`states` は単位ごとの表示。
-struct PageFam<'a> {
-    f: &'a Family,
+struct PageFam<'a, K> {
+    f: &'a Family<K>,
     project: usize,
     idx: usize,
     states: Vec<UnitState>,
 }
 
 /// `limit` 列を超える配置になりそうなら、そこで打ち切って `over` を立てる。
-fn pack(c: &Ctx, fams: &[PageFam<'_>], fresh_columns: bool, limit: usize) -> Packed {
+fn pack<K: Id>(c: &Ctx, fams: &[PageFam<'_, K>], fresh_columns: bool, limit: usize) -> Packed {
     let mut p = Packer {
         c,
         fams,
@@ -544,7 +544,7 @@ fn pack(c: &Ctx, fams: &[PageFam<'_>], fresh_columns: bool, limit: usize) -> Pac
     }
 }
 
-fn try_pack(c: &Ctx, fams: &[PageFam<'_>]) -> Option<Packed> {
+fn try_pack<K: Id>(c: &Ctx, fams: &[PageFam<'_, K>]) -> Option<Packed> {
     [true, false]
         .into_iter()
         .map(|fresh| pack(c, fams, fresh, c.max_cols))
@@ -552,7 +552,7 @@ fn try_pack(c: &Ctx, fams: &[PageFam<'_>]) -> Option<Packed> {
 }
 
 /// 単位ごとの、含まれるスレッドの数。
-fn unit_sizes(f: &Family) -> Vec<usize> {
+fn unit_sizes<K: Id>(f: &Family<K>) -> Vec<usize> {
     let mut sizes = vec![0; f.units];
     for u in f.members.iter().filter_map(|m| m.unit) {
         sizes[u] += 1;
@@ -563,7 +563,7 @@ fn unit_sizes(f: &Family) -> Vec<usize> {
 /// 組の最初の表示。1 列に収まるまで静かな単位を後ろから 1 行表示にする。
 /// 全部を 1 行にしても画面全体(`max_cols` 列)に入らない分は、先に「ほか N 件」にまとめる
 /// (並べられる行数には画面の広さという上限があり、件数が多くても配置の計算量を抑えられる)。
-fn base_states(c: &Ctx, f: &Family) -> Vec<UnitState> {
+fn base_states<K: Id>(c: &Ctx, f: &Family<K>) -> Vec<UnitState> {
     let mut states = vec![UnitState::Card; f.units];
     if f.units == 0 {
         return states;
@@ -611,7 +611,7 @@ fn base_states(c: &Ctx, f: &Family) -> Vec<UnitState> {
 }
 
 /// 隠す順(組, 単位)。隠せる単位が最も多い組から、後ろの単位を 1 つずつ。
-fn hide_order(fams: &[PageFam<'_>]) -> Vec<(usize, usize)> {
+fn hide_order<K: Id>(fams: &[PageFam<'_, K>]) -> Vec<(usize, usize)> {
     let mut heap: std::collections::BinaryHeap<(usize, usize)> = fams
         .iter()
         .enumerate()
@@ -637,15 +637,15 @@ fn hide_order(fams: &[PageFam<'_>]) -> Vec<(usize, usize)> {
 /// `items`((プロジェクト, そのプロジェクトの組の位置))を 1 枚に詰める。
 /// 入らなければ、全部を 1 行表示 → 静かな単位を隠していく(隠す数は二分探索で決める)、の順に縮める。
 /// 隠せる静かな単位を全部隠しても入らないときは、縮めきった組を返す(要確認の子は縮めない)。
-fn fit_page<'a>(
+fn fit_page<'a, K: Id>(
     c: &Ctx,
-    projects: &'a [Vec<Family>],
+    projects: &'a [Vec<Family<K>>],
     bases: &[Vec<Vec<UnitState>>],
     items: &[(usize, usize)],
-) -> Result<Layout, Vec<PageFam<'a>>> {
+) -> Result<Layout<K>, Vec<PageFam<'a, K>>> {
     let mut items = items.to_vec();
     items.sort_unstable();
-    let mut fams: Vec<PageFam<'a>> = items
+    let mut fams: Vec<PageFam<'a, K>> = items
         .iter()
         .map(|&(project, idx)| PageFam {
             f: &projects[project][idx],
@@ -681,7 +681,12 @@ fn fit_page<'a>(
 }
 
 /// `rows`(全部 1 行表示)から、`order` の先頭 `k` 件の単位を隠した状態にする。
-fn hide(fams: &mut [PageFam<'_>], rows: &[Vec<UnitState>], order: &[(usize, usize)], k: usize) {
+fn hide<K: Id>(
+    fams: &mut [PageFam<'_, K>],
+    rows: &[Vec<UnitState>],
+    order: &[(usize, usize)],
+    k: usize,
+) {
     for (fam, base) in fams.iter_mut().zip(rows) {
         fam.states.clone_from(base);
     }
@@ -703,9 +708,9 @@ const HIDE_SCAN_MAX: usize = 256;
 /// 3. `lb` から `hi` の手前まで、小さい方から 1 つずつ確かめ、最初に入った数を採る。
 ///
 /// 確かめるのは最大 `HIDE_SCAN_MAX` 回なので、計算量は O((log n + HIDE_SCAN_MAX) · 1 回の詰め)。
-fn min_hidden(
+fn min_hidden<K: Id>(
     c: &Ctx,
-    fams: &mut Vec<PageFam<'_>>,
+    fams: &mut Vec<PageFam<'_, K>>,
     rows: &[Vec<UnitState>],
     order: &[(usize, usize)],
 ) -> Option<(usize, Packed)> {
@@ -776,7 +781,7 @@ const TALL_REFINE: usize = 8;
 /// 縮めるのはカードが連なっている間隔だけで、プロジェクトと組の見出しの領域は縮めない(`Squash`)。
 /// 重なったカードは `Strip`(上端の 1 行だけが見える)にし、要確認 → 実行中 → その他の順に手前に出す。
 /// 組の枠・見出し・「ほか N 件」も同じ縮め方で置くので、隠した子の置き場(`Layout::anchor`)も残る。
-fn overlap_fit(c: &Ctx, fams: &[PageFam<'_>]) -> Layout {
+fn overlap_fit<K: Id>(c: &Ctx, fams: &[PageFam<'_, K>]) -> Layout<K> {
     let first = pack(c, fams, false, usize::MAX);
     let virt = |tall: f32| Ctx {
         s: c.s,
@@ -937,7 +942,7 @@ impl Squash {
 
 /// 列ごとの縮め方。どのカードの下端も画面の内側に収める(収まる列は縮めない)。
 /// 見出しの領域を除いても収まらない列は、見出しも含めて一様に縮める(カードを領域の外へ出さないことを優先する)。
-fn squash_columns(c: &Ctx, fams: &[PageFam<'_>], packed: &Packed) -> Vec<Squash> {
+fn squash_columns<K: Id>(c: &Ctx, fams: &[PageFam<'_, K>], packed: &Packed) -> Vec<Squash> {
     let limit = c.area.h - c.foot();
     let mut runs: Vec<Vec<(f32, f32)>> = vec![Vec::new(); packed.cols];
     let mut tails: Vec<Vec<Tail>> = (0..packed.cols).map(|_| Vec::new()).collect();
@@ -1015,8 +1020,8 @@ fn squash_columns(c: &Ctx, fams: &[PageFam<'_>], packed: &Packed) -> Vec<Squash>
 }
 
 /// 重ねた列で、上に別のカードが載って隠れるカードを `Strip` にする(`placed` は (ID, 列))。
-fn mark_covered(out: &mut Layout, placed: &[(String, usize)]) {
-    let mut by_col: HashMap<usize, Vec<&str>> = HashMap::new();
+fn mark_covered<K: Id>(out: &mut Layout<K>, placed: &[(K, usize)]) {
+    let mut by_col: HashMap<usize, Vec<&K>> = HashMap::new();
     for (id, col) in placed {
         by_col.entry(*col).or_default().push(id);
     }
@@ -1042,7 +1047,7 @@ fn mark_covered(out: &mut Layout, placed: &[(String, usize)]) {
 }
 
 /// 詰めた結果を座標にする。`squash` は列ごとの縦の縮め方(`overlap_fit` だけが縮める列を渡す)。
-fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed, squash: &[Squash]) -> Layout {
+fn finish<K: Id>(c: &Ctx, fams: &[PageFam<'_, K>], packed: Packed, squash: &[Squash]) -> Layout<K> {
     let s = c.s;
     let mut out = Layout {
         scale: s,
@@ -1060,7 +1065,7 @@ fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed, squash: &[Squash]) -> L
     // 同じ組の何枠目か(列をまたぐ組の見出しを区別する)。
     let mut pieces_of: HashMap<(usize, usize), usize> = HashMap::new();
     // 重ねて置いた列のカード(ID と列)。手前に出す順の z を振り、隠れるものを `Strip` にする。
-    let mut squashed: Vec<(String, usize)> = Vec::new();
+    let mut squashed: Vec<(K, usize)> = Vec::new();
     for (si, seg) in packed.segs.iter().enumerate() {
         let col = seg.col.min(cols - 1);
         let sq = squash.get(seg.col);
@@ -1135,7 +1140,7 @@ fn finish(c: &Ctx, fams: &[PageFam<'_>], packed: Packed, squash: &[Squash]) -> L
                 piece: piece_no,
                 continued: piece.continued,
                 orphan: f_.orphan_of.is_some(),
-                root: f_.root_id().map(str::to_string),
+                root: f_.root_id().cloned(),
                 rect: Rect {
                     x,
                     y: top,
@@ -1257,16 +1262,16 @@ fn tier_z(tier: Tier) -> u32 {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ShapeMember {
-    pub id: String,
+pub struct ShapeMember<K = String> {
+    pub id: K,
     /// 同じ枠に置いた親のメンバー ID。None なら枠の見出しから線を引く(親情報なし・続き)。
-    pub parent: Option<String>,
+    pub parent: Option<K>,
     pub rect: Rect,
 }
 
 /// 配置した親子グループの枠 1 つ(列をまたぐ組は列ごとに 1 つ)。
 #[derive(Clone, Debug, PartialEq)]
-pub struct FamilyShape {
+pub struct FamilyShape<K = String> {
     /// `plan_board` に渡したプロジェクトの位置と、その中の組の位置。
     pub project: usize,
     pub family: usize,
@@ -1276,18 +1281,18 @@ pub struct FamilyShape {
     pub continued: bool,
     pub orphan: bool,
     /// この組の親のカードの ID。親情報なしの組は None。
-    pub root: Option<String>,
+    pub root: Option<K>,
     pub rect: Rect,
     /// 見出しの行。
     pub head: Rect,
     /// 枠の中のカードを上から順に。
-    pub members: Vec<ShapeMember>,
+    pub members: Vec<ShapeMember<K>>,
     /// 「ほか N 件」の行の位置と件数。
     pub more: Option<(Rect, usize)>,
     /// 「ほか N 件」のうち、要確認のスレッドの数(表示の予算で集約したときだけ 0 でない)。
     pub more_attention: usize,
     /// 「ほか N 件」にまとめたスレッドの ID。
-    pub hidden_ids: Vec<String>,
+    pub hidden_ids: Vec<K>,
 }
 
 /// 枠・見出し・接続線の位置。カードの現在位置(動いている途中の位置)から毎フレーム求める。
@@ -1301,8 +1306,8 @@ pub struct Decor {
 }
 
 /// `pose` が各カードの現在位置を返す(無ければ配置した位置)。
-pub fn decor(shape: &FamilyShape, s: f32, pose: &dyn Fn(&str) -> Option<Rect>) -> Decor {
-    let cur = |m: &ShapeMember| pose(&m.id).unwrap_or(m.rect);
+pub fn decor<K: Id>(shape: &FamilyShape<K>, s: f32, pose: &dyn Fn(&K) -> Option<Rect>) -> Decor {
+    let cur = |m: &ShapeMember<K>| pose(&m.id).unwrap_or(m.rect);
     let pad = FAM_PAD * s;
     // 枠は、全メンバー(と「ほか N 件」)の現在位置を含む大きさにする。止まっているときは配置した枠そのもの。
     // 左右は各メンバーが配置の枠からどれだけ動いたかの最大・最小で、上下は現在位置の上端・下端に余白を足して決める。
@@ -1381,15 +1386,15 @@ pub fn decor(shape: &FamilyShape, s: f32, pose: &dyn Fn(&str) -> Option<Rect>) -
         }
     };
     let anchor = head;
-    let root = shape.root.as_deref();
+    let root = shape.root.as_ref();
     for m in &shape.members {
-        if Some(m.id.as_str()) == root {
+        if Some(&m.id) == root {
             continue;
         }
         let parent = m
             .parent
-            .as_deref()
-            .and_then(|p| shape.members.iter().find(|x| x.id == p))
+            .as_ref()
+            .and_then(|p| shape.members.iter().find(|x| &x.id == p))
             .map(cur);
         match parent {
             Some(p) => link(p, cur(m), p.y + p.h),
@@ -1397,12 +1402,7 @@ pub fn decor(shape: &FamilyShape, s: f32, pose: &dyn Fn(&str) -> Option<Rect>) -
         }
     }
     if let Some(m) = more {
-        match shape
-            .members
-            .iter()
-            .find(|x| Some(x.id.as_str()) == root)
-            .map(cur)
-        {
+        match shape.members.iter().find(|x| Some(&x.id) == root).map(cur) {
             Some(p) => link(p, m, p.y + p.h),
             None => link(anchor, m, head.y + head.h),
         }
@@ -1435,7 +1435,7 @@ const SOLID_TEXTURES: usize = 4;
 /// 1 つの配置が GLES の合成に渡す面の数(上限の見積もり)。`AgentScreen::decor_layers` の作り方に合わせてある。
 /// 枠 1 つ = 塗り 1 + 枠線 4 + 接続線(メンバーと「ほか N 件」ごとに最大 2)+ 見出し 1 + 要確認の札 1 + 「ほか N 件」1。
 /// 面(描く数)と、固有のテクスチャ(カード、見出し、札、「ほか」)の数を返す。
-pub fn surface_cost(l: &Layout) -> SurfaceCost {
+pub fn surface_cost<K: Id>(l: &Layout<K>) -> SurfaceCost {
     let mut cost = SurfaceCost {
         draws: l.cards.len(),
         textures: l.cards.len() + SOLID_TEXTURES,
@@ -1472,7 +1472,7 @@ impl SurfaceCost {
 /// 段は、自分と子孫のうち最も重要なものの段で決める(要確認の子を持つ親は、要確認の段で集約する)。
 /// 子孫は必ず親より前に並ぶので、先頭からどこで切っても、残ったスレッドの親は残る。
 /// 親(各組の先頭のメンバー)は候補に入れない。親のカードの無い置き場は無いため。
-fn cut_order(projects: &[Vec<Family>]) -> Vec<(usize, usize, usize)> {
+fn cut_order<K: Id>(projects: &[Vec<Family<K>>]) -> Vec<(usize, usize, usize)> {
     let level = |t: Tier| match t {
         Tier::Attention => 0u8,
         Tier::Running => 1,
@@ -1502,11 +1502,11 @@ fn cut_order(projects: &[Vec<Family>]) -> Vec<(usize, usize, usize)> {
 }
 
 /// `cut` の先頭 `n` 件を「ほか N 件」に回した組(`projects` と同じ位置)。変わらない組はそのまま写す。
-fn cut_families(
-    projects: &[Vec<Family>],
+fn cut_families<K: Id>(
+    projects: &[Vec<Family<K>>],
     order: &[(usize, usize, usize)],
     n: usize,
-) -> Vec<Vec<Family>> {
+) -> Vec<Vec<Family<K>>> {
     let mut cut: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
     for &(p, i, m) in &order[..n] {
         cut.entry((p, i)).or_default().push(m);
@@ -1526,13 +1526,13 @@ fn cut_families(
         .collect()
 }
 
-fn cut_family(f: &Family, gone: &[usize]) -> Family {
+fn cut_family<K: Id>(f: &Family<K>, gone: &[usize]) -> Family<K> {
     let mut removed = vec![false; f.members.len()];
     for &m in gone {
         removed[m] = true;
     }
     let mut new_at = vec![usize::MAX; f.members.len()];
-    let mut members: Vec<Member> = Vec::with_capacity(f.members.len() - gone.len());
+    let mut members: Vec<Member<K>> = Vec::with_capacity(f.members.len() - gone.len());
     for (m, member) in f.members.iter().enumerate() {
         if removed[m] {
             continue;
@@ -1560,7 +1560,7 @@ fn cut_family(f: &Family, gone: &[usize]) -> Family {
 
 /// 最初に集約するカードの数の見積もり。どの組も枠 1 つ(見出しと札の 2 面)で済む最も少ない場合の値なので、
 /// 実際に必要な数より小さい。足りなければ `plan_board` が配置を測り直して増やす。
-fn first_cut(projects: &[Vec<Family>], cuttable: usize) -> usize {
+fn first_cut<K: Id>(projects: &[Vec<Family<K>>], cuttable: usize) -> usize {
     let cards: usize = projects.iter().flatten().map(|f| f.members.len()).sum();
     let framed = projects.iter().flatten().filter(|f| f.framed()).count();
     let by_textures =
@@ -1580,12 +1580,12 @@ fn first_cut(projects: &[Vec<Family>], cuttable: usize) -> usize {
 /// 重ねた配置は数百〜数千枚のカードを 1 枚に入れられるが、GLES の合成には面とテクスチャの上限がある
 /// (`GPU_AGENT_DRAWS`、`GPU_AGENT_TEXTURES`)。配置が `surface_cost` で上限を超えるときは、
 /// 重要でないスレッドから「ほか N 件」に回してやり直す(`cut_order`)。収まる盤面は何も省かない。
-pub fn plan_board(area: Rect, scale: f32, projects: &[Vec<Family>]) -> Layout {
+pub fn plan_board<K: Id>(area: Rect, scale: f32, projects: &[Vec<Family<K>>]) -> Layout<K> {
     if area.w <= 0.0 || area.h <= 0.0 || projects.iter().all(Vec::is_empty) {
         return Layout::default();
     }
     if projects.iter().flatten().all(|f| !f.framed()) {
-        let groups: Vec<Vec<String>> = projects
+        let groups: Vec<Vec<K>> = projects
             .iter()
             .map(|p| p.iter().map(|f| f.members[0].id.clone()).collect())
             .collect();
@@ -1613,7 +1613,7 @@ pub fn plan_board(area: Rect, scale: f32, projects: &[Vec<Family>]) -> Layout {
 }
 
 /// 全部の組を 1 枚に配置する(省かない)。
-fn plan_all(area: Rect, scale: f32, projects: &[Vec<Family>]) -> Layout {
+fn plan_all<K: Id>(area: Rect, scale: f32, projects: &[Vec<Family<K>>]) -> Layout<K> {
     let items: Vec<(usize, usize)> = projects
         .iter()
         .enumerate()
@@ -2422,7 +2422,7 @@ mod tests {
 
     /// 全部を 1 行表示にしてから、隠す数を 1 から順に確かめて、入る最小の数を求める(遅いが確実な基準)。
     fn brute_min_hidden(c: &Ctx, projects: &[Vec<Family>]) -> Option<usize> {
-        let mut fams: Vec<PageFam> = Vec::new();
+        let mut fams: Vec<PageFam<String>> = Vec::new();
         for (project, list) in projects.iter().enumerate() {
             for (idx, f) in list.iter().enumerate() {
                 fams.push(PageFam {
@@ -2567,7 +2567,7 @@ mod tests {
         let shape = &l.families[0];
         // 先頭の子(a)と末尾の子(q0)が入れ替わる途中: a は q0 の位置、q0 は a の位置にいる。
         let (a, q) = (l.cards["a"].rect, l.cards["q0"].rect);
-        let pose = |id: &str| match id {
+        let pose = |id: &String| match id.as_str() {
             "a" => Some(Rect {
                 x: a.x - 300.0,
                 ..q
@@ -2577,7 +2577,7 @@ mod tests {
         };
         let d = decor(shape, 1.0, &pose);
         for id in ["p", "a", "r", "q0"] {
-            let c = pose(id).unwrap_or(l.cards[id].rect);
+            let c = pose(&id.to_string()).unwrap_or(l.cards[id].rect);
             assert!(c.x >= d.frame.x - 0.01 && c.y >= d.frame.y - 0.01, "{id}");
             assert!(
                 c.x + c.w <= d.frame.x + d.frame.w + 0.01
@@ -2623,7 +2623,7 @@ mod tests {
         nodes.push(node("g", Some("r"), Tier::Quiet));
         let l = &plan_board(AREA, 1.0, &[fams(&nodes)]);
         let shape = &l.families[0];
-        let rect_of = |id: &str| Some(l.cards[id].rect);
+        let rect_of = |id: &String| Some(l.cards[id].rect);
         let d = decor(shape, 1.0, &rect_of);
         assert!(!d.links.is_empty());
         // 子ごとに、親の下から子の中央の高さまで縦線が届き、横線が子のカードの左端に届く。
@@ -2654,7 +2654,7 @@ mod tests {
             );
         }
         // 動いている最中は、現在位置に線と枠が付いてくる。
-        let moved = |id: &str| {
+        let moved = |id: &String| {
             l.cards.get(id).map(|c| Rect {
                 y: c.rect.y + 100.0,
                 ..c.rect

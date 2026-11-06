@@ -178,6 +178,7 @@ pub fn kiosk(
         .agents
         .enabled
         .then(|| crate::agents::start(&cfg.agents));
+    // 画面は 1 つ。接続(primary と extra_servers)は Provider が集めて同じ画面に渡す。
     if cfg.agents.enabled {
         screens.push(decorated(
             cfg,
@@ -293,6 +294,73 @@ mod tests {
             None,
         );
         (app, dir)
+    }
+
+    /// 追加の T3 Server (`extra_servers`) を足しても、Agent の画面は 1 つのまま。
+    /// 管理ページの取得状態は、接続ごとに 1 件(primary は従来の id)出る。
+    #[test]
+    fn extra_servers_share_the_single_agents_screen() {
+        use crate::config::ConfigAgentServer;
+        let mut cfg = Config::default();
+        cfg.agents.enabled = true;
+        cfg.agents.url = "http://127.0.0.1:1".into();
+        cfg.agents.token_file = "/nonexistent/miharashi-test-primary".into();
+        cfg.agents.extra_servers = ["container", "second"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| ConfigAgentServer {
+                id: (*id).into(),
+                label: Some(format!("接続{i}")),
+                url: format!("http://127.0.0.1:{}", 2 + i),
+                token_file: format!("/nonexistent/miharashi-test-{id}"),
+            })
+            .collect();
+        let (dir, p) = test_photo();
+        let app = kiosk(
+            &cfg,
+            (64, 36),
+            None,
+            Source::File(p, None),
+            Box::new(DummyData::new()),
+            dummy_snapshot(0.0),
+            None,
+            None,
+        );
+        let view = App::panel_view(&app).expect("panel view");
+        let agents: Vec<_> = view.screens.iter().filter(|s| s.id == "agents").collect();
+        assert_eq!(agents.len(), 1, "追加先のための画面は増えない");
+        assert_eq!(
+            view.screens.len(),
+            kiosk_screen_count_without_extras(&cfg),
+            "画面の数は extra_servers の有無で変わらない"
+        );
+        let feeds = App::admin_sources(&app).feeds();
+        let ids: Vec<&str> = feeds.iter().map(|f| f.id.as_str()).collect();
+        assert!(ids.contains(&"agents"));
+        assert!(ids.contains(&"agents:container") && ids.contains(&"agents:second"));
+        let label = |id: &str| feeds.iter().find(|f| f.id == id).unwrap().label.clone();
+        assert_eq!(label("agents"), "T3(エージェント)");
+        assert_eq!(label("agents:container"), "T3(接続0)");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn kiosk_screen_count_without_extras(cfg: &Config) -> usize {
+        let mut plain = cfg.clone();
+        plain.agents.extra_servers = Vec::new();
+        let (dir, p) = test_photo();
+        let app = kiosk(
+            &plain,
+            (64, 36),
+            None,
+            Source::File(p, None),
+            Box::new(DummyData::new()),
+            dummy_snapshot(0.0),
+            None,
+            None,
+        );
+        let n = App::panel_view(&app).unwrap().screens.len();
+        let _ = std::fs::remove_dir_all(dir);
+        n
     }
 
     /// 警報の取得は room の画面とは別。`room.enabled = false` でも `ok` になりうる。

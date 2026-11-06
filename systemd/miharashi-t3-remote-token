@@ -1,0 +1,727 @@
+#!/usr/bin/env python3
+# 追加先の T3 Server(LXC コンテナ内など)の token を、読み取りだけの権限で発行し直し、監視ホストへ配送する。
+# 「管理用の配送役」。既存の LXC リモートの権限で、コンテナ内の t3 CLI を実行する。
+# 設計: docs/t3-agent-multi-server/token-delivery.md
+#
+# 手順(新しい token で、**稼働中の worker が**取得できたと確かめてから、同じラベルの古いセッションを失効させる):
+#   0. 排他ロックを取る(同じ接続の更新が重ならないようにする)。取れなければ何もせず終わる(終了コード 75)。
+#      管理 API(miharashi の管理ページ)に読み取りで接続できることを、発行の前に確かめる(できなければ何も発行せず終了コード 1)。
+#   1. コンテナで `t3 auth session list --json` を実行し、ラベルが専用か・前回の残りがないか確かめる。
+#   2. コンテナで `t3 auth session issue --scope orchestration:read --label <専用ラベル> --json` を実行する。
+#      返った権限が orchestration:read だけでなければ、そのセッションを失効させて止める。
+#   3. token をパイプ(標準入力)で `miharashi t3-token-receive --stdin` に流す。受取ツールが検査し、対象の T3 に
+#      ホストから問い合わせ、token_file を原子的に置き換え、置いたファイルの世代(秘密を含まない)を標準出力に出す。
+#      token は引数・環境変数・ログ・一時ファイルに出さない。
+#   4. `miharashi agents-check`(worker と同じコードの別プロセス)で、置いた token_file から取得できることを事前に確かめる。
+#      これは事前の疎通確認で、失効の条件ではない(別プロセスの成功は、稼働中の worker の成功ではない)。
+#   5. **稼働中の miharashi の worker** が、手順 3 で置いた世代の token_file で取得に成功し、接続が正常(LIVE)であることを、
+#      管理 API(`GET /api/v1/admin/overview` の `feeds[agents:<id>]`)の `token_revision` で観測するまで待つ。固定の待ち時間では
+#      失効させない(poll_secs が長くても、worker が読み直していなくても)。観測できなければ何も失効させず終了コード 3。
+#   6. 同じラベルで、権限が orchestration:read だけの古いセッションを失効させる。一覧で消えたことを確かめる。
+#
+# 失敗時: 受取の前に失敗したら、今回作ったセッションを失効させる(古い token と token_file は変わらない)。
+# 発行の途中で中断・失敗して応答を受け取れなかったときも、同じラベルで増えたセッションを失効させる(できなければ状態の
+# cleanup_pending に残す)。受取の後(token_file が新しい token に替わった後)や、替わったかどうか不明なとき(タイムアウト・
+# シグナルでの終了・想定外の終了コード)は、新旧どちらも失効させない(止めずに調べる)。
+# 古いセッションの失効に失敗した場合も新しい token は有効で、次の実行が同じラベルの残りをまとめて失効させる。
+#
+# 終了コード: 0 = 完了 / 1 = 失敗(古い token と token_file は変わらない)/ 2 = 設定・使い方の誤り(何も実行していない)/
+#   3 = token_file は新しい token に替わった(または替わったか不明)が、稼働中の worker での確認まで終わっていない
+#       (要調査。何も失効させていない)/
+#   4 = 更新は成功したが、古いセッションを失効しきれていない(新しい token は有効。次の実行で再試行)/
+#   75 = 別の実行が動いている(何もしない)。
+#
+# 設定は環境変数(systemd の EnvironmentFile。秘密は含めない)。--check-config で確認、--status で前回の結果を見る:
+#   T3R_SERVER_ID            設定の [[agents.extra_servers]] の id(必須。primary は断る)
+#   T3R_EXPECT_ENVIRONMENT_ID 対象の T3 の environmentId(必須。受取と確認で、接続先の取り違えを防ぐ)
+#   T3R_CONFIG               miharashi の設定ファイル(必須。絶対パス)
+#   T3R_LXC_REMOTE / T3R_LXC_CONTAINER   既存の LXC リモート名とコンテナ名(必須)
+#   T3R_CONTAINER_USER       コンテナ内で t3 を動かすユーザー(必須。exec_mode=direct では数値の uid)
+#   T3R_T3_CLI               コンテナ内の t3 CLI の絶対パス(必須)
+#   T3R_LABEL                この接続専用のラベル(既定 miharashi-agent-monitor-<id>。primary の既定ラベルは使えない)
+#   T3R_LXC_BIN              lxc クライアント(既定 lxc。絶対パス推奨)
+#   T3R_EXEC_MODE            su(既定。`su - <user> -c <引用した 1 本の文字列>`)/ direct(`--user/--group/--env HOME/--cwd` で
+#                            直接実行。シェルを通さない。T3R_CONTAINER_GID と T3R_CONTAINER_HOME が要る)
+#   T3R_MIHARASHI_BIN        既定 /usr/local/bin/miharashi
+#   T3R_STATE_DIR            状態・ロックの置き場所(既定 $STATE_DIRECTORY、なければ ~/.local/state/miharashi-t3-remote-token)
+#   T3R_TOKEN_TTL            発行する token の期限(例 30d。省略すると T3 の既定)
+#   T3R_ADMIN_URL            miharashi の管理ページ(管理 API)の origin(必須。http は IP アドレスか localhost だけ、https は名前も可。
+#                            パス・認証情報・クエリは書かない。リダイレクトは追跡しない)
+#   T3R_ADMIN_TOKEN_FILE     管理トークンのファイル(必須。絶対パス。miharashi と同じ規則: リンクでない通常のファイルで、実行ユーザーの
+#                            0600、または root:実行グループの 0640。値は引数・環境変数・ログ・状態に出さず、HTTP ヘッダーだけに使う)
+#   T3R_WORKER_WAIT(600)     稼働中の worker が新しい世代で取得するのを待つ上限(秒)。worker は poll_secs ごとに取得し、token_file は
+#                            30 秒ごとに読み直すので、poll_secs + 30 秒より長くする
+#   T3R_ADMIN_POLL(3)/ T3R_ADMIN_TIMEOUT(10)  管理 API を見る間隔・1 回の要求の期限(秒)
+#   T3R_EXEC_TIMEOUT(60)/ T3R_RECEIVE_TIMEOUT(60)/ T3R_VERIFY_TIMEOUT(90)  秒
+#
+# 既存の primary の更新(miharashi-t3-token と miharashi-t3-token.timer)は使わない・変えない。このスクリプトは
+# `config-get agents.url` や primary の token_file にも触れない。
+from __future__ import annotations
+
+import errno
+import fcntl
+import http.client
+import ipaddress
+import json
+import os
+import re
+import shlex
+import signal
+import stat
+import subprocess
+import sys
+import time
+import urllib.parse
+from datetime import datetime, timezone
+
+NAME = "miharashi-t3-remote-token"
+SCOPE = "orchestration:read"
+# primary(miharashi-t3-token)の既定ラベル。ここと同じラベルを使うと primary のセッションを失効させかねない。
+PRIMARY_DEFAULT_LABEL = "miharashi-agent-monitor"
+EX_OK, EX_FAIL, EX_CONFIG, EX_ATTENTION, EX_REVOKE_INCOMPLETE, EX_BUSY = 0, 1, 2, 3, 4, 75
+# miharashi t3-token-receive の終了コード(src/token_receive.rs と同じ): 1・2 = 置き換えの前に止まった(token_file は変わらない)、
+# 3 = 置き換えのあとの不備(installed-unchecked。token_file は新しい token に替わっている)。それ以外は結果不明。
+RECV_OK, RECV_FAILED, RECV_USAGE, RECV_INSTALLED_UNCHECKED = 0, 1, 2, 3
+# 古い受取ツール(終了コード 3 を持たない)は installed-unchecked を終了コード 1 と標準エラーの目印で伝える。
+INSTALLED_MARKER = b"t3-token-receive: installed-unchecked:"
+ADMIN_OVERVIEW_PATH = "/api/v1/admin/overview"
+ADMIN_MAX_BYTES = 1024 * 1024
+# 受取ツールが標準出力に出す、置いたファイルの世代(秘密を含まない)
+REVISION_RE = re.compile(rb"revision (r1(?:\.-?[0-9]{1,40}){5})\n?")
+HOST_RE = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
+
+SERVER_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+ENV_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+LABEL_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+REMOTE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+CONTAINER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,62}")
+USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+NUM_RE = re.compile(r"[0-9]{1,10}")
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+TTL_RE = re.compile(r"[0-9]{1,6}[smhd]")
+ABS_PATH_RE = re.compile(r"/[A-Za-z0-9._+/-]{1,400}")
+# token の形(受取ツールと同じく空白・制御文字・非 ASCII を含まない 1 語、改行込みで 8192 バイト以内)
+TOKEN_RE = re.compile(r"[\x21-\x7e]{1,8191}")
+ENV_PASS = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "LXD_CONF", "LXD_SOCKET")
+
+
+class Fail(Exception):
+    """想定内の失敗。`code` は終了コード、`stage`/`kind` は状態ファイルと診断に残す短い名前(秘密は含めない)。"""
+
+    def __init__(self, message: str, code: int = EX_FAIL, kind: str = "failed"):
+        super().__init__(message)
+        self.code = code
+        self.kind = kind
+
+
+class Interrupted(Exception):
+    pass
+
+
+def log(message: str) -> None:
+    print(f"{NAME}: {message}", flush=True)
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------- 設定
+
+
+def parse_admin_url(value: str) -> tuple[str, str, int]:
+    """管理 API の origin を厳密に検査する。戻りは (scheme, host, port)。miharashi の check_url と同じ方針:
+    平文 HTTP は IP アドレスか localhost だけ(名前解決で別の相手に管理トークンを送らない)。パス・認証情報・クエリ・断片は不可。"""
+    bad = lambda why: Fail(f"T3R_ADMIN_URL が不正です({why})", EX_CONFIG, "config")  # noqa: E731
+    if not value.isascii() or any(c <= " " or c == "\x7f" for c in value):
+        raise bad("空白・制御文字・非 ASCII を含む")
+    try:
+        u = urllib.parse.urlsplit(value)
+        port = u.port
+        host = u.hostname
+    except ValueError:
+        raise bad("解釈できない")
+    if u.scheme not in ("http", "https"):
+        raise bad("http:// または https://")
+    if "@" in u.netloc or u.query or u.fragment or u.path not in ("", "/") or not host:
+        raise bad("origin(scheme://host[:port])だけ。認証情報・パス・クエリは書かない")
+    is_ip = True
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        is_ip = False
+    if not is_ip and not HOST_RE.fullmatch(host):
+        raise bad("host が不正")
+    if u.scheme == "http" and not is_ip and host != "localhost":
+        raise bad("平文 HTTP は IP アドレスか localhost だけ")
+    return u.scheme, host, port or (443 if u.scheme == "https" else 80)
+
+
+class Settings:
+    def __init__(self, env: dict[str, str]):
+        def need(key: str) -> str:
+            value = env.get(key, "")
+            if not value:
+                raise Fail(f"{key} が設定されていません", EX_CONFIG, "config")
+            return value
+
+        def check(key: str, value: str, pattern: re.Pattern, what: str) -> str:
+            if not pattern.fullmatch(value):
+                raise Fail(f"{key} が不正です({what})", EX_CONFIG, "config")
+            return value
+
+        self.server_id = check("T3R_SERVER_ID", need("T3R_SERVER_ID"), SERVER_ID_RE, "英数字・-・_ の 1〜64 文字")
+        if self.server_id == "primary":
+            raise Fail("T3R_SERVER_ID に primary は使えません(primary は miharashi-t3-token の担当)", EX_CONFIG, "config")
+        self.env_id = check("T3R_EXPECT_ENVIRONMENT_ID", need("T3R_EXPECT_ENVIRONMENT_ID"), ENV_ID_RE, "英数字・.・-・_")
+        self.label = check("T3R_LABEL", env.get("T3R_LABEL") or f"{PRIMARY_DEFAULT_LABEL}-{self.server_id}", LABEL_RE, "英数字・.・-・_ の 1〜64 文字")
+        if self.label == PRIMARY_DEFAULT_LABEL:
+            raise Fail(f"T3R_LABEL に primary の既定ラベル {PRIMARY_DEFAULT_LABEL} は使えません", EX_CONFIG, "config")
+        self.config = check("T3R_CONFIG", need("T3R_CONFIG"), ABS_PATH_RE, "絶対パス")
+        self.remote = check("T3R_LXC_REMOTE", need("T3R_LXC_REMOTE"), REMOTE_RE, "英数字・.・-・_")
+        self.container = check("T3R_LXC_CONTAINER", need("T3R_LXC_CONTAINER"), CONTAINER_RE, "英数字とハイフン")
+        self.cli = check("T3R_T3_CLI", need("T3R_T3_CLI"), ABS_PATH_RE, "絶対パス")
+        if any(part in ("..", ".") for part in self.cli.split("/")):
+            raise Fail("T3R_T3_CLI に . / .. は使えません", EX_CONFIG, "config")
+        lxc = env.get("T3R_LXC_BIN") or "lxc"
+        if not (ABS_PATH_RE.fullmatch(lxc) or re.fullmatch(r"[A-Za-z0-9._-]{1,64}", lxc)):
+            raise Fail("T3R_LXC_BIN が不正です", EX_CONFIG, "config")
+        self.lxc = lxc
+        self.mode = env.get("T3R_EXEC_MODE") or "su"
+        user = need("T3R_CONTAINER_USER")
+        if self.mode == "su":
+            self.user = check("T3R_CONTAINER_USER", user, USER_RE, "ユーザー名")
+            self.gid = self.home = ""
+        elif self.mode == "direct":
+            self.user = check("T3R_CONTAINER_USER", user, NUM_RE, "exec_mode=direct では数値の uid")
+            self.gid = check("T3R_CONTAINER_GID", need("T3R_CONTAINER_GID"), NUM_RE, "数値の gid")
+            self.home = check("T3R_CONTAINER_HOME", need("T3R_CONTAINER_HOME"), ABS_PATH_RE, "絶対パス")
+        else:
+            raise Fail("T3R_EXEC_MODE は su / direct のどちらか", EX_CONFIG, "config")
+        self.miharashi = env.get("T3R_MIHARASHI_BIN") or "/usr/local/bin/miharashi"
+        check("T3R_MIHARASHI_BIN", self.miharashi, ABS_PATH_RE, "絶対パス")
+        self.ttl = env.get("T3R_TOKEN_TTL") or ""
+        if self.ttl:
+            check("T3R_TOKEN_TTL", self.ttl, TTL_RE, "例 30d")
+        self.exec_timeout = self._secs(env, "T3R_EXEC_TIMEOUT", 60)
+        self.receive_timeout = self._secs(env, "T3R_RECEIVE_TIMEOUT", 60)
+        self.verify_timeout = self._secs(env, "T3R_VERIFY_TIMEOUT", 90)
+        self.worker_wait = self._secs(env, "T3R_WORKER_WAIT", 600)
+        self.admin_poll = self._secs(env, "T3R_ADMIN_POLL", 3)
+        self.admin_timeout = self._secs(env, "T3R_ADMIN_TIMEOUT", 10)
+        self.admin_url = need("T3R_ADMIN_URL")
+        self.admin_scheme, self.admin_host, self.admin_port = parse_admin_url(self.admin_url)
+        self.admin_token_file = check("T3R_ADMIN_TOKEN_FILE", need("T3R_ADMIN_TOKEN_FILE"), ABS_PATH_RE, "絶対パス")
+        if any(part in ("..", ".") for part in self.admin_token_file.split("/")):
+            raise Fail("T3R_ADMIN_TOKEN_FILE に . / .. は使えません", EX_CONFIG, "config")
+        state = env.get("T3R_STATE_DIR") or env.get("STATE_DIRECTORY") or os.path.join(os.path.expanduser("~"), ".local/state/miharashi-t3-remote-token")
+        self.state_dir = state.split(":")[0]
+        if not os.path.isabs(self.state_dir):
+            raise Fail("T3R_STATE_DIR は絶対パス", EX_CONFIG, "config")
+        self.env_pass = {k: env[k] for k in ENV_PASS if k in env}
+
+    @staticmethod
+    def _secs(env: dict[str, str], key: str, default: int, minimum: int = 1) -> int:
+        raw = env.get(key)
+        if raw is None or raw == "":
+            return default
+        if not re.fullmatch(r"[0-9]{1,5}", raw) or not (minimum <= int(raw) <= 3600):
+            raise Fail(f"{key} は {minimum}〜3600 秒", EX_CONFIG, "config")
+        return int(raw)
+
+    # コンテナ内で t3 CLI を動かす lxc の引数(token は含まない)。su では 1 本のシェル文字列を作るので、各語を引用する。
+    def remote_argv(self, args: list[str]) -> list[str]:
+        target = f"{self.remote}:{self.container}"
+        if self.mode == "su":
+            inner = " ".join(shlex.quote(a) for a in [self.cli, *args])
+            return [self.lxc, "exec", "-T", "-n", target, "--", "su", "-", self.user, "-c", inner]
+        return [
+            self.lxc, "exec", "-T", "-n", "--user", self.user, "--group", self.gid,
+            "--env", f"HOME={self.home}", "--cwd", self.home, target, "--", self.cli, *args,
+        ]
+
+
+# ---------------------------------------------------------------- 実行の補助
+
+
+def run(argv: list[str], env: dict[str, str], timeout: int, stdin_data: bytearray | None = None) -> tuple[int | None, bytes, bytes]:
+    """子プロセスを実行する。タイムアウトしたら子のグループごと止め、戻りコードは None。"""
+    proc = subprocess.Popen(
+        argv, env=env, stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(bytes(stdin_data) if stdin_data is not None else None, timeout=timeout)
+        return proc.returncode, out, err
+    except subprocess.TimeoutExpired:
+        kill_group(proc)
+        proc.communicate()
+        return None, b"", b""
+    except BaseException:
+        kill_group(proc)
+        raise
+
+
+def kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        proc.kill()
+
+
+def one_line(raw: bytes | str, secret: bytes | None = None, limit: int = 200) -> str:
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+    if secret:
+        text = text.replace(secret.decode("ascii", "replace"), "<redacted>")
+    return " ".join("".join(c if c.isprintable() else " " for c in text).split())[:limit]
+
+
+def diagnostic(raw: bytes, secret: bytes | None = None) -> str:
+    """子プロセスの標準エラーから表示用の 1 行を作る。先行する警告で本体が切れないよう、診断行(`t3-token-receive:` で始まる最後の行)、
+    なければ最後の行を使う。判定には使わない(判定は終了コードと標準エラー全体で行う)。"""
+    text = raw.decode("utf-8", "replace")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    tagged = [ln for ln in lines if ln.lstrip().startswith("t3-token-receive:")]
+    pick = (tagged or lines or [""])[-1]
+    return one_line(pick, secret)
+
+
+class AdminError(Exception):
+    """管理 API を読めない(理由は短い固定の文。管理トークンの値は含めない)。`config` は設定・ファイルの誤り。"""
+
+    def __init__(self, message: str, config: bool = False):
+        super().__init__(message)
+        self.config = config
+
+
+def read_admin_token(path: str) -> bytes:
+    """管理トークンのファイルを miharashi と同じ規則で読む: リンクを追跡せず、開いた FD で通常ファイル・所有者と権限
+    (実行ユーザーの 0600、または root:実行グループの 0640)・8192 バイト以内・1 語の ASCII(16 文字以上)を確かめる。"""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOCTTY)
+    except OSError as e:
+        raise AdminError(f"管理トークンのファイルを開けません({errno.errorcode.get(e.errno, 'error')}。リンクは使えません)", True)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise AdminError("管理トークンのファイルが通常のファイルではありません", True)
+        mode = st.st_mode & 0o777
+        if not ((mode == 0o600 and st.st_uid == os.geteuid()) or (mode == 0o640 and st.st_uid == 0 and st.st_gid == os.getegid())):
+            raise AdminError("管理トークンのファイルの所有者・権限が規則と違います(実行ユーザーの 0600、または root:実行グループの 0640)", True)
+        data = os.read(fd, 8193)
+    except OSError:
+        raise AdminError("管理トークンのファイルを読めません", True)
+    finally:
+        os.close(fd)
+    token = data.strip()
+    if len(data) > 8192 or len(token) < 16 or not all(0x21 <= b <= 0x7E for b in token):
+        raise AdminError("管理トークンの形式が不正です(16 文字以上の 1 語の ASCII)", True)
+    return token
+
+
+def fetch_admin_overview(settings: "Settings") -> dict:
+    """管理 API の overview を読み取り(GET)で取る。プロキシ・リダイレクトは使わない。要求・応答の上限と JSON の形を確かめる。
+    管理トークンは HTTP ヘッダーだけに載せる(引数・環境変数・ログ・状態・例外の文に出さない)。"""
+    token = read_admin_token(settings.admin_token_file)
+    if settings.admin_scheme == "https":
+        conn: http.client.HTTPConnection = http.client.HTTPSConnection(settings.admin_host, settings.admin_port, timeout=settings.admin_timeout)
+    else:
+        conn = http.client.HTTPConnection(settings.admin_host, settings.admin_port, timeout=settings.admin_timeout)
+    try:
+        conn.request("GET", ADMIN_OVERVIEW_PATH, headers={"Authorization": "Bearer " + token.decode("ascii"), "Accept": "application/json"})
+        resp = conn.getresponse()
+        body = resp.read(ADMIN_MAX_BYTES + 1)
+        status = resp.status
+    except (OSError, http.client.HTTPException):
+        raise AdminError("管理 API に接続できません")
+    finally:
+        conn.close()
+        del token
+    if status != 200:
+        raise AdminError(f"管理 API が HTTP {status} を返しました(管理ページが無効、トークンの不一致、リダイレクトなど)")
+    if len(body) > ADMIN_MAX_BYTES:
+        raise AdminError("管理 API の応答が大きすぎます")
+    try:
+        data = json.loads(body)
+    except ValueError:
+        raise AdminError("管理 API の応答が JSON ではありません")
+    if not isinstance(data, dict) or not isinstance(data.get("feeds"), list):
+        raise AdminError("管理 API の応答の形が想定と違います")
+    return data
+
+
+def worker_feed(data: dict, server_id: str) -> dict | None:
+    """overview の feeds から、この接続の取得元(id は `agents:<server_id>`)を取り出す。"""
+    for feed in data["feeds"]:
+        if isinstance(feed, dict) and feed.get("id") == f"agents:{server_id}":
+            return feed
+    return None
+
+
+class Rotation:
+    def __init__(self, settings: Settings):
+        self.s = settings
+        self.env = settings.env_pass
+        self.state: dict = {
+            "server": settings.server_id, "label": settings.label, "started_at": now(), "finished_at": None,
+            "result": "running", "exit_code": None, "stage": "start", "new_session_id": None,
+            "revoked": [], "remaining_old": [], "cleanup_pending": False, "detail": "",
+        }
+        self.token: bytearray | None = None
+        self.new_id: str | None = None
+        self.before_ids: set[str] = set()
+        # start / issuing(発行コマンドの実行中。T3 側でセッションが作られたが応答を受け取れていないかもしれない)/
+        # issued(受取の前)/ receiving(結果不明)/ installed / verified
+        self.phase = "start"
+
+    # -- 状態ファイル(秘密は入れない)
+    def save(self, **updates) -> None:
+        self.state.update(updates)
+        path = os.path.join(self.s.state_dir, f"{self.s.server_id}.state.json")
+        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.state, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, path)
+        except OSError as e:
+            log(f"状態ファイルを書けません: {e.strerror}")
+
+    def wipe(self) -> None:
+        if self.token is not None:
+            for i in range(len(self.token)):
+                self.token[i] = 0
+            self.token = None
+
+    # -- コンテナ内の t3 CLI
+    def t3(self, args: list[str]) -> tuple[int | None, bytes, bytes]:
+        return run(self.s.remote_argv(args), self.env, self.s.exec_timeout)
+
+    def list_sessions(self) -> list[dict]:
+        rc, out, err = self.t3(["auth", "session", "list", "--json"])
+        if rc is None:
+            raise Fail("セッションの一覧がタイムアウトしました", EX_FAIL, "list-timeout")
+        if rc != 0:
+            raise Fail(f"セッションの一覧を取れません: {one_line(err)}", EX_FAIL, "list-failed")
+        try:
+            data = json.loads(out)
+            assert isinstance(data, list)
+            return [s for s in data if isinstance(s, dict) and isinstance(s.get("sessionId"), str)]
+        except (ValueError, AssertionError):
+            raise Fail("セッションの一覧が JSON の配列ではありません", EX_FAIL, "list-invalid")
+
+    def mine(self, sessions: list[dict]) -> list[dict]:
+        return [s for s in sessions if (s.get("client") or {}).get("label") == self.s.label]
+
+    @staticmethod
+    def is_read_only_bearer(s: dict) -> bool:
+        return s.get("scopes") == [SCOPE] and s.get("method") in (None, "bearer-access-token")
+
+    def revoke(self, session_id: str) -> bool:
+        if not SESSION_ID_RE.fullmatch(session_id):
+            return False
+        rc, _, _ = self.t3(["auth", "session", "revoke", session_id])
+        return rc == 0
+
+    def revoke_new_quietly(self, why: str) -> None:
+        """今回作ったセッションを失効させる(使わない token を残さない)。失敗は残りとして記録する。"""
+        if self.new_id and self.revoke(self.new_id):
+            log(f"今回作ったセッション {self.new_id} を失効させました({why})")
+            self.save(new_session_id=None, detail=why)
+        elif self.new_id:
+            log(f"今回作ったセッション {self.new_id} を失効できませんでした。次の実行が同じラベルの残りとして失効させます")
+            self.save(remaining_old=[self.new_id])
+
+    # -- 管理 API(稼働中の worker の観測)
+    def preflight_admin(self) -> None:
+        """発行の前に、管理 API を読めて、この接続の取得元が出ていることを確かめる(観測できないまま発行しない)。"""
+        s = self.s
+        self.save(stage="preflight")
+        try:
+            data = fetch_admin_overview(s)
+        except AdminError as e:
+            raise Fail(f"管理 API を読めないので、更新を始めません: {e}", EX_CONFIG if e.config else EX_FAIL, "admin-config" if e.config else "admin-unavailable")
+        if worker_feed(data, s.server_id) is None:
+            raise Fail(f"管理 API に接続 agents:{s.server_id} の取得元がありません(設定の extra_servers と、稼働中の miharashi を確かめる)。更新を始めません", EX_FAIL, "admin-no-connection")
+
+    def wait_for_worker(self, revision: str) -> None:
+        """稼働中の worker が、配置した世代の token_file で取得に成功し、接続が正常(LIVE)だと観測するまで待つ。
+        固定の待ち時間では失効させない。観測できなければ失敗(新旧とも失効させない)。"""
+        s = self.s
+        deadline = time.monotonic() + s.worker_wait
+        last = "未観測"
+        seen_polls = 0
+        while True:
+            try:
+                feed = worker_feed(fetch_admin_overview(s), s.server_id)
+                seen_polls += 1
+                if feed is None:
+                    last = "管理 API に取得元がありません"
+                elif feed.get("state") == "ok" and feed.get("token_revision") == revision:
+                    return
+                else:
+                    reported = feed.get("token_revision")
+                    last = (
+                        f"取得元の状態 {one_line(str(feed.get('state')), limit=32)}、"
+                        + ("worker が最後に成功した世代はまだ配置した世代ではありません" if isinstance(reported, str) else "worker はまだ世代を報告していません(取得に成功していない、または古い miharashi)")
+                    )
+            except AdminError as e:
+                last = str(e)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Fail(
+                    f"稼働中の worker が新しい token(配置した世代)で取得できたと {s.worker_wait} 秒以内に観測できませんでした({last})。"
+                    "新旧どちらも失効させません",
+                    EX_ATTENTION, "worker-unconfirmed",
+                )
+            time.sleep(min(s.admin_poll, remaining))
+
+    # -- 本体
+    def execute(self) -> int:
+        s = self.s
+        self.preflight_admin()
+        self.save(stage="list")
+        before = self.list_sessions()
+        collide = [x["sessionId"] for x in self.mine(before) if not self.is_read_only_bearer(x)]
+        if collide:
+            raise Fail(f"ラベル {s.label} に、読み取りだけではないセッションがあります。専用のラベルではないので止めます", EX_CONFIG, "label-collision")
+        self.before_ids = {x["sessionId"] for x in before}
+
+        self.save(stage="issue")
+        args = ["auth", "session", "issue", "--scope", SCOPE, "--label", s.label, "--json"]
+        if s.ttl:
+            args[5:5] = ["--ttl", s.ttl]
+        # 発行コマンドを動かす間に中断されても、T3 側で作られたセッションを探せるよう、先に段階と発行前の一覧を持っておく
+        self.phase = "issuing"
+        rc, out, err = self.t3(args)
+        if rc != 0:
+            # タイムアウト・失敗でも、T3 側でセッションが作られた可能性がある。作られていれば今すぐ失効させる。
+            self.cleanup_orphans(self.before_ids)
+            self.phase = "start"
+            raise Fail(f"token を発行できません: {'タイムアウト' if rc is None else f'終了コード {rc}'}", EX_FAIL, "issue-failed")
+        try:
+            issued = json.loads(out)
+            new_id = issued["sessionId"]
+            scopes = issued["scopes"]
+            token = issued["token"]
+            assert isinstance(new_id, str) and SESSION_ID_RE.fullmatch(new_id)
+        except (ValueError, KeyError, TypeError, AssertionError):
+            self.cleanup_orphans(self.before_ids)
+            self.phase = "start"
+            raise Fail("発行の応答を読めません", EX_FAIL, "issue-invalid")
+        del out
+        self.new_id = new_id
+        self.phase = "issued"
+        self.save(stage="issued", new_session_id=new_id)
+        if scopes != [SCOPE]:
+            self.revoke_new_quietly("権限が orchestration:read だけではない")
+            raise Fail(f"発行された権限が {SCOPE} だけではありません(受け取った権限の数: {len(scopes) if isinstance(scopes, list) else '?'})。token は使いません", EX_FAIL, "bad-scope")
+        if not isinstance(token, str) or not TOKEN_RE.fullmatch(token):
+            self.revoke_new_quietly("token の形式が不正")
+            raise Fail("発行された token の形式が不正です。使いません", EX_FAIL, "bad-token")
+        self.token = bytearray(token.encode("ascii") + b"\n")
+        secret = token.encode("ascii")
+        del token, issued
+
+        # 受取(token はパイプで流す)
+        self.save(stage="receive")
+        self.phase = "receiving"
+        recv_argv = [s.miharashi, "t3-token-receive", "--config", s.config, "--server", s.server_id, "--stdin", "--expect-environment-id", s.env_id]
+        rc, recv_out, recv_err = run(recv_argv, self.env, s.receive_timeout, self.token)
+        self.wipe()
+        # 表示用の短い理由(最後の診断行。先行する警告で目印が切れても本体を出す)。判定にはこの短縮を使わない
+        reason = diagnostic(recv_err, secret)
+        if rc is None:
+            # 置き換えの途中で止めた(token_file は旧か新のどちらか。原子的な置き換えなので壊れてはいない)
+            raise Fail("受取がタイムアウトしました。token_file が新旧どちらか不明なので、どちらのセッションも失効させません", EX_ATTENTION, "receive-timeout")
+        if rc < 0:
+            # シグナルで終了した(OOM kill・外部からの kill など)。置き換え(rename)のあとかもしれないので、
+            # 受取の標準エラーは見ずに結果不明として扱い、配置済みかもしれない新しい token を失効させない。
+            raise Fail(f"受取がシグナル {-rc} で終了しました。token_file が新旧どちらか不明なので、どちらのセッションも失効させません", EX_ATTENTION, "receive-signal")
+        if rc == RECV_INSTALLED_UNCHECKED or (rc == RECV_FAILED and INSTALLED_MARKER in recv_err):
+            self.phase = "installed"
+            raise Fail(f"token_file は新しい token に替わりましたが、置いた後の確認に失敗しました。失効させません: {reason}", EX_ATTENTION, "installed-unchecked")
+        if rc in (RECV_FAILED, RECV_USAGE):
+            # 置き換えの前に失敗: token_file は変わっていない
+            self.phase = "issued"
+            self.revoke_new_quietly("受取に失敗")
+            raise Fail(f"受取に失敗しました(古い token は有効なまま): {reason}", EX_FAIL, "receive-failed")
+        if rc != RECV_OK:
+            # 想定外の終了コード(panic の 101 など)。置き換えの前か後か分からない
+            raise Fail(f"受取が想定外の終了コード {rc} で終了しました。token_file が新旧どちらか不明なので、どちらのセッションも失効させません: {reason}", EX_ATTENTION, "receive-unknown")
+        self.phase = "installed"
+        log(f"token_file を新しい token に置き換えました(セッション {self.new_id})")
+        m = REVISION_RE.fullmatch(recv_out)
+        if not m:
+            # 古い受取ツールなど。稼働中の worker が配置した世代で取得できたかを観測できないので、失効させない
+            raise Fail("受取ツールが置いたファイルの世代を返しませんでした(古い miharashi?)。稼働中の worker での確認ができないので失効させません", EX_ATTENTION, "revision-unknown")
+        revision = m.group(1).decode("ascii")
+
+        # 事前の疎通確認: 実際の worker と同じコードの別プロセスで、置いた token_file から取得できる(失効の条件ではない)
+        self.save(stage="verify")
+        verify_argv = [s.miharashi, "agents-check", "--config", s.config, "--server", s.server_id,
+                       "--expect-environment", f"{s.server_id}={s.env_id}", "--timeout", str(s.verify_timeout)]
+        rc, out, err = run(verify_argv, self.env, s.verify_timeout + 30)
+        if rc != 0:
+            detail = one_line(out.splitlines()[-1] if out.strip() else err, secret)
+            raise Fail(f"worker による取得の確認に失敗しました。古いセッションは失効させません({detail})", EX_ATTENTION, "verify-failed")
+        self.phase = "verified"
+        log("worker と同じコードの別プロセスで、新しい token による取得に成功しました(事前の確認)")
+
+        # 失効の条件: 稼働中の worker が、配置した世代の token_file で取得に成功していること
+        self.save(stage="worker")
+        log(f"稼働中の worker が新しい世代で取得するのを管理 API で待ちます(最大 {s.worker_wait} 秒)")
+        self.wait_for_worker(revision)
+        self.phase = "worker-confirmed"
+        log("稼働中の worker が新しい token で取得に成功し、接続が正常なことを確かめました")
+
+        # 古いセッションの失効
+        self.save(stage="revoke")
+        try:
+            current = self.list_sessions()
+        except Fail as e:
+            raise Fail(f"{e} 古いセッションは失効させていません。次の実行で失効させます", EX_REVOKE_INCOMPLETE, "revoke-skipped")
+        ids = {x["sessionId"] for x in current}
+        if self.new_id not in ids:
+            raise Fail("今回作ったセッションが一覧にありません。古いセッションは失効させません", EX_ATTENTION, "new-session-missing")
+        old = [x["sessionId"] for x in self.mine(current) if x["sessionId"] != self.new_id and self.is_read_only_bearer(x)]
+        revoked, failed = [], []
+        for sid in old:
+            (revoked if self.revoke(sid) else failed).append(sid)
+        try:
+            left = [x["sessionId"] for x in self.mine(self.list_sessions()) if x["sessionId"] != self.new_id and self.is_read_only_bearer(x)]
+        except Fail:
+            left = failed or ["確認できず"]
+        self.save(revoked=revoked, remaining_old=left)
+        log(f"古いセッションを {len(revoked)} 件失効させました(ラベル {s.label})")
+        if left:
+            raise Fail(f"古いセッションが {len(left)} 件残っています。新しい token は有効で、次の実行で再試行します", EX_REVOKE_INCOMPLETE, "revoke-incomplete")
+        return EX_OK
+
+    def cleanup_orphans(self, before_ids: set[str]) -> bool:
+        """発行の応答を受け取れなかったとき、T3 に作られたかもしれない同じラベルの新しいセッションを失効させる。
+        戻りは後始末が済んだか。済まなかった(一覧を取れない・失効に失敗)ときは、残存の可能性を状態に残す。"""
+        left: list[str] = []
+        listed = True
+        try:
+            for x in self.mine(self.list_sessions()):
+                if x["sessionId"] not in before_ids and self.is_read_only_bearer(x):
+                    if self.revoke(x["sessionId"]):
+                        log(f"応答を受け取れなかった発行のセッション {x['sessionId']} を失効させました")
+                    else:
+                        left.append(x["sessionId"])
+        except Fail as e:
+            listed = False
+            log(f"発行の後始末の一覧を取れませんでした: {e}。次の実行が同じラベルの残りを失効させます")
+        if listed and not left:
+            return True
+        # 残っているかもしれない(確認できない・失効に失敗)。次の実行が同じラベルの残りをまとめて失効させる
+        self.save(cleanup_pending=True, remaining_old=left or ["確認できず"])
+        return False
+
+    def abort_cleanup(self) -> None:
+        # 後始末の最中に再度シグナルを受けても中断されない(systemd の SIGKILL までが期限)
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)
+        try:
+            if self.phase == "issuing":
+                # 発行コマンドの実行中に中断された。T3 側ではセッションが作られているかもしれない(応答喪失と同じ)
+                self.cleanup_orphans(self.before_ids)
+            elif self.phase == "issued":
+                self.revoke_new_quietly("中断")
+        finally:
+            self.wipe()
+
+
+# ---------------------------------------------------------------- 入口
+
+
+def lock_state(settings: Settings):
+    os.makedirs(settings.state_dir, mode=0o700, exist_ok=True)
+    os.chmod(settings.state_dir, 0o700)
+    fd = os.open(os.path.join(settings.state_dir, f"{settings.server_id}.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        os.close(fd)
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            return None
+        raise
+    return fd
+
+
+def describe(settings: Settings) -> None:
+    log(f"接続 {settings.server_id}: コンテナ {settings.remote}:{settings.container}(ユーザー {settings.user}、{settings.mode})、ラベル {settings.label}")
+    log(f"稼働中の worker の観測: 管理 API {settings.admin_scheme}://{settings.admin_host}:{settings.admin_port}(管理トークン {settings.admin_token_file}。値は表示しません)、最大 {settings.worker_wait} 秒")
+    log("コンテナ内の実行例: " + shlex.join(settings.remote_argv(["auth", "session", "list", "--json"])))
+
+
+def main(argv: list[str], env: dict[str, str]) -> int:
+    os.umask(0o077)
+    mode = argv[0] if argv else "run"
+    if mode not in ("run", "--check-config", "--status"):
+        print(f"使い方: {NAME} [--check-config | --status]", file=sys.stderr)
+        return EX_CONFIG
+    try:
+        settings = Settings(env)
+    except Fail as e:
+        print(f"{NAME}: {e}", file=sys.stderr)
+        return e.code
+    if mode == "--check-config":
+        describe(settings)
+        return EX_OK
+    if mode == "--status":
+        path = os.path.join(settings.state_dir, f"{settings.server_id}.state.json")
+        try:
+            with open(path) as f:
+                print(f.read())
+            return EX_OK
+        except OSError:
+            print(f"{NAME}: 状態がまだありません({settings.server_id})", file=sys.stderr)
+            return EX_FAIL
+
+    try:
+        lock_fd = lock_state(settings)
+    except OSError as e:
+        print(f"{NAME}: 状態ディレクトリを使えません: {e.strerror}", file=sys.stderr)
+        return EX_CONFIG
+    if lock_fd is None:
+        log(f"接続 {settings.server_id} の別の実行が動いています。何もしません")
+        return EX_BUSY
+
+    rotation = Rotation(settings)
+
+    def on_signal(signum, _frame):
+        raise Interrupted(signal.Signals(signum).name)
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGHUP, on_signal)
+    code = EX_FAIL
+    try:
+        code = rotation.execute()
+        rotation.save(result="ok", exit_code=code, finished_at=now(), stage="done", detail="")
+        log("完了しました")
+    except Fail as e:
+        code = e.code
+        log(f"失敗({e.kind}): {e}")
+        rotation.save(result=e.kind, exit_code=code, finished_at=now(), detail=str(e)[:300])
+    except Interrupted as e:
+        # 受取に渡したあと(token_file が新しい token に替わったかもしれない)の中断は、確認が終わっていない状態(3)
+        code = EX_ATTENTION if rotation.phase in ("receiving", "installed", "verified", "worker-confirmed") else EX_FAIL
+        log(f"中断されました({e})")
+        rotation.abort_cleanup()
+        rotation.save(result="interrupted", exit_code=code, finished_at=now(), detail=f"{e} で中断(stage={rotation.state['stage']}、phase={rotation.phase})")
+    except Exception as e:  # 想定外。値は出さず、種類だけ残す
+        code = EX_FAIL
+        log(f"想定外の失敗: {type(e).__name__}")
+        rotation.abort_cleanup()
+        rotation.save(result="error", exit_code=code, finished_at=now(), detail=type(e).__name__)
+    finally:
+        rotation.wipe()
+        os.close(lock_fd)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:], dict(os.environ)))

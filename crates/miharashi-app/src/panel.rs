@@ -26,6 +26,7 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 mod admin;
 mod feeds;
+mod rotation;
 
 /// `/api/v1/status` の形を変えたら上げる。パネルはこれを見て古い形を読み分ける。
 const SCHEMA_VERSION: u32 = 1;
@@ -168,12 +169,16 @@ pub enum FeedState {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct FeedReport {
-    pub id: &'static str,
-    pub label: &'static str,
+    pub id: String,
+    pub label: String,
     pub state: FeedState,
     /// 最後に成功した時刻(RFC3339)
     pub last_ok: Option<String>,
     pub error: Option<String>,
+    /// T3 の接続だけ: 最後に取得に成功したときに worker が使った token_file の世代(秘密を含まない)。
+    /// 配送役が、新しく配置した世代で稼働中の worker が取得できたことを確かめるのに使う。他の取得元では出ない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_revision: Option<String>,
 }
 
 /// トークンファイルの状態(管理ページの `tokens[].state`)。
@@ -185,6 +190,12 @@ pub enum TokenState {
     Unreadable,
     WrongOwner,
     LoosePermissions,
+    /// T3 の token ファイルがシンボリックリンク(リンクは追跡しない)
+    Symlink,
+    /// T3 の token ファイルが通常のファイルではない(FIFO・デバイスなど)
+    NotRegular,
+    /// T3 の token ファイルの形式が不正(空・複数行・空白や非 ASCII を含む・大きすぎる)
+    BadFormat,
 }
 
 /// 取得スレッドの状態への参照。`Err` = その取得が動いていない(理由。`feeds[].error` に出る)。
@@ -199,7 +210,8 @@ pub struct AdminSources {
     /// 警報。room 画面とは無関係(`[alerts] disaster` と HA の url で決まる)
     pub disaster: Source<crate::disaster::HomeShared>,
     pub aircraft: Source<crate::aircraft::HealthShared>,
-    pub agents: Source<crate::agents::Shared>,
+    /// 接続(`primary` と `extra_servers`)ごとの取得状態。
+    pub agents: Source<Vec<crate::agents::Connection>>,
 }
 
 impl Default for AdminSources {

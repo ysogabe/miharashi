@@ -1,0 +1,32 @@
+[Unit]
+Description=Miharashi: renew the read-only token of the extra T3 server "%i" (container)
+Documentation=https://github.com/ysogabe/miharashi/blob/main/docs/t3-agent-multi-server/token-delivery.md
+# テンプレート(インスタンス名 = 設定の [[agents.extra_servers]] の id)。既存の miharashi-t3-token(primary 用)とは別物で、
+# primary の token・ラベル・セッションには触れない。導入していない。導入の手順: token-delivery.md「配送役の導入」。
+# 手で動かす: systemctl start miharashi-t3-remote-token@<id> / 結果: journalctl -u miharashi-t3-remote-token@<id>
+#   前回の結果: miharashi-t3-remote-token --status(環境変数は EnvironmentFile と同じ)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# キオスクの実行ユーザーと同じ一般ユーザー(受取ツールが置く token_file を miharashi の worker が読むため、所有者が同じである必要がある)。
+# このユーザーの既存の LXC クライアント設定(~/.config/lxc)を使う。キオスクのプロセスには何も追加しない。
+User=@USER@
+# 接続ごとの設定(秘密は入れない。例: miharashi-t3-remote-token.env.example)。root:<実行ユーザーのグループ> 0640 を推奨。
+EnvironmentFile=/etc/miharashi/t3-remote-token/%i.env
+Environment=T3R_SERVER_ID=%i
+ExecStart=@BINDIR@/miharashi-t3-remote-token
+# 状態ファイル(秘密なし)とロック。T3R_STATE_DIR が無ければ systemd が渡す STATE_DIRECTORY を使う。
+StateDirectory=miharashi-t3-remote-token
+StateDirectoryMode=0700
+# 排他・発行・確認・稼働中の worker の観測待ち(T3R_WORKER_WAIT。既定 600 秒)・失効の合計より十分長く。超えたら止め、
+# 発行の途中・受取の前なら今回の新しいセッションを失効させる(受取に渡したあとは新旧とも失効させない)。
+TimeoutStartSec=25min
+KillMode=mixed
+TimeoutStopSec=60
+
+# lxc クライアントが ~/.config/lxc(証明書)を読むので ProtectHome は使わない。/usr・/etc などは読み取りだけにする。
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes

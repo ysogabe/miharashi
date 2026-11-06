@@ -51,8 +51,8 @@ pub struct World {
     /// 実測値と時刻(日付・時刻は 1 秒ごとに ScreenManager が設定する)
     pub system: Snapshot,
     pub photo_feed: FeedState,
-    /// T3 Agent 一覧。AgentProvider が更新し、画面は読むだけ。
-    pub agents: crate::agents::AgentSnapshot,
+    /// T3 Agent 一覧。接続(`primary` と `extra_servers`)ごとに 1 要素。AgentProvider が更新し、画面は読むだけ。
+    pub agents: Vec<crate::agents::ServerSnapshot>,
     /// 今の壁時計。ScreenManager が毎周期書く(`png` の fixture と動画の書き出しでは固定・仮想の時刻)。
     /// 画面は `Local::now()` を直接読まず、これを読む(None は ScreenManager を通さない試験だけ)。
     pub wall: Option<chrono::DateTime<chrono::Local>>,

@@ -2,6 +2,7 @@
 //! `bench`(CPU 描画のベースライン)、`bench-gpu`(重い描画の GPU ベンチマーク)。
 mod agent_demo;
 mod agents;
+mod agents_check;
 mod aircraft;
 mod album;
 mod app;
@@ -21,6 +22,8 @@ mod runtime;
 mod scene_check;
 mod screen;
 mod screen_power;
+mod token_file;
+mod token_receive;
 mod video;
 mod weather;
 
@@ -471,7 +474,7 @@ fn png_with(cli: Cli, open: &OpenGles) -> Result<(), String> {
         vrm_gles_fixtures(check, &cfg, &cli, size, &out, fixture_wall())?;
     }
     println!(
-        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,room,room-offline,room-empty,refresh-glitch,refresh-return,scene-notice,agents-overview,agents-busy,agents-new-*,agents-changed-*,agents-stale,agents-empty}}.png ({}x{})",
+        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,room,room-offline,room-empty,refresh-glitch,refresh-return,scene-notice,agents-overview,agents-busy,agents-new-*,agents-changed-*,agents-stale,agents-empty,agents-multi-two,agents-multi-stale,agents-multi-four}}.png ({}x{})",
         out.display(),
         size.0,
         size.1
@@ -640,7 +643,7 @@ fn vrm_gles_fixtures(
     struct Feed(std::rc::Rc<std::cell::RefCell<agents::AgentSnapshot>>);
     impl Provider for Feed {
         fn update(&mut self, world: &mut World) {
-            world.agents = self.0.borrow().clone();
+            world.agents = agents::ServerSnapshot::primary(self.0.borrow().clone());
         }
     }
 
@@ -1089,6 +1092,14 @@ fn main() -> Result<(), String> {
     // config-get は最初の引数がキー(位置引数)
     let key = (cmd == "config-get" && rest.first().is_some_and(|k| !k.starts_with("--")))
         .then(|| rest.remove(0));
+    // 受取ツールは専用の引数を取る(parse_cli に通さない)。終了コードは 0 / 1(受け取りの失敗)/ 2(使い方)
+    if cmd == "t3-token-receive" {
+        std::process::exit(token_receive::run(rest));
+    }
+    // 診断用: 画面を使わず、実際の worker で T3 への接続だけを確かめる(専用の引数。終了コード 0 / 1 / 2)
+    if cmd == "agents-check" {
+        std::process::exit(agents_check::run(rest));
+    }
     let cli = parse_cli(rest)?;
     match cmd.as_str() {
         "run" => run(cli),
@@ -1130,7 +1141,7 @@ fn main() -> Result<(), String> {
             }
         }
         other => Err(format!(
-            "unknown command {other}(run / png / agents-demo / demo-video / intro-video / agents-intro-video / bench / bench-gpu / bench-scene / bench-metrics / kms-info / check-config / config-get)"
+            "unknown command {other}(run / png / agents-demo / demo-video / intro-video / agents-intro-video / bench / bench-gpu / bench-scene / bench-metrics / kms-info / check-config / config-get / t3-token-receive / agents-check)"
         )),
     }
 }
@@ -1324,6 +1335,28 @@ mod tests {
             std::fs::write(dir.join("admin.toml"), o).unwrap();
         }
         (dir, base)
+    }
+
+    /// 複数 T3 Server(agents.extra_servers)の設定があっても、config-get は従来どおり primary の url / token_file を返す。
+    /// 追加先のキーは持たない(トークン更新スクリプトが追加先を取り違えない)。
+    #[test]
+    fn config_get_keeps_returning_primary_with_extra_servers() {
+        let base_text = "[agents]\nurl = \"http://192.0.2.30:3773\"\ntoken_file = \"/var/lib/miharashi/t3-agent.token\"\n\n[[agents.extra_servers]]\nid = \"container\"\nurl = \"http://192.0.2.31:3773\"\ntoken_file = \"/var/lib/miharashi/t3-container.token\"\n";
+        let (_dir, base) = config_dir("extra-servers", base_text, None);
+        assert_eq!(
+            config_get(Some(&base), "agents.url"),
+            Ok("http://192.0.2.30:3773".to_string())
+        );
+        assert_eq!(
+            config_get(Some(&base), "agents.token_file"),
+            Ok("/var/lib/miharashi/t3-agent.token".to_string())
+        );
+        for key in ["agents.extra_servers", "agents.extra_servers.url"] {
+            assert!(matches!(
+                config_get(Some(&base), key),
+                Err(ConfigGetError::UnknownKey(_))
+            ));
+        }
     }
 
     /// AC17: config-get は起動時と同じ規則の値を出す。印には触らない。

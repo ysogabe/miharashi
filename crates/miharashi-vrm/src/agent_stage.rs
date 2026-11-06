@@ -503,6 +503,7 @@ impl AgentStage {
             badge: None,
             compact,
             one_line: false,
+            server: None,
         }
     }
 

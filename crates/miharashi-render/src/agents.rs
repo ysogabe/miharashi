@@ -86,6 +86,9 @@ pub struct AgentCardContent {
     /// title, and age. The surface height is the row height (`ROW_BASE_HEIGHT`
     /// at text scale 1.0), so the caller chooses it by sizing the surface.
     pub one_line: bool,
+    /// 複数の接続を監視しているときの、接続の短い目印(設定順の番号)。`None` なら従来どおり何も足さない。
+    /// どのカードの種類(通常・重なった帯・1 行)でも、状態と経過時間より先に幅を確保して必ず描く。
+    pub server: Option<String>,
 }
 
 /// Destination bounds in screen pixels. The center is kept stable by the
@@ -186,26 +189,24 @@ pub fn render_card(content: &AgentCardContent, size: (u32, u32), text: &mut Text
     let inner = (right - left).max(20.0);
     let top = 12.0 * s;
     let label = content.state.label();
-    let row = 23.0 * s;
-    let age = content.age.as_deref().unwrap_or("");
-    let age_w = if age.is_empty() {
-        0.0
-    } else {
-        text.measure(age, row)
-    };
-    if !age.is_empty() {
-        text.draw_right(&mut canvas, age, right, top, row, muted);
+    let top_row = card_top_row(text, content, left, right, s);
+    let row = top_row.size;
+    if let Some(span) = top_row.age
+        && let Some(age) = content.age.as_deref()
+    {
+        text.draw_right(&mut canvas, age, span.x + span.w, top, row, muted);
     }
-    let mut x = left;
-    if !content.project.is_empty() {
-        let room = (inner - age_w - text.measure(label, row) - 40.0 * s).max(40.0);
-        let project = fit_text(text, &content.project, row, room);
-        text.draw(&mut canvas, &project, x, top, row, muted);
-        x += text.measure(&project, row) + 16.0 * s;
+    if let (Some(span), Some(tag)) = (top_row.tag, content.server.as_deref()) {
+        text.draw(&mut canvas, tag, span.x, top, row, bright);
     }
+    if let Some((span, project)) = &top_row.project {
+        text.draw(&mut canvas, project, span.x, top, row, muted);
+    }
+    let x = top_row.state.x;
     text.draw(&mut canvas, label, x, top, row, state_color);
     if content.compact {
-        let start = x + text.measure(label, row) + 18.0 * s;
+        let start = x + top_row.state.w + 18.0 * s;
+        let age_w = top_row.age.map_or(0.0, |a| a.w);
         let room = right - age_w - 14.0 * s - start;
         if room > 24.0 {
             let title = fit_text(text, &content.title, 24.0 * s, room);
@@ -318,28 +319,185 @@ fn render_row(content: &AgentCardContent, mut pix: Pixmap, text: &mut TextEngine
     let size = 21.0 * s;
     let top = (hf - size * 1.3) / 2.0;
     let left = 14.0 * s;
-    let right = wf - 14.0 * s;
     canvas.fill_circle(
         left + 5.0 * s,
         hf / 2.0,
         5.0 * s,
         Color::from_rgba8(cr, cg, cb, 255),
     );
-    let age = content.age.as_deref().unwrap_or("");
-    let age_w = if age.is_empty() {
-        0.0
-    } else {
-        let w = text.measure(age, size * 0.9);
-        text.draw_right(&mut canvas, age, right, top, size * 0.9, muted);
-        w
-    };
-    let start = left + 20.0 * s;
-    let room = right - age_w - 12.0 * s - start;
-    if room > 24.0 {
-        let title = fit_text(text, &content.title, size, room);
-        text.draw(&mut canvas, &title, start, top, size, bright);
+    let row = card_row(text, content, (wf, hf));
+    if let (Some(span), Some(age)) = (row.age, content.age.as_deref()) {
+        text.draw_right(&mut canvas, age, span.x + span.w, top, size * 0.9, muted);
+    }
+    if let (Some(span), Some(tag)) = (row.tag, content.server.as_deref()) {
+        text.draw(&mut canvas, tag, span.x, top, size, bright);
+    }
+    if row.title_room > 24.0 {
+        let title = fit_text(text, &content.title, size, row.title_room);
+        text.draw(&mut canvas, &title, row.title_x, top, size, bright);
     }
     canvas.pixmap
+}
+
+/// 横方向の範囲(左端と幅)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Span {
+    pub x: f32,
+    pub w: f32,
+}
+
+impl Span {
+    pub fn end(self) -> f32 {
+        self.x + self.w
+    }
+}
+
+/// 通常のカード・重なった帯の 1 行目(接続の目印 / 接続名・プロジェクト / 状態 / 経過時間)の並び。
+#[derive(Clone, Debug, PartialEq)]
+pub struct TopRow {
+    /// 状態・目印・経過時間の文字の大きさ。幅が足りないときだけ小さくする。
+    pub size: f32,
+    pub tag: Option<Span>,
+    /// 接続名・プロジェクトの文字(幅に収まるよう省略したもの)。足りなければ None(目印だけを残す)。
+    pub project: Option<(Span, String)>,
+    pub state: Span,
+    /// 幅が足りなくなったときは、経過時間より先に目印と状態を残す。
+    pub age: Option<Span>,
+}
+
+/// 1 行目の並びを実測で決める。`server` が None のときは、接続の目印を足す前の並びと同じ。
+pub fn card_top_row(
+    text: &mut TextEngine,
+    content: &AgentCardContent,
+    left: f32,
+    right: f32,
+    s: f32,
+) -> TopRow {
+    let inner = (right - left).max(20.0);
+    let label = content.state.label();
+    let age = content.age.as_deref().filter(|a| !a.is_empty());
+    let mut size = 23.0 * s;
+    let Some(tag) = content.server.as_deref().filter(|t| !t.is_empty()) else {
+        // 接続の目印がない(1 台だけの表示): 従来の並び。
+        let age_w = age.map_or(0.0, |a| text.measure(a, size));
+        let label_w = text.measure(label, size);
+        let mut x = left;
+        let mut project = None;
+        if !content.project.is_empty() {
+            let room = inner - age_w - label_w - 40.0 * s;
+            // 幅が足りないカード(列が多い盤面)では、状態と経過時間を優先して名前を省く(重ねて描かない)。
+            if room >= 56.0 * s {
+                let shown = fit_text(text, &content.project, size, room);
+                let w = text.measure(&shown, size);
+                project = Some((Span { x, w }, shown));
+                x += w + 16.0 * s;
+            }
+        }
+        return TopRow {
+            size,
+            tag: None,
+            project,
+            state: Span { x, w: label_w },
+            age: age.map(|_| Span {
+                x: right - age_w,
+                w: age_w,
+            }),
+        };
+    };
+    // 目印・状態・経過時間が収まらないときは、まず文字を小さくし(下限 0.6 倍)、それでも足りなければ経過時間を省く。
+    let floor = size * 0.6;
+    let gap = 10.0 * s;
+    let before_age = 14.0 * s;
+    let mut with_age = age.is_some();
+    let (tag_w, label_w, age_w) = loop {
+        let tag_w = text.measure(tag, size);
+        let label_w = text.measure(label, size);
+        let age_w = match (with_age, age) {
+            (true, Some(a)) => text.measure(a, size),
+            _ => 0.0,
+        };
+        let need = tag_w + gap + label_w + if with_age { before_age + age_w } else { 0.0 };
+        if need <= inner {
+            break (tag_w, label_w, age_w);
+        }
+        if size > floor {
+            size = (size * 0.92).max(floor);
+        } else if with_age {
+            with_age = false;
+        } else {
+            break (tag_w, label_w, age_w);
+        }
+    };
+    let tag_span = Span { x: left, w: tag_w };
+    let mut x = left + tag_w + gap;
+    let need = tag_w + gap + label_w + if with_age { before_age + age_w } else { 0.0 };
+    let mut project = None;
+    if !content.project.is_empty() {
+        let room = inner - need - 20.0 * s;
+        if room >= 56.0 * s {
+            let shown = fit_text(text, &content.project, size, room);
+            let w = text.measure(&shown, size);
+            project = Some((Span { x, w }, shown));
+            x += w + 16.0 * s;
+        }
+    }
+    TopRow {
+        size,
+        tag: Some(tag_span),
+        project,
+        state: Span { x, w: label_w },
+        age: with_age.then_some(Span {
+            x: right - age_w,
+            w: age_w,
+        }),
+    }
+}
+
+/// 1 行のカードの並び(状態の点 / 接続の目印 / 題名 / 経過時間)。
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowLayout {
+    pub tag: Option<Span>,
+    pub title_x: f32,
+    /// 題名に使える幅(24 以下なら題名は描かない)。
+    pub title_room: f32,
+    pub age: Option<Span>,
+}
+
+/// 1 行のカード(`one_line`)の並びを実測で決める。
+pub fn card_row(text: &mut TextEngine, content: &AgentCardContent, size: (f32, f32)) -> RowLayout {
+    let (wf, hf) = size;
+    let s = (hf / ROW_BASE_HEIGHT).clamp(0.6, MAX_TEXT_SCALE);
+    let font = 21.0 * s;
+    let left = 14.0 * s;
+    let right = wf - 14.0 * s;
+    let start = left + 20.0 * s;
+    let tag_w = content
+        .server
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .map(|t| text.measure(t, font));
+    let mut age = content
+        .age
+        .as_deref()
+        .filter(|a| !a.is_empty())
+        .map(|a| text.measure(a, font * 0.9));
+    // 目印は残す。収まらないときだけ経過時間を省く。
+    if let (Some(tw), Some(aw)) = (tag_w, age)
+        && start + tw + 8.0 * s + aw + 12.0 * s > right
+    {
+        age = None;
+    }
+    let age_w = age.unwrap_or(0.0);
+    let (tag, title_x) = match tag_w {
+        Some(w) => (Some(Span { x: start, w }), start + w + 8.0 * s),
+        None => (None, start),
+    };
+    RowLayout {
+        tag,
+        title_x,
+        title_room: right - age_w - 12.0 * s - title_x,
+        age: age.map(|w| Span { x: right - w, w }),
+    }
 }
 
 /// A 1x1 premultiplied pixel. Scaled to any rectangle, it is a flat fill, so the
@@ -573,6 +731,7 @@ mod tests {
             badge: Some("状態が変わりました".into()),
             compact: false,
             one_line: false,
+            server: None,
         };
         let card = Arc::new(render_card(&content, (600, 300), &mut text));
         let tall = render_card(&content, (480, 700), &mut text);
@@ -635,6 +794,176 @@ mod tests {
             assert_ne!(&frame.data()[offset..offset + 3], &[8, 12, 20]);
             let path = std::env::temp_dir().join(name);
             frame.save_png(&path).unwrap();
+        }
+    }
+
+    fn sample(
+        server: Option<&str>,
+        project: &str,
+        state: AgentState,
+        age: &str,
+    ) -> AgentCardContent {
+        AgentCardContent {
+            project: project.into(),
+            title: "接続名の識別を確かめる長い題名のスレッド".into(),
+            state,
+            detail: "手元の T3 で承認".into(),
+            provider_model: Some("Codex · 選択モデル".into()),
+            age: Some(age.into()),
+            progress: None,
+            badge: None,
+            compact: false,
+            one_line: false,
+            server: server.map(str::to_string),
+        }
+    }
+
+    fn assert_disjoint(spans: &[(&str, Span)], right: f32, what: &str) {
+        let mut v: Vec<&(&str, Span)> = spans.iter().collect();
+        v.sort_by(|a, b| a.1.x.total_cmp(&b.1.x));
+        for pair in v.windows(2) {
+            assert!(
+                pair[0].1.end() <= pair[1].1.x + 0.01,
+                "{what}: {} ({:?}) overlaps {} ({:?})",
+                pair[0].0,
+                pair[0].1,
+                pair[1].0,
+                pair[1].1
+            );
+        }
+        for (name, sp) in spans {
+            assert!(sp.end() <= right + 0.01, "{what}: {name} {sp:?} > {right}");
+        }
+    }
+
+    /// 接続の目印があるカードの 1 行目は、最小幅から広い幅まで、目印・接続名・状態・経過時間が重ならず、
+    /// 目印と状態は必ず残る。目印がないときは従来の並び(目印なし・状態は左端)。
+    #[test]
+    fn top_row_keeps_tag_and_state_and_never_overlaps() {
+        let mut text = TextEngine::new("Noto Sans CJK JP");
+        let long = "とても長い接続名の接続とても長い接続名の接続とても / 日本語プロジェクト";
+        for state in [AgentState::Input, AgentState::Approval, AgentState::Running] {
+            for age in ["1分未満", "12時間"] {
+                // 通常のカードの最小幅 (380 * 0.6) から、広い列まで。
+                for w in [228.0f32, 260.0, 300.0, 380.0, 440.0, 600.0, 880.0] {
+                    let s = (w / BASE_CARD_WIDTH).clamp(0.6, MAX_TEXT_SCALE);
+                    let (left, right) = (26.0 * s, w - 22.0 * s);
+                    for project in ["", long, "コンテナ"] {
+                        let c = sample(Some("②"), project, state, age);
+                        let row = card_top_row(&mut text, &c, left, right, s);
+                        let tag = row.tag.expect("the tag is always kept");
+                        assert!(tag.w > 1.0);
+                        assert!(row.state.w > 1.0);
+                        let mut spans = vec![("tag", tag), ("state", row.state)];
+                        if let Some((sp, shown)) = &row.project {
+                            assert!(!shown.is_empty());
+                            spans.push(("project", *sp));
+                        }
+                        if let Some(a) = row.age {
+                            spans.push(("age", a));
+                        }
+                        assert_disjoint(&spans, right, &format!("w={w} {project} {age}"));
+                        assert!(tag.x >= left - 0.01);
+                        // 経過時間を省くのは、目印と状態だけでも足りないほど狭いときだけ。
+                        if row.age.is_none() {
+                            let need = tag.w + 10.0 * s + row.state.w;
+                            assert!(need > (right - left) * 0.5, "w={w}");
+                        }
+                    }
+                }
+            }
+        }
+        // 十分に広ければ接続名も出る。
+        let s = 1.0;
+        let c = sample(Some("②"), "コンテナ", AgentState::Approval, "3分");
+        let wide = card_top_row(&mut text, &c, 26.0 * s, 440.0 - 22.0 * s, s);
+        assert_eq!(
+            wide.project.as_ref().map(|(_, t)| t.as_str()),
+            Some("コンテナ")
+        );
+        // 目印がないときは従来どおり(目印なし、接続名がなければ状態が左端)。
+        let c = sample(None, "", AgentState::Approval, "3分");
+        let legacy = card_top_row(&mut text, &c, 26.0, 418.0, 1.0);
+        assert!(legacy.tag.is_none() && legacy.project.is_none());
+        assert_eq!(legacy.state.x, 26.0);
+        assert_eq!(legacy.size, 23.0);
+    }
+
+    /// 1 行のカードも、目印を題名・経過時間より先に確保して重ならない。
+    #[test]
+    fn one_line_row_keeps_the_tag_and_never_overlaps() {
+        let mut text = TextEngine::new("Noto Sans CJK JP");
+        for w in [150.0f32, 200.0, 228.0, 300.0, 440.0, 800.0] {
+            for age in ["1分未満", "12時間"] {
+                let mut c = sample(Some("④"), "", AgentState::Running, age);
+                c.one_line = true;
+                let layout = card_row(&mut text, &c, (w, ROW_BASE_HEIGHT));
+                let tag = layout.tag.expect("the tag is kept");
+                let mut spans = vec![("tag", tag)];
+                if let Some(a) = layout.age {
+                    spans.push(("age", a));
+                }
+                if layout.title_room > 24.0 {
+                    spans.push((
+                        "title",
+                        Span {
+                            x: layout.title_x,
+                            w: layout.title_room,
+                        },
+                    ));
+                }
+                assert_disjoint(&spans, w, &format!("row w={w} {age}"));
+            }
+        }
+    }
+
+    fn ink(p: &Pixmap, x0: u32, x1: u32, y0: u32, y1: u32) -> usize {
+        (y0..y1.min(p.height()))
+            .flat_map(|y| (x0..x1.min(p.width())).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let d = &p.data()[((y * p.width() + x) * 4) as usize..][..3];
+                d[0] > 150 && d[1] > 150 && d[2] > 150
+            })
+            .count()
+    }
+
+    /// 目印は実際に描かれ(明るい字の画素が増える)、通常・帯・1 行のどれでも、目印の範囲に字が入る。
+    #[test]
+    fn the_tag_is_drawn_on_every_card_mode() {
+        let mut text = TextEngine::new("Noto Sans CJK JP");
+        for (label, compact, one_line, size) in [
+            ("full", false, false, (300u32, 210u32)),
+            ("strip", true, false, (300, 58)),
+            ("row", false, true, (300, 38)),
+        ] {
+            let mut c = sample(Some("③"), "", AgentState::Approval, "3分");
+            c.compact = compact;
+            c.one_line = one_line;
+            let with = render_card(&c, size, &mut text);
+            c.server = None;
+            let without = render_card(&c, size, &mut text);
+            let (span, s) = if one_line {
+                let l = card_row(
+                    &mut text,
+                    &sample(Some("③"), "", AgentState::Approval, "3分"),
+                    (size.0 as f32, size.1 as f32),
+                );
+                (l.tag.unwrap(), 1.0)
+            } else {
+                let s = (size.0 as f32 / BASE_CARD_WIDTH).clamp(0.6, MAX_TEXT_SCALE);
+                let mut c = sample(Some("③"), "", AgentState::Approval, "3分");
+                c.compact = compact;
+                let t = card_top_row(&mut text, &c, 26.0 * s, size.0 as f32 - 22.0 * s, s);
+                (t.tag.unwrap(), s)
+            };
+            let _ = s;
+            let (x0, x1) = (span.x.floor() as u32, span.end().ceil() as u32 + 1);
+            let tagged_ink = ink(&with, x0, x1, 0, size.1.min(60));
+            assert!(tagged_ink > 15, "{label}: the tag is inked: {tagged_ink}");
+            if !one_line {
+                // 目印がないときは、同じ範囲に状態の字が来る(目印の分だけ右へ動く)。
+                assert_ne!(with.data(), without.data(), "{label}");
+            }
         }
     }
 }

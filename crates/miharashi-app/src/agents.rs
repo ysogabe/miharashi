@@ -5,9 +5,7 @@ use crate::screen::{Provider, World};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs;
 use std::net::IpAddr;
-use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -20,7 +18,33 @@ const CHANGE_LIMIT: usize = 64;
 const PROTOCOL_VERSION: u64 = 2;
 const PROTOCOL_HEADER: &str = "x-t3-orchestration-protocol";
 
+/// 1 接続の取得結果。接続ごとに worker が 1 本あり、それぞれが自分の `Shared` だけを書く。
 pub type Shared = Arc<RwLock<AgentSnapshot>>;
+
+/// 設定上の安定した接続の識別子(`primary` と `[[agents.extra_servers]]` の `id`)。
+pub type ServerId = Arc<str>;
+
+/// スレッドの識別。T3 の thread id は接続の中でだけ一意なので、接続の識別子と組にして構造的に持つ
+/// (文字列を連結して 1 本の ID にはしない)。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ThreadKey {
+    pub server: ServerId,
+    pub thread: String,
+}
+
+/// プロジェクトの識別。project id も接続の中でだけ一意。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProjectKey {
+    pub server: ServerId,
+    pub project: String,
+}
+
+/// 変更通知の識別。`AgentChange::id` は接続ごとの連番なので、カーソルの比較は同じ接続の中だけで行う。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ChangeKey {
+    pub server: ServerId,
+    pub id: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentConnection {
@@ -64,6 +88,8 @@ pub enum AgentChangeKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AgentEntry {
+    /// このスレッドを持つ接続。worker が取得時に付ける(画面は ServerSnapshot の接続で付け直す)。
+    pub server_id: ServerId,
     pub thread_id: String,
     pub project_id: String,
     pub project_title: String,
@@ -99,8 +125,31 @@ pub struct AgentEntry {
     pub parent_title: Option<String>,
 }
 
+impl AgentEntry {
+    pub fn key(&self) -> ThreadKey {
+        ThreadKey {
+            server: self.server_id.clone(),
+            thread: self.thread_id.clone(),
+        }
+    }
+    pub fn project_key(&self) -> ProjectKey {
+        ProjectKey {
+            server: self.server_id.clone(),
+            project: self.project_id.clone(),
+        }
+    }
+    /// 親スレッド。親子は同じ接続の中だけで結ぶ。
+    pub fn parent_key(&self) -> Option<ThreadKey> {
+        self.parent_thread_id.as_ref().map(|parent| ThreadKey {
+            server: self.server_id.clone(),
+            thread: parent.clone(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentChange {
+    pub server_id: ServerId,
     pub id: u64,
     pub thread_id: String,
     pub kind: AgentChangeKind,
@@ -113,6 +162,8 @@ pub struct AgentChange {
     pub observed_at: SystemTime,
 }
 
+/// 1 接続ぶんの取得結果。sequence / cursor / generation / last_success / error は接続ごとに持ち、
+/// 全体の stale や合成した sequence は作らない。
 #[derive(Debug, Clone, Default)]
 pub struct AgentSnapshot {
     pub environment_id: Option<String>,
@@ -123,6 +174,10 @@ pub struct AgentSnapshot {
     pub entries: Arc<[AgentEntry]>,
     pub changes: Arc<[AgentChange]>,
     pub connection: AgentConnection,
+    /// 最後に取得に成功したときに使った token_file の世代(秘密を含まない。`token_file::revision`)。
+    /// 失敗では更新しない。配送役が管理 API(`feeds[].token_revision`)でこれを読み、新しく配置した世代で
+    /// 稼働中の worker が取得できたことを確かめてから古いセッションを失効させる。
+    pub token_revision: Option<String>,
     pub last_success: Option<SystemTime>,
     pub last_success_mono: Option<Instant>,
     pub change_cursor: u64,
@@ -131,38 +186,161 @@ pub struct AgentSnapshot {
     pub error_summary: Option<String>,
 }
 
-pub struct AgentProvider(Shared);
+/// World に載せる 1 接続ぶん。接続は設定の順(`primary` が先頭)に並ぶ。
+#[derive(Debug, Clone, Default)]
+pub struct ServerSnapshot {
+    pub server_id: ServerId,
+    /// 画面に出す名前(設定の label。descriptor 由来の名前は識別に使わない)。
+    pub label: String,
+    /// 同じ environment_id が別の接続からも返っている(重複接続。自動では統合しない)。
+    pub duplicate_environment: bool,
+    pub snapshot: AgentSnapshot,
+}
+
+impl ServerSnapshot {
+    pub fn new(server_id: &str, label: &str, snapshot: AgentSnapshot) -> Self {
+        Self {
+            server_id: server_id.into(),
+            label: label.into(),
+            duplicate_environment: false,
+            snapshot,
+        }
+    }
+
+    /// 旧設定と同じ 1 台だけの構成(`primary`)。demo・fixture が使う。
+    pub fn primary(snapshot: AgentSnapshot) -> Vec<Self> {
+        vec![Self::new(
+            crate::config::PRIMARY_SERVER_ID,
+            crate::config::PRIMARY_SERVER_ID,
+            snapshot,
+        )]
+    }
+}
+
+/// 起動した 1 接続。管理ページは `shared` を接続ごとに読む。
+#[derive(Clone)]
+pub struct Connection {
+    pub server_id: ServerId,
+    pub label: String,
+    pub shared: Shared,
+}
+
+/// 接続ごとの共有値を 1 本に集める。各 worker は自分の `Shared` だけを書き、
+/// ここで接続の順に並べて `World::agents` を作る(1 台の遅れや失敗が他の接続の値を変えない)。
+pub struct AgentProvider {
+    connections: Vec<Connection>,
+    last: Vec<ServerSnapshot>,
+    warned_duplicates: Vec<ServerId>,
+}
 
 impl AgentProvider {
-    pub fn new(shared: Shared) -> Self {
-        Self(shared)
+    pub fn new(connections: Vec<Connection>) -> Self {
+        let last = connections
+            .iter()
+            .map(|c| ServerSnapshot {
+                server_id: c.server_id.clone(),
+                label: c.label.clone(),
+                duplicate_environment: false,
+                snapshot: AgentSnapshot::default(),
+            })
+            .collect();
+        Self {
+            connections,
+            last,
+            warned_duplicates: Vec::new(),
+        }
     }
 }
 
 impl Provider for AgentProvider {
     fn update(&mut self, world: &mut World) {
-        if let Ok(snapshot) = self.0.try_read() {
-            world.agents = snapshot.clone();
+        for (slot, connection) in self.last.iter_mut().zip(&self.connections) {
+            // 書き込み中の接続は前回の値のまま(他の接続の更新は止めない)。
+            if let Ok(snapshot) = connection.shared.try_read() {
+                slot.snapshot = snapshot.clone();
+            }
         }
+        let duplicates = duplicate_environments(&self.last);
+        for slot in &mut self.last {
+            slot.duplicate_environment = duplicates.contains(&slot.server_id);
+        }
+        if duplicates != self.warned_duplicates {
+            if !duplicates.is_empty() {
+                eprintln!(
+                    "miharashi: T3 接続 {} が同じ environment_id を返しています(重複接続。統合はしません)",
+                    duplicates
+                        .iter()
+                        .map(|id| id.as_ref())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            self.warned_duplicates = duplicates;
+        }
+        world.agents = self.last.clone();
     }
 }
 
-/// `enabled` のときだけ呼び出す。返した共有値は Provider と screen で使える。
-pub fn start(cfg: &ConfigAgents) -> Shared {
-    let shared = Arc::new(RwLock::new(AgentSnapshot::default()));
-    let thread_shared = shared.clone();
-    let settings = cfg.clone();
-    if let Err(e) = thread::Builder::new()
-        .name("t3-agents".into())
-        .spawn(move || worker(settings, thread_shared))
-    {
-        set_connection(
-            &shared,
-            AgentConnection::Retrying,
-            Some(format!("worker を起動できない: {e}")),
-        );
+/// 同じ environment_id を返している接続の id(設定の順)。
+fn duplicate_environments(servers: &[ServerSnapshot]) -> Vec<ServerId> {
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for s in servers {
+        if let Some(id) = s.snapshot.environment_id.as_deref() {
+            *seen.entry(id).or_default() += 1;
+        }
     }
-    shared
+    servers
+        .iter()
+        .filter(|s| {
+            s.snapshot
+                .environment_id
+                .as_deref()
+                .is_some_and(|id| seen.get(id).copied().unwrap_or(0) > 1)
+        })
+        .map(|s| s.server_id.clone())
+        .collect()
+}
+
+/// `enabled` のときだけ呼び出す。接続(`primary` と `extra_servers`)ごとに worker を 1 本起動し、
+/// それぞれの共有値を設定の順に返す。
+pub fn start(cfg: &ConfigAgents) -> Vec<Connection> {
+    start_selected(cfg, None)
+}
+
+/// `start` と同じだが、`only` があればその id の接続だけを起動する(診断用の `agents-check`)。
+/// 設定の順は保つ。worker 本体は `start` と同じ関数なので、ここで確かめた動きは本番の worker と同じ。
+pub fn start_selected(cfg: &ConfigAgents, only: Option<&[String]>) -> Vec<Connection> {
+    cfg.servers()
+        .into_iter()
+        .filter(|server| only.is_none_or(|ids| ids.contains(&server.id)))
+        .enumerate()
+        .map(|(index, server)| {
+            let shared = Arc::new(RwLock::new(AgentSnapshot::default()));
+            let server_id: ServerId = server.id.as_str().into();
+            let thread_shared = shared.clone();
+            // この接続だけの URL / token_file を持つ設定にする(他の接続の値は渡さない)。
+            let mut settings = cfg.clone();
+            settings.url = server.url;
+            settings.token_file = server.token_file;
+            settings.extra_servers = Vec::new();
+            let worker_id = server_id.clone();
+            if let Err(e) = thread::Builder::new()
+                .name(format!("t3-agents-{index}"))
+                .spawn(move || worker(settings, worker_id, thread_shared))
+            {
+                set_connection(
+                    &shared,
+                    AgentConnection::Retrying,
+                    Some(format!("worker を起動できない: {e}")),
+                );
+            }
+            Connection {
+                server_id,
+                label: server.label,
+                shared,
+            }
+        })
+        .collect()
 }
 
 /// 認証情報を送る URL は HTTPS、または名前解決をしない HTTP IP / localhost に限る。
@@ -195,7 +373,7 @@ pub fn check_url(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn worker(cfg: ConfigAgents, shared: Shared) {
+fn worker(cfg: ConfigAgents, server_id: ServerId, shared: Shared) {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(cfg.timeout_secs)))
         .max_redirects(0)
@@ -206,6 +384,7 @@ fn worker(cfg: ConfigAgents, shared: Shared) {
     let endpoint = format!("{base}/api/orchestration/shell");
     let descriptor_endpoint = format!("{base}/.well-known/t3/environment");
     let mut token = String::new();
+    let mut token_revision = String::new();
     let mut token_fingerprint = 0u64;
     let mut auth_blocked = false;
     let mut last_token_check = Instant::now() - Duration::from_secs(30);
@@ -229,13 +408,14 @@ fn worker(cfg: ConfigAgents, shared: Shared) {
         {
             last_token_check = Instant::now();
             match read_token(&cfg.token_file) {
-                Ok(next) => {
+                Ok((next, next_revision)) => {
                     let next_fingerprint = fingerprint(&next);
                     if !auth_retry_allowed(auth_blocked, token_fingerprint, next_fingerprint) {
                         next_poll = Instant::now() + Duration::from_secs(30);
                         continue;
                     }
                     token = next;
+                    token_revision = next_revision;
                     token_fingerprint = next_fingerprint;
                     auth_blocked = false;
                 }
@@ -267,7 +447,7 @@ fn worker(cfg: ConfigAgents, shared: Shared) {
             Ok(remote) => {
                 let had_success = shared.read().map(|s| s.synchronized).unwrap_or(false);
                 let is_resync = had_success && !was_connected;
-                install_snapshot(&shared, remote, is_resync);
+                install_snapshot(&shared, &server_id, remote, is_resync, &token_revision);
                 was_connected = true;
                 backoff = 5;
                 next_poll = Instant::now() + Duration::from_secs(cfg.poll_secs);
@@ -324,22 +504,46 @@ fn set_connection(shared: &Shared, connection: AgentConnection, error: Option<St
     }
 }
 
-fn install_snapshot(shared: &Shared, remote: RemoteSnapshot, resync: bool) {
+fn install_snapshot(
+    shared: &Shared,
+    server_id: &ServerId,
+    mut remote: RemoteSnapshot,
+    resync: bool,
+    token_revision: &str,
+) {
     let now_wall = SystemTime::now();
     let now_mono = Instant::now();
-    let (old_entries, old_changes, synchronized, mut cursor) = match shared.read() {
+    let (old_entries, old_changes, synchronized, mut cursor, old_environment) = match shared.read()
+    {
         Ok(current) => (
             current.entries.clone(),
             current.changes.clone(),
             current.synchronized,
             current.change_cursor,
+            current.environment_id.clone(),
         ),
         Err(_) => return,
     };
+    for entry in &mut remote.entries {
+        entry.server_id = server_id.clone();
+    }
+    // 再接続で取り直した descriptor の environment_id が変わった(別の T3 に入れ替わった)ときは、
+    // この接続の履歴を引き継がない。再同期と同じく、変更通知を出さずに世代を進める。
+    let environment_changed = matches!(
+        (&old_environment, &remote.environment_id),
+        (Some(old), Some(new)) if old != new
+    );
+    let resync = resync || environment_changed;
     let sync_reset = synchronized && resync;
     let changes = if synchronized && !resync {
         let mut history = old_changes.to_vec();
-        history.extend(diff(&old_entries, &remote.entries, &mut cursor, now_wall));
+        history.extend(diff(
+            server_id,
+            &old_entries,
+            &remote.entries,
+            &mut cursor,
+            now_wall,
+        ));
         if history.len() > CHANGE_LIMIT {
             history.drain(..history.len() - CHANGE_LIMIT);
         }
@@ -360,6 +564,9 @@ fn install_snapshot(shared: &Shared, remote: RemoteSnapshot, resync: bool) {
         current.entries = remote.entries.into();
         current.changes = changes.into();
         current.connection = AgentConnection::Live;
+        // 取得に成功した token の世代。失敗では更新しない(最後に成功した世代のまま)ので、
+        // 「新しい世代で成功した」ことの証拠は成功したときにだけ書き換わる。
+        current.token_revision = Some(token_revision.to_string());
         current.last_success = Some(now_wall);
         current.last_success_mono = Some(now_mono);
         current.synchronized = true;
@@ -579,6 +786,8 @@ fn parse_shell_recent(
             .map(|s| sanitize(s, ENTRY_TEXT_LIMIT))
             .filter(|s| !s.is_empty());
         entries.push(AgentEntry {
+            // 接続は install_snapshot が付ける(parse は 1 つの shell 応答だけを見る)。
+            server_id: ServerId::default(),
             thread_id: sanitize(id, 256),
             project_id: sanitize(project_id, 256),
             project_title,
@@ -831,6 +1040,7 @@ fn normalize_state(
 }
 
 fn diff(
+    server_id: &ServerId,
     old: &[AgentEntry],
     new: &[AgentEntry],
     cursor: &mut u64,
@@ -841,7 +1051,15 @@ fn diff(
     let mut result = Vec::new();
     for entry in new {
         let Some(previous) = old_by_id.get(entry.thread_id.as_str()).copied() else {
-            push_change(&mut result, cursor, now, entry, AgentChangeKind::New, None);
+            push_change(
+                &mut result,
+                server_id,
+                cursor,
+                now,
+                entry,
+                AgentChangeKind::New,
+                None,
+            );
             continue;
         };
         let kind = if previous.state != entry.state {
@@ -883,7 +1101,15 @@ fn diff(
             None
         };
         if let Some(kind) = kind {
-            push_change(&mut result, cursor, now, entry, kind, Some(previous));
+            push_change(
+                &mut result,
+                server_id,
+                cursor,
+                now,
+                entry,
+                kind,
+                Some(previous),
+            );
         }
     }
     // Removed entries naturally disappear from the complete snapshot; no entry allocation is retained.
@@ -895,6 +1121,7 @@ fn diff(
 
 fn push_change(
     out: &mut Vec<AgentChange>,
+    server_id: &ServerId,
     cursor: &mut u64,
     now: SystemTime,
     entry: &AgentEntry,
@@ -903,6 +1130,7 @@ fn push_change(
 ) {
     *cursor = cursor.saturating_add(1);
     out.push(AgentChange {
+        server_id: server_id.clone(),
         id: *cursor,
         thread_id: entry.thread_id.clone(),
         kind,
@@ -961,30 +1189,75 @@ fn auth_retry_allowed(blocked: bool, previous_fingerprint: u64, next_fingerprint
     !blocked || previous_fingerprint != next_fingerprint
 }
 
-fn read_token(path: &str) -> Result<String, String> {
-    let path_ref = Path::new(path);
-    let metadata =
-        fs::metadata(path_ref).map_err(|e| format!("T3 token file を確認できません: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if !token_perms_ok(
-            metadata.mode(),
-            metadata.uid(),
-            metadata.gid(),
-            effective_uid(),
-            effective_gid(),
-        ) {
-            return Err("T3 token file は実行ユーザーの 0600、または root:実行グループの 0640 にしてください".into());
+/// worker が使う token の読み込み。リンクを追跡せず、開いた FD で通常ファイル・所有者・権限・サイズ・1 行の
+/// 形式を検査してから読む(`token_file` モジュール)。エラーには値を含めない。
+/// 戻りは (token, token_file の世代)。世代は秘密を含まず、`install_snapshot` が「取得に成功した token の世代」として残す。
+fn read_token(path: &str) -> Result<(String, String), String> {
+    crate::token_file::read_private_token_with_revision(path, effective_uid(), effective_gid())
+        .map_err(|e| e.message().to_string())
+}
+
+/// `probe_shell` の失敗。値(token)は含まない。
+#[derive(Debug, PartialEq)]
+pub(crate) enum ProbeError {
+    BadUrl(String),
+    EnvironmentMismatch,
+    Unauthorized,
+    Forbidden,
+    /// リダイレクト・未対応の protocol など、想定外の応答
+    Rejected(String),
+    Transport(String),
+}
+
+/// `probe_shell` が成功したときの、接続先の環境。
+#[derive(Debug)]
+pub(crate) struct ProbeOk {
+    pub environment_id: Option<String>,
+}
+
+/// 接続先の T3 に、この token で一覧 API(`GET /api/orchestration/shell`)が読めるかを 1 回だけ確かめる
+/// (token の受取ツール用)。worker と同じ規則: URL は `check_url`、リダイレクトは追跡しない。
+/// 先に認証なしで環境情報を取り、`expect_environment_id` があって違えば token を送らずに止める。
+pub(crate) fn probe_shell(
+    url: &str,
+    token: &str,
+    timeout_secs: u64,
+    expect_environment_id: Option<&str>,
+) -> Result<ProbeOk, ProbeError> {
+    check_url(url).map_err(ProbeError::BadUrl)?;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(timeout_secs)))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let base = url.trim_end_matches('/');
+    let to_probe = |e: FetchError| match e {
+        FetchError::Unauthorized => ProbeError::Unauthorized,
+        FetchError::Forbidden => ProbeError::Forbidden,
+        FetchError::RateLimited(_) => {
+            ProbeError::Rejected("T3 が取得を制限しています (429)".into())
         }
+        FetchError::Invalid(w) => ProbeError::Rejected(w),
+        FetchError::Transport(w) => ProbeError::Transport(w),
+    };
+    let environment = fetch_environment(&agent, &format!("{base}/.well-known/t3/environment"))
+        .map_err(to_probe)?;
+    if let Some(expected) = expect_environment_id
+        && environment.environment_id.as_deref() != Some(expected)
+    {
+        return Err(ProbeError::EnvironmentMismatch);
     }
-    let text =
-        fs::read_to_string(path_ref).map_err(|e| format!("T3 token file を読めません: {e}"))?;
-    let token = text.trim();
-    if token.is_empty() || token.contains(['\r', '\n']) || token.len() > 8192 {
-        return Err("T3 token file の形式が不正です".into());
-    }
-    Ok(token.to_string())
+    fetch(
+        &agent,
+        &format!("{base}/api/orchestration/shell"),
+        token,
+        24,
+    )
+    .map_err(to_probe)?;
+    Ok(ProbeOk {
+        environment_id: environment.environment_id,
+    })
 }
 
 /// トークンファイルの所有者と権限が規則どおりか: 実行ユーザーの 0600、または root:実行グループの 0640。
@@ -1015,8 +1288,13 @@ pub(crate) fn effective_gid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, TcpListener};
+
+    fn sid() -> ServerId {
+        "primary".into()
+    }
 
     fn shell(threads: Vec<Value>, sequence: u64) -> Value {
         serde_json::json!({
@@ -1119,12 +1397,30 @@ mod tests {
         // preparing → starting は同じ「起動中」で、同じ run なので知らせない。
         let preparing = parse(mock_thread("t", "preparing", "now"));
         let starting = parse(mock_thread("t", "starting", "now"));
-        assert!(diff(&preparing, &starting, &mut cursor, SystemTime::now()).is_empty());
+        assert!(
+            diff(
+                &sid(),
+                &preparing,
+                &starting,
+                &mut cursor,
+                SystemTime::now()
+            )
+            .is_empty()
+        );
         // 終わった thread の lastError が消えても、異常として知らせない。
         let mut with_error = mock_thread("t", "completed", "now");
         with_error["lastError"] = Value::String("old".into());
         let cleared = parse(mock_thread("t", "completed", "now"));
-        assert!(diff(&parse(with_error), &cleared, &mut cursor, SystemTime::now()).is_empty());
+        assert!(
+            diff(
+                &sid(),
+                &parse(with_error),
+                &cleared,
+                &mut cursor,
+                SystemTime::now()
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1198,11 +1494,12 @@ mod tests {
     fn semantic_diff_ignores_updated_at_and_repeated_snapshot() {
         let first = parse_shell(&shell(vec![mock_thread("t1", "running", "a")], 1)).unwrap();
         let mut cursor = 0;
-        let initial = diff(&[], &first.entries, &mut cursor, SystemTime::now());
+        let initial = diff(&sid(), &[], &first.entries, &mut cursor, SystemTime::now());
         assert_eq!(initial[0].kind, AgentChangeKind::New);
         let second = parse_shell(&shell(vec![mock_thread("t1", "running", "b")], 2)).unwrap();
         assert!(
             diff(
+                &sid(),
                 &first.entries,
                 &second.entries,
                 &mut cursor,
@@ -1213,6 +1510,7 @@ mod tests {
         let third = parse_shell(&shell(vec![mock_thread("t1", "completed", "c")], 3)).unwrap();
         assert_eq!(
             diff(
+                &sid(),
                 &first.entries,
                 &third.entries,
                 &mut cursor,
@@ -1235,6 +1533,7 @@ mod tests {
         b.active_run_id = Some("run-b".into());
         let mut cursor = 0;
         let changes = diff(
+            &sid(),
             std::slice::from_ref(&a),
             &[b],
             &mut cursor,
@@ -1256,6 +1555,7 @@ mod tests {
         b.goal = Some("後".into());
         let mut cursor = 0;
         let changes = diff(
+            &sid(),
             std::slice::from_ref(&a),
             &[b],
             &mut cursor,
@@ -1442,7 +1742,7 @@ mod tests {
             1,
         ))
         .unwrap();
-        install_snapshot(&shared, remote, false);
+        install_snapshot(&shared, &sid(), remote, false, "r1.test");
         assert!(shared.read().unwrap().changes.is_empty());
         let remote = parse_shell(&shell(
             vec![
@@ -1452,7 +1752,7 @@ mod tests {
             2,
         ))
         .unwrap();
-        install_snapshot(&shared, remote, true);
+        install_snapshot(&shared, &sid(), remote, true, "r1.test");
         assert!(shared.read().unwrap().changes.is_empty());
         assert_eq!(shared.read().unwrap().resync_generation, 1);
     }
@@ -1600,7 +1900,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("miharashi-t3-token-{}", std::process::id()));
         fs::write(&path, "test-token\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(read_token(path.to_str().unwrap()).unwrap(), "test-token");
+        assert_eq!(read_token(path.to_str().unwrap()).unwrap().0, "test-token");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read_token(path.to_str().unwrap()).is_err());
         fs::remove_file(path).unwrap();
@@ -1612,5 +1912,501 @@ mod tests {
         assert!(!auth_retry_allowed(true, old, fingerprint("old-token")));
         assert!(auth_retry_allowed(true, old, fingerprint("new-token")));
         assert!(auth_retry_allowed(false, old, old));
+    }
+
+    /// 独立した 2 台の mock T3。要求ごとに「この token でなければ 401」「応答を遅らせる」を切り替えられる。
+    #[derive(Clone)]
+    enum Mode {
+        Ok,
+        Slow(Duration),
+        Unauthorized,
+    }
+
+    struct MockT3 {
+        url: String,
+        mode: Arc<std::sync::Mutex<Mode>>,
+        sequence: Arc<std::sync::atomic::AtomicU64>,
+        env_id: Arc<std::sync::Mutex<String>>,
+    }
+
+    fn mock_t3(token: &'static str, threads: Vec<Value>) -> MockT3 {
+        use std::io::BufRead;
+        use std::sync::atomic::Ordering;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let mode = Arc::new(std::sync::Mutex::new(Mode::Ok));
+        let sequence = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let env_id = Arc::new(std::sync::Mutex::new(format!("env-{token}")));
+        let (m, q, e) = (mode.clone(), sequence.clone(), env_id.clone());
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let (m, q, e, threads) = (m.clone(), q.clone(), e.clone(), threads.clone());
+                thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap_or(0);
+                    let mut auth = String::new();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                            break;
+                        }
+                        if line.to_ascii_lowercase().starts_with("authorization:") {
+                            auth = line.trim().to_string();
+                        }
+                    }
+                    let mode = m.lock().unwrap().clone();
+                    let reply = |stream: &mut std::net::TcpStream, code: &str, body: String| {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    };
+                    if first.contains("/.well-known/t3/environment") {
+                        let body = serde_json::json!({
+                            "orchestrationProtocolVersion": 2,
+                            "environmentId": e.lock().unwrap().clone(),
+                            "environmentLabel": "mock",
+                        })
+                        .to_string();
+                        reply(&mut stream, "200 OK", body);
+                        return;
+                    }
+                    if let Mode::Slow(d) = mode {
+                        thread::sleep(d);
+                    }
+                    let authorized = auth
+                        .to_ascii_lowercase()
+                        .ends_with(&format!("bearer {token}"));
+                    if matches!(mode, Mode::Unauthorized) || !authorized {
+                        reply(&mut stream, "401 Unauthorized", "{}".into());
+                    } else {
+                        let body = shell(threads, q.load(Ordering::SeqCst)).to_string();
+                        reply(&mut stream, "200 OK", body);
+                    }
+                });
+            }
+        });
+        MockT3 {
+            url,
+            mode,
+            sequence,
+            env_id,
+        }
+    }
+
+    #[cfg(unix)]
+    fn token_file(name: &str, token: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path =
+            std::env::temp_dir().join(format!("miharashi-multi-{}-{name}", std::process::id()));
+        fs::write(&path, format!("{token}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    fn wait_for(what: &str, secs: u64, mut ok: impl FnMut() -> bool) {
+        let end = Instant::now() + Duration::from_secs(secs);
+        while !ok() {
+            assert!(Instant::now() < end, "待ち切れなかった: {what}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn server_state(world: &World, id: &str) -> (AgentConnection, Option<u64>, Vec<String>) {
+        let s = world.agents.iter().find(|s| &*s.server_id == id).unwrap();
+        (
+            s.snapshot.connection,
+            s.snapshot.sequence,
+            s.snapshot
+                .entries
+                .iter()
+                .map(|e| e.thread_id.clone())
+                .collect(),
+        )
+    }
+
+    /// 稼働中の worker は、取得に成功した token_file の世代を残す。ファイルを差し替えても、worker がそれを
+    /// 読み直して取得に成功するまでは古い世代のまま(古い世代での成功を、新しい世代での成功と取り違えない)。
+    /// 世代は秘密を含まず、token の値ではなくファイルの実体から作る。
+    #[cfg(unix)]
+    #[test]
+    fn worker_keeps_the_revision_of_the_token_file_it_last_succeeded_with() {
+        use std::os::unix::fs::PermissionsExt;
+        let t3 = mock_t3("token-rev", vec![mock_thread("t1", "running", "now")]);
+        let path = token_file("rev", "token-rev");
+        let cfg = ConfigAgents {
+            enabled: true,
+            url: t3.url.clone(),
+            token_file: path.clone(),
+            poll_secs: 1,
+            timeout_secs: 2,
+            stale_secs: 30,
+            recent_hours: 24,
+            extra_servers: Vec::new(),
+            rotation_state_dir: String::new(),
+        };
+        let connections = start(&cfg);
+        let shared = connections[0].shared.clone();
+        wait_for("取得に成功する", 10, || {
+            shared.read().unwrap().connection == AgentConnection::Live
+        });
+        let (euid, egid) = (effective_uid(), effective_gid());
+        let (_, on_disk) =
+            crate::token_file::read_private_token_with_revision(&path, euid, egid).unwrap();
+        let first = shared.read().unwrap().token_revision.clone();
+        assert_eq!(first.as_deref(), Some(on_disk.as_str()));
+        assert!(!first.as_deref().unwrap().contains("token-rev"));
+        // 新しい実体に差し替える(受取ツールと同じ。同じ名前に別の inode を rename で置く)
+        let replacement = format!("{path}.new");
+        fs::write(&replacement, "token-rev\n").unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::rename(&replacement, &path).unwrap();
+        let (_, replaced) =
+            crate::token_file::read_private_token_with_revision(&path, euid, egid).unwrap();
+        assert_ne!(replaced, on_disk, "差し替えると世代が変わる");
+        // worker は次の読み直し(30 秒ごと)まで古い token_file のまま取得を続ける。その成功は古い世代のまま
+        let sequence = shared.read().unwrap().sequence;
+        t3.sequence.store(
+            sequence.unwrap_or(0) + 5,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        wait_for("古い token_file のまま取得が続く", 10, || {
+            shared.read().unwrap().sequence != sequence
+        });
+        let after = shared.read().unwrap().clone();
+        assert_eq!(after.connection, AgentConnection::Live);
+        assert_eq!(after.token_revision.as_deref(), Some(on_disk.as_str()));
+        assert_ne!(after.token_revision.as_deref(), Some(replaced.as_str()));
+    }
+
+    /// 独立した 2 台: 片方の遅延(timeout)・401・復帰の間も、もう片方の取得は止まらず、
+    /// それぞれ自分の token だけで認証し、同じ thread / project ID でも接続ごとに別のスレッドとして届く。
+    #[cfg(unix)]
+    #[test]
+    fn one_connection_failing_never_stops_the_other() {
+        use std::sync::atomic::Ordering;
+        let a = mock_t3("token-a", vec![mock_thread("t1", "running", "now")]);
+        let b = mock_t3("token-b", vec![mock_thread("t1", "waiting", "now")]);
+        let cfg = ConfigAgents {
+            enabled: true,
+            url: a.url.clone(),
+            token_file: token_file("a", "token-a"),
+            poll_secs: 1,
+            timeout_secs: 1,
+            stale_secs: 30,
+            recent_hours: 24,
+            extra_servers: vec![crate::config::ConfigAgentServer {
+                id: "container".into(),
+                label: Some("コンテナ".into()),
+                url: b.url.clone(),
+                token_file: token_file("b", "token-b"),
+            }],
+            rotation_state_dir: String::new(),
+        };
+        let connections = start(&cfg);
+        assert_eq!(connections.len(), 2);
+        assert_eq!(&*connections[0].server_id, "primary");
+        assert_eq!(connections[1].label, "コンテナ");
+        let mut provider = AgentProvider::new(connections);
+        let mut world = World::default();
+        let mut poll = |world: &mut World| provider.update(world);
+
+        // 1. 両方とも、自分の token で取得できる。同じ thread id "t1" は接続ごとの別のエントリ。
+        wait_for("両方の接続が Live", 10, || {
+            poll(&mut world);
+            world.agents.len() == 2
+                && world
+                    .agents
+                    .iter()
+                    .all(|s| s.snapshot.connection == AgentConnection::Live)
+        });
+        let ea = &world.agents[0].snapshot.entries[0];
+        let eb = &world.agents[1].snapshot.entries[0];
+        assert_eq!((ea.thread_id.as_str(), eb.thread_id.as_str()), ("t1", "t1"));
+        assert_eq!((&*ea.server_id, &*eb.server_id), ("primary", "container"));
+        assert_ne!(ea.key(), eb.key());
+        assert_ne!(ea.state, eb.state, "接続ごとの中身が混ざらない");
+        assert_ne!(
+            world.agents[0].snapshot.environment_id,
+            world.agents[1].snapshot.environment_id
+        );
+
+        // 2. B が応答を遅らせる(timeout)。B は再接続中になるが、A は更新され続ける。
+        *b.mode.lock().unwrap() = Mode::Slow(Duration::from_secs(3));
+        wait_for("B が再接続中", 10, || {
+            poll(&mut world);
+            server_state(&world, "container").0 == AgentConnection::Retrying
+        });
+        let before = server_state(&world, "primary").1;
+        a.sequence.store(40, Ordering::SeqCst);
+        wait_for("B の障害中も A が更新される", 10, || {
+            poll(&mut world);
+            let a_now = server_state(&world, "primary");
+            a_now.0 == AgentConnection::Live && a_now.1 == Some(40) && a_now.1 != before
+        });
+        assert_eq!(
+            server_state(&world, "container").2,
+            ["t1"],
+            "B の最後のデータは障害中も残る(画面が「前回取得時」と示す)"
+        );
+
+        // 3. B が復帰する。A の履歴は B の再同期に巻き込まれない。
+        *b.mode.lock().unwrap() = Mode::Ok;
+        b.sequence.store(9, Ordering::SeqCst);
+        wait_for("B が復帰", 20, || {
+            poll(&mut world);
+            let b_now = server_state(&world, "container");
+            b_now.0 == AgentConnection::Live && b_now.1 == Some(9)
+        });
+        let gen_a = world.agents[0].snapshot.resync_generation;
+        assert_eq!(gen_a, 0, "A は再同期していない");
+        assert_eq!(
+            world.agents[1].snapshot.resync_generation, 1,
+            "B だけが再同期した"
+        );
+
+        // 4. 再接続で取り直した descriptor の environment_id が変わると、その接続の履歴だけが捨てられる。
+        *b.mode.lock().unwrap() = Mode::Slow(Duration::from_secs(3));
+        wait_for("B が再接続中(2 回目)", 15, || {
+            poll(&mut world);
+            server_state(&world, "container").0 == AgentConnection::Retrying
+        });
+        *b.env_id.lock().unwrap() = "env-replaced".into();
+        *b.mode.lock().unwrap() = Mode::Ok;
+        let gen_b = world.agents[1].snapshot.resync_generation;
+        wait_for("B の environment_id が入れ替わる", 40, || {
+            poll(&mut world);
+            let b_now = &world.agents[1].snapshot;
+            b_now.environment_id.as_deref() == Some("env-replaced")
+                && b_now.connection == AgentConnection::Live
+        });
+        assert!(world.agents[1].snapshot.resync_generation > gen_b);
+        assert!(world.agents[1].snapshot.changes.is_empty());
+        assert_eq!(world.agents[0].snapshot.resync_generation, 0);
+
+        // 5. B が 401 になる。B は認証が必要になるが、A は Live のまま。
+        *b.mode.lock().unwrap() = Mode::Unauthorized;
+        wait_for("B が 401", 10, || {
+            poll(&mut world);
+            server_state(&world, "container").0 == AgentConnection::AuthenticationRequired
+        });
+        a.sequence.store(41, Ordering::SeqCst);
+        wait_for("B の 401 中も A が更新される", 10, || {
+            poll(&mut world);
+            let a_now = server_state(&world, "primary");
+            a_now.0 == AgentConnection::Live && a_now.1 == Some(41)
+        });
+    }
+
+    /// 受けた要求(パス, Authorization ヘッダー)を記録する mock。`redirect_shell_to` があれば一覧 API は 302 で返す。
+    type RequestLog = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    fn recording_mock(redirect_shell_to: Option<String>) -> (String, RequestLog) {
+        use std::io::BufRead;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let log: RequestLog = Default::default();
+        let l = log.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let (l, redirect) = (l.clone(), redirect_shell_to.clone());
+                thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap_or(0);
+                    let mut auth = String::new();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                            break;
+                        }
+                        if line.to_ascii_lowercase().starts_with("authorization:") {
+                            auth = line.trim().to_string();
+                        }
+                    }
+                    let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
+                    l.lock().unwrap().push((path.clone(), auth));
+                    if path.contains("/.well-known/t3/environment") {
+                        let body = r#"{"orchestrationProtocolVersion":2,"environmentId":"env-x"}"#;
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    } else if let Some(to) = redirect {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 302 Found\r\nLocation: {to}/api/orchestration/shell\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                    } else {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                        );
+                    }
+                });
+            }
+        });
+        (url, log)
+    }
+
+    /// 2 台のうち一方がリダイレクトで他方の origin を指しても、その token は他方に届かない。
+    /// token_file がリンクに差し替えられた接続は、何も送らずに認証が必要になる。
+    #[cfg(unix)]
+    #[test]
+    fn redirects_and_swapped_links_never_move_a_token_to_another_origin() {
+        let (a_url, a_log) = recording_mock(None);
+        let (b_url, b_log) = recording_mock(Some(a_url.clone()));
+        // C: token_file がリンク(正しい token を指している)。C の mock は何も受けないはず
+        let (c_url, c_log) = recording_mock(None);
+        let real = token_file("c-real", "token-c");
+        let link =
+            std::env::temp_dir().join(format!("miharashi-multi-{}-c-link", std::process::id()));
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let cfg = ConfigAgents {
+            enabled: true,
+            url: a_url.clone(),
+            token_file: token_file("a2", "token-a"),
+            poll_secs: 1,
+            timeout_secs: 2,
+            stale_secs: 30,
+            recent_hours: 24,
+            extra_servers: vec![
+                crate::config::ConfigAgentServer {
+                    id: "container".into(),
+                    label: None,
+                    url: b_url,
+                    token_file: token_file("b2", "token-b"),
+                },
+                crate::config::ConfigAgentServer {
+                    id: "linked".into(),
+                    label: None,
+                    url: c_url,
+                    token_file: link.to_str().unwrap().to_string(),
+                },
+            ],
+            rotation_state_dir: String::new(),
+        };
+        let mut provider = AgentProvider::new(start(&cfg));
+        let mut world = World::default();
+        wait_for("B と C が失敗として現れる", 15, || {
+            provider.update(&mut world);
+            let st = |id: &str| {
+                world
+                    .agents
+                    .iter()
+                    .find(|s| &*s.server_id == id)
+                    .map(|s| s.snapshot.connection)
+            };
+            st("container")
+                .is_some_and(|c| c != AgentConnection::Connecting && c != AgentConnection::Live)
+                && st("linked") == Some(AgentConnection::AuthenticationRequired)
+        });
+        thread::sleep(Duration::from_millis(500));
+        let linked = world
+            .agents
+            .iter()
+            .find(|s| &*s.server_id == "linked")
+            .unwrap();
+        assert!(
+            linked
+                .snapshot
+                .error_summary
+                .as_deref()
+                .is_some_and(|e| e.contains("シンボリックリンク")),
+            "{:?}",
+            linked.snapshot.error_summary
+        );
+        assert!(!format!("{:?}", linked.snapshot.error_summary).contains("token-c"));
+        // A の mock に届いた Authorization は、A 自身の token だけ。B の token は一度も来ない
+        for (path, auth) in a_log.lock().unwrap().iter() {
+            assert!(
+                !auth.contains("token-b"),
+                "A に B の token が届いた: {path}"
+            );
+            assert!(
+                !auth.contains("token-c"),
+                "A に C の token が届いた: {path}"
+            );
+        }
+        // B は自分の origin にだけ token を送り、リダイレクトは追跡していない
+        assert!(
+            b_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, a)| a.contains("token-b"))
+        );
+        // C(リンク)には環境情報の問い合わせも含め、token を載せた要求が 1 件も届かない
+        assert!(c_log.lock().unwrap().iter().all(|(_, a)| a.is_empty()));
+    }
+
+    #[test]
+    fn duplicate_environment_ids_are_flagged_not_merged() {
+        let mk = |id: &str, env: Option<&str>| {
+            ServerSnapshot::new(
+                id,
+                id,
+                AgentSnapshot {
+                    environment_id: env.map(str::to_string),
+                    ..AgentSnapshot::default()
+                },
+            )
+        };
+        let servers = vec![
+            mk("primary", Some("e1")),
+            mk("b", Some("e1")),
+            mk("c", Some("e2")),
+            mk("d", None),
+        ];
+        let dup = duplicate_environments(&servers);
+        let ids: Vec<&str> = dup.iter().map(|d| d.as_ref()).collect();
+        assert_eq!(ids, ["primary", "b"]);
+    }
+
+    #[test]
+    fn a_replaced_environment_resets_only_its_own_history() {
+        let shared: Shared = Default::default();
+        let id = sid();
+        let remote = |env: &str, threads: Vec<Value>, seq| {
+            let mut r = parse_shell(&shell(threads, seq)).unwrap();
+            r.environment_id = Some(env.into());
+            r
+        };
+        install_snapshot(
+            &shared,
+            &id,
+            remote("e1", vec![mock_thread("a", "running", "now")], 1),
+            false,
+            "r1.test",
+        );
+        install_snapshot(
+            &shared,
+            &id,
+            remote("e1", vec![mock_thread("a", "waiting", "now")], 2),
+            false,
+            "r1.test",
+        );
+        assert_eq!(shared.read().unwrap().changes.len(), 1);
+        // 同じ environment_id なら履歴を引き継ぐ。変わったら、変更通知を出さず世代を進める。
+        let generation = shared.read().unwrap().resync_generation;
+        install_snapshot(
+            &shared,
+            &id,
+            remote("e2", vec![mock_thread("b", "running", "now")], 3),
+            false,
+            "r1.test",
+        );
+        let s = shared.read().unwrap();
+        assert_eq!(s.resync_generation, generation + 1);
+        assert!(s.changes.is_empty(), "別環境の差分を新着として出さない");
+        assert_eq!(s.entries[0].thread_id, "b");
+        assert_eq!(&*s.entries[0].server_id, "primary");
     }
 }
