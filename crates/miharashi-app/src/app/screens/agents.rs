@@ -1456,8 +1456,14 @@ impl AgentScreen {
         } else {
             state.label().into()
         };
-        // 取得が止まっている接続のカードは、古い旨を明記する(その接続の通知は出さない)。
-        if self.is_stale(&e.server_id) {
+        // 障害直後から最終取得データである旨を示す。通知停止は従来の stale 判定のまま。
+        let previous_data = self.server_index(&e.server_id).is_some_and(|i| {
+            let server = &self.servers[i];
+            server.stale
+                || (server.last_snapshot.last_success.is_some()
+                    && server.last_snapshot.connection != AgentConnection::Live)
+        });
+        if previous_data {
             detail = format!("前回取得時 · {detail}");
         }
         let active = self.last_activity.get(&e.key()).copied().unwrap_or(now);

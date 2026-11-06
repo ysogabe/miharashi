@@ -1179,3 +1179,48 @@ fn four_long_named_servers_through_the_vrm_path_keep_priority_counts_and_layout(
         }
     }
 }
+
+/// stale 到達前でも、障害側の保持カードだけが最終取得データであると分かる。
+#[test]
+fn failed_connection_marks_previous_data_immediately_and_clears_on_recovery() {
+    let now = Instant::now();
+    for failure in [
+        AgentConnection::AuthenticationRequired,
+        AgentConnection::Retrying,
+    ] {
+        let mut s = screen();
+        let mut world = vec![
+            server(
+                "primary",
+                "primary",
+                Poll::new(vec![entry("p", "t", AgentState::Running, None)], now),
+            ),
+            server(
+                "container",
+                "コンテナ",
+                Poll::new(vec![entry("p", "t", AgentState::Running, None)], now),
+            ),
+        ];
+        s.sync_all(&world, now);
+        world[0].snapshot.connection = failure;
+        let failed_at = now + Duration::from_secs(5);
+        s.sync_all(&world, failed_at);
+        assert!(!s.servers[0].stale, "まだ stale の通知停止時点ではない");
+        for e in &s.entries {
+            assert_eq!(
+                s.content(e, failed_at, None, false, false)
+                    .detail
+                    .starts_with("前回取得時"),
+                &*e.server_id == "primary",
+            );
+        }
+        world[0].snapshot.connection = AgentConnection::Live;
+        world[0].snapshot.last_success_mono = Some(failed_at);
+        s.sync_all(&world, failed_at + Duration::from_secs(1));
+        assert!(s.entries.iter().all(|e| {
+            !s.content(e, failed_at, None, false, false)
+                .detail
+                .starts_with("前回取得時")
+        }));
+    }
+}
