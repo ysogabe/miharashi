@@ -250,14 +250,15 @@ token_file = "/var/lib/miharashi/t3-container.token"
 
 設定が規則に合わないと、起動時と `miharashi check-config` が理由を出して失敗します(`agents.enabled = false` でも追加先は検査します)。戻すときは `[[agents.extra_servers]]` を外して再起動します。
 
-- `miharashi config-get agents.url` / `agents.token_file` は従来どおり `primary` の値を返します。`miharashi-t3-token.timer` が更新するのは `primary` の `token_file` だけで、追加先の token は更新しません。追加先の token は、その T3 Server で `orchestration:read` だけの token を発行し、`token_file` に 0600 で置いてください(自動更新の経路は別途設計します)。
+- `miharashi config-get agents.url` / `agents.token_file` は従来どおり `primary` の値を返します。`miharashi-t3-token.timer` が更新するのは `primary` の `token_file` だけで、追加先の token は更新しません。追加先の token は、その T3 Server で `orchestration:read` だけの token を発行し、`token_file` に 0600 で置いてください。ホストの専用ディレクトリへ検査して置く受取ツール(`miharashi t3-token-receive`)と、新しい token を確かめてから古い token を失効させる手順は [T3 token の配送と更新](t3-agent-multi-server/token-delivery.md) にあります(配送経路・UID/GID・実機の確認は実機の試験で決めます)。
+- T3 の token ファイルは、どの接続でも、シンボリックリンクではない通常のファイルで、実行ユーザーの 0600(または root:実行グループの 0640)、8192 バイト以下、token だけの 1 行である必要があります。リンクにしていた場合は通常のファイルに置き直してください(取得元は「認証が必要」になり、管理ページの tokens に `symlink` と出ます)。
 - 各追加先は自分の `url` と `token_file` だけを使います。別の接続先へ token は送りません。
 - 追加先は primary と同じ Agent 画面(画面 ID は `agents` のまま。画面は増えません)に、同時に表示されます。接続ごとに取得・認証・再接続・stale の判定が独立していて、1 台が遅れたり 401 になったり止まったりしても、ほかの接続の表示と通知は止まりません。
   - 2 台以上のときだけ、プロジェクトの枠の見出しが「接続名 / プロジェクト名」になり、各カードと変更の通知にも接続名が付きます(接続名は設定の `label`。`primary` は「primary」)。1 台だけの設定では、今までと同じ見た目です。
   - 画面上部に、接続ごとの状態(LIVE / 接続中 / 認証要 / 権限なし / API異常 / STALE / 再接続)・スレッド数・「未表示 N」と最終取得の時刻を並べます。カードが盤面に入りきらないときは、承認待ち・入力待ち・異常を先に残し、重要でない単独のスレッドから外して、接続ごとの「未表示」の件数に数えます。
   - 取得が `stale_secs` を超えて止まった接続のカードは薄くなり「前回取得時」と付き、その接続の通知だけが止まります(復帰したときの変更は静かに受け入れます)。
   - 別の接続で同じ thread / project の ID があっても別のスレッドとして扱い、親子・通知・表示の履歴を混ぜません。再接続したときに取り直した `environmentId` が変わった接続は、その接続の履歴とカードを捨てます。2 つの接続が同じ `environmentId` を返したときは、重複接続としてログと画面に警告します(統合はしません)。
-  - 管理ページの `feeds` には接続ごとに 1 件(primary は従来の `agents`、追加先は `agents:<id>`)が出ます。追加先の `tokens` の表示と読み込みの保護は、後続の実装で入ります。
+  - 管理ページの `feeds` には接続ごとに 1 件(primary は従来の `agents`、追加先は `agents:<id>`)が出ます。管理ページの `tokens` の表も接続ごとに 1 行(primary は `agents`、追加先は `agents:<id>`)で、取得の結果とは別に token ファイルの状態(正常・無い・リンク・形式が不正など)と更新時刻が出ます。追加先の登録・編集は設定ファイルだけです。
 - 追加先の token の更新は、まだ決まっていません(`miharashi-t3-token.timer` は `primary` だけ。上の手動配置のみ)。コンテナ内の T3 Server への接続、画面表示、片方の停止・復帰は、実機ではまだ確認していません(この版の確認はモック 2 台とテストまでです)。実機で確かめるまでは、本番対応済みとして扱わないでください。
 
 取得は専用 worker が `GET /api/orchestration/shell` を 5 秒ごとに行い、接続時に環境情報を `GET /.well-known/t3/environment` で取得します。画面は一覧の状態だけを表示し、会話本文や承認内容は取得しません。認証が失効した場合は 401 / 403 を区別して表示し、token ファイルが変更されたときに再試行します。

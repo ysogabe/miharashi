@@ -108,17 +108,24 @@ pub(super) fn from_aircraft(h: &Health) -> FeedReport {
     report("aircraft", "tar1090(航空機)", state, h.last_ok, error)
 }
 
-/// 1 接続ぶん。`primary` は従来どおり id `agents`・名前 `T3(エージェント)`、追加の接続は `agents:<id>`・`T3(<label>)`。
+/// 1 接続の管理ページ上の (id, 表示名)。`primary` は従来どおり id `agents`・名前 `T3(エージェント)`、
+/// 追加の接続は `agents:<id>`・`T3(<label>)`。取得元(feeds)とトークン(tokens)で同じ id を使い、行を突き合わせられる。
+pub(super) fn agent_identity(server_id: &str, label: &str) -> (String, String) {
+    if server_id == crate::config::PRIMARY_SERVER_ID {
+        ("agents".into(), "T3(エージェント)".into())
+    } else {
+        (format!("agents:{server_id}"), format!("T3({label})"))
+    }
+}
+
+/// 1 接続ぶんの取得元。
 pub(super) fn from_agent_connection(
     server_id: &str,
     label: &str,
     s: &AgentSnapshot,
 ) -> Vec<FeedReport> {
     let mut r = from_agents(s);
-    if server_id != crate::config::PRIMARY_SERVER_ID {
-        r.id = format!("agents:{server_id}");
-        r.label = format!("T3({label})");
-    }
+    (r.id, r.label) = agent_identity(server_id, label);
     vec![r]
 }
 
@@ -203,14 +210,19 @@ impl AdminSources {
     }
 }
 
-/// トークンファイルの状態。中身は読まず、`open` の成否と `metadata` だけを見る。
+/// トークンファイルの状態。中身は読まず、`open` の成否と `fstat` だけを見る(HA・パネル・管理ページ用)。
+/// FIFO で固まらないよう `O_NONBLOCK` で開く。リンクは従来どおり追跡する(それらの読み手が追跡するため)。
 /// 規則は `agents::token_perms_ok` と同じ(`uid` / `gid` は実行ユーザーとグループ。テストでは偽の値を渡す):
 /// 実行ユーザー所有の 0600、または root 所有でグループが実行グループの 0640。
 /// 所有者が規則の外なら `WrongOwner`。所有者は規則内で権限が規則に合わない(その他に読み取りがある、
 /// グループに読み取りがあるのに root 所有でない、など)なら `LoosePermissions`。
 pub(super) fn check_token_file(path: &str, uid: u32, gid: u32) -> TokenState {
-    use std::os::unix::fs::MetadataExt;
-    let file = match std::fs::File::open(path) {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
+        .open(path)
+    {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return TokenState::Missing,
         Err(_) => return TokenState::Unreadable,
@@ -229,6 +241,23 @@ pub(super) fn check_token_file(path: &str, uid: u32, gid: u32) -> TokenState {
         TokenState::LoosePermissions
     } else {
         TokenState::WrongOwner
+    }
+}
+
+/// T3 の接続の token ファイルの状態。worker が読むときと同じ検査(`token_file::read_private_token`:
+/// リンクを追跡しない・通常ファイル・所有者と権限・8192 バイト以下・1 行)を通ったら `Ok`。
+/// 値は検査のために一瞬だけメモリに読むが、返さず、エラーにも出さない。
+pub(super) fn check_agent_token_file(path: &str, uid: u32, gid: u32) -> TokenState {
+    use crate::token_file::TokenFileError as E;
+    match crate::token_file::read_private_token(path, uid, gid) {
+        Ok(_) => TokenState::Ok,
+        Err(E::Missing) => TokenState::Missing,
+        Err(E::Symlink) => TokenState::Symlink,
+        Err(E::NotRegular) => TokenState::NotRegular,
+        Err(E::Unreadable) => TokenState::Unreadable,
+        Err(E::WrongOwner) => TokenState::WrongOwner,
+        Err(E::LoosePermissions) => TokenState::LoosePermissions,
+        Err(E::TooLarge | E::BadFormat) => TokenState::BadFormat,
     }
 }
 

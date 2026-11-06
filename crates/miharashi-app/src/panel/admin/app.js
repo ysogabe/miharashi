@@ -46,6 +46,9 @@ const TOKEN_STATES = {
   unreadable: ["開けない", "failing"],
   wrong_owner: ["所有者が違う", "warn"],
   loose_permissions: ["権限が緩い", "warn"],
+  symlink: ["リンクは使えない", "failing"],
+  not_regular: ["通常のファイルではない", "failing"],
+  bad_format: ["形式が不正", "failing"],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -332,9 +335,11 @@ function renderTokens(tokens) {
   body.replaceChildren();
   for (const t of Array.isArray(tokens) ? tokens : []) {
     const tr = el("tr");
-    tr.append(el("td", lookup(TOKEN_LABELS, t.id) || t.id));
+    // 接続ごとの T3(agents:<id>)は、サーバーが付けた表示名を使う
+    tr.append(el("td", clip(t.label || lookup(TOKEN_LABELS, t.id) || t.id)));
     tr.append(el("td", t.path || "", "path"));
     tr.append(stateCell(TOKEN_STATES, t.state));
+    tr.append(el("td", formatTime(t.modified_at)));
     body.append(tr);
   }
 }

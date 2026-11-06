@@ -185,6 +185,12 @@ pub enum TokenState {
     Unreadable,
     WrongOwner,
     LoosePermissions,
+    /// T3 の token ファイルがシンボリックリンク(リンクは追跡しない)
+    Symlink,
+    /// T3 の token ファイルが通常のファイルではない(FIFO・デバイスなど)
+    NotRegular,
+    /// T3 の token ファイルの形式が不正(空・複数行・空白や非 ASCII を含む・大きすぎる)
+    BadFormat,
 }
 
 /// 取得スレッドの状態への参照。`Err` = その取得が動いていない(理由。`feeds[].error` に出る)。

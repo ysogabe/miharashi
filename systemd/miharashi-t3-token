@@ -14,7 +14,15 @@
 # URL と token_file は `miharashi config-get`(管理ページの上書きを含む、次回起動と同じ値。docs/admin-web/design.md)で取る。
 # miharashi が無い(または config-get が失敗した)ときは、警告を 1 行出して設定ファイルの [agents] を sed で読む。
 # 設定は環境変数で上書きできる: MIHARASHI_CONFIG、MIHARASHI_BIN(既定 /usr/local/bin/miharashi)、T3_CLI、T3_URL、
-# T3_TOKEN_FILE、T3_TOKEN_LABEL、T3_TOKEN_REVOKE_WAIT(秒)。
+# T3_TOKEN_FILE、T3_TOKEN_LABEL、T3_TOKEN_REVOKE_WAIT(秒)、T3_TOKEN_REVOKE_MODE、T3_TOKEN_KEEP_ID。
+#
+# 別の場所の T3 Server(コンテナなど)で発行し、別のホストが受け取る運用では、手順 4 で置いたあとに 60 秒待って
+# 古いセッションを失効させる既定の動きは使えない(受け取った側が新しい token を使えると確かめる前に失効してしまう)。
+# そこで T3_TOKEN_REVOKE_MODE で段を分けられる(既定の wait は従来どおり)。docs/t3-agent-multi-server/token-delivery.md:
+#   wait  (既定) 1〜5 を続けて行う。
+#   defer 1〜4 だけ行い、新しいセッション ID(秘密ではない)を表示して終わる。古いセッションは失効させない。
+#   only  失効だけ行う。T3_TOKEN_KEEP_ID に残すセッション ID(defer が表示したもの)を渡す。待たない。
+#         URL・token_file は要らない。受け取った側で新しい token の取得成功を確かめてから実行する。
 # 関数の定義と本処理(main)は分けてある。直接実行されたときだけ main を呼ぶ(systemd/test-miharashi-t3-token.sh は source して関数を呼ぶ)。
 set -eu
 umask 077
@@ -26,6 +34,7 @@ LABEL=${T3_TOKEN_LABEL:-miharashi-agent-monitor}
 SCOPE=orchestration:read
 # miharashi は token_file を 30 秒ごとに読み直す。古いトークンを失効させるのは、その 2 倍待ってから。
 REVOKE_WAIT=${T3_TOKEN_REVOKE_WAIT:-60}
+REVOKE_MODE=${T3_TOKEN_REVOKE_MODE:-wait}
 
 log() { echo "miharashi-t3-token: $*"; }
 die() {
@@ -92,8 +101,46 @@ cleanup() {
     [[ -z "$work" ]] || rm -rf "$work"
 }
 
+# 同じラベルの古いセッションを失効させる($1 = 残すセッション ID。それ以外の同じラベルのものが対象)。$work が要る。
+revoke_old() {
+    local keep_id=$1 old revoked id
+    "$T3_CLI" auth session list --json >"$work/sessions.json" 2>"$work/err" ||
+        die "セッションの一覧を取れません。古いセッションは失効させていません: $(head -c 300 "$work/err")"
+    old=$(python3 -I -c '
+import json, sys
+label, keep = sys.argv[1], sys.argv[2]
+mine = [s["sessionId"] for s in json.load(sys.stdin) if (s.get("client") or {}).get("label") == label]
+if keep not in mine:
+    sys.exit("今回作ったセッションが一覧にありません")
+print("\n".join(i for i in mine if i != keep))
+' "$LABEL" "$keep_id" <"$work/sessions.json") || die "古いセッションを特定できません。失効させていません"
+    revoked=0
+    for id in $old; do
+        if "$T3_CLI" auth session revoke "$id" >/dev/null 2>"$work/err"; then
+            revoked=$((revoked + 1))
+        else
+            log "セッション $id を失効できません: $(head -c 300 "$work/err")"
+        fi
+    done
+    log "古いセッションを $revoked 件失効させました(ラベル $LABEL)"
+}
+
 main() {
-    local URL TOKEN_FILE TOKEN_DIR keep_id expires_at days old revoked id tmp code granted
+    local URL TOKEN_FILE TOKEN_DIR keep_id expires_at days tmp code granted
+    case "$REVOKE_MODE" in
+    wait | defer | only) ;;
+    *) die "T3_TOKEN_REVOKE_MODE は wait / defer / only のどれか(指定: $REVOKE_MODE)" ;;
+    esac
+    if [[ "$REVOKE_MODE" == only ]]; then
+        # 失効だけ。URL も token_file も使わない
+        [[ "${T3_TOKEN_KEEP_ID:-}" =~ ^[A-Za-z0-9._-]+$ ]] || die "only には T3_TOKEN_KEEP_ID(残すセッション ID)が要ります"
+        [[ -x "$T3_CLI" ]] || die "t3 CLI がありません: $T3_CLI(T3_CLI で指定できます)"
+        work=$(mktemp -d)
+        trap cleanup EXIT
+        trap 'exit 1' HUP INT TERM
+        revoke_old "$T3_TOKEN_KEEP_ID"
+        return 0
+    fi
     URL=$(resolve_url)
     TOKEN_FILE=$(resolve_token_file)
     [[ -n "$URL" ]] || die "$CONFIG の [agents] に url がありません"
@@ -140,26 +187,12 @@ main() {
     log "新しいトークンを $TOKEN_FILE に置きました(権限 $SCOPE、有効 $days 日)"
 
     # 5. 同じラベルの古いセッションを失効させる(今回作ったもの以外)
+    if [[ "$REVOKE_MODE" == defer ]]; then
+        log "新しいセッション ID は $keep_id です。古いセッションはまだ失効させていません(受け取った側で新しい token の取得成功を確かめてから T3_TOKEN_REVOKE_MODE=only T3_TOKEN_KEEP_ID=$keep_id で失効させます)"
+        return 0
+    fi
     sleep "$REVOKE_WAIT"
-    "$T3_CLI" auth session list --json >"$work/sessions.json" 2>"$work/err" ||
-        die "セッションの一覧を取れません。古いセッションは失効させていません: $(head -c 300 "$work/err")"
-    old=$(python3 -I -c '
-import json, sys
-label, keep = sys.argv[1], sys.argv[2]
-mine = [s["sessionId"] for s in json.load(sys.stdin) if (s.get("client") or {}).get("label") == label]
-if keep not in mine:
-    sys.exit("今回作ったセッションが一覧にありません")
-print("\n".join(i for i in mine if i != keep))
-' "$LABEL" "$keep_id" <"$work/sessions.json") || die "古いセッションを特定できません。失効させていません"
-    revoked=0
-    for id in $old; do
-        if "$T3_CLI" auth session revoke "$id" >/dev/null 2>"$work/err"; then
-            revoked=$((revoked + 1))
-        else
-            log "セッション $id を失効できません: $(head -c 300 "$work/err")"
-        fi
-    done
-    log "古いセッションを $revoked 件失効させました(ラベル $LABEL)"
+    revoke_old "$keep_id"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

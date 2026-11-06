@@ -21,6 +21,8 @@ mod runtime;
 mod scene_check;
 mod screen;
 mod screen_power;
+mod token_file;
+mod token_receive;
 mod video;
 mod weather;
 
@@ -1089,6 +1091,10 @@ fn main() -> Result<(), String> {
     // config-get は最初の引数がキー(位置引数)
     let key = (cmd == "config-get" && rest.first().is_some_and(|k| !k.starts_with("--")))
         .then(|| rest.remove(0));
+    // 受取ツールは専用の引数を取る(parse_cli に通さない)。終了コードは 0 / 1(受け取りの失敗)/ 2(使い方)
+    if cmd == "t3-token-receive" {
+        std::process::exit(token_receive::run(rest));
+    }
     let cli = parse_cli(rest)?;
     match cmd.as_str() {
         "run" => run(cli),
@@ -1130,7 +1136,7 @@ fn main() -> Result<(), String> {
             }
         }
         other => Err(format!(
-            "unknown command {other}(run / png / agents-demo / demo-video / intro-video / agents-intro-video / bench / bench-gpu / bench-scene / bench-metrics / kms-info / check-config / config-get)"
+            "unknown command {other}(run / png / agents-demo / demo-video / intro-video / agents-intro-video / bench / bench-gpu / bench-scene / bench-metrics / kms-info / check-config / config-get / t3-token-receive)"
         )),
     }
 }

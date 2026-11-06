@@ -5,9 +5,7 @@ use crate::screen::{Provider, World};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs;
 use std::net::IpAddr;
-use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -1174,30 +1172,74 @@ fn auth_retry_allowed(blocked: bool, previous_fingerprint: u64, next_fingerprint
     !blocked || previous_fingerprint != next_fingerprint
 }
 
+/// worker が使う token の読み込み。リンクを追跡せず、開いた FD で通常ファイル・所有者・権限・サイズ・1 行の
+/// 形式を検査してから読む(`token_file` モジュール)。エラーには値を含めない。
 fn read_token(path: &str) -> Result<String, String> {
-    let path_ref = Path::new(path);
-    let metadata =
-        fs::metadata(path_ref).map_err(|e| format!("T3 token file を確認できません: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if !token_perms_ok(
-            metadata.mode(),
-            metadata.uid(),
-            metadata.gid(),
-            effective_uid(),
-            effective_gid(),
-        ) {
-            return Err("T3 token file は実行ユーザーの 0600、または root:実行グループの 0640 にしてください".into());
+    crate::token_file::read_private_token(path, effective_uid(), effective_gid())
+        .map_err(|e| e.message().to_string())
+}
+
+/// `probe_shell` の失敗。値(token)は含まない。
+#[derive(Debug, PartialEq)]
+pub(crate) enum ProbeError {
+    BadUrl(String),
+    EnvironmentMismatch,
+    Unauthorized,
+    Forbidden,
+    /// リダイレクト・未対応の protocol など、想定外の応答
+    Rejected(String),
+    Transport(String),
+}
+
+/// `probe_shell` が成功したときの、接続先の環境。
+#[derive(Debug)]
+pub(crate) struct ProbeOk {
+    pub environment_id: Option<String>,
+}
+
+/// 接続先の T3 に、この token で一覧 API(`GET /api/orchestration/shell`)が読めるかを 1 回だけ確かめる
+/// (token の受取ツール用)。worker と同じ規則: URL は `check_url`、リダイレクトは追跡しない。
+/// 先に認証なしで環境情報を取り、`expect_environment_id` があって違えば token を送らずに止める。
+pub(crate) fn probe_shell(
+    url: &str,
+    token: &str,
+    timeout_secs: u64,
+    expect_environment_id: Option<&str>,
+) -> Result<ProbeOk, ProbeError> {
+    check_url(url).map_err(ProbeError::BadUrl)?;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(timeout_secs)))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let base = url.trim_end_matches('/');
+    let to_probe = |e: FetchError| match e {
+        FetchError::Unauthorized => ProbeError::Unauthorized,
+        FetchError::Forbidden => ProbeError::Forbidden,
+        FetchError::RateLimited(_) => {
+            ProbeError::Rejected("T3 が取得を制限しています (429)".into())
         }
+        FetchError::Invalid(w) => ProbeError::Rejected(w),
+        FetchError::Transport(w) => ProbeError::Transport(w),
+    };
+    let environment = fetch_environment(&agent, &format!("{base}/.well-known/t3/environment"))
+        .map_err(to_probe)?;
+    if let Some(expected) = expect_environment_id
+        && environment.environment_id.as_deref() != Some(expected)
+    {
+        return Err(ProbeError::EnvironmentMismatch);
     }
-    let text =
-        fs::read_to_string(path_ref).map_err(|e| format!("T3 token file を読めません: {e}"))?;
-    let token = text.trim();
-    if token.is_empty() || token.contains(['\r', '\n']) || token.len() > 8192 {
-        return Err("T3 token file の形式が不正です".into());
-    }
-    Ok(token.to_string())
+    fetch(
+        &agent,
+        &format!("{base}/api/orchestration/shell"),
+        token,
+        24,
+    )
+    .map_err(to_probe)?;
+    Ok(ProbeOk {
+        environment_id: environment.environment_id,
+    })
 }
 
 /// トークンファイルの所有者と権限が規則どおりか: 実行ユーザーの 0600、または root:実行グループの 0640。
@@ -1228,6 +1270,7 @@ pub(crate) fn effective_gid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, TcpListener};
 
@@ -2083,6 +2126,150 @@ mod tests {
             let a_now = server_state(&world, "primary");
             a_now.0 == AgentConnection::Live && a_now.1 == Some(41)
         });
+    }
+
+    /// 受けた要求(パス, Authorization ヘッダー)を記録する mock。`redirect_shell_to` があれば一覧 API は 302 で返す。
+    type RequestLog = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    fn recording_mock(redirect_shell_to: Option<String>) -> (String, RequestLog) {
+        use std::io::BufRead;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let log: RequestLog = Default::default();
+        let l = log.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let (l, redirect) = (l.clone(), redirect_shell_to.clone());
+                thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap_or(0);
+                    let mut auth = String::new();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                            break;
+                        }
+                        if line.to_ascii_lowercase().starts_with("authorization:") {
+                            auth = line.trim().to_string();
+                        }
+                    }
+                    let path = first.split_whitespace().nth(1).unwrap_or("").to_string();
+                    l.lock().unwrap().push((path.clone(), auth));
+                    if path.contains("/.well-known/t3/environment") {
+                        let body = r#"{"orchestrationProtocolVersion":2,"environmentId":"env-x"}"#;
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    } else if let Some(to) = redirect {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 302 Found\r\nLocation: {to}/api/orchestration/shell\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                    } else {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                        );
+                    }
+                });
+            }
+        });
+        (url, log)
+    }
+
+    /// 2 台のうち一方がリダイレクトで他方の origin を指しても、その token は他方に届かない。
+    /// token_file がリンクに差し替えられた接続は、何も送らずに認証が必要になる。
+    #[cfg(unix)]
+    #[test]
+    fn redirects_and_swapped_links_never_move_a_token_to_another_origin() {
+        let (a_url, a_log) = recording_mock(None);
+        let (b_url, b_log) = recording_mock(Some(a_url.clone()));
+        // C: token_file がリンク(正しい token を指している)。C の mock は何も受けないはず
+        let (c_url, c_log) = recording_mock(None);
+        let real = token_file("c-real", "token-c");
+        let link =
+            std::env::temp_dir().join(format!("miharashi-multi-{}-c-link", std::process::id()));
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let cfg = ConfigAgents {
+            enabled: true,
+            url: a_url.clone(),
+            token_file: token_file("a2", "token-a"),
+            poll_secs: 1,
+            timeout_secs: 2,
+            stale_secs: 30,
+            recent_hours: 24,
+            extra_servers: vec![
+                crate::config::ConfigAgentServer {
+                    id: "container".into(),
+                    label: None,
+                    url: b_url,
+                    token_file: token_file("b2", "token-b"),
+                },
+                crate::config::ConfigAgentServer {
+                    id: "linked".into(),
+                    label: None,
+                    url: c_url,
+                    token_file: link.to_str().unwrap().to_string(),
+                },
+            ],
+        };
+        let mut provider = AgentProvider::new(start(&cfg));
+        let mut world = World::default();
+        wait_for("B と C が失敗として現れる", 15, || {
+            provider.update(&mut world);
+            let st = |id: &str| {
+                world
+                    .agents
+                    .iter()
+                    .find(|s| &*s.server_id == id)
+                    .map(|s| s.snapshot.connection)
+            };
+            st("container")
+                .is_some_and(|c| c != AgentConnection::Connecting && c != AgentConnection::Live)
+                && st("linked") == Some(AgentConnection::AuthenticationRequired)
+        });
+        thread::sleep(Duration::from_millis(500));
+        let linked = world
+            .agents
+            .iter()
+            .find(|s| &*s.server_id == "linked")
+            .unwrap();
+        assert!(
+            linked
+                .snapshot
+                .error_summary
+                .as_deref()
+                .is_some_and(|e| e.contains("シンボリックリンク")),
+            "{:?}",
+            linked.snapshot.error_summary
+        );
+        assert!(!format!("{:?}", linked.snapshot.error_summary).contains("token-c"));
+        // A の mock に届いた Authorization は、A 自身の token だけ。B の token は一度も来ない
+        for (path, auth) in a_log.lock().unwrap().iter() {
+            assert!(
+                !auth.contains("token-b"),
+                "A に B の token が届いた: {path}"
+            );
+            assert!(
+                !auth.contains("token-c"),
+                "A に C の token が届いた: {path}"
+            );
+        }
+        // B は自分の origin にだけ token を送り、リダイレクトは追跡していない
+        assert!(
+            b_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, a)| a.contains("token-b"))
+        );
+        // C(リンク)には環境情報の問い合わせも含め、token を載せた要求が 1 件も届かない
+        assert!(c_log.lock().unwrap().iter().all(|(_, a)| a.is_empty()));
     }
 
     #[test]

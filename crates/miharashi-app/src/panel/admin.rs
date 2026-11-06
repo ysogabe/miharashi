@@ -5,8 +5,8 @@
 //! 今ある経路: `GET /api/v1/admin/overview`、`POST /api/v1/admin/restart`、`PUT /api/v1/admin/config`。
 //! 静的ファイル `/admin`、`/admin/app.js`、`/admin/app.css` も同じワーカーで返す(埋め込み。認証なし)。
 use super::{
-    AdminSources, HttpError, PanelInput, RateLimit, Reaper, Route, Shared, body_prefetched, error,
-    json_response, same_secret,
+    AdminSources, HttpError, PanelInput, RateLimit, Reaper, Route, Shared, TokenState,
+    body_prefetched, error, json_response, same_secret,
 };
 use crate::config::{
     self, Config, LoadedConfig, Overlay, OverlayErrorKind, overlay_generation, remove_boot_marker,
@@ -95,23 +95,13 @@ struct Ctx {
 /// 管理トークンのファイルを読む。`agents::read_token` と同じ厳しい規則: 実行ユーザーの 0600、または
 /// root:実行グループの 0640。16 文字以上で 1 行。`euid` / `egid` は実行ユーザーとグループ。
 fn read_admin_token(path: &str, euid: u32, egid: u32) -> Result<String, String> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
-    if !crate::agents::token_perms_ok(meta.mode(), meta.uid(), meta.gid(), euid, egid) {
-        return Err(format!(
-            "{path}: 所有者か権限が規則に合わない(権限 {:o})。実行ユーザーの 0600、または root:実行グループの 0640 にする",
-            meta.mode() & 0o777
-        ));
-    }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    let token = text.trim();
+    // T3 の token と同じ読み方(リンクを追跡しない・開いた FD で検査・8192 バイトまで・1 行)
+    let token = crate::token_file::read_private_token(path, euid, egid)
+        .map_err(|e| format!("{path}: {}", e.message()))?;
     if token.len() < 16 {
         return Err(format!("{path}: トークンが短い(16 文字以上)"));
     }
-    if token.contains(['\r', '\n']) {
-        return Err(format!("{path}: トークンは 1 行で書く"));
-    }
-    Ok(token.to_string())
+    Ok(token)
 }
 
 /// `[admin]` が有効なら管理トークンを読み、管理ワーカーを起こす。管理トークンが規則を満たさない、
@@ -447,25 +437,47 @@ fn retry_after_s(started: Instant) -> u64 {
     left.as_secs() + u64::from(left.subsec_nanos() > 0)
 }
 
-/// overview の `tokens`。(id, 設定のパス)の 4 つを `check_token_file` で調べる。値は読まない。
+/// overview の `tokens`。HA・パネル・管理ページと、T3 の接続ごとの token_file(`primary` と `extra_servers`)を
+/// `check_token_file` / `check_agent_token_file` で調べる。値は返さない。
+/// 各要素は id・label・path・state・modified_at(更新が止まっていないかを見る目安。ファイルが無ければ null)。
+/// T3 の id は取得元(feeds)と同じ(`agents` と `agents:<id>`)。
 fn token_reports(cfg: &Config) -> Vec<Value> {
     let (uid, gid) = (
         crate::agents::effective_uid(),
         crate::agents::effective_gid(),
     );
-    [
-        ("home_assistant", &cfg.home_assistant.token_file),
-        ("agents", &cfg.agents.token_file),
-        ("panel", &cfg.panel.token_file),
-        ("admin", &cfg.admin.token_file),
-    ]
-    .into_iter()
-    .map(|(id, path)| {
-        // 取得が有効かどうかとは別に、ファイルそのものの状態を出す
+    let report = |id: &str, label: &str, path: &str, state: TokenState, link: bool| {
+        // リンクを追跡しない T3 の token は、リンク自体の時刻を見る
+        let modified = if link {
+            std::fs::symlink_metadata(path)
+        } else {
+            std::fs::metadata(path)
+        }
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|t| rfc3339(t.into()));
+        json!({"id": id, "label": label, "path": path, "state": state, "modified_at": modified})
+    };
+    let mut out = Vec::new();
+    // 取得が有効かどうかとは別に、ファイルそのものの状態を出す
+    out.push({
+        let path = &cfg.home_assistant.token_file;
         let state = super::feeds::check_token_file(path, uid, gid);
-        json!({"id": id, "path": path, "state": state})
-    })
-    .collect()
+        report("home_assistant", "Home Assistant", path, state, false)
+    });
+    for server in cfg.agents.servers() {
+        let (id, label) = super::feeds::agent_identity(&server.id, &server.label);
+        let state = super::feeds::check_agent_token_file(&server.token_file, uid, gid);
+        out.push(report(&id, &label, &server.token_file, state, true));
+    }
+    for (id, label, path) in [
+        ("panel", "操作パネル", &cfg.panel.token_file),
+        ("admin", "管理ページ", &cfg.admin.token_file),
+    ] {
+        let state = super::feeds::check_token_file(path, uid, gid);
+        out.push(report(id, label, path, state, false));
+    }
+    out
 }
 
 /// `GET /api/v1/admin/overview` の本文。
@@ -1320,6 +1332,150 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(t["state"], "missing");
+    }
+
+    /// 接続ごとの「取得の結果(feeds)」と「token ファイルの状態(tokens)」は別々に出る。
+    /// 取得が成功/401 でも token が正常/欠落とは限らず、その組み合わせがそのまま見える。
+    #[test]
+    fn overview_separates_fetch_state_from_token_state_for_each_connection() {
+        use crate::agents::{AgentConnection, Connection, Shared};
+        let fx = Fx::new("multi-feeds-tokens");
+        let d = fx.dir.display();
+        fx.token("t3.token", "primary-secret-0123456789", 0o600);
+        fx.token("t3-container.token", "container-secret-0123456789", 0o600);
+        // spare は token が無い。linked はリンク(追跡しない)。loose は権限が緩い
+        fx.token("real.token", "linked-secret-0123456789", 0o600);
+        std::os::unix::fs::symlink(fx.path("real.token"), fx.path("t3-linked.token")).unwrap();
+        let base_path = fx.base(
+            "",
+            &format!(
+                "[agents]\ntoken_file = \"{d}/t3.token\"\n\
+                 [[agents.extra_servers]]\nid = \"container\"\nlabel = \"コンテナ\"\nurl = \"http://192.0.2.31:3773\"\ntoken_file = \"{d}/t3-container.token\"\n\
+                 [[agents.extra_servers]]\nid = \"spare\"\nurl = \"http://192.0.2.32:3773\"\ntoken_file = \"{d}/t3-spare.token\"\n\
+                 [[agents.extra_servers]]\nid = \"linked\"\nurl = \"http://192.0.2.33:3773\"\ntoken_file = \"{d}/t3-linked.token\"\n"
+            ),
+        );
+        let loaded = Config::load_with_overlay(&base_path, false).unwrap();
+        assert_eq!(loaded.effective.agents.servers().len(), 4);
+        let shared = |c: AgentConnection, err: Option<&str>| {
+            let s = Shared::default();
+            s.write().unwrap().connection = c;
+            s.write().unwrap().error_summary = err.map(str::to_string);
+            s
+        };
+        let conn = |id: &str, label: &str, s: Shared| Connection {
+            server_id: id.into(),
+            label: label.into(),
+            shared: s,
+        };
+        let sources = AdminSources {
+            agents: Ok(vec![
+                // primary: 取得成功・token 正常
+                conn("primary", "primary", shared(AgentConnection::Live, None)),
+                // container: token は正常なのに T3 が 401
+                conn(
+                    "container",
+                    "コンテナ",
+                    shared(
+                        AgentConnection::AuthenticationRequired,
+                        Some("T3 が認証を拒否しました (401)"),
+                    ),
+                ),
+                // spare: token ファイルが無いので認証できない
+                conn(
+                    "spare",
+                    "spare",
+                    shared(
+                        AgentConnection::AuthenticationRequired,
+                        Some("token ファイルがありません"),
+                    ),
+                ),
+                conn(
+                    "linked",
+                    "linked",
+                    shared(AgentConnection::Connecting, None),
+                ),
+            ]),
+            ..AdminSources::default()
+        };
+        let (_p, base) = start_with(loaded, 200, sources);
+        let v = overview(&base);
+        let by = |list: &str, id: &str| {
+            v[list]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|x| x["id"] == id)
+                .unwrap_or_else(|| panic!("{list} に {id} がありません"))
+                .clone()
+        };
+        // 取得元(feeds): primary は従来の id、追加は agents:<id>
+        assert_eq!(by("feeds", "agents")["state"], "ok");
+        assert_eq!(by("feeds", "agents:container")["state"], "auth_required");
+        assert_eq!(by("feeds", "agents:container")["label"], "T3(コンテナ)");
+        assert_eq!(
+            by("feeds", "agents:container")["error"],
+            "T3 が認証を拒否しました (401)"
+        );
+        assert_eq!(by("feeds", "agents:spare")["state"], "auth_required");
+        assert_eq!(by("feeds", "agents:linked")["state"], "connecting");
+        // トークン(tokens): 同じ id で、取得の結果とは独立に出る
+        assert_eq!(by("tokens", "agents")["state"], "ok");
+        assert_eq!(by("tokens", "agents")["label"], "T3(エージェント)");
+        assert_eq!(by("tokens", "agents")["path"], format!("{d}/t3.token"));
+        assert!(
+            by("tokens", "agents")["modified_at"]
+                .as_str()
+                .unwrap()
+                .contains('T')
+        );
+        assert_eq!(
+            by("tokens", "agents:container")["state"],
+            "ok",
+            "token は正常。拒否しているのは T3 側(取得元の 401)"
+        );
+        assert_eq!(by("tokens", "agents:container")["label"], "T3(コンテナ)");
+        assert_eq!(by("tokens", "agents:spare")["state"], "missing");
+        assert_eq!(by("tokens", "agents:spare")["label"], "T3(spare)");
+        assert!(by("tokens", "agents:spare")["modified_at"].is_null());
+        assert_eq!(by("tokens", "agents:linked")["state"], "symlink");
+        // 並びは従来どおり(HA、T3 の各接続、パネル、管理)。1 接続 1 行
+        let ids: Vec<&str> = v["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "home_assistant",
+                "agents",
+                "agents:container",
+                "agents:spare",
+                "agents:linked",
+                "panel",
+                "admin"
+            ]
+        );
+        // どの値も返らない
+        let text = v.to_string();
+        for secret in ["primary-secret", "container-secret", "linked-secret"] {
+            assert!(!text.contains(secret), "{secret}");
+        }
+    }
+
+    /// 追加の接続が無い設定では、tokens は従来の 4 件・従来の id・従来の並び。
+    #[test]
+    fn tokens_without_extra_servers_keep_the_legacy_shape() {
+        let fx = Fx::new("tokens-legacy");
+        let cfg = Config::load_with_overlay(&fx.base("", ""), false)
+            .unwrap()
+            .effective;
+        let reports = token_reports(&cfg);
+        let ids: Vec<&str> = reports.iter().map(|t| t["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["home_assistant", "agents", "panel", "admin"]);
+        assert_eq!(reports[1]["path"], cfg.agents.token_file);
     }
 
     #[test]
