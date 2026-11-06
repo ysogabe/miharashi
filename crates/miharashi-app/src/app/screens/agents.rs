@@ -105,7 +105,17 @@ impl PoseTween {
 struct Group {
     /// 複数の接続を監視しているときは「接続名 / プロジェクト名」。
     label: String,
+    /// 複数の接続を監視しているときの、接続の目印・接続名・プロジェクト名(見出しは幅に合わせてこれから組む)。
+    heading: Option<GroupHeading>,
     entries: Vec<AgentEntry>,
+}
+
+/// 複数の接続を監視しているときの枠の見出しの部品。目印は上部の接続別の欄と同じもの。
+#[derive(Clone)]
+struct GroupHeading {
+    tag: String,
+    server: String,
+    project: String,
 }
 
 /// 接続ごとの画面側の同期状態。カーソル・世代・stale・最後に見た取得結果は接続ごとに持ち、
@@ -137,6 +147,14 @@ impl ServerUiState {
             last_snapshot: AgentSnapshot::default(),
             entries: Vec::new(),
         }
+    }
+}
+
+/// 接続の短い目印: 設定の順に ①②③④…(接続は最大 4 台)。ラベルが似ていても、番号で区別できる。
+fn server_tag(index: usize) -> String {
+    match char::from_u32(0x2460 + index as u32) {
+        Some(c) if index < 20 => c.to_string(),
+        _ => (index + 1).to_string(),
     }
 }
 
@@ -276,6 +294,11 @@ impl AgentScreen {
     /// その接続が stale(取得が `stale_secs` を超えて止まっている)か。
     fn is_stale(&self, id: &ServerId) -> bool {
         self.server_index(id).is_some_and(|i| self.servers[i].stale)
+    }
+
+    /// 接続の短い目印(設定順の番号)。上部の接続別の欄・枠の見出し・カードで同じものを使う。
+    fn server_tag(&self, id: &ServerId) -> String {
+        server_tag(self.server_index(id).unwrap_or(0))
     }
 
     fn server_label<'a>(&'a self, id: &'a ServerId) -> &'a str {
@@ -752,13 +775,22 @@ impl AgentScreen {
                 Some(e) if !e.project_title.is_empty() => e.project_title.clone(),
                 _ => short(&id.project),
             };
-            let label = if multi {
-                format!("{} / {name}", self.server_label(&id.server))
+            let (label, heading) = if multi {
+                let server = self.server_label(&id.server).to_string();
+                (
+                    format!("{server} / {name}"),
+                    Some(GroupHeading {
+                        tag: self.server_tag(&id.server),
+                        server,
+                        project: name,
+                    }),
+                )
             } else {
-                name
+                (name, None)
             };
             out.groups.push(Group {
                 label,
+                heading,
                 entries: ranks.into_iter().map(|r| sorted[r].clone()).collect(),
             });
             out.families.push(families);
@@ -1475,6 +1507,8 @@ impl AgentScreen {
             badge: None,
             compact,
             one_line: false,
+            // 幅が足りなくても接続名より先に残す目印。接続が 1 台だけのときは出さない。
+            server: self.multi().then(|| self.server_tag(&e.server_id)),
         }
     }
 }
@@ -1645,9 +1679,10 @@ struct ChipLayout {
 }
 
 /// 状態・件数・未表示が欄に収まる大きさを決め、残りの幅に接続名を省略して入れる。
-/// 欄が狭いほど接続名から削り、状態・件数・未表示は(文字を小さくしても)必ず残す。
+/// 欄が狭いほど接続名から削り、目印(①など)・状態・件数・未表示は(文字を小さくしても)必ず残す。
 fn chip_layout(
     text: &mut miharashi_render::TextEngine,
+    tag: &str,
     label: &str,
     status: &str,
     count: &str,
@@ -1664,11 +1699,31 @@ fn chip_layout(
             + text.measure(count, size)
             + hidden.map_or(0.0, |t| gap + text.measure(t, size))
     };
-    while size > 11.0 && tail_w(text, size) + gap + size * 1.5 > room {
+    // 目印も、状態・件数・未表示と同じく必ず残す。
+    let head_w = |text: &mut miharashi_render::TextEngine, size: f32| {
+        if tag.is_empty() {
+            0.0
+        } else {
+            text.measure(tag, size) + gap * 0.5
+        }
+    };
+    while size > 11.0 && head_w(text, size) + tail_w(text, size) + gap + size * 1.5 > room {
         size *= 0.92;
     }
     let tail = tail_w(text, size);
-    let name = fit_header_label(label, (room - tail - gap).max(size), size);
+    let head = head_w(text, size);
+    let label_room = room - head - tail - gap;
+    // 接続名は、「…」を含めて 2 文字ぶん入るときだけ出す(入らなければ目印だけ)。
+    let shown = if label_room >= size * 2.0 {
+        fit_header_label(label, label_room, size)
+    } else {
+        String::new()
+    };
+    let name = match (tag.is_empty(), shown.is_empty()) {
+        (true, _) => shown,
+        (false, true) => tag.to_string(),
+        (false, false) => format!("{tag} {shown}"),
+    };
     let status_x = text.measure(&name, size) + gap;
     let count_x = status_x + text.measure(status, size) + gap;
     let after_count = count_x + text.measure(count, size);
@@ -1707,8 +1762,10 @@ fn draw_server_chips(
         };
         let hidden = h.hidden.get(&st.id).copied().unwrap_or(0);
         let hidden_text = (hidden > 0).then(|| format!("未表示 {hidden}"));
+        let tag = server_tag(i);
         let l = chip_layout(
             text,
+            &tag,
             &st.label,
             status,
             &count,
@@ -1824,6 +1881,7 @@ fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine,
     let counts = [
         (
             "実行中",
+            "実行",
             all.iter()
                 .filter(|e| {
                     matches!(
@@ -1838,6 +1896,7 @@ fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine,
         ),
         (
             "承認待ち",
+            "承認",
             all.iter()
                 .filter(|e| {
                     e.has_pending_approvals || e.state == crate::agents::AgentState::Approval
@@ -1847,6 +1906,7 @@ fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine,
         ),
         (
             "入力・計画",
+            "入力",
             all.iter()
                 .filter(|e| {
                     e.has_pending_user_input
@@ -1861,6 +1921,7 @@ fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine,
         ),
         (
             "異常",
+            "異常",
             all.iter()
                 .filter(|e| e.state == crate::agents::AgentState::Error)
                 .count(),
@@ -1868,6 +1929,7 @@ fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine,
         ),
         (
             "応答完了",
+            "完了",
             all.iter()
                 .filter(|e| e.state == crate::agents::AgentState::Completed)
                 .count(),
@@ -1875,6 +1937,7 @@ fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine,
         ),
         (
             "その他",
+            "他",
             all.iter()
                 .filter(|e| {
                     matches!(
@@ -1889,26 +1952,41 @@ fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine,
             [143, 163, 183, 255],
         ),
     ];
-    let mut x = 32.0;
-    for (label, count, color) in counts {
-        text.draw(canvas, &format!("{label} {count}"), x, 174.0, 20.0, color);
-        x += 175.0;
-    }
     let total = all.len();
     let synchronized = servers.iter().any(|s| s.last_snapshot.synchronized);
-    let mut count = if synchronized {
-        format!("{total} スレッド · {} プロジェクト", groups.len())
-    } else {
-        "-- スレッド".into()
-    };
     let urgent = all.iter().filter(|e| attention(e)).count();
-    if urgent > 0 {
-        count.push_str(&format!(" · 要確認 {urgent} 件"));
+    let summary = summary_row(
+        text,
+        w,
+        &counts,
+        &SummaryTotals {
+            synchronized,
+            threads: total,
+            projects: groups.len(),
+            urgent,
+            overflow: h.overflow,
+        },
+    );
+    for item in &summary.items {
+        text.draw(
+            canvas,
+            &item.text,
+            item.x,
+            SUMMARY_Y,
+            summary.size,
+            item.color,
+        );
     }
-    if h.overflow > 0 {
-        count.push_str(&format!(" · ほか {} 件更新", h.overflow));
+    if !summary.right.is_empty() {
+        text.draw(
+            canvas,
+            &summary.right,
+            summary.right_x,
+            SUMMARY_Y,
+            summary.right_size,
+            [143, 163, 183, 255],
+        );
     }
-    text.draw_right(canvas, &count, w - 32.0, 174.0, 21.0, [143, 163, 183, 255]);
     if servers.iter().all(|s| s.last_snapshot.synchronized) && total == 0 {
         text.draw(
             canvas,
@@ -1944,7 +2022,7 @@ fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine,
         let count_size = 23.0 * scale;
         if lane.cont {
             // 同じプロジェクトが次の列へ続いた枠。名前だけを控えめに出す。
-            let name = fit_header_label(&group.label, (head.w - 90.0 * scale).max(40.0), name_size);
+            let name = group_head_text(text, group, (head.w - 90.0 * scale).max(40.0), name_size);
             text.draw(
                 canvas,
                 &name,
@@ -1966,8 +2044,9 @@ fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine,
         }
         let count = group.entries.len().to_string();
         let count_w = text.measure(&count, count_size);
-        let name = fit_header_label(
-            &group.label,
+        let name = group_head_text(
+            text,
+            group,
             (head.w - count_w - 24.0 * scale).max(40.0),
             name_size,
         );
@@ -2038,6 +2117,160 @@ fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine,
         1.0,
         miharashi_render::canvas::rgba(48, 67, 87, 255),
     );
+}
+
+const SUMMARY_Y: f32 = 174.0;
+
+/// 集計の行の右側(合計)に出す数。
+struct SummaryTotals {
+    synchronized: bool,
+    threads: usize,
+    projects: usize,
+    urgent: usize,
+    overflow: usize,
+}
+
+struct SummaryItem {
+    text: String,
+    x: f32,
+    color: [u8; 4],
+}
+
+/// 状態別の件数(左)と合計(右寄せ)の並び。文字は実測で置き、重ならない。
+struct SummaryRow {
+    size: f32,
+    items: Vec<SummaryItem>,
+    right: String,
+    right_x: f32,
+    right_size: f32,
+}
+
+/// 集計の行を置く。左の 6 項目は、収まるときは従来の 175px 間隔・20px のまま。右の合計と重なるときは、
+/// 合計の細かい項目(プロジェクト数、更新の件数)を減らす前に、まず左の文字を小さくし、項目名を短くし、
+/// 詰めて置く。それでも収まらなければ合計を省略する。左と右の間は常に 24px 以上あける。
+fn summary_row(
+    text: &mut miharashi_render::TextEngine,
+    width: f32,
+    counts: &[(&str, &str, usize, [u8; 4])],
+    t: &SummaryTotals,
+) -> SummaryRow {
+    const LEFT: f32 = 32.0;
+    const MARGIN_RIGHT: f32 = 32.0;
+    const MIN_GAP: f32 = 24.0;
+    let urgent = (t.urgent > 0).then(|| format!("要確認 {} 件", t.urgent));
+    let overflow = (t.overflow > 0).then(|| format!("ほか {} 件更新", t.overflow));
+    let threads = if t.synchronized {
+        format!("{} スレッド", t.threads)
+    } else {
+        "-- スレッド".to_string()
+    };
+    let join = |parts: Vec<String>| parts.join(" · ");
+    let with_projects = if t.synchronized {
+        format!("{threads} · {} プロジェクト", t.projects)
+    } else {
+        threads.clone()
+    };
+    let variants: Vec<String> = [
+        join(
+            [Some(with_projects), urgent.clone(), overflow.clone()]
+                .into_iter()
+                .flatten()
+                .collect(),
+        ),
+        join(
+            [Some(threads.clone()), urgent.clone(), overflow.clone()]
+                .into_iter()
+                .flatten()
+                .collect(),
+        ),
+        join(
+            [Some(threads.clone()), urgent.clone()]
+                .into_iter()
+                .flatten()
+                .collect(),
+        ),
+        urgent.clone().unwrap_or(threads),
+    ]
+    .into_iter()
+    .fold(Vec::new(), |mut v, s| {
+        if v.last() != Some(&s) {
+            v.push(s);
+        }
+        v
+    });
+    // (左の文字の倍率, 項目名を短くするか)。先頭は従来の見た目。
+    let configs = [
+        (1.0f32, false),
+        (0.92, false),
+        (0.85, false),
+        (0.85, true),
+        (0.78, true),
+        (0.7, true),
+    ];
+    let place = |text: &mut miharashi_render::TextEngine, k: f32, short: bool| {
+        let size = 20.0 * k;
+        let mut items = Vec::new();
+        let mut x = LEFT;
+        for &(label, abbr, count, color) in counts {
+            let item = format!("{} {count}", if short { abbr } else { label });
+            let w = text.measure(&item, size);
+            items.push(SummaryItem {
+                text: item,
+                x,
+                color,
+            });
+            // 従来は 175px 間隔。1 項目がそれに収まるうちは間隔を変えない(最後に長い項目があっても右とはあける)。
+            x += if k == 1.0 && w + 12.0 <= 175.0 {
+                175.0
+            } else {
+                w + 22.0 * k
+            };
+        }
+        let end = items
+            .last()
+            .map_or(LEFT, |i| i.x + text.measure(&i.text, size));
+        (size, items, end)
+    };
+    let limit = width - MARGIN_RIGHT;
+    for variant in &variants {
+        for &(k, short) in &configs {
+            let (size, items, end) = place(text, k, short);
+            let right_size = 21.0 * k;
+            let right_w = text.measure(variant, right_size);
+            let right_x = limit - right_w;
+            if end + MIN_GAP <= right_x {
+                return SummaryRow {
+                    size,
+                    items,
+                    right: variant.clone(),
+                    right_x,
+                    right_size,
+                };
+            }
+        }
+    }
+    // 合計をどこまで短くしても入らない: 左を最小にし、残りの幅に合計を省略して置く。
+    let (size, items, end) = place(text, 0.7, true);
+    let right_size = 21.0 * 0.7;
+    let room = limit - end - MIN_GAP;
+    let right = if room > right_size * 2.0 {
+        draw::fit_label_text(
+            text,
+            variants.last().map_or("", String::as_str),
+            right_size,
+            room,
+        )
+    } else {
+        String::new()
+    };
+    let right_x = limit - text.measure(&right, right_size);
+    SummaryRow {
+        size,
+        items,
+        right,
+        right_x,
+        right_size,
+    }
 }
 
 /// 単色の面を長方形に伸ばして 1 枚足す。
@@ -2216,6 +2449,44 @@ fn short(s: &str) -> String {
         .rev()
         .collect()
 }
+/// 枠の見出し。接続が複数のときは「目印 接続名 / プロジェクト」を幅に合わせて組む。
+/// 目印は必ず残し、接続名は幅の 4 割までに抑えて、残りをプロジェクトに回す。
+fn group_head_text(
+    text: &mut miharashi_render::TextEngine,
+    group: &Group,
+    max_width: f32,
+    size: f32,
+) -> String {
+    let Some(h) = &group.heading else {
+        return fit_header_label(&group.label, max_width, size);
+    };
+    let lead = format!("{} ", h.tag);
+    let full = format!("{lead}{} / {}", h.server, h.project);
+    if text.measure(&full, size) <= max_width {
+        return full;
+    }
+    let budget = (max_width - text.measure(&lead, size)).max(0.0);
+    let sep = " / ";
+    let sep_w = text.measure(sep, size);
+    let server_w = text.measure(&h.server, size);
+    let min_server = (budget * 0.4).min(server_w);
+    let project_cap = budget - sep_w - min_server;
+    if project_cap < size * 2.0 {
+        // 幅がほとんどない: 目印と、入るだけの接続名。
+        return if budget >= size * 2.0 {
+            format!(
+                "{lead}{}",
+                draw::fit_label_text(text, &h.server, size, budget)
+            )
+        } else {
+            h.tag.clone()
+        };
+    }
+    let project = draw::fit_label_text(text, &h.project, size, project_cap);
+    let server_room = budget - sep_w - text.measure(&project, size);
+    let server = draw::fit_label_text(text, &h.server, size, server_room);
+    format!("{lead}{server}{sep}{project}")
+}
 fn fit_header_label(value: &str, max_width: f32, font_size: f32) -> String {
     let width = |c: char| {
         if c.is_ascii() {
@@ -2344,7 +2615,7 @@ fn content_key_from_display(c: &draw::AgentCardContent) -> String {
         c.badge,
         c.compact,
         c.one_line
-    )
+    ) + &format!("|{:?}", c.server)
 }
 
 #[cfg(test)]

@@ -82,6 +82,12 @@ impl<S: Screen> WithScene<S> {
         Region { x, y, w, h }
     }
 
+    /// 内側の画面(試験用)。
+    #[cfg(test)]
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
     /// 場面(試験用)。
     #[cfg(test)]
     pub fn scene(&self) -> &VrmScene {
