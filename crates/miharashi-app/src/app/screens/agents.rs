@@ -1715,7 +1715,7 @@ fn chip_layout(
     let label_room = room - head - tail - gap;
     // 接続名は、「…」を含めて 2 文字ぶん入るときだけ出す(入らなければ目印だけ)。
     let shown = if label_room >= size * 2.0 {
-        fit_header_label(label, label_room, size)
+        draw::fit_label_text(text, label, size, label_room)
     } else {
         String::new()
     };
@@ -1797,7 +1797,7 @@ fn draw_server_chips(
         }
         if !sub.is_empty() {
             let size = 18.0 * fs;
-            let sub = fit_header_label(&sub, chip_w - 12.0 * fs, size);
+            let sub = draw::fit_label_text(text, &sub, size, chip_w - 12.0 * fs);
             text.draw(canvas, &sub, x, 134.0, size, MUTED);
         }
     }

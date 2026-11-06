@@ -644,7 +644,7 @@ fn server_chips_never_overlap_and_keep_status_and_counts() {
         let fs = (width / 1920.0).clamp(0.6, 1.0);
         for n in 1..=4usize {
             let chip_w = (width - 64.0) / n as f32;
-            for label in ["コンテナ", long, "a"] {
+            for label in ["コンテナ", long, "a", &"W".repeat(32)] {
                 let l = chip_layout(
                     &mut text,
                     "②",
