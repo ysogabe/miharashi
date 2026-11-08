@@ -3,11 +3,14 @@
 //! 画面は 2 層で描く。変わりにくい層(背景・カード・時計)は `daidai_base` で一度描いて取っておき、
 //! 毎フレームは取っておいた絵を戻してから `draw_avatar` でアバターだけを上下にずらして重ねる。
 //! アバターは Nearest で拡大するので、ドットが潰れたりにじんだりしない。
+//! 素材の四隅は描くときに角丸で切り抜く(素材 PNG は触らない)。角の外は背景と光がそのまま見える。
 use crate::agents::{fit_label_text, wrap_text};
 use crate::canvas::{Canvas, rgba};
 use crate::photo_layout::scale;
 use crate::text::TextEngine;
-use tiny_skia::{FilterQuality, Pixmap, PixmapPaint, Transform};
+use tiny_skia::{
+    FillRule, FilterQuality, Paint, PathBuilder, Pattern, Pixmap, SpreadMode, Transform,
+};
 
 /// アバター素材の一辺(画素)。実ファイルもこの大きさ(正方形)を想定するが、違っても縦横を保って収める。
 pub const AVATAR_SIZE: u32 = 480;
@@ -15,6 +18,8 @@ pub const AVATAR_SIZE: u32 = 480;
 pub const MAX_CARDS: usize = 4;
 /// アバターが上下に揺れる周期 [秒]。
 pub const BOB_PERIOD_SECS: f32 = 3.2;
+/// アバターの角丸の半径(表示した絵の短い辺に対する割合)。後ろの光の円(半径 0.48 倍)になじむ大きさ。
+pub const AVATAR_CORNER_RATIO: f32 = 0.14;
 /// 揺れの振れ幅(高さ 1080 のときの画素数。片側)。
 const BOB_AMPLITUDE: f32 = 7.0;
 
@@ -277,7 +282,29 @@ fn cards_panel(
     }
 }
 
+/// 角丸の長方形(左上 x,y、大きさ w,h、半径 r)の輪郭。r は短い辺の半分までに抑える。
+fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
+    let r = r.clamp(0.0, w.min(h) / 2.0);
+    // 円弧を 3 次ベジェで近似する係数
+    let k = r * (1.0 - 0.552_284_75);
+    let (x1, y1) = (x + w, y + h);
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x1 - r, y);
+    pb.cubic_to(x1 - k, y, x1, y + k, x1, y + r);
+    pb.line_to(x1, y1 - r);
+    pb.cubic_to(x1, y1 - k, x1 - k, y1, x1 - r, y1);
+    pb.line_to(x + r, y1);
+    pb.cubic_to(x + k, y1, x, y1 - k, x, y1 - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + k, x + k, y, x + r, y);
+    pb.close();
+    pb.finish()
+}
+
 /// アバターを `bob`(画素。下が正)だけずらして重ねる。Nearest で拡大するので、ドットの縁はにじまない。
+/// 四隅は角丸(半径は表示した絵の短い辺の `AVATAR_CORNER_RATIO` 倍)で切り抜く。切り抜きは絵を模様(pattern)にして
+/// 角丸の輪郭を塗る形なので、揺れで位置が変わっても、大きさが変わっても、同じ形になる(マスクの作り直しは要らない)。
 pub fn draw_avatar(c: &mut Canvas, avatar: &Pixmap, bob: i32) {
     let g = avatar_geometry(c.width(), c.height());
     // 縦横を保って g.size に収める(素材が正方形でなくても潰さない)
@@ -285,16 +312,23 @@ pub fn draw_avatar(c: &mut Canvas, avatar: &Pixmap, bob: i32) {
     let (dw, dh) = (avatar.width() as f32 * s, avatar.height() as f32 * s);
     let x = g.x as f32 + ((g.size - dw) / 2.0).round();
     let y = g.y as f32 + ((g.size - dh) / 2.0).round() + bob as f32;
-    let paint = PixmapPaint {
-        quality: FilterQuality::Nearest,
-        ..PixmapPaint::default()
+    let Some(path) = rounded_rect_path(x, y, dw, dh, dw.min(dh) * AVATAR_CORNER_RATIO) else {
+        return;
     };
-    c.pixmap.draw_pixmap(
-        0,
-        0,
+    let mut paint = Paint::default();
+    paint.anti_alias = true;
+    paint.shader = Pattern::new(
         avatar.as_ref(),
-        &paint,
+        SpreadMode::Pad,
+        FilterQuality::Nearest,
+        1.0,
         Transform::from_row(s, 0.0, 0.0, s, x, y),
+    );
+    c.pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
         None,
     );
 }
@@ -411,13 +445,77 @@ mod tests {
         let mut c = Canvas::new(1920, 1080);
         c.clear(rgba(BG[0], BG[1], BG[2], 255));
         draw_avatar(&mut c, &dots, 0);
-        let px = c.pixmap.data();
+        let g = avatar_geometry(1920, 1080);
+        let corner = (g.size * AVATAR_CORNER_RATIO).ceil() as i32 + 1;
+        let (x0, y0, sz) = (g.x, g.y, g.size as i32);
         let mut seen = std::collections::HashSet::new();
-        for p in px.as_chunks::<4>().0 {
-            seen.insert(*p);
+        for (i, p) in c.pixmap.data().as_chunks::<4>().0.iter().enumerate() {
+            let (px, py) = ((i % 1920) as i32 - x0, (i / 1920) as i32 - y0);
+            // 角丸のふちは背景となじませるので中間色が出る。角の四角の中は数えない
+            let in_corner_box =
+                (px < corner || px >= sz - corner) && (py < corner || py >= sz - corner);
+            if !in_corner_box {
+                seen.insert(*p);
+            }
         }
         // 背景 + 4 色だけ(補間されていれば中間色が増える)
         assert_eq!(seen.len(), 5, "{seen:?}");
+    }
+
+    #[test]
+    fn avatar_corners_are_clipped_to_the_background_but_the_centre_is_kept() {
+        // 全面が不透明な赤の素材でも、四隅は背景のまま、中央は素材の色になる
+        let mut red = Pixmap::new(48, 48).unwrap();
+        red.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        for bob in [0, 7, -7] {
+            let mut c = Canvas::new(1920, 1080);
+            c.clear(rgba(BG[0], BG[1], BG[2], 255));
+            draw_avatar(&mut c, &red, bob);
+            let g = avatar_geometry(1920, 1080);
+            let (x0, y0) = (g.x, g.y + bob);
+            let at = |c: &Canvas, x: i32, y: i32| {
+                let i = (y as usize * 1920 + x as usize) * 4;
+                let d = c.pixmap.data();
+                [d[i], d[i + 1], d[i + 2]]
+            };
+            let bg = [BG[0], BG[1], BG[2]];
+            let sz = g.size as i32;
+            for (cx, cy) in [(0, 0), (sz - 1, 0), (0, sz - 1), (sz - 1, sz - 1)] {
+                assert_eq!(at(&c, x0 + cx, y0 + cy), bg, "bob {bob} 角 ({cx},{cy})");
+            }
+            assert_eq!(at(&c, x0 + sz / 2, y0 + sz / 2), [255, 0, 0]);
+            // 辺の中ほど(角から離れた所)は切り抜かれない
+            assert_eq!(at(&c, x0 + sz / 2, y0), [255, 0, 0]);
+            assert_eq!(at(&c, x0, y0 + sz / 2), [255, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn corner_radius_follows_the_display_size() {
+        // 画面が半分なら、切り抜く角の大きさも半分(同じ割合)になる
+        let mut red = Pixmap::new(48, 48).unwrap();
+        red.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        let clipped_run = |w: u32, h: u32| {
+            let mut c = Canvas::new(w, h);
+            c.clear(rgba(BG[0], BG[1], BG[2], 255));
+            draw_avatar(&mut c, &red, 0);
+            let g = avatar_geometry(w, h);
+            // 上辺に沿って、背景のままの画素が何個続くか
+            (0..g.size as i32)
+                .take_while(|dx| {
+                    let i = (g.y as usize * w as usize + (g.x + dx) as usize) * 4;
+                    c.pixmap.data()[i] == BG[0]
+                })
+                .count() as f32
+                / g.size
+        };
+        let (full, half) = (clipped_run(1920, 1080), clipped_run(960, 540));
+        assert!(full > 0.02 && (full - half).abs() < 0.02, "{full} {half}");
+    }
+
+    #[test]
+    fn rounded_rect_radius_never_exceeds_half_the_short_side() {
+        assert!(rounded_rect_path(0.0, 0.0, 10.0, 4.0, 100.0).is_some());
     }
 
     #[test]

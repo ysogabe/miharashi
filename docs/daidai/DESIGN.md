@@ -36,16 +36,21 @@ FeedSource(trait) ── FileSource ──> parse_feed ──> Shared ──(Dai
 ## 描画
 
 - アバターは 480x480 の PNG を **Nearest** で拡大縮小する(ドットが潰れない・にじまない)。
+- 素材は背景が白く不透明なので、描くときに四隅を**角丸で切り抜く**(半径は表示した絵の短い辺の 14% = `AVATAR_CORNER_RATIO`、後ろの光の円になじむ大きさ)。
+  絵を模様にして角丸の輪郭を塗るので、揺れ・拡大縮小・ポーズの差し替えでも同じ形になり、マスクの作り直しは要らない。角の外は背景と光がそのまま見える。素材 PNG は加工しない。
 - 揺れは周期 3.2 秒・振れ幅 7px(高さ 1080 基準)の正弦波を**整数画素に丸めた**上下のずれ。描き直すのは画素が変わったときだけで、実行ループを動かし続けない。
 - 背景・カード・時計の層は取っておき、毎フレームは戻してアバターだけを重ねる。
 - カードが無いとき: アバターと、大きな時計・日付・「通知はありません」だけの控えめな表示。自動巡回の `skip_if_empty` ではこの状態が「空」。
 
 ## アバター素材
 
-`crates/miharashi-render/assets/daidai/daidai-{idle,working,milestone,making}.png`(480x480)。いまは仮の画像
-(`cargo run --release -p miharashi-render --example daidai_placeholders -- crates/miharashi-render/assets/daidai` で再生成できる)。
-実ファイルへは**同じ名前で差し替える**(ビルドに埋め込まれる)。ビルドし直さずに差し替えるなら `[daidai] avatar_dir` に同じ名前で置く
-(起動時に読む。無い・壊れたポーズだけ埋め込みに戻る)。
+`crates/miharashi-render/assets/daidai/daidai-{idle,working,milestone,making}.png`(480x480、RGB・背景は白で不透明)。
+本物の素材に差し替え済み(ビルドに埋め込まれる)。ポーズを足す・直すときも**同じ名前で置き換える**。
+ビルドし直さずに差し替えるなら `[daidai] avatar_dir` に同じ名前で置く(起動時に読む。無い・壊れたポーズだけ埋め込みに戻る)。
+素材の四隅は描画側で角丸に切り抜くので、素材自体は四角のままでよい(透過 PNG にしても動く)。
+
+仮素材の生成用に `daidai_placeholders` example が残っている。これは**仮の絵を書き出す**もので、出力先に本物の素材があると上書きしてしまうので、
+`assets/daidai` を指定して実行しない(試すときは別のディレクトリへ)。
 
 ## 確認
 
