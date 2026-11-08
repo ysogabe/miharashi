@@ -44,7 +44,7 @@ flowchart LR
 | `miharashi-render` | Canvas、文字、グラフ、各画面の描画、地図、メニュー、グリッチ | `src/canvas.rs`・`text.rs`・`screens.rs`・`agents.rs` など |
 | `miharashi-linux` | libseat、evdev、DRM/KMS、CPU/GPU・電力量の収集 | `src/seat.rs`・`input.rs`・`drm_select.rs`・`kms.rs`・`metrics.rs` |
 | `miharashi-gpu` | EGL/GBM/GLES、写真・レーダー・カードの合成、offscreen 検証 | `src/display.rs`・`compose.rs`・`photo.rs`・`offscreen.rs` |
-| `miharashi-video` | FFmpeg/VA-API の動画ベンチマーク | `src/lib.rs` |
+| `miharashi-video` | FFmpeg の動画デコード(VA-API の dmabuf = ベンチマーク用 `Decoder`、CPU の RGBA = だいだい画面のポーズ動画用 `CpuDecoder`) | `src/lib.rs` |
 | `miharashi-app` | CLI、設定、runtime、画面管理、外部データ取得、操作パネル | `src/main.rs`・`config.rs`・`runtime.rs`・`screen.rs`・`app/` |
 
 既定のビルド対象は video を除く 4 crate。app の Linux/GPU 依存は Linux 向けに限定し、video は `--features miharashi-app/video` で有効にする。render は Linux 専用 crate に依存しない。実際の依存は各 `Cargo.toml` と `Cargo.lock` を基準にする。

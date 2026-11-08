@@ -191,9 +191,17 @@ pub fn kiosk(
     // だいだい画面(Muse からの通知)。既定は無効。取得元が起動できなければ画面も出さない
     let daidai_shared = crate::daidai::start(&cfg.daidai);
     if daidai_shared.is_some() {
-        screens.push(Box::new(screens::daidai::DaidaiScreen::new(
-            crate::daidai::AvatarSet::load(&cfg.daidai.avatar_dir),
-        )));
+        // ポーズ動画は avatar_dir の daidai-<pose>.mp4 だけ(無い・壊れている・video 無しのビルドは PNG)
+        let video = crate::daidai_video::VideoPlayback::new(
+            crate::daidai_video::dir_opener(&cfg.daidai.avatar_dir),
+            cfg.daidai.video_max_fps,
+        );
+        screens.push(Box::new(
+            screens::daidai::DaidaiScreen::new(crate::daidai::AvatarSet::load(
+                &cfg.daidai.avatar_dir,
+            ))
+            .with_video(video),
+        ));
     }
     // 3D の画面(既定は無効。GL が使えないときは案内を出し、自動巡回では飛ばす)
     if cfg.cube.enabled {

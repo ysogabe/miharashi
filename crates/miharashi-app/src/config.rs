@@ -995,8 +995,12 @@ pub struct ConfigDaidai {
     /// フィードを読み直す間隔(秒)
     pub poll_secs: u64,
     /// アバター素材の置き場(`daidai-idle|working|milestone|making.png`)。空 = リポジトリ内のプレースホルダー。
-    /// 無い・読めないポーズだけ既定の素材に戻る
+    /// 無い・読めないポーズだけ既定の素材に戻る。同じ名前の `.mp4`(`daidai-working.mp4` など)があれば、
+    /// そのポーズはループ再生する(`video` つきのビルドだけ。無い・壊れている・ビルドに無いときは PNG)
     pub avatar_dir: String,
+    /// ポーズ動画を描き直す回数の上限(フレーム / 秒、1〜30)。CPU の負荷の上限になる。動画の元のフレームレートより
+    /// 大きくしても速くはならない。実際の間隔はモニターの垂直同期(60Hz なら 12 / 15 / 20 / 30)に切り上がる
+    pub video_max_fps: u32,
 }
 
 /// 監視する接続の総数の上限(`[agents]` の `primary` を含む)。
@@ -1369,6 +1373,7 @@ impl Default for ConfigDaidai {
             feed_path: "/var/lib/miharashi/daidai-feed.json".into(),
             poll_secs: 10,
             avatar_dir: String::new(),
+            video_max_fps: 12,
         }
     }
 }
@@ -1944,6 +1949,9 @@ impl Config {
             if !d.avatar_dir.is_empty() && !is_plain_path_text(&d.avatar_dir) {
                 return Err("daidai.avatar_dir に制御文字は使えない".into());
             }
+            if !(1..=30).contains(&d.video_max_fps) {
+                return Err("daidai.video_max_fps は 1〜30".into());
+            }
         }
         Ok(())
     }
@@ -1972,6 +1980,7 @@ mod tests {
         assert!(!d.enabled, "既定は無効");
         assert_eq!((d.source.as_str(), d.poll_secs), ("file", 10));
         assert!(d.avatar_dir.is_empty());
+        assert_eq!(d.video_max_fps, 12);
         // 無効なら値を検査しない(agents と同じ)。有効なら検査する
         assert!(Config::parse("[daidai]\nfeed_path = \"\"\n").is_ok());
         let on = "[daidai]\nenabled = true\n";
@@ -1982,6 +1991,8 @@ mod tests {
             "poll_secs = 3601",
             "source = \"http\"",
             "avatar_dir = \"/a\\u0007b\"",
+            "video_max_fps = 0",
+            "video_max_fps = 31",
         ] {
             let e = Config::parse(&format!("{on}{bad}\n")).unwrap_err();
             assert!(e.contains("daidai"), "{bad}: {e}");
