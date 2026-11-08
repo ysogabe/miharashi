@@ -5,6 +5,7 @@ pub mod screens {
     pub mod agents;
     pub mod aircraft;
     pub mod cube;
+    pub mod daidai;
     pub mod gl_check;
     pub mod photo;
     pub mod room;
@@ -187,6 +188,13 @@ pub fn kiosk(
             AgentScreen::new(size, gl, cfg.agents.stale_secs),
         ));
     }
+    // だいだい画面(Muse からの通知)。既定は無効。取得元が起動できなければ画面も出さない
+    let daidai_shared = crate::daidai::start(&cfg.daidai);
+    if daidai_shared.is_some() {
+        screens.push(Box::new(screens::daidai::DaidaiScreen::new(
+            crate::daidai::AvatarSet::load(&cfg.daidai.avatar_dir),
+        )));
+    }
     // 3D の画面(既定は無効。GL が使えないときは案内を出し、自動巡回では飛ばす)
     if cfg.cube.enabled {
         let (full, third) = cfg.cube.layouts();
@@ -216,6 +224,9 @@ pub fn kiosk(
     };
     if let Some(shared) = agent_shared {
         m = m.with_provider(Box::new(crate::agents::AgentProvider::new(shared)));
+    }
+    if let Some(shared) = daidai_shared {
+        m = m.with_provider(Box::new(crate::daidai::DaidaiProvider::new(shared)));
     }
     m = m.with_admin(|a| {
         a.geoframe = admin_geoframe;
@@ -294,6 +305,80 @@ mod tests {
             None,
         );
         (app, dir)
+    }
+
+    fn kiosk_ids(cfg: &Config) -> (Vec<&'static str>, std::path::PathBuf) {
+        let (dir, p) = test_photo();
+        let app = kiosk(
+            cfg,
+            (64, 36),
+            None,
+            Source::File(p, None),
+            Box::new(DummyData::new()),
+            dummy_snapshot(0.0),
+            None,
+            None,
+        );
+        let ids = App::panel_view(&app)
+            .expect("panel view")
+            .screens
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        (ids, dir)
+    }
+
+    /// だいだい画面は既定では登録せず、有効にしたときだけ agents の次に登録する。
+    #[test]
+    fn daidai_screen_is_registered_only_when_enabled() {
+        let mut cfg = Config::default();
+        let (ids, _) = kiosk_ids(&cfg);
+        assert!(!ids.contains(&"daidai"), "{ids:?}");
+        cfg.daidai.enabled = true;
+        cfg.daidai.feed_path = "/nonexistent/miharashi-daidai-feed.json".into();
+        let (ids, _) = kiosk_ids(&cfg);
+        assert_eq!(ids, ["status", "photo", "daidai"]);
+        // agents も有効なら agents の次
+        cfg.agents.enabled = true;
+        cfg.agents.token_file = "/nonexistent/miharashi-test-primary".into();
+        let (ids, _) = kiosk_ids(&cfg);
+        assert_eq!(ids, ["status", "photo", "agents", "daidai"]);
+        // 取得元が起動できない設定(未対応の source)なら、画面も出さずに本体は動く
+        cfg.daidai.source = "http".into();
+        let (ids, _) = kiosk_ids(&cfg);
+        assert_eq!(ids, ["status", "photo", "agents"]);
+    }
+
+    /// フィードのファイルが無くても、だいだい画面を選んで描ける(本体も画面も壊れない)。
+    #[test]
+    fn daidai_screen_with_a_missing_feed_file_draws_and_does_not_disturb_the_others() {
+        let mut cfg = Config::default();
+        cfg.daidai.enabled = true;
+        cfg.daidai.feed_path = "/nonexistent/miharashi-daidai-feed.json".into();
+        let (dir, p) = test_photo();
+        let mut app = kiosk(
+            &cfg,
+            (320, 180),
+            None,
+            Source::File(p, None),
+            Box::new(DummyData::new()),
+            dummy_snapshot(0.0),
+            None,
+            None,
+        );
+        let mut c = Canvas::new(320, 180);
+        let now = Instant::now();
+        assert!(app.show_screen("daidai"));
+        app.tick(now);
+        app.render(&mut c);
+        assert_eq!(app.screen_id(), "daidai");
+        let daidai_px = c.pixmap.data().to_vec();
+        // 巡回で別の画面に移っても、いつもどおり描ける
+        assert!(app.show_screen("status"));
+        app.tick(now + std::time::Duration::from_millis(50));
+        app.render(&mut c);
+        assert_ne!(c.pixmap.data(), &daidai_px[..], "状況画面は別の絵");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// 追加の T3 Server (`extra_servers`) を足しても、Agent の画面は 1 つのまま。

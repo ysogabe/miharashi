@@ -4,6 +4,7 @@ pub mod aircraft;
 pub mod alert;
 pub mod canvas;
 pub mod chart;
+pub mod daidai;
 pub mod geo;
 pub mod glitch;
 pub mod menu;

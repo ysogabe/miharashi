@@ -33,6 +33,7 @@ Echo Show の「操作パネル」([panel/DESIGN.md](panel/DESIGN.md))とは区�
 | 3 | `room` | ROOM & WEATHER | 室内環境(HA)と天気(気象庁)、自宅の市町村の警報・注意報 | 5 = 週間予報 ↔ 時間ごと(将来)。当面なし |
 | 4 | `aircraft` | AIRCRAFT | 受信機中心のレーダーと、いちばん近い機体の諸元 | 8/2 = 注目する機体を切り替え、5 = 注目を「いちばん近い機体」に戻す |
 | 5 | `agents` | T3 AGENTS | T3 のプロジェクト・スレッドのカードボード(#46、[設計](DESIGN-t3-agent-monitor.md))。`[agents] enabled = false` なら登録しない | なし(操作不要) |
+| 6 | `daidai` | DAIDAI | Muse(だいだい)からの通知カードとドット絵のアバター(#97 の PoC、[設計](daidai/DESIGN.md))。`[daidai] enabled = false` なら登録しない | なし(操作不要) |
 
 ### 2.1 室内環境と天気(`room`)
 

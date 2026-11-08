@@ -1,0 +1,21 @@
+{
+  "avatar_pose": "idle",
+  "cards": [
+    {
+      "body": "これはPoCのサンプル表示です。実際の朝の通知がここに出ます。",
+      "expires_at": "2026-11-08T12:00:00+09:00",
+      "id": "sample-morning-1",
+      "kind": "morning",
+      "title": "おはようございます"
+    },
+    {
+      "body": "確認してほしいことがあるときに、だいだいからここで知らせます（サンプル）。",
+      "expires_at": null,
+      "id": "sample-request-1",
+      "kind": "request",
+      "title": "お願い"
+    }
+  ],
+  "updated_at": "2026-11-08T07:00:00+09:00",
+  "version": 1
+}

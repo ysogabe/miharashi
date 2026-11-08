@@ -24,6 +24,7 @@ pub struct Config {
     pub ui: Ui,
     pub panel: Panel,
     pub agents: ConfigAgents,
+    pub daidai: ConfigDaidai,
     pub cube: Cube,
     pub gl_check: GlCheck,
     pub vrm: Vrm,
@@ -981,6 +982,23 @@ pub struct ConfigAgents {
     pub rotation_state_dir: String,
 }
 
+/// だいだい画面(Muse からの通知カードとアバター。Issue #97)。既定は無効。
+/// PoC のフィードは本体ホスト上のローカル JSON ファイル。`source` で取得元を選ぶ(今は `file` だけ。HTTP は将来)。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConfigDaidai {
+    pub enabled: bool,
+    /// フィードの取得元。file = `feed_path` のローカルファイル
+    pub source: String,
+    /// `source = "file"` のフィードの JSON ファイル。読めない・無い・不正なら「カード無し」で表示する
+    pub feed_path: String,
+    /// フィードを読み直す間隔(秒)
+    pub poll_secs: u64,
+    /// アバター素材の置き場(`daidai-idle|working|milestone|making.png`)。空 = リポジトリ内のプレースホルダー。
+    /// 無い・読めないポーズだけ既定の素材に戻る
+    pub avatar_dir: String,
+}
+
 /// 監視する接続の総数の上限(`[agents]` の `primary` を含む)。
 pub const MAX_AGENT_SERVERS: usize = 4;
 /// `[agents]` の `url` / `token_file` の接続につける server_id。追加の接続には使えない。
@@ -1339,6 +1357,18 @@ impl Default for ConfigAgents {
             recent_hours: 24,
             extra_servers: Vec::new(),
             rotation_state_dir: String::new(),
+        }
+    }
+}
+
+impl Default for ConfigDaidai {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            source: "file".into(),
+            feed_path: "/var/lib/miharashi/daidai-feed.json".into(),
+            poll_secs: 10,
+            avatar_dir: String::new(),
         }
     }
 }
@@ -1727,7 +1757,8 @@ impl Config {
         if !matches!(self.display.renderer.as_str(), "auto" | "cpu" | "gles") {
             return Err("display.renderer は auto / cpu / gles".into());
         }
-        const START_SCREENS: [&str; 5] = ["status", "photo", "room", "aircraft", "agents"];
+        const START_SCREENS: [&str; 6] =
+            ["status", "photo", "room", "aircraft", "agents", "daidai"];
         // 3D の画面(キューブ、状態を汚す試験画面)。有効にしたものだけ起動時の画面に選べる
         const GL_SCREENS: [&str; 4] = ["cube", "cube-third", "dirty-a", "dirty-b"];
         let (full, third) = self.cube.layouts();
@@ -1770,10 +1801,13 @@ impl Config {
                 ));
             }
         } else if !START_SCREENS.contains(&start) {
-            return Err("ui.start_screen は status / photo / room / aircraft / agents / cube / cube-third / dirty-a / dirty-b".into());
+            return Err("ui.start_screen は status / photo / room / aircraft / agents / daidai / cube / cube-third / dirty-a / dirty-b".into());
         }
         if self.ui.start_screen == "agents" && !self.agents.enabled {
             return Err("ui.start_screen = agents には agents.enabled = true が必要".into());
+        }
+        if self.ui.start_screen == "daidai" && !self.daidai.enabled {
+            return Err("ui.start_screen = daidai には daidai.enabled = true が必要".into());
         }
         const REFRESH_SCREENS: [&str; 4] = ["status", "photo", "room", "aircraft"];
         if let Some(id) = self
@@ -1823,7 +1857,7 @@ impl Config {
                 && !GL_SCREENS.contains(&st.screen.as_str())
         }) {
             return Err(format!(
-                "rotation.steps に未知の画面 {:?}(status / photo / room / aircraft / agents / cube / cube-third / dirty-a / dirty-b)",
+                "rotation.steps に未知の画面 {:?}(status / photo / room / aircraft / agents / daidai / cube / cube-third / dirty-a / dirty-b)",
                 st.screen
             ));
         }
@@ -1893,6 +1927,24 @@ impl Config {
                 return Err("agents.token_file は必須、poll_secs は 1〜3600、timeout_secs は 1〜60、stale_secs は poll_secs 以上かつ 86400 以下、recent_hours は 1〜8760".into());
             }
         }
+        if self.daidai.enabled {
+            let d = &self.daidai;
+            if d.source != "file" {
+                return Err(format!(
+                    "daidai.source は file(今は file だけ): {:?}",
+                    d.source
+                ));
+            }
+            if !is_plain_path_text(&d.feed_path) {
+                return Err("daidai.feed_path は必須(制御文字なし)".into());
+            }
+            if !(1..=3600).contains(&d.poll_secs) {
+                return Err("daidai.poll_secs は 1〜3600".into());
+            }
+            if !d.avatar_dir.is_empty() && !is_plain_path_text(&d.avatar_dir) {
+                return Err("daidai.avatar_dir に制御文字は使えない".into());
+            }
+        }
         Ok(())
     }
 }
@@ -1913,6 +1965,38 @@ fn miharashi_linux_validate(_: &Config) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daidai_defaults_and_rules() {
+        let d = Config::parse("").unwrap().daidai;
+        assert!(!d.enabled, "既定は無効");
+        assert_eq!((d.source.as_str(), d.poll_secs), ("file", 10));
+        assert!(d.avatar_dir.is_empty());
+        // 無効なら値を検査しない(agents と同じ)。有効なら検査する
+        assert!(Config::parse("[daidai]\nfeed_path = \"\"\n").is_ok());
+        let on = "[daidai]\nenabled = true\n";
+        assert!(Config::parse(on).is_ok());
+        for bad in [
+            "feed_path = \"\"",
+            "poll_secs = 0",
+            "poll_secs = 3601",
+            "source = \"http\"",
+            "avatar_dir = \"/a\\u0007b\"",
+        ] {
+            let e = Config::parse(&format!("{on}{bad}\n")).unwrap_err();
+            assert!(e.contains("daidai"), "{bad}: {e}");
+        }
+        assert!(
+            Config::parse("[daidai]\nnope = 1\n").is_err(),
+            "未知のキーは不可"
+        );
+        // 画面 id は起動時の画面と巡回に書ける。画面が無効なら起動時の画面には選べない
+        let start = "[ui]\nstart_screen = \"daidai\"\n";
+        assert!(Config::parse(start).is_err());
+        assert!(Config::parse(&format!("{start}{on}")).is_ok());
+        let rot = "[rotation]\nenabled = true\nsteps = [{ screen = \"daidai\", secs = 30, skip_if_empty = true }]\n";
+        assert!(Config::parse(rot).is_ok());
+    }
 
     #[test]
     fn admin_defaults_and_rules() {
