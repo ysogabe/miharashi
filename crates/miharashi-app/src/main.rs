@@ -9,6 +9,7 @@ mod app;
 mod bench;
 mod config;
 mod daidai;
+mod daidai_video;
 mod data;
 mod disaster;
 mod env;

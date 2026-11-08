@@ -165,6 +165,10 @@
 # アバター素材の置き場。daidai-idle.png / daidai-working.png / daidai-milestone.png / daidai-making.png を置く。
 # 空ならリポジトリ内のプレースホルダー(crates/miharashi-render/assets/daidai/)。無い・読めないポーズだけ既定に戻る。起動時に読む
 # avatar_dir = "/var/lib/miharashi/daidai"
+# ポーズ動画(Issue #99)。avatar_dir に daidai-idle.mp4 / daidai-working.mp4 / daidai-milestone.mp4 / daidai-making.mp4 を置くと、
+# そのポーズはアバターを動画のループ再生にする(動画のあいだは揺らさない)。`cargo build --features video` でビルドしたときだけ。
+# 無い・壊れている・デコードできない・ビルドに video が無いポーズは、PNG のまま。画面が見えていない・モニターが消えているあいだは何も読まない。
+# video_max_fps = 12         # 動画を描き直す回数の上限(1〜30、フレーム/秒)。CPU の負荷の上限。60Hz なら 12 / 15 / 20 / 30 に切り上がる
 
 [cube]
 # 3D の画面(回る立方体。GLES 専用。renderer = cpu や GL なしでは案内を出し、自動巡回では飛ばす)。既定は無効。

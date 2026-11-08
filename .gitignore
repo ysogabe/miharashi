@@ -18,6 +18,8 @@
 *.mp4
 # LP に載せる総合・Agent 紹介動画だけは置く(docs/LP.md §3)
 !site/videos/*.mp4
+# だいだい画面のアバター(ポーズ動画)。差し替え用の素材なので置く(docs/daidai/DESIGN.md)
+!crates/miharashi-render/assets/daidai/*.mp4
 
 # 接続ごとの実環境の設定(配送役。例は systemd/miharashi-t3-remote-token.env.example)
 /systemd/*.env
