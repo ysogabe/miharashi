@@ -7,7 +7,9 @@
 //!
 //! ポーズ動画(`daidai_video`、Issue #99)があるポーズは、アバターを PNG の揺れでなく動画のループ再生にする。
 //! 再生中は実行ループを動かし続け(`animating` = 描き直しの上限 `frame_interval` つき)、画面が見えていない・
-//! モニターが消えているあいだは何も読まない。動画が使えないポーズは、これまでどおり PNG の揺れ。
+//! モニターが消えているあいだは何も読まず(デコーダーも捨てる)、アラート・メニューが上に載っているあいだは
+//! 読み進めずに最後のフレームを出したままにする(`WithScene` と同じ。閉じたら続きから)。
+//! 動画が使えないポーズは、これまでどおり PNG の揺れ。
 use crate::daidai::{AvatarSet, DaidaiSnapshot};
 use crate::daidai_video::VideoPlayback;
 use crate::screen::{RenderContext, Screen, ScreenId, World};
@@ -31,6 +33,8 @@ pub struct DaidaiScreen {
     visible: bool,
     /// モニターが点いているか(消えているあいだは動画を読まない)
     display_on: bool,
+    /// アラート・メニューが上に載っているか(載っているあいだは動画を進めない)
+    covered: bool,
     /// 表示を始めた時刻(揺れの位相の起点)
     entered: Instant,
     /// 直近の tick の時刻。描画はこれで揺れを決める(実時計を直接読まない)
@@ -55,6 +59,7 @@ impl DaidaiScreen {
             video: VideoPlayback::none(),
             visible: false,
             display_on: true,
+            covered: false,
             entered: now,
             last_now: now,
             current: None,
@@ -71,9 +76,9 @@ impl DaidaiScreen {
         self
     }
 
-    /// 動画を読んでよいか(見えていて、モニターが点いている)
+    /// 動画を読み進めてよいか(見えていて、モニターが点いていて、上に何も載っていない)
     fn video_active(&self) -> bool {
-        self.visible && self.display_on
+        self.visible && self.display_on && !self.covered
     }
 
     fn bob(&self, canvas_h: u32) -> i32 {
@@ -131,8 +136,9 @@ impl Screen for DaidaiScreen {
         self.video.stop();
     }
 
-    fn set_presentation(&mut self, visible: bool, _covered: bool, display_on: bool, _now: Instant) {
+    fn set_presentation(&mut self, visible: bool, covered: bool, display_on: bool, _now: Instant) {
         self.display_on = display_on;
+        self.covered = covered;
         if !(visible && display_on) {
             // 見えない・消灯中は、デコーダーごと捨てて何も読まない(戻ったら先頭から)
             self.video.stop();
@@ -150,20 +156,27 @@ impl Screen for DaidaiScreen {
             return false;
         }
         if self.video_active() {
+            let was_playing = self.video.playing();
             self.video.update(world.daidai.pose, now);
             if self.video.playing() {
                 // 動画は毎周期描く(間隔の上限は `frame_interval`。描かずに `animating` だけ立てると実行ループが空回りする)
                 return true;
             }
-        } else {
+            if was_playing {
+                // 再生の途中で読めなくなった。最後の動画のフレームが残らないよう、PNG で描き直す
+                self.drawn = None;
+            }
+        } else if !(self.visible && self.display_on) {
             self.video.stop();
         }
         let (view, pose) = self.current.clone().expect("直前に入れた");
-        let want = Drawn {
-            view,
-            pose,
-            bob: self.bob(self.height),
+        // 動画のフレームを出している(載っているあいだ止めている)ときは揺らさない
+        let bob = if self.video.frame(pose).is_some() {
+            0
+        } else {
+            self.bob(self.height)
         };
+        let want = Drawn { view, pose, bob };
         self.drawn.as_ref() != Some(&want)
     }
 
@@ -501,9 +514,31 @@ mod tests {
         assert!(s.tick(&w, at(t0, 40.5)));
         assert!(s.animating());
         assert_eq!(opens.borrow().len(), 2);
+        // アラート・メニューが載っているあいだは、読み進めず、最後のフレームを出したまま
+        let held = render_once(&mut s, &w);
+        let decoded = stats.borrow().decoded;
+        s.set_presentation(true, true, true, at(t0, 41.0));
+        assert!(!s.animating());
+        assert_eq!(s.frame_interval(), None);
+        assert!(!s.tick(&w, at(t0, 50.5)), "動かない絵は描き直さない");
+        assert_eq!(
+            stats.borrow().decoded,
+            decoded,
+            "載っているあいだは読まない"
+        );
+        assert_eq!(
+            avatar_centre_red(&render_once(&mut s, &w)),
+            avatar_centre_red(&held),
+            "最後のフレームのまま"
+        );
+        // 閉じたら続きから(デコーダーは持ったまま。開き直さない)
+        s.set_presentation(true, false, true, at(t0, 60.0));
+        assert!(s.tick(&w, at(t0, 60.5)));
+        assert!(s.animating());
+        assert_eq!(opens.borrow().len(), 2);
         // 別の画面へ移ると止まる
-        s.on_leave(at(t0, 41.0));
-        s.set_presentation(false, false, true, at(t0, 41.0));
+        s.on_leave(at(t0, 61.0));
+        s.set_presentation(false, false, true, at(t0, 61.0));
         assert!(!s.animating());
         let frozen = stats.borrow().decoded;
         assert!(!s.tick(&w, at(t0, 90.5)), "非表示は再描画を求めない");
@@ -605,6 +640,60 @@ mod tests {
         assert_eq!(*opens.borrow(), [Pose::Idle, Pose::Working]);
     }
 
+    #[test]
+    fn a_clip_that_dies_midway_is_redrawn_as_the_png_not_left_on_screen() {
+        struct Dies(u32);
+        impl crate::daidai_video::FrameSource for Dies {
+            fn decode_next(&mut self) -> Result<(), String> {
+                if self.0 == 0 {
+                    return Err("壊れた".into());
+                }
+                self.0 -= 1;
+                Ok(())
+            }
+            fn frame(&mut self) -> Result<Pixmap, String> {
+                let mut p = Pixmap::new(1, 1).unwrap();
+                p.fill(miharashi_render::canvas::rgba(200, 0, 0, 255));
+                Ok(p)
+            }
+            fn fps(&self) -> f64 {
+                24.0
+            }
+        }
+        let mut s = DaidaiScreen::new(AvatarSet::load("")).with_video(VideoPlayback::new(
+            Some(Box::new(|_| Ok(Box::new(Dies(3))))),
+            12,
+        ));
+        let t0 = Instant::now();
+        s.on_enter(t0);
+        s.set_presentation(true, false, true, t0);
+        let w = world_pose(Pose::Working);
+        assert!(s.tick(&w, t0));
+        assert_eq!(avatar_centre_red(&render_once(&mut s, &w)), 200, "動画の絵");
+        // 読めなくなる周期: その場で PNG に戻り、描き直しを求める(揺れが 0 でも動画の絵を残さない)
+        let mut died_at = None;
+        for k in 1..8 {
+            let r = s.tick(&w, at(t0, f64::from(k) * 2.0 + 0.5));
+            if !s.animating() {
+                assert!(r, "PNG に戻った周期で描き直しを求める");
+                died_at = Some(k);
+                break;
+            }
+            render_once(&mut s, &w);
+        }
+        assert!(died_at.is_some(), "動画は途中で止まる");
+        // 動画の絵(赤 200 の 1 色)は残らず、動画の無い画面と同じ PNG の絵になる(同じ時刻の揺れ)
+        let later = t0 + Duration::from_millis(700);
+        s.tick(&w, later);
+        let mut plain = DaidaiScreen::new(AvatarSet::load(""));
+        plain.on_enter(t0);
+        plain.tick(&w, later);
+        assert_eq!(
+            render_once(&mut s, &w).pixmap.data(),
+            render_once(&mut plain, &w).pixmap.data()
+        );
+    }
+
     /// ScreenManager を通しても、動画が再生中の画面だけが動き続け、間隔の上限がつく。
     #[test]
     fn manager_animates_only_while_the_clip_plays_on_the_shown_screen() {
@@ -633,5 +722,15 @@ mod tests {
         app.set_display_on(true, at(t0, 4.0));
         app.tick(at(t0, 4.5));
         assert!(App::animating(&app), "点灯したら再開");
+        // メニューが載っているあいだは動かさず、閉じたら戻る
+        assert!(app.on_key(crate::screen::KeyPress::Menu));
+        app.tick(at(t0, 5.5));
+        assert!(app.menu_open());
+        assert!(!App::animating(&app), "メニュー中は継続描画にしない");
+        assert_eq!(App::frame_interval(&app), None);
+        assert!(app.on_key(crate::screen::KeyPress::Menu));
+        app.tick(at(t0, 6.5));
+        assert!(!app.menu_open());
+        assert!(App::animating(&app), "閉じると戻る");
     }
 }
