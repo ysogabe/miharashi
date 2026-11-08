@@ -151,6 +151,21 @@
 # url = "http://192.0.2.11:3773"
 # token_file = "/var/lib/miharashi/t3-container.token"
 
+[daidai]
+# だいだい画面(画面 id = daidai。Muse からの通知カードと、ドット絵のアバター。Issue #97)。既定は無効。
+# 有効にすると agents の次(最後)に登録され、4/6・メニュー・[rotation] の steps・ui.start_screen に書ける。
+# PoC のフィードは本体ホスト上の JSON ファイル(書式の見本は docs/daidai/feed.sample.json)。書き手は
+# 一時ファイルに書いてから rename で置き換えること(書きかけを読むと、その周期だけカード無しになる)。
+# ファイルが無い・空・JSON が不正・256 KiB を超えるときは「カード無し」(アバターと時計)で表示する。
+# 期限(expires_at)を過ぎたカードは、ファイルを読み直さなくても表示から外れる。
+# enabled = false
+# source = "file"            # フィードの取得元。今は file だけ(HTTP は将来)
+# feed_path = "/var/lib/miharashi/daidai-feed.json"
+# poll_secs = 10             # フィードを読み直す間隔(1〜3600)
+# アバター素材の置き場。daidai-idle.png / daidai-working.png / daidai-milestone.png / daidai-making.png を置く。
+# 空ならリポジトリ内のプレースホルダー(crates/miharashi-render/assets/daidai/)。無い・読めないポーズだけ既定に戻る。起動時に読む
+# avatar_dir = "/var/lib/miharashi/daidai"
+
 [cube]
 # 3D の画面(回る立方体。GLES 専用。renderer = cpu や GL なしでは案内を出し、自動巡回では飛ばす)。既定は無効。
 # 画面 id は cube(全面)と cube-third(中央 1/3 幅の領域を単色の下地に重ねる)。[rotation] の steps や
@@ -197,7 +212,7 @@
 
 [ui]
 # font = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
-# start_screen = "status"  # status / photo / room / aircraft / agents([rotation] が有効なら使わない)
+# start_screen = "status"  # status / photo / room / aircraft / agents / daidai([rotation] が有効なら使わない)
 # 焼き付き対策: refresh_minutes 分ごとに、refresh_screens の画面をグリッチ → 暗転 → 再表示(約 1.6 秒)で
 # 描き直し、そのたびに画面全体を数 px ずらす(9 か所を順に回る)。0 なら行わない。動かない線が多い画面に使う(状況画面も入れるなら ["aircraft", "status"])
 # refresh_minutes = 5

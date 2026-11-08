@@ -561,7 +561,7 @@ fn fit_text(text: &mut TextEngine, value: &str, size: f32, max_width: f32) -> St
 
 /// Greedy per-character wrapping (Japanese has no word spaces); the last
 /// allowed line is ellipsized when text remains.
-fn wrap_text(
+pub(crate) fn wrap_text(
     text: &mut TextEngine,
     value: &str,
     size: f32,

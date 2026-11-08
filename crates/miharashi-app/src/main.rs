@@ -8,6 +8,7 @@ mod album;
 mod app;
 mod bench;
 mod config;
+mod daidai;
 mod data;
 mod disaster;
 mod env;
@@ -461,6 +462,27 @@ fn png_with(cli: Cli, open: &OpenGles) -> Result<(), String> {
         miharashi_render::glitch::refresh_frame(&mut c, &clean, t, 3);
         save(&c, Layers::Image, name)?;
     }
+    // だいだい画面。見本のフィード(docs/daidai/feed.sample.json)を本物の読み取りの経路で読み、
+    // カードあり・ポーズ違い・カード無し(アバターと時計だけ)を描く。時刻は固定(いつ作っても同じ絵)
+    {
+        use miharashi_render::daidai::Pose;
+        let avatars = daidai::AvatarSet::load(&cfg.daidai.avatar_dir);
+        let wall = chrono::DateTime::parse_from_rfc3339("2026-11-08T07:12:00+09:00")
+            .map_err(|e| e.to_string())?;
+        let with_cards =
+            app::screens::daidai::view_of(&daidai::parse_feed(daidai::SAMPLE_FEED), &wall);
+        let no_cards = app::screens::daidai::view_of(&daidai::DaidaiSnapshot::default(), &wall);
+        for (name, view, pose, secs) in [
+            ("daidai", &with_cards, Pose::Idle, 0.0),
+            ("daidai-working", &with_cards, Pose::Working, 0.8),
+            ("daidai-milestone", &with_cards, Pose::Milestone, 0.8),
+            ("daidai-making", &with_cards, Pose::Making, 2.4),
+            ("daidai-empty", &no_cards, Pose::Idle, 0.8),
+        ] {
+            app::screens::daidai::render_fixture(&mut c, &mut text, &avatars, view, pose, secs);
+            save(&c, Layers::Image, name)?;
+        }
+    }
     agent_png_fixtures(&out, size, &mut text)?;
     // 3D だけの画面(試験用の場面)。GL が使えない(renderer = cpu や GPU なし)ときは案内の 1 枚になる
     let mut notice = scene_manager(&cfg, true, scene_check::Base::None, false);
@@ -474,7 +496,7 @@ fn png_with(cli: Cli, open: &OpenGles) -> Result<(), String> {
         vrm_gles_fixtures(check, &cfg, &cli, size, &out, fixture_wall())?;
     }
     println!(
-        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,room,room-offline,room-empty,refresh-glitch,refresh-return,scene-notice,agents-overview,agents-busy,agents-new-*,agents-changed-*,agents-stale,agents-empty,agents-multi-two,agents-multi-stale,agents-multi-four}}.png ({}x{})",
+        "wrote {}/{{status,status-details,menu,photo,alert-quake,alert-disaster,trip-card,everyday-card,aircraft,aircraft-trail-short,aircraft-trail-long,aircraft-focus,aircraft-empty,room,room-offline,room-empty,refresh-glitch,refresh-return,scene-notice,agents-overview,agents-busy,agents-new-*,agents-changed-*,agents-stale,agents-empty,agents-multi-two,agents-multi-stale,agents-multi-four,daidai,daidai-working,daidai-milestone,daidai-making,daidai-empty}}.png ({}x{})",
         out.display(),
         size.0,
         size.1
