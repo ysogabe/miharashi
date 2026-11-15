@@ -296,13 +296,10 @@ pub fn start(cfg: &ConfigDaidai) -> Option<Started> {
     };
     let shared: Shared = Arc::new(Mutex::new(DaidaiSnapshot::default()));
     let out = shared.clone();
-    let notices = Arc::new(NoticeBoard::new(
-        notice_state_path(
-            &cfg.notice_state_path,
-            std::env::var_os("STATE_DIRECTORY").as_deref(),
-        ),
-        chrono::Utc::now().timestamp(),
-    ));
+    let notices = Arc::new(NoticeBoard::new(notice_state_path(
+        &cfg.notice_state_path,
+        std::env::var_os("STATE_DIRECTORY").as_deref(),
+    )));
     let board = notices.clone();
     let poll = Duration::from_secs(cfg.poll_secs.max(1));
     let spawned = std::thread::Builder::new()

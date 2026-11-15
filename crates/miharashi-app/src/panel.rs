@@ -1628,8 +1628,9 @@ mod tests {
         (p, base)
     }
 
-    fn new_board(now_unix: i64) -> Arc<NoticeBoard> {
-        Arc::new(NoticeBoard::new(None, now_unix))
+    /// 時計を `now_ms`(UNIX ミリ秒)に止めた帳簿。rev は `now_ms` から、変化のたびに 1 ずつ増える。
+    fn new_board(now_ms: i64) -> Arc<NoticeBoard> {
+        Arc::new(NoticeBoard::with_clock(None, Arc::new(move || now_ms)))
     }
 
     fn observe(board: &NoticeBoard, snap: &crate::daidai::DaidaiSnapshot) {

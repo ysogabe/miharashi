@@ -2,12 +2,19 @@
 //! 最初に見た時刻を持つ。操作パネルの `/api/v1/status` と SSE の `daidai` ブロック、`POST /api/v1/daidai/ack` の元。
 //!
 //! 取得のスレッド(`daidai::start`)が取得のたびに `observe` する。画面が出ていなくても動く。
-//! 内容が変わったとき(通知の追加・消滅・期限切れ・既読)だけ `rev` を 1 増やし、状態を書き、パネルへ
-//! 「今すぐ送る」を知らせる。`age_s` は状態ではなく、`block` で組み立てるときに計算する。
+//! 公開する内容が変わったとき(通知の追加・消滅・期限切れ・既読)だけ `rev` を進めてパネルへ「今すぐ
+//! 送る」を知らせ、そのあとで状態を書く。`age_s` は状態ではなく、`block` で組み立てるときに計算する。
+//!
+//! `rev` の基準は UNIX ミリ秒: 変化のたびに `rev = max(rev + 1, 今のミリ秒)`、起動時は
+//! `rev = max(保存してあった rev, 今のミリ秒)`。変化は取得の周期(1 秒以上)と、レート制限のかかった
+//! ack でしか起きないので、`rev` が時計より先へ行くのは 1 ミリ秒に 2 回以上変わったときだけ。保存が
+//! 失敗していても、再起動で後戻りしない(時計が戻ったときだけ保存した値が守る)。保存に頼らないので、
+//! 知らせるのは保存より先(SSE がディスクの書き込みを待たない)。
 //!
 //! ロック: `inner`(帳簿の中身)を持ったまま `persist` と `waker` のロックを取らない。書き込みは
 //! `persist` を取ってから `inner` を短く取る(順序は persist → inner だけ)。知らせるのは `inner` を
 //! 外してから(パネルの state のロックは別のスレッドが inner より先に取る: state → inner)。
+//! 手順は「`inner` の中で変更 → `inner` を外す → 知らせる → 保存」。
 use crate::daidai::{DaidaiSnapshot, is_notice_id};
 use chrono::{DateTime, Utc};
 use miharashi_render::daidai::Pose;
@@ -28,6 +35,14 @@ const MAX_STATE_BYTES: u64 = 256 * 1024;
 
 /// 知らせる先(パネルの SSE を今すぐ進める)。
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
+/// 今の UNIX ミリ秒(`rev` の基準。テストでは差し替える)。
+pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
+/// 状態ファイルの書き込み(テストでは遅いもの・失敗するものに差し替える)。
+pub type Saver = Arc<dyn Fn(&Path, &str) -> Result<(), String> + Send + Sync>;
+
+fn system_clock() -> Clock {
+    Arc::new(|| Utc::now().timestamp_millis())
+}
 
 /// 今の通知 1 件(`age_s` を除く)。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +78,8 @@ struct Inner {
     pose: Pose,
     /// 最後に rev へ反映した内容。None = まだ一度も `observe` していない
     last: Option<Signature>,
+    /// 最後に「保存する」と決めた状態(rev と known)。これと違えば保存する。None = まだ決めていない
+    queued: Option<(u64, HashMap<String, Known>)>,
 }
 
 impl Inner {
@@ -82,14 +99,28 @@ impl Inner {
         }
     }
 
-    /// 内容が前回と違えば rev を進める。進めたか。
-    fn commit(&mut self) -> bool {
+    /// 公開する内容が前回と違えば rev を進める(`max(rev + 1, now_ms)`)。進めたか。
+    fn commit(&mut self, now_ms: i64) -> bool {
         let sig = self.signature();
         if self.last.as_ref() == Some(&sig) {
             return false;
         }
         self.last = Some(sig);
-        self.rev += 1;
+        self.rev = (self.rev + 1).max(u64::try_from(now_ms).unwrap_or(0));
+        true
+    }
+
+    /// 保存する状態(rev・known・既読)が、最後に保存すると決めたものと違うか。違えば「決めた」ことにする。
+    /// 公開する内容とは別: 窓の外の id が入れ替わっても known は変わるので保存する(rev は進めない)。
+    fn take_dirty(&mut self) -> bool {
+        let same = self
+            .queued
+            .as_ref()
+            .is_some_and(|(rev, known)| *rev == self.rev && *known == self.known);
+        if same {
+            return false;
+        }
+        self.queued = Some((self.rev, self.known.clone()));
         true
     }
 
@@ -115,21 +146,34 @@ impl Inner {
 /// 状態ファイルへの書き込み。`path` が None ならメモリだけ。
 struct Persist {
     path: Option<PathBuf>,
+    save: Saver,
     /// 直近の失敗の理由(同じ理由を毎回は出さない)
     last_error: Option<String>,
 }
 
 /// 通知の帳簿。`Arc` で取得のスレッドとパネルが共有する。
 pub struct NoticeBoard {
+    clock: Clock,
     inner: Mutex<Inner>,
     persist: Mutex<Persist>,
     waker: Mutex<Option<Waker>>,
 }
 
 impl NoticeBoard {
-    /// `path` の状態を読んで始める。rev は `max(保存してあった rev, now_unix)` から。
-    /// ファイルが無い・壊れている・大きすぎるときは空から始める(rev は UNIX 秒から)。
-    pub fn new(path: Option<PathBuf>, now_unix: i64) -> Self {
+    /// `path` の状態を読んで、システムの時計で始める。
+    pub fn new(path: Option<PathBuf>) -> Self {
+        Self::with_parts(path, system_clock(), Arc::new(save))
+    }
+
+    /// 時計を差し替えて始める(テスト用)。
+    #[cfg(test)]
+    pub fn with_clock(path: Option<PathBuf>, clock: Clock) -> Self {
+        Self::with_parts(path, clock, Arc::new(save))
+    }
+
+    /// `path` の状態を読んで始める。rev は `max(保存してあった rev, 今の UNIX ミリ秒)` から。
+    /// ファイルが無い・壊れている・大きすぎるときは空から始める(rev は UNIX ミリ秒から)。
+    pub fn with_parts(path: Option<PathBuf>, clock: Clock, save: Saver) -> Self {
         let (saved_rev, known) = match &path {
             Some(p) => match load(p) {
                 Ok(v) => v,
@@ -145,17 +189,20 @@ impl NoticeBoard {
             },
             None => (0, HashMap::new()),
         };
-        let rev = saved_rev.max(u64::try_from(now_unix).unwrap_or(0));
+        let rev = saved_rev.max(u64::try_from(clock()).unwrap_or(0));
         Self {
+            clock,
             inner: Mutex::new(Inner {
                 rev,
                 known,
                 rows: Vec::new(),
                 pose: Pose::Idle,
                 last: None,
+                queued: None,
             }),
             persist: Mutex::new(Persist {
                 path,
+                save,
                 last_error: None,
             }),
             waker: Mutex::new(None),
@@ -171,7 +218,7 @@ impl NoticeBoard {
     /// 取得に失敗した周期では呼ばない(一時的な失敗で通知を消さない)。変わったか。
     pub fn observe(&self, snap: &DaidaiSnapshot, now: DateTime<Utc>) -> bool {
         let now_unix = now.timestamp();
-        let changed = {
+        let (changed, dirty) = {
             let mut g = self.inner.lock().unwrap();
             // 同じ id は最初の 1 枚だけ。そのあと期限の切れたカードを除く
             let mut seen_ids: Vec<&str> = Vec::new();
@@ -210,11 +257,15 @@ impl NoticeBoard {
             g.rows = rows;
             g.pose = snap.pose;
             g.trim_known();
-            g.commit()
+            let changed = g.commit((self.clock)());
+            (changed, g.take_dirty())
         };
+        // 知らせてから保存する(保存が遅くても SSE は待たない。rev の単調性は保存に頼らない)
         if changed {
-            self.persist();
             self.notify();
+        }
+        if dirty {
+            self.persist();
         }
         changed
     }
@@ -222,7 +273,7 @@ impl NoticeBoard {
     /// `id` とそれより古い今の通知を全部既読にする。今の通知に無い id・既に既読のものだけなら何もしない。
     /// 変わったか。
     pub fn ack(&self, id: &str) -> bool {
-        let changed = {
+        let (changed, dirty) = {
             let mut g = self.inner.lock().unwrap();
             let Some(pos) = g.rows.iter().position(|r| r.id == id) else {
                 return false;
@@ -237,11 +288,15 @@ impl NoticeBoard {
                     flipped = true;
                 }
             }
-            flipped && g.commit()
+            let changed = flipped && g.commit((self.clock)());
+            (changed, flipped && g.take_dirty())
         };
+        // 知らせてから保存する。HTTP の応答は保存が終わってから返る
         if changed {
-            self.persist();
             self.notify();
+        }
+        if dirty {
+            self.persist();
         }
         changed
     }
@@ -294,7 +349,7 @@ impl NoticeBoard {
             let g = self.inner.lock().unwrap();
             state_json(g.rev, &g.known)
         };
-        let result = save(&path, &text);
+        let result = (p.save)(&path, &text);
         match (&result, &p.last_error) {
             (Err(e), last) if last.as_ref() != Some(e) => {
                 eprintln!(
@@ -427,8 +482,23 @@ mod tests {
         DateTime::from_timestamp(unix, 0).unwrap()
     }
 
+    /// 時計を `now_unix` 秒(= その ×1000 ミリ秒)に止めた帳簿。
+    fn new_at(path: Option<PathBuf>, now_unix: i64) -> NoticeBoard {
+        NoticeBoard::with_clock(path, Arc::new(move || now_unix * 1000))
+    }
+
+    /// 動かせる時計(ミリ秒)。
+    fn ticking(start_ms: i64) -> (Clock, Arc<std::sync::atomic::AtomicI64>) {
+        let cell = Arc::new(std::sync::atomic::AtomicI64::new(start_ms));
+        let c = cell.clone();
+        (
+            Arc::new(move || c.load(std::sync::atomic::Ordering::SeqCst)),
+            cell,
+        )
+    }
+
     fn board() -> NoticeBoard {
-        NoticeBoard::new(None, T0)
+        new_at(None, T0)
     }
 
     /// カード 1 枚の JSON
@@ -469,9 +539,9 @@ mod tests {
     fn no_block_until_the_first_observe_and_that_observe_always_counts() {
         let b = board();
         assert!(b.block(T0).is_none());
-        assert_eq!(b.rev(), T0 as u64);
+        assert_eq!(b.rev(), T0 as u64 * 1000);
         assert!(b.observe(&feed(&[]), at(T0)), "空のフィードでも最初は変化");
-        assert_eq!(b.rev(), T0 as u64 + 1);
+        assert_eq!(b.rev(), T0 as u64 * 1000 + 1);
         let v = b.block(T0).unwrap();
         assert_eq!(v["notices"], json!([]));
         assert_eq!(v["unseen"], 0);
@@ -482,7 +552,7 @@ mod tests {
     fn the_same_feed_again_changes_nothing() {
         let dir = tmp_dir("same");
         let path = dir.join("n.json");
-        let b = NoticeBoard::new(Some(path.clone()), T0);
+        let b = new_at(Some(path.clone()), T0);
         let f = feed(&[card("a", "A", "")]);
         assert!(b.observe(&f, at(T0)));
         let rev = b.rev();
@@ -817,7 +887,7 @@ mod tests {
         let path = dir.join("n.json");
         let p = |unix: i64| format!(r#","posted_at":"{}""#, at(unix).to_rfc3339());
         let f = feed(&[card("a", "a", &p(T0 - 5)), card("b", "b", &p(T0 - 9))]);
-        let b = NoticeBoard::new(Some(path.clone()), T0);
+        let b = new_at(Some(path.clone()), T0);
         b.observe(&f, at(T0));
         assert!(b.ack("a"));
         let rev = b.rev();
@@ -830,7 +900,7 @@ mod tests {
         );
 
         // 再起動(時計が少し戻っていても rev は戻らない)
-        let b = NoticeBoard::new(Some(path.clone()), T0 - 100);
+        let b = new_at(Some(path.clone()), T0 - 100);
         assert!(b.rev() >= rev, "{} < {rev}", b.rev());
         assert!(b.block(T0).is_none(), "最初の observe まで出さない");
         assert!(b.observe(&f, at(T0 + 10)), "最初の observe は必ず変化");
@@ -840,15 +910,22 @@ mod tests {
         let g = feed(&[card("p", "p", "")]);
         b.observe(&g, at(T0 + 20));
         drop(b);
-        let b = NoticeBoard::new(Some(path.clone()), T0);
+        let b = new_at(Some(path.clone()), T0);
         b.observe(&g, at(T0 + 999));
         assert_eq!(b.block(T0 + 999).unwrap()["notices"][0]["age_s"], 979);
         drop(b);
 
-        // 保存してあった rev が時計より先なら、そこから
-        std::fs::write(&path, r#"{"version":1,"rev":9999999999,"known":[]}"#).unwrap();
-        let b = NoticeBoard::new(Some(path.clone()), T0);
-        assert_eq!(b.rev(), 9_999_999_999);
+        // 保存してあった rev が時計より先なら、そこから(最初の変化は +1、時計に追い付かない)
+        let ahead = T0 as u64 * 1000 + 5_000_000;
+        std::fs::write(
+            &path,
+            format!(r#"{{"version":1,"rev":{ahead},"known":[]}}"#),
+        )
+        .unwrap();
+        let b = new_at(Some(path.clone()), T0);
+        assert_eq!(b.rev(), ahead);
+        assert!(b.observe(&f, at(T0)));
+        assert_eq!(b.rev(), ahead + 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -857,8 +934,8 @@ mod tests {
         let dir = tmp_dir("bad");
         let path = dir.join("n.json");
         // ファイルなし
-        let b = NoticeBoard::new(Some(path.clone()), T0);
-        assert_eq!(b.rev(), T0 as u64);
+        let b = new_at(Some(path.clone()), T0);
+        assert_eq!(b.rev(), T0 as u64 * 1000);
         // 壊れている・形が違う・大きすぎる
         for text in [
             "".to_string(),
@@ -871,8 +948,13 @@ mod tests {
             " ".repeat(MAX_STATE_BYTES as usize + 1),
         ] {
             std::fs::write(&path, &text).unwrap();
-            let b = NoticeBoard::new(Some(path.clone()), T0);
-            assert_eq!(b.rev(), T0 as u64, "{:?}", &text[..text.len().min(30)]);
+            let b = new_at(Some(path.clone()), T0);
+            assert_eq!(
+                b.rev(),
+                T0 as u64 * 1000,
+                "{:?}",
+                &text[..text.len().min(30)]
+            );
         }
         // 項目の一部が不正でも、読める項目は使う
         std::fs::write(
@@ -880,20 +962,163 @@ mod tests {
             r#"{"version":1,"rev":7,"known":[{"id":"ok","first_seen":5,"read":true},{"id":"bad id","first_seen":1},{"id":"x"},3]}"#,
         )
         .unwrap();
-        let b = NoticeBoard::new(Some(path.clone()), 3);
+        let b = new_at(Some(path.clone()), 0);
         assert_eq!(b.rev(), 7);
         assert_eq!(b.inner.lock().unwrap().known.len(), 1);
 
         // 書けない置き場でも続く(rev は進む。再起動後は時計から始まる)
         let bad = dir.join("no-such-dir").join("n.json");
-        let b = NoticeBoard::new(Some(bad.clone()), T0);
+        let b = new_at(Some(bad.clone()), T0);
         assert!(b.observe(&feed(&[card("a", "a", "")]), at(T0)));
         assert!(b.ack("a"));
-        assert_eq!(b.rev(), T0 as u64 + 2);
+        assert_eq!(b.rev(), T0 as u64 * 1000 + 2);
         assert!(!bad.exists());
         assert_eq!(b.block(T0).unwrap()["unseen"], 0);
-        let b2 = NoticeBoard::new(Some(bad), T0 + 1);
-        assert!(b2.rev() > T0 as u64);
+        let b2 = new_at(Some(bad), T0 + 1);
+        assert!(b2.rev() > T0 as u64 * 1000 + 2, "時計から始まる");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 保存に失敗したまま、1 ミリ秒に何度も変わっても、再起動で rev が後戻りしない。
+    #[test]
+    fn rev_stays_monotonic_across_a_restart_even_when_every_save_fails() {
+        let dir = tmp_dir("fail");
+        let bad = dir.join("no-such-dir").join("n.json");
+        let (clock, _) = ticking(T0 * 1000);
+        let b = NoticeBoard::with_clock(Some(bad.clone()), clock);
+        let mut max_seen = b.rev();
+        // 時計を止めたまま 200 回変える(rev は時計より先へ行く)
+        for i in 0..200 {
+            b.observe(&feed(&[card("a", &format!("t{i}"), "")]), at(T0));
+            max_seen = max_seen.max(b.block(T0).unwrap()["rev"].as_u64().unwrap());
+        }
+        assert!(b.ack("a"));
+        max_seen = max_seen.max(b.rev());
+        assert_eq!(max_seen, T0 as u64 * 1000 + 201, "時計が止まれば +1 ずつ");
+        assert!(!bad.exists());
+        drop(b);
+        // 少し後(1 秒後)に作り直す: 前に出した最大より大きい
+        let (clock, _) = ticking(T0 * 1000 + 1000);
+        let b = NoticeBoard::with_clock(Some(bad.clone()), clock);
+        assert!(b.rev() > max_seen, "{} <= {max_seen}", b.rev());
+        assert!(b.observe(&feed(&[card("a", "t", "")]), at(T0 + 1)));
+        assert!(b.rev() > max_seen);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 変化のたびに `max(rev + 1, 今のミリ秒)`。時計が進めば時計へ、止まれば +1。
+    #[test]
+    fn each_change_sets_rev_to_the_larger_of_plus_one_and_the_clock() {
+        let (clock, now) = ticking(T0 * 1000);
+        let b = NoticeBoard::with_clock(None, clock);
+        assert_eq!(b.rev(), T0 as u64 * 1000);
+        assert!(b.observe(&feed(&[card("a", "1", "")]), at(T0)));
+        assert_eq!(b.rev(), T0 as u64 * 1000 + 1);
+        assert!(b.observe(&feed(&[card("a", "2", "")]), at(T0)));
+        assert_eq!(b.rev(), T0 as u64 * 1000 + 2);
+        now.store(T0 * 1000 + 1500, std::sync::atomic::Ordering::SeqCst);
+        assert!(b.observe(&feed(&[card("a", "3", "")]), at(T0 + 1)));
+        assert_eq!(b.rev(), T0 as u64 * 1000 + 1500);
+        // 時計が戻っても rev は戻らない
+        now.store(T0 * 1000 - 9000, std::sync::atomic::Ordering::SeqCst);
+        assert!(b.observe(&feed(&[card("a", "4", "")]), at(T0 + 2)));
+        assert_eq!(b.rev(), T0 as u64 * 1000 + 1501);
+    }
+
+    /// 保存してあった rev が時計より先なら、再起動後もそこから進む。
+    #[test]
+    fn a_saved_rev_ahead_of_the_clock_wins_on_restart() {
+        let dir = tmp_dir("ahead");
+        let path = dir.join("n.json");
+        let ahead = T0 as u64 * 1000 + 60_000;
+        std::fs::write(
+            &path,
+            format!(r#"{{"version":1,"rev":{ahead},"known":[]}}"#),
+        )
+        .unwrap();
+        let b = new_at(Some(path.clone()), T0);
+        assert_eq!(b.rev(), ahead);
+        assert!(b.observe(&feed(&[]), at(T0)));
+        assert_eq!(b.rev(), ahead + 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 窓の外(6 件目以降)の id が入れ替わると、保存する状態(known)は変わる。rev は進めない。
+    #[test]
+    fn a_swap_of_ids_outside_the_window_is_saved_without_bumping_the_rev() {
+        let dir = tmp_dir("outside");
+        let path = dir.join("n.json");
+        let b = new_at(Some(path.clone()), T0);
+        let p = |unix: i64| format!(r#","posted_at":"{}""#, at(unix).to_rfc3339());
+        let cards = |last: &str| -> Vec<String> {
+            let mut v: Vec<String> = (0..6)
+                .map(|i| card(&format!("n{i}"), "t", &p(T0 - i)))
+                .collect();
+            v.push(card(last, "t", &p(T0 - 10)));
+            v
+        };
+        assert!(b.observe(&feed(&cards("n6")), at(T0)));
+        let rev = b.rev();
+        assert!(std::fs::read_to_string(&path).unwrap().contains(r#""n6""#));
+        // 7 件目(窓の外)が n6 から n7 に入れ替わる: 公開する内容は同じ(unseen も 7 のまま)
+        assert!(
+            !b.observe(&feed(&cards("n7")), at(T0 + 1)),
+            "rev は進めない"
+        );
+        assert_eq!(b.rev(), rev);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(r#""n7""#), "known の変化は保存する: {saved}");
+        assert_eq!(parse_state(&saved).unwrap().0, rev);
+        // 同じ取得をもう一度: 何も書かない
+        std::fs::remove_file(&path).unwrap();
+        assert!(!b.observe(&feed(&cards("n7")), at(T0 + 2)));
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 保存が遅くても、知らせ(SSE の起床)は保存を待たない。
+    #[test]
+    fn the_wake_does_not_wait_for_a_slow_save() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let dir = tmp_dir("slow");
+        let path = dir.join("n.json");
+        let saves = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = saves.clone();
+        let slow: Saver = Arc::new(move |_, text| {
+            std::thread::sleep(Duration::from_secs(2));
+            log.lock().unwrap().push(text.to_string());
+            Ok(())
+        });
+        let b = Arc::new(NoticeBoard::with_parts(
+            Some(path),
+            Arc::new(move || T0 * 1000),
+            slow,
+        ));
+        let (tx, rx) = mpsc::channel();
+        b.set_waker(Arc::new(move || {
+            let _ = tx.send(Instant::now());
+        }));
+        let started = Instant::now();
+        let b2 = b.clone();
+        let observer = std::thread::spawn(move || {
+            b2.observe(&feed(&[card("a", "a", "")]), at(T0));
+            b2.ack("a");
+        });
+        // 最初の知らせは、2 秒の保存より十分前(1 秒以内)に来る
+        let woke = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("1 秒以内に知らせる");
+        assert!(woke.duration_since(started) < Duration::from_secs(1));
+        // その時点でパネルが読む rev は進んでいて、保存はまだ終わっていない
+        assert_eq!(b.rev(), T0 as u64 * 1000 + 1);
+        assert!(saves.lock().unwrap().is_empty());
+        observer.join().unwrap();
+        // 保存は順に 2 回(observe と ack)。2 回目は ack 後の状態
+        let saved = saves.lock().unwrap().clone();
+        assert_eq!(saved.len(), 2);
+        assert!(saved[1].contains(r#""read":true"#));
+        assert_eq!(parse_state(&saved[1]).unwrap().0, T0 as u64 * 1000 + 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
