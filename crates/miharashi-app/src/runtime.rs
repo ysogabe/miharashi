@@ -688,7 +688,7 @@ pub fn run(
                 started: process_start,
                 sources: app.admin_sources(),
             };
-            match Panel::start(&cfg.panel, control, Some(admin)) {
+            match Panel::start(&cfg.panel, control, Some(admin), app.notices()) {
                 Ok(p) => {
                     eprintln!("panel: {} で待ち受け", p.addr());
                     published_display = display_status(screen_on, power.as_deref());

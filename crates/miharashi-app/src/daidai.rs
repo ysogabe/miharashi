@@ -6,12 +6,17 @@
 //!
 //! 読み取りに失敗した・ファイルが無い・JSON が不正なときは「カード無し」として扱い、例外では落とさない。
 //! 期限(`expires_at`)の判定は画面が描くたびに壁時計で行う(ファイルを読み直さなくても期限が切れる)。
+//!
+//! カードは操作パネルへの「通知」にもなる(`notices.rs`、Issue #101)。通知にするのは `id` を明示した
+//! カードだけで、通知用の文字列と時刻・優先度は読み取りのときにここで作って `Card::notice` に残す。
 use crate::config::ConfigDaidai;
+use crate::notices::NoticeBoard;
 use crate::screen::{Provider, World};
 use chrono::{DateTime, FixedOffset, TimeZone};
 use miharashi_render::Pixmap;
 use miharashi_render::daidai::{self, CardKind, Pose};
 use serde_json::Value;
+use std::ffi::OsStr;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -26,6 +31,33 @@ const MAX_BODY_CHARS: usize = 400;
 /// 素材 PNG の大きさの上限(読み込む前にファイルの大きさで確かめる)。
 const MAX_AVATAR_BYTES: u64 = 8 * 1024 * 1024;
 
+/// 通知用の文字数の上限(操作パネルとの約束。画面用の 120 / 400 とは別)。
+pub const NOTICE_MAX_TITLE_CHARS: usize = 40;
+pub const NOTICE_MAX_BODY_CHARS: usize = 200;
+/// 通知の id の長さの上限。
+const NOTICE_MAX_ID_CHARS: usize = 64;
+
+/// 通知の id として使える形か(`^[A-Za-z0-9_.:-]{1,64}$`)。
+pub fn is_notice_id(id: &str) -> bool {
+    (1..=NOTICE_MAX_ID_CHARS).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+}
+
+/// カードが通知になるときの中身(読み取りのときに作る)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoticeFields {
+    /// フィードに明示的に書かれた id(`is_notice_id` に合うもの)
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    /// `priority` が `"low"`(それ以外・省略は通常)
+    pub low: bool,
+    /// `posted_at` の UNIX 秒。無い・読めないときは None(ホストが最初に見た時刻を使う)
+    pub posted_at: Option<i64>,
+}
+
 /// 通知カード 1 枚(検証済み)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Card {
@@ -35,6 +67,8 @@ pub struct Card {
     pub body: String,
     /// None は期限なし
     pub expires_at: Option<DateTime<FixedOffset>>,
+    /// 通知になるカードだけ Some(明示の `id` が通知の id の形で、通知用の title / body が空でない)
+    pub notice: Option<NoticeFields>,
 }
 
 /// 画面が読む最新のフィード。`World::daidai` に写される。
@@ -64,6 +98,62 @@ fn clean(s: &str, max_chars: usize) -> String {
     flat.trim().chars().take(max_chars).collect()
 }
 
+/// 通知用の文字列。生の値から、制御文字を空白に、双方向制御文字とゼロ幅文字を削ってから切り詰める
+/// (画面用に切った後の文字列からは作らない。先頭に除去する文字が並ぶ入力で結果がずれる)。
+fn notice_text(raw: &str, max_chars: usize) -> String {
+    let kept: String = raw
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{061C}'
+                    | '\u{200E}'
+                    | '\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{200B}'
+                    | '\u{2060}'
+                    | '\u{FEFF}'
+            )
+        })
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let cut: String = kept.trim().chars().take(max_chars).collect();
+    cut.trim_end().to_string()
+}
+
+/// 通知になるカードなら、その中身。明示の `id` が通知の id の形でない・title も body も空なら None。
+fn parse_notice(o: &serde_json::Map<String, Value>) -> Option<NoticeFields> {
+    let id = o.get("id").and_then(Value::as_str)?;
+    if !is_notice_id(id) {
+        return None;
+    }
+    let title = notice_text(
+        o.get("title").and_then(Value::as_str).unwrap_or(""),
+        NOTICE_MAX_TITLE_CHARS,
+    );
+    let body = notice_text(
+        o.get("body").and_then(Value::as_str).unwrap_or(""),
+        NOTICE_MAX_BODY_CHARS,
+    );
+    if title.is_empty() && body.is_empty() {
+        return None;
+    }
+    let posted_at = o
+        .get("posted_at")
+        .and_then(Value::as_str)
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.timestamp());
+    let low = o.get("priority").and_then(Value::as_str) == Some("low");
+    Some(NoticeFields {
+        id: id.to_string(),
+        title,
+        body,
+        low,
+        posted_at,
+    })
+}
+
 /// カード 1 枚を検証する。title が無い・期限の形が不正なカードは捨てる(ほかのカードは残す)。
 fn parse_card(v: &Value, index: usize) -> Option<Card> {
     let o = v.as_object()?;
@@ -88,6 +178,7 @@ fn parse_card(v: &Value, index: usize) -> Option<Card> {
             MAX_BODY_CHARS,
         ),
         expires_at,
+        notice: parse_notice(o),
     })
 }
 
@@ -172,8 +263,27 @@ pub fn source_from_config(cfg: &ConfigDaidai) -> Result<Box<dyn FeedSource>, Str
     }
 }
 
+/// 取得の開始結果。
+pub struct Started {
+    /// 画面が読む最新のフィード
+    pub shared: Shared,
+    /// 操作パネルへ出す通知の帳簿(取得のスレッドが更新する。画面が出ていなくても動く)
+    pub notices: Arc<NoticeBoard>,
+}
+
+/// 通知の帳簿の置き場所。`[daidai] notice_state_path` が空なら、`STATE_DIRECTORY`(systemd の
+/// StateDirectory)があればその下の `daidai-notices.json`、無ければ置かない(メモリだけ)。
+pub fn notice_state_path(configured: &str, state_directory: Option<&OsStr>) -> Option<PathBuf> {
+    if !configured.is_empty() {
+        return Some(PathBuf::from(configured));
+    }
+    state_directory
+        .filter(|d| !d.is_empty())
+        .map(|d| PathBuf::from(d).join("daidai-notices.json"))
+}
+
 /// 取得を始める。無効なら None。最初の値が入るまでは「カード無し」。
-pub fn start(cfg: &ConfigDaidai) -> Option<Shared> {
+pub fn start(cfg: &ConfigDaidai) -> Option<Started> {
     if !cfg.enabled {
         return None;
     }
@@ -186,6 +296,11 @@ pub fn start(cfg: &ConfigDaidai) -> Option<Shared> {
     };
     let shared: Shared = Arc::new(Mutex::new(DaidaiSnapshot::default()));
     let out = shared.clone();
+    let notices = Arc::new(NoticeBoard::new(notice_state_path(
+        &cfg.notice_state_path,
+        std::env::var_os("STATE_DIRECTORY").as_deref(),
+    )));
+    let board = notices.clone();
     let poll = Duration::from_secs(cfg.poll_secs.max(1));
     let spawned = std::thread::Builder::new()
         .name("daidai".into())
@@ -201,7 +316,11 @@ pub fn start(cfg: &ConfigDaidai) -> Option<Shared> {
                         }
                         None => eprintln!("daidai: フィードを読めた"),
                     }
-                    last_error = error;
+                    last_error = error.clone();
+                }
+                // 読めなかった周期は帳簿に渡さない(一時的な失敗で通知を消さない)
+                if error.is_none() {
+                    board.observe(&snap, chrono::Utc::now());
                 }
                 if let Ok(mut g) = out.lock() {
                     *g = snap;
@@ -213,7 +332,7 @@ pub fn start(cfg: &ConfigDaidai) -> Option<Shared> {
         eprintln!("daidai: スレッドを起動できない: {e}");
         return None;
     }
-    Some(shared)
+    Some(Started { shared, notices })
 }
 
 /// 取得した最新値を毎周期 `World::daidai` に写す。ブロックしない。
@@ -312,7 +431,7 @@ mod tests {
         assert_eq!(s, parse_feed(SAMPLE), "docs の見本とテストの見本は同じ内容");
     }
 
-    const SAMPLE: &str = r#"{"avatar_pose":"idle","cards":[{"body":"これはPoCのサンプル表示です。実際の朝の通知がここに出ます。","expires_at":"2026-11-08T12:00:00+09:00","id":"sample-morning-1","kind":"morning","title":"おはようございます"},{"body":"確認してほしいことがあるときに、だいだいからここで知らせます（サンプル）。","expires_at":null,"id":"sample-request-1","kind":"request","title":"お願い"}],"updated_at":"2026-11-08T07:00:00+09:00","version":1}"#;
+    const SAMPLE: &str = r#"{"avatar_pose":"idle","cards":[{"body":"これはPoCのサンプル表示です。実際の朝の通知がここに出ます。","expires_at":"2026-11-08T12:00:00+09:00","id":"sample-morning-1","kind":"morning","posted_at":"2026-11-08T07:00:00+09:00","priority":"normal","title":"おはようございます"},{"body":"確認してほしいことがあるときに、だいだいからここで知らせます（サンプル）。","expires_at":null,"id":"sample-request-1","kind":"request","priority":"low","title":"お願い"}],"updated_at":"2026-11-08T07:00:00+09:00","version":1}"#;
 
     fn at(s: &str) -> DateTime<FixedOffset> {
         DateTime::parse_from_rfc3339(s).unwrap()
@@ -390,6 +509,47 @@ mod tests {
         let ids: Vec<_> = s.cards.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["ok1", "ok2"]);
         assert_eq!(s.cards[1].kind, CardKind::Info, "知らない kind は info");
+    }
+
+    #[test]
+    fn notice_fields_come_only_from_an_explicit_valid_id() {
+        let s = parse_feed(
+            r#"{"version":1,"cards":[
+                {"title":"no id"},
+                {"id":"has space","title":"bad id"},
+                {"id":"card-0","title":"explicit card-0","body":"b","posted_at":"2026-11-08T07:00:00+09:00","priority":"low"},
+                {"id":"ok","title":"t","posted_at":"yesterday"}
+            ]}"#,
+        );
+        assert_eq!(s.cards.len(), 4, "画面の id の扱いは変えない");
+        assert_eq!(s.cards[0].id, "card-0", "補完の id");
+        assert!(s.cards[0].notice.is_none(), "補完の id は通知にしない");
+        assert!(s.cards[1].notice.is_none(), "形の合わない id");
+        assert_eq!(s.cards[1].id, "has space");
+        let n = s.cards[2].notice.as_ref().unwrap();
+        assert_eq!(s.cards[2].id, "card-0");
+        assert_eq!(
+            (n.id.as_str(), n.title.as_str(), n.body.as_str()),
+            ("card-0", "explicit card-0", "b")
+        );
+        assert!(n.low);
+        assert_eq!(
+            n.posted_at,
+            Some(at("2026-11-08T07:00:00+09:00").timestamp())
+        );
+        let n = s.cards[3].notice.as_ref().unwrap();
+        assert!(!n.low);
+        assert_eq!(n.posted_at, None, "読めない posted_at は無いものとして扱う");
+    }
+
+    #[test]
+    fn is_notice_id_matches_the_documented_pattern() {
+        for ok in ["a", "A-z_0.9:x", &"x".repeat(64)] {
+            assert!(is_notice_id(ok), "{ok}");
+        }
+        for bad in ["", &"x".repeat(65), "a b", "a\n", "日本語", "a/b", "a@b"] {
+            assert!(!is_notice_id(bad), "{bad:?}");
+        }
     }
 
     #[test]

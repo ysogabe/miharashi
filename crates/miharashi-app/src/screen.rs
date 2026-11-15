@@ -238,6 +238,10 @@ pub trait App {
     fn admin_sources(&self) -> crate::panel::AdminSources {
         Default::default()
     }
+    /// 操作パネルの `daidai` ブロックと `POST /api/v1/daidai/ack` の元になる通知の帳簿(`[daidai]` が無効なら None)。
+    fn notices(&self) -> Option<std::sync::Arc<crate::notices::NoticeBoard>> {
+        None
+    }
 }
 
 /// 登録されている画面 1 つ。`id` はパネルとの約束なので変えない。

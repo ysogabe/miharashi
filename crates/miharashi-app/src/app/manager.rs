@@ -104,6 +104,8 @@ pub struct ScreenManager {
     scene_screen: Option<usize>,
     /// 管理ページが取得の状態を読むための参照(読むだけ)
     admin: crate::panel::AdminSources,
+    /// だいだいの通知の帳簿(`[daidai]` が有効なときだけ)。操作パネルが読む
+    notices: Option<std::sync::Arc<crate::notices::NoticeBoard>>,
     pub ticks: u64,
     pub keys: u64,
 }
@@ -155,6 +157,7 @@ impl ScreenManager {
             top_valid: false,
             scene_screen: None,
             admin: Default::default(),
+            notices: None,
             ticks: 0,
             keys: 0,
         };
@@ -485,6 +488,12 @@ impl ScreenManager {
     /// 管理ページに渡す取得元の参照を、`f` で書き換える(画面が持たない取得 = 警報・航空機は `main` が足す)。
     pub fn with_admin(mut self, f: impl FnOnce(&mut crate::panel::AdminSources)) -> Self {
         f(&mut self.admin);
+        self
+    }
+
+    /// だいだいの通知の帳簿を操作パネルに渡せるようにする。
+    pub fn with_notices(mut self, notices: std::sync::Arc<crate::notices::NoticeBoard>) -> Self {
+        self.notices = Some(notices);
         self
     }
 
@@ -1010,6 +1019,10 @@ impl App for ScreenManager {
 
     fn admin_sources(&self) -> crate::panel::AdminSources {
         self.admin.clone()
+    }
+
+    fn notices(&self) -> Option<std::sync::Arc<crate::notices::NoticeBoard>> {
+        self.notices.clone()
     }
 
     fn panel_view(&self) -> Option<PanelView> {

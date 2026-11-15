@@ -169,6 +169,10 @@
 # そのポーズはアバターを動画のループ再生にする(動画のあいだは揺らさない)。`cargo build --features video` でビルドしたときだけ。
 # 無い・壊れている・デコードできない・ビルドに video が無いポーズは、PNG のまま。画面が見えていない・モニターが消えているあいだは何も読まない。
 # video_max_fps = 12         # 動画を描き直す回数の上限(1〜30、フレーム/秒)。CPU の負荷の上限。60Hz なら 12 / 15 / 20 / 30 に切り上がる
+# 操作パネルへの通知(Issue #101、docs/daidai/DESIGN.md)。フィードのカードのうち id を明示したものが通知になる(posted_at・priority は任意)。
+# 通知の rev と既読を残すファイル。空なら、環境変数 STATE_DIRECTORY があればその下の daidai-notices.json、無ければメモリだけ。
+# 通知は poll_secs ごとにフィードを読んだときに反映される(短くしたいときは poll_secs を下げる)
+# notice_state_path = ""
 
 [cube]
 # 3D の画面(回る立方体。GLES 専用。renderer = cpu や GL なしでは案内を出し、自動巡回では飛ばす)。既定は無効。

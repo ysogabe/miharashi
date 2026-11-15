@@ -9,9 +9,14 @@
 //! `POST /api/v1/rotation` で自動巡回を止めたままにする・再開する(#57)。`/status` の
 //! `rotation.control` はこれを受け付けるか(巡回が有効なら常に true)。
 //!
+//! `/status` と SSE には、だいだいの通知の `daidai` ブロックを足せる(`[daidai]` が有効なときだけ。Issue #101)。
+//! 元は取得のスレッドが持つ通知の帳簿(`notices.rs`)で、変わったときは実行ループの `publish` を通さずに
+//! SSE へ知らせる。`POST /api/v1/daidai/ack` で既読にする(レート制限は他の操作とは別)。
+//!
 //! モニターの消灯・点灯(`POST /api/v1/display`)は、HA の手動オーバーライド(input_select)を書き換える。
 //! キオスクの中だけで切り替えると HA の画面と食い違うので、実際の切り替えは `DisplayControl` に任せる。
 use crate::config;
+use crate::notices::NoticeBoard;
 use crate::screen::{KeyPress, PanelRotation, PanelView};
 pub use admin::AdminContext;
 use serde_json::{Value, json};
@@ -80,6 +85,7 @@ enum Route {
     Screen,
     Display,
     Rotation,
+    DaidaiAck,
     AdminOverview,
     AdminRestart,
     AdminConfig,
@@ -101,6 +107,7 @@ impl Route {
             "/api/v1/screen" => (Route::Screen, Auth::Panel),
             "/api/v1/display" => (Route::Display, Auth::Panel),
             "/api/v1/rotation" => (Route::Rotation, Auth::Panel),
+            "/api/v1/daidai/ack" => (Route::DaidaiAck, Auth::Panel),
             "/api/v1/admin/overview" => (Route::AdminOverview, Auth::Admin),
             "/api/v1/admin/restart" => (Route::AdminRestart, Auth::Admin),
             "/api/v1/admin/config" => (Route::AdminConfig, Auth::Admin),
@@ -137,6 +144,7 @@ impl Route {
             | Route::Screen
             | Route::Display
             | Route::Rotation
+            | Route::DaidaiAck
             | Route::AdminRestart => *method == Method::Post,
             Route::AdminConfig => *method == Method::Put,
         }
@@ -320,9 +328,20 @@ struct Shared {
     last_request: Mutex<Option<Instant>>,
     /// モニターを切り替えられるか(HA の mode エンティティが設定してあるか)
     display_control: bool,
+    /// だいだいの通知の帳簿(`[daidai]` が無効なら None。`daidai` ブロックも ack も無い)
+    notices: Option<Arc<NoticeBoard>>,
+    /// `POST /api/v1/daidai/ack` のレート制限。input / screen / display / rotation とは別の枠
+    ack_rate: Mutex<RateLimit>,
 }
 
 impl Shared {
+    /// 実行ループを通さずに、今すぐ SSE へ送らせる(通知の帳簿の変化)。
+    fn wake(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.generation += 1;
+        self.changed.notify_all();
+    }
+
     fn status_json(&self, view: &PanelView, display: DisplayStatus) -> Value {
         let screen = view.screens.get(view.current).map(|s| {
             json!({
@@ -333,7 +352,7 @@ impl Shared {
                 "page": view.page,
             })
         });
-        json!({
+        let mut status = json!({
             "schema_version": SCHEMA_VERSION,
             "host": self.host,
             "screen": screen,
@@ -357,7 +376,16 @@ impl Shared {
             },
             "uptime_s": self.started.elapsed().as_secs(),
             "generated_at": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
-        })
+        });
+        // 通知の帳簿のロックは state のロックの内側でだけ取る(帳簿を持ったまま state は取らない)
+        if let Some(block) = self
+            .notices
+            .as_ref()
+            .and_then(|b| b.block(chrono::Utc::now().timestamp()))
+        {
+            status["daidai"] = block;
+        }
+        status
     }
 
     /// 今の状態の JSON と世代。まだ一度も置かれていなければ None。
@@ -401,10 +429,12 @@ impl Panel {
     /// 設定どおりに待ち受けを始める。失敗したら Err(キオスクはパネルなしで動き続ける)。
     /// `display` はモニターの切り替え先(HA 連携が無ければ None。`/api/v1/display` は 409)。
     /// `admin` は管理ページの材料(`[admin]` が有効で、管理トークンが規則を満たすときだけ管理ページが動く)。
+    /// `notices` はだいだいの通知の帳簿(`[daidai]` が無効なら None)。
     pub fn start(
         cfg: &config::Panel,
         display: Option<Arc<dyn DisplayControl>>,
         admin: Option<AdminContext>,
+        notices: Option<Arc<NoticeBoard>>,
     ) -> Result<Self, String> {
         let addr = check_listen(&cfg.listen)?;
         let token = read_token(&cfg.token_file)?;
@@ -415,6 +445,7 @@ impl Panel {
             cfg.max_rate_per_sec,
             display,
             admin,
+            notices,
         ))
     }
 
@@ -424,6 +455,7 @@ impl Panel {
         max_rate_per_sec: u32,
         display: Option<Arc<dyn DisplayControl>>,
         admin: Option<AdminContext>,
+        notices: Option<Arc<NoticeBoard>>,
     ) -> Self {
         let addr = server.server_addr().to_ip().expect("TCP で待ち受けている");
         let shared = Arc::new(Shared {
@@ -438,7 +470,18 @@ impl Panel {
             sse: AtomicUsize::new(0),
             last_request: Mutex::new(None),
             display_control: display.is_some(),
+            notices: notices.clone(),
+            ack_rate: Mutex::new(RateLimit::new(max_rate_per_sec)),
         });
+        if let Some(n) = &notices {
+            // 帳簿は Panel の作り直しをまたいで生きる。弱い参照にして、古い Panel を引き止めない
+            let weak = Arc::downgrade(&shared);
+            n.set_waker(Arc::new(move || {
+                if let Some(s) = weak.upgrade() {
+                    s.wake();
+                }
+            }));
+        }
         let (tx, keys) = channel();
         let reaper = Reaper::default();
         let (admin, admin_disabled) = admin::prepare(admin, &token, &shared, &tx, addr, &reaper);
@@ -742,6 +785,22 @@ fn serve(
                     }
                 }
             }
+            Route::DaidaiAck => match &shared.notices {
+                None => error(404, "だいだいの通知は無効"),
+                Some(board) => {
+                    if !shared.ack_rate.lock().unwrap().allow(Instant::now()) {
+                        error(429, "操作が速すぎる")
+                    } else {
+                        let (id, result) = ack_notice(&mut req, board);
+                        let code = result.as_ref().map_or_else(|(c, _)| *c, |_| 204);
+                        eprintln!("panel: {} daidai ack {id:?} -> {code}", peer(&req));
+                        match result {
+                            Ok(()) => Response::from_data(Vec::new()).with_status_code(204),
+                            Err((code, msg)) => error(code, &msg),
+                        }
+                    }
+                }
+            },
             Route::Rotation => {
                 if !rate.allow(Instant::now()) {
                     error(429, "操作が速すぎる")
@@ -800,6 +859,23 @@ fn read_field(req: &mut Request, field: &str, example: &str) -> Result<String, H
                 format!(r#"本文は {{"{field}": "{example}"}} の形の JSON"#),
             )
         })
+}
+
+/// `POST /api/v1/daidai/ack` の本文 `{"id": "…"}` を読んで、その通知とそれより古い今の通知を既読にする。
+/// 今の通知に無い id・既に既読のものは何もせず成功(冪等)。戻り値: (id(ログ用), 結果)。
+fn ack_notice(req: &mut Request, board: &NoticeBoard) -> (String, Result<(), HttpError>) {
+    let id = match read_field(req, "id", "n-20261108-0731") {
+        Ok(i) => i,
+        Err(e) => return ("-".into(), Err(e)),
+    };
+    if !crate::daidai::is_notice_id(&id) {
+        return (
+            "-".into(),
+            Err((400, "id は英数字と _ . : - の 1〜64 文字".into())),
+        );
+    }
+    board.ack(&id);
+    (id, Ok(()))
 }
 
 /// `POST /api/v1/display` の本文を読んで、モニターの手動オーバーライドを切り替える。
@@ -990,7 +1066,7 @@ mod tests {
 
     fn start_with(rate: u32, display: Option<Arc<dyn DisplayControl>>) -> (Panel, String) {
         let server = Server::http("127.0.0.1:0").unwrap();
-        let p = Panel::spawn(server, TOKEN.into(), rate, display, None);
+        let p = Panel::spawn(server, TOKEN.into(), rate, display, None, None);
         let base = format!("http://{}", p.addr());
         (p, base)
     }
@@ -1522,5 +1598,327 @@ mod tests {
         assert_eq!(data()["rotation"]["state"], "on", "再開したら送る");
         assert_eq!(p.stat(), "connected");
         let _ = base;
+    }
+
+    // ---- だいだいの通知(Issue #101) ----
+
+    fn notice_feed(cards: &[(&str, &str, i64)]) -> crate::daidai::DaidaiSnapshot {
+        // (id, title, 何秒前に掲示したか)
+        let now = chrono::Utc::now().timestamp();
+        let cards: Vec<String> = cards
+            .iter()
+            .map(|(id, title, ago)| {
+                let at = chrono::DateTime::from_timestamp(now - ago, 0).unwrap();
+                format!(
+                    r#"{{"id":"{id}","title":"{title}","body":"本文 {id}","posted_at":"{}"}}"#,
+                    at.to_rfc3339()
+                )
+            })
+            .collect();
+        crate::daidai::parse_feed(&format!(
+            r#"{{"version":1,"avatar_pose":"idle","cards":[{}]}}"#,
+            cards.join(",")
+        ))
+    }
+
+    fn start_with_board(rate: u32, board: &Arc<NoticeBoard>) -> (Panel, String) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let p = Panel::spawn(server, TOKEN.into(), rate, None, None, Some(board.clone()));
+        let base = format!("http://{}", p.addr());
+        (p, base)
+    }
+
+    /// 時計を `now_ms`(UNIX ミリ秒)に止めた帳簿。rev は `now_ms` から、変化のたびに 1 ずつ増える。
+    fn new_board(now_ms: i64) -> Arc<NoticeBoard> {
+        Arc::new(NoticeBoard::with_clock(None, Arc::new(move || now_ms)))
+    }
+
+    fn observe(board: &NoticeBoard, snap: &crate::daidai::DaidaiSnapshot) {
+        board.observe(snap, chrono::Utc::now());
+    }
+
+    fn status(base: &str) -> Value {
+        serde_json::from_str(&get(base, "/api/v1/status", true).1).unwrap()
+    }
+
+    /// 値の型だけを残した形(キーの集合と型を比べる)。
+    fn shape(v: &Value) -> Value {
+        match v {
+            Value::Null => json!("null"),
+            Value::Bool(_) => json!("bool"),
+            Value::Number(n) if n.is_u64() || n.is_i64() => json!("int"),
+            Value::Number(_) => json!("float"),
+            Value::String(_) => json!("string"),
+            Value::Array(a) => Value::Array(a.iter().map(shape).collect()),
+            Value::Object(o) => {
+                Value::Object(o.iter().map(|(k, v)| (k.clone(), shape(v))).collect())
+            }
+        }
+    }
+
+    #[test]
+    fn status_has_a_daidai_block_only_with_a_board_that_has_observed() {
+        // 帳簿なし(daidai が無効): キーそのものが無い(null も出さない)
+        let (p, base) = start(20);
+        p.publish(Some(view(0)), DisplayStatus::default());
+        assert!(status(&base).get("daidai").is_none());
+
+        // 帳簿はあるが最初の observe の前: まだ出さない
+        let board = new_board(1_794_700_000);
+        let (p, base) = start_with_board(20, &board);
+        p.publish(Some(view(0)), DisplayStatus::default());
+        assert!(status(&base).get("daidai").is_none());
+
+        observe(
+            &board,
+            &notice_feed(&[("n-b", "古い", 3300), ("n-a", "おはよう", 12)]),
+        );
+        let v = status(&base);
+        assert_eq!(
+            v["schema_version"], 1,
+            "既存の項目と schema_version は変えない"
+        );
+        assert_eq!(v["screen"]["id"], "status");
+        let d = &v["daidai"];
+        assert!(d["rev"].is_u64(), "rev は整数: {}", d["rev"]);
+        assert_eq!(d["rev"], 1_794_700_001u64);
+        assert_eq!(d["unseen"], 2);
+        assert_eq!(d["ack"], true);
+        assert_eq!(d["avatar_pose"], "idle");
+        let n = d["notices"].as_array().unwrap();
+        assert_eq!(n.len(), 2);
+        assert_eq!(n[0]["id"], "n-a", "新しい順");
+        assert_eq!(n[0]["title"], "おはよう");
+        assert_eq!(n[0]["body"], "本文 n-a");
+        assert_eq!(n[0]["priority"], "normal");
+        assert!(n[0]["age_s"].is_u64());
+        assert!((12..=14).contains(&n[0]["age_s"].as_u64().unwrap()));
+        assert_eq!(n[1]["id"], "n-b");
+    }
+
+    /// miharashi-panel の app/src/test/resources/fixtures/status-daidai.json(Panel 側の見本)。
+    const PANEL_FIXTURE: &str = r#"{"daidai":{"ack":true,"avatar_pose":"idle","notices":[{"age_s":12,"body":"今日は燃えるごみの日です","id":"n-20261108-0731","priority":"normal","title":"おはよう"},{"age_s":3300,"body":"傘を持って出かけてください","id":"n-20261108-0630","priority":"normal","title":"午後は雨"}],"rev":128,"unseen":2},"feed":"online","generated_at":"2026-11-08T07:31:12+09:00","host":"geoframe-n100","schema_version":1,"screen":{"count":2,"id":"status","index":0,"page":"OVERVIEW","title":"STATUS"},"screens":[{"id":"status","title":"STATUS"},{"id":"photo","title":"PHOTO FRAME"}],"uptime_s":3600}"#;
+
+    #[test]
+    fn the_daidai_block_has_the_same_keys_and_types_as_the_panel_fixture() {
+        let fixture: Value = serde_json::from_str(PANEL_FIXTURE).unwrap();
+        // rev 127 から始めて、最初の observe で 128
+        let board = new_board(127);
+        let (p, base) = start_with_board(20, &board);
+        p.publish(Some(view(0)), DisplayStatus::default());
+        let feed = {
+            let now = chrono::Utc::now().timestamp();
+            let at = |ago: i64| {
+                chrono::DateTime::from_timestamp(now - ago, 0)
+                    .unwrap()
+                    .to_rfc3339()
+            };
+            crate::daidai::parse_feed(&format!(
+                r#"{{"version":1,"avatar_pose":"idle","cards":[
+                    {{"id":"n-20261108-0731","title":"おはよう","body":"今日は燃えるごみの日です","posted_at":"{}"}},
+                    {{"id":"n-20261108-0630","title":"午後は雨","body":"傘を持って出かけてください","posted_at":"{}"}}
+                ]}}"#,
+                at(12),
+                at(3300)
+            ))
+        };
+        observe(&board, &feed);
+        let v = status(&base);
+        assert_eq!(shape(&v["daidai"]), shape(&fixture["daidai"]));
+        let (got, want) = (&v["daidai"], &fixture["daidai"]);
+        for key in ["rev", "unseen", "ack", "avatar_pose"] {
+            assert_eq!(got[key], want[key], "{key}");
+        }
+        for (g, w) in got["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(want["notices"].as_array().unwrap())
+        {
+            for key in ["id", "title", "body", "priority"] {
+                assert_eq!(g[key], w[key], "{key}");
+            }
+            let (ga, wa) = (g["age_s"].as_i64().unwrap(), w["age_s"].as_i64().unwrap());
+            assert!((wa..=wa + 3).contains(&ga), "{ga} {wa}");
+        }
+        // 見本のほかのキーも、こちらの /status に同じ型である
+        for (k, w) in fixture.as_object().unwrap() {
+            if k != "daidai" {
+                assert_eq!(shape(&v[k]), shape(w), "{k}");
+            }
+        }
+    }
+
+    #[test]
+    fn ack_marks_read_and_answers_204_400_404_401_405() {
+        let board = new_board(1000);
+        let (p, base) = start_with_board(20, &board);
+        p.publish(Some(view(0)), DisplayStatus::default());
+        observe(
+            &board,
+            &notice_feed(&[("n-c", "c", 10), ("n-b", "b", 20), ("n-a", "a", 30)]),
+        );
+        let ack = |body: &str| post_to(&base, "/api/v1/daidai/ack", Some(TOKEN), body);
+        let d = status(&base)["daidai"].clone();
+        let (rev, unseen) = (d["rev"].as_u64().unwrap(), d["unseen"].as_u64().unwrap());
+        assert_eq!(unseen, 3);
+        // 知らない id・形の合う id は 204 で何も変えない
+        assert_eq!(ack(r#"{"id":"n-zzz"}"#), 204);
+        assert_eq!(status(&base)["daidai"]["rev"], rev);
+        // その id とそれより古いものが既読
+        assert_eq!(ack(r#"{"id":"n-b"}"#), 204);
+        let d = status(&base)["daidai"].clone();
+        assert_eq!(d["unseen"], 1);
+        assert_eq!(d["rev"], rev + 1);
+        // 既読のものをもう一度: 204、変化なし
+        assert_eq!(ack(r#"{"id":"n-a"}"#), 204);
+        assert_eq!(status(&base)["daidai"]["rev"], rev + 1);
+        // 形の違うもの
+        for bad in [
+            r#"{"id":"has space"}"#,
+            r#"{"id":""}"#,
+            r#"{"id":5}"#,
+            r#"{"key":"n-a"}"#,
+            "n-a",
+            "",
+        ] {
+            assert_eq!(ack(bad), 400, "{bad}");
+        }
+        let long = format!(r#"{{"id":"{}"}}"#, "x".repeat(65));
+        assert_eq!(ack(&long), 400);
+        assert_eq!(ack(&"x".repeat(2000)), 413);
+        // 認証と経路
+        assert_eq!(
+            post_to(&base, "/api/v1/daidai/ack", None, r#"{"id":"n-a"}"#),
+            401
+        );
+        assert_eq!(get(&base, "/api/v1/daidai/ack", true).0, 405);
+        assert_eq!(
+            status(&base)["daidai"]["rev"],
+            rev + 1,
+            "拒否したものは何も変えない"
+        );
+        assert_eq!(p.inputs().count(), 0, "実行ループには何も渡さない");
+
+        // 無効(帳簿なし)なら 404(認証のあと)
+        let (_p, base) = start(20);
+        assert_eq!(
+            post_to(&base, "/api/v1/daidai/ack", Some(TOKEN), r#"{"id":"n-a"}"#),
+            404
+        );
+        assert_eq!(
+            post_to(&base, "/api/v1/daidai/ack", None, r#"{"id":"n-a"}"#),
+            401
+        );
+    }
+
+    #[test]
+    fn ack_has_its_own_rate_limit_bucket() {
+        let board = new_board(1000);
+        let (p, base) = start_with_board(3, &board);
+        p.publish(Some(view(0)), DisplayStatus::default());
+        observe(&board, &notice_feed(&[("n-a", "a", 1)]));
+        let acks: Vec<u16> = (0..5)
+            .map(|_| post_to(&base, "/api/v1/daidai/ack", Some(TOKEN), r#"{"id":"n-a"}"#))
+            .collect();
+        assert_eq!(acks, [204, 204, 204, 429, 429]);
+        // ack を連打しても、操作は 429 にならない
+        let codes: Vec<u16> = (0..3)
+            .map(|_| post(&base, Some(TOKEN), r#"{"key":"prev"}"#))
+            .collect();
+        assert_eq!(codes, [204, 204, 204]);
+        assert_eq!(p.inputs().count(), 3);
+        // 逆に、操作を使い切っても ack は別の枠
+        assert_eq!(post(&base, Some(TOKEN), r#"{"key":"prev"}"#), 429);
+        std::thread::sleep(Duration::from_millis(1100));
+        for _ in 0..3 {
+            assert_eq!(post(&base, Some(TOKEN), r#"{"key":"prev"}"#), 204);
+        }
+        assert_eq!(post(&base, Some(TOKEN), r#"{"key":"prev"}"#), 429);
+        assert_eq!(
+            post_to(&base, "/api/v1/daidai/ack", Some(TOKEN), r#"{"id":"n-a"}"#),
+            204
+        );
+    }
+
+    /// SSE を開いて、`data:` の行を 1 つずつ読む(読み取りは 1 秒で諦める = 1 秒以内に届くことを確かめる)。
+    fn sse(p: &Panel) -> impl FnMut() -> Value {
+        let mut s = std::net::TcpStream::connect(p.addr()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        write!(
+            s,
+            "GET /api/v1/events HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {TOKEN}\r\n\r\n"
+        )
+        .unwrap();
+        let mut r = std::io::BufReader::new(s);
+        move || loop {
+            let mut line = String::new();
+            let n = r
+                .read_line(&mut line)
+                .expect("1 秒以内に status が届く(読み取りが期限切れ)");
+            assert!(n > 0, "切れた");
+            if let Some(d) = line.strip_prefix("data: ") {
+                return serde_json::from_str::<Value>(d).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn sse_sends_a_board_change_and_an_ack_within_a_second_without_publish() {
+        let board = new_board(1000);
+        let (p, base) = start_with_board(20, &board);
+        p.publish(Some(view(0)), DisplayStatus::default());
+        observe(&board, &notice_feed(&[("n-a", "a", 1)]));
+        let mut data = sse(&p);
+        let first = data();
+        assert_eq!(first["daidai"]["unseen"], 1);
+        let generation = p.shared.state.lock().unwrap().generation;
+
+        // これ以降、実行ループの publish は呼ばない
+        let started = Instant::now();
+        observe(&board, &notice_feed(&[("n-b", "b", 0), ("n-a", "a", 1)]));
+        let v = data();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(v["daidai"]["unseen"], 2);
+        assert_eq!(v["daidai"]["notices"][0]["id"], "n-b");
+        assert_eq!(
+            v["daidai"]["rev"],
+            first["daidai"]["rev"].as_u64().unwrap() + 1
+        );
+
+        let started = Instant::now();
+        assert_eq!(
+            post_to(&base, "/api/v1/daidai/ack", Some(TOKEN), r#"{"id":"n-b"}"#),
+            204
+        );
+        let v = data();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(v["daidai"]["unseen"], 0);
+        assert_eq!(
+            v["daidai"]["rev"],
+            first["daidai"]["rev"].as_u64().unwrap() + 2
+        );
+
+        // 変化の無い取得・既読では送らない(generation も進まない)
+        let g = p.shared.state.lock().unwrap().generation;
+        assert_eq!(g, generation + 2);
+        observe(&board, &notice_feed(&[("n-b", "b", 0), ("n-a", "a", 1)]));
+        post_to(&base, "/api/v1/daidai/ack", Some(TOKEN), r#"{"id":"n-b"}"#);
+        assert_eq!(p.shared.state.lock().unwrap().generation, g);
+    }
+
+    #[test]
+    fn a_new_panel_takes_over_the_boards_waker() {
+        // パネルは再起動・再試行で作り直される。帳簿の知らせ先は新しい方に置き換わる
+        let board = new_board(1000);
+        let (old, _) = start_with_board(20, &board);
+        old.publish(Some(view(0)), DisplayStatus::default());
+        let (p, _) = start_with_board(20, &board);
+        p.publish(Some(view(0)), DisplayStatus::default());
+        let mut data = sse(&p);
+        data();
+        observe(&board, &notice_feed(&[("n-a", "a", 1)]));
+        assert_eq!(data()["daidai"]["unseen"], 1);
+        drop(old);
     }
 }

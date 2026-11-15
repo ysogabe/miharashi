@@ -189,8 +189,8 @@ pub fn kiosk(
         ));
     }
     // だいだい画面(Muse からの通知)。既定は無効。取得元が起動できなければ画面も出さない
-    let daidai_shared = crate::daidai::start(&cfg.daidai);
-    if daidai_shared.is_some() {
+    let daidai = crate::daidai::start(&cfg.daidai);
+    if daidai.is_some() {
         // ポーズ動画は avatar_dir の daidai-<pose>.mp4 だけ(無い・壊れている・video 無しのビルドは PNG)
         let video = crate::daidai_video::VideoPlayback::new(
             crate::daidai_video::dir_opener(&cfg.daidai.avatar_dir),
@@ -233,8 +233,9 @@ pub fn kiosk(
     if let Some(shared) = agent_shared {
         m = m.with_provider(Box::new(crate::agents::AgentProvider::new(shared)));
     }
-    if let Some(shared) = daidai_shared {
-        m = m.with_provider(Box::new(crate::daidai::DaidaiProvider::new(shared)));
+    if let Some(d) = daidai {
+        m = m.with_provider(Box::new(crate::daidai::DaidaiProvider::new(d.shared)));
+        m = m.with_notices(d.notices);
     }
     m = m.with_admin(|a| {
         a.geoframe = admin_geoframe;
@@ -334,6 +335,32 @@ mod tests {
             .map(|s| s.id)
             .collect();
         (ids, dir)
+    }
+
+    /// 通知の帳簿は [daidai] が有効なときだけ App から取り出せる(操作パネルへ渡す)。
+    #[test]
+    fn the_notice_board_reaches_the_panel_only_when_daidai_is_enabled() {
+        let build = |cfg: &Config| {
+            let (dir, p) = test_photo();
+            let app = kiosk(
+                cfg,
+                (64, 36),
+                None,
+                Source::File(p, None),
+                Box::new(DummyData::new()),
+                dummy_snapshot(0.0),
+                None,
+                None,
+            );
+            (app, dir)
+        };
+        let mut cfg = Config::default();
+        let (app, _dir) = build(&cfg);
+        assert!(App::notices(&app).is_none());
+        cfg.daidai.enabled = true;
+        cfg.daidai.feed_path = "/nonexistent/miharashi-daidai-feed.json".into();
+        let (app, _dir) = build(&cfg);
+        assert!(App::notices(&app).is_some());
     }
 
     /// だいだい画面は既定では登録せず、有効にしたときだけ agents の次に登録する。
