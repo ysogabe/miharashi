@@ -16,6 +16,7 @@ mod env;
 #[cfg(target_os = "linux")]
 mod gpu_bench;
 mod home;
+mod notices;
 mod panel;
 mod photos;
 mod quake;

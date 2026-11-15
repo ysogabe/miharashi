@@ -884,7 +884,7 @@ mod tests {
             started: Instant::now() - Duration::from_secs(age_s),
             sources,
         };
-        let p = Panel::spawn(server, PANEL_TOKEN.into(), 20, None, Some(ctx));
+        let p = Panel::spawn(server, PANEL_TOKEN.into(), 20, None, Some(ctx), None);
         p.publish(Some(view()), DisplayStatus::default());
         let base = format!("http://{}", p.addr());
         (p, base)

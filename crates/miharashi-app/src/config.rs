@@ -1001,6 +1001,9 @@ pub struct ConfigDaidai {
     /// ポーズ動画を描き直す回数の上限(フレーム / 秒、1〜30)。CPU の負荷の上限になる。動画の元のフレームレートより
     /// 大きくしても速くはならない。実際の間隔はモニターの垂直同期(60Hz なら 12 / 15 / 20 / 30)に切り上がる
     pub video_max_fps: u32,
+    /// 通知(操作パネルの `daidai` ブロック。Issue #101)の rev と既読を残すファイル。空なら、環境変数
+    /// `STATE_DIRECTORY` があればその下の `daidai-notices.json`、無ければ残さない(メモリだけ)
+    pub notice_state_path: String,
 }
 
 /// 監視する接続の総数の上限(`[agents]` の `primary` を含む)。
@@ -1374,6 +1377,7 @@ impl Default for ConfigDaidai {
             poll_secs: 10,
             avatar_dir: String::new(),
             video_max_fps: 12,
+            notice_state_path: String::new(),
         }
     }
 }
@@ -1952,6 +1956,9 @@ impl Config {
             if !(1..=30).contains(&d.video_max_fps) {
                 return Err("daidai.video_max_fps は 1〜30".into());
             }
+            if !d.notice_state_path.is_empty() && !is_plain_path_text(&d.notice_state_path) {
+                return Err("daidai.notice_state_path に制御文字は使えない".into());
+            }
         }
         Ok(())
     }
@@ -1981,6 +1988,7 @@ mod tests {
         assert_eq!((d.source.as_str(), d.poll_secs), ("file", 10));
         assert!(d.avatar_dir.is_empty());
         assert_eq!(d.video_max_fps, 12);
+        assert!(d.notice_state_path.is_empty());
         // 無効なら値を検査しない(agents と同じ)。有効なら検査する
         assert!(Config::parse("[daidai]\nfeed_path = \"\"\n").is_ok());
         let on = "[daidai]\nenabled = true\n";
@@ -1993,6 +2001,7 @@ mod tests {
             "avatar_dir = \"/a\\u0007b\"",
             "video_max_fps = 0",
             "video_max_fps = 31",
+            "notice_state_path = \"/a\\u0007b\"",
         ] {
             let e = Config::parse(&format!("{on}{bad}\n")).unwrap_err();
             assert!(e.contains("daidai"), "{bad}: {e}");
