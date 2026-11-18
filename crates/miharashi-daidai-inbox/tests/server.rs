@@ -303,6 +303,62 @@ fn rate_limit_counts_failures_and_returns_retry_after() {
     assert!(!f.feed.exists());
 }
 
+/// 認証より前に終わる要求(重複した Authorization、不正なヘッダー、404、405)も数える。
+/// 数えない経路があると、そこを使って無制限に叩ける。
+#[test]
+fn requests_that_end_before_authentication_are_counted_too() {
+    let dup = format!(
+        "POST /api/v1/notices HTTP/1.1\r\nAuthorization: Bearer {TOKEN}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n"
+    );
+    let malformed = b"POST /api/v1/notices HTTP/1.1\r\nno colon here\r\n\r\n".to_vec();
+    type Send = Box<dyn Fn(SocketAddr) -> Reply>;
+    let cases: Vec<(&str, Send, u16)> = vec![
+        (
+            "重複した Authorization",
+            Box::new(move |a| send_raw(a, dup.as_bytes())),
+            400,
+        ),
+        (
+            "不正なヘッダー",
+            Box::new(move |a| send_raw(a, &malformed)),
+            400,
+        ),
+        ("404", Box::new(|a| get(a, "/nope", Some(TOKEN))), 404),
+        (
+            "405",
+            Box::new(|a| get(a, "/api/v1/notices", Some(TOKEN))),
+            405,
+        ),
+    ];
+    for (name, send, status) in &cases {
+        let f = start_with("rate-pre-auth", "127.0.0.1", 3, 6);
+        for i in 0..3 {
+            assert_eq!(send(f.addr).status, *status, "{name} #{i}");
+        }
+        let r = send(f.addr);
+        assert_eq!(r.status, 429, "{name}");
+        assert!(r.head.contains("Retry-After: "), "{name}: {}", r.head);
+        // 同じ送信元の正しい POST も、枠が空なら通らない
+        assert_eq!(post(f.addr, OK_BODY).status, 429, "{name}");
+        assert!(!f.feed.exists(), "{name}");
+    }
+}
+
+/// 種類を混ぜても、同じ送信元のバケットを共有する。認証に成功した health だけは数えない。
+#[test]
+fn pre_auth_failures_share_one_bucket_and_authenticated_health_stays_free() {
+    let f = start_with("rate-mixed", "127.0.0.1", 3, 6);
+    assert_eq!(get(f.addr, "/nope", Some(TOKEN)).status, 404);
+    assert_eq!(get(f.addr, "/api/v1/notices", None).status, 405);
+    for _ in 0..5 {
+        assert_eq!(get(f.addr, "/api/v1/health", Some(TOKEN)).status, 200);
+    }
+    assert_eq!(get(f.addr, "/api/v1/health", None).status, 401);
+    assert_eq!(get(f.addr, "/nope", None).status, 429);
+    // 枠が空でも、認証に成功した health は 429 にならない
+    assert_eq!(get(f.addr, "/api/v1/health", Some(TOKEN)).status, 200);
+}
+
 #[test]
 fn successful_and_failed_posts_both_count() {
     let f = start_with("rate-post", "127.0.0.1", 2, 6);

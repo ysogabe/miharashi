@@ -1,7 +1,9 @@
 //! 待ち受けと 1 要求の処理。接続は 1 本ずつ順に処理する(書き込みも自然に直列になる。`feed` のロックは別途ある)。
 //!
 //! 順序: accept → 送信元 IP の照合(外れたら何も読まずに 403 で切る)→ 要求行 + ヘッダー → 経路(404 / 405)→
-//! 認証(401。失敗もレート制限に数える)→ レート制限(429)→ 本文(認証を通ったときだけ読む)→ 検証(400)→ 書き込み。
+//! 認証(401)→ レート制限(429)→ 本文(認証を通ったときだけ読む)→ 検証(400)→ 書き込み。
+//! レート制限には、許可リストを通った送信元の要求を、認証に成功した `GET /api/v1/health` を除いてすべて数える
+//! (認証前に終わる要求も含む)。枠が空なら、認証前に終わる要求の応答も 429 に置き換わる。
 
 use crate::config::{Config, normalize_ip};
 use crate::feed::{self, FeedError};
@@ -38,6 +40,16 @@ struct Handled {
     path: String,
     response: Response,
     id: Option<String>,
+}
+
+/// `Server::screen` の結果。
+enum Screened {
+    /// 認証前に終わった(読み取りの失敗、404、405、ヘッダーの不正、401、503)。数える。
+    Done(Handled),
+    /// 認証に成功した `GET /api/v1/health`。数えない。
+    Health(Handled),
+    /// 認証に成功した `POST /api/v1/notices`。数えてから本文を読む。
+    Post(http::Head, Vec<u8>),
 }
 
 impl Server {
@@ -94,12 +106,90 @@ impl Server {
         finish(stream);
     }
 
+    /// 1 要求の処理。許可リストを通った送信元の要求は、認証に成功した `GET /api/v1/health` を除いて、
+    /// 必ず 1 件として数える。数える場所はここ 1 か所に集めた(`screen` が `Screened::Done` を返したら数え、
+    /// `Screened::Post` を返したら本文を読む前に数える)。`screen` の中でどこから抜けても数え漏れない。
     fn handle<S: TimedRead>(&self, peer: IpAddr, s: &mut S, deadline: Instant) -> Handled {
-        let done = |method: &str, path: &str, response: Response| Handled {
-            method: method.to_string(),
-            path: path.to_string(),
+        let (head, prefix) = match self.screen(s, deadline) {
+            Screened::Health(h) => return h,
+            Screened::Done(h) => {
+                return match self.charge(peer) {
+                    Ok(()) => h,
+                    Err(r) => Handled {
+                        response: r,
+                        id: None,
+                        ..h
+                    },
+                };
+            }
+            Screened::Post(head, prefix) => (head, prefix),
+        };
+        let done = |response: Response| Handled {
+            method: head.method.clone(),
+            path: head.path.clone(),
             response,
             id: None,
+        };
+        if let Err(r) = self.charge(peer) {
+            return done(r);
+        }
+        let (method, path) = (head.method.as_str(), head.path.as_str());
+
+        // POST /api/v1/notices
+        match head.single("content-type") {
+            Ok(Some(ct)) if is_json_media_type(ct) => {}
+            Ok(_) => {
+                return done(Response::error(
+                    415,
+                    "content-type must be application/json",
+                ));
+            }
+            Err(e) => return done(bad(e)),
+        }
+        let len = match head.single("content-length") {
+            Ok(Some(v)) => match http::parse_content_length(v) {
+                Ok(n) if n <= MAX_BODY_BYTES => n,
+                Ok(_) => return done(bad(HttpError::BodyTooLarge)),
+                Err(e) => return done(bad(e)),
+            },
+            Ok(None) => {
+                return done(Response::error(411, "content-length required"));
+            }
+            Err(e) => return done(bad(e)),
+        };
+        let body = match read_body(s, prefix, len, deadline) {
+            Ok(b) => b,
+            Err(e) => return done(bad(e)),
+        };
+        let now = now_secs();
+        let new = match notice::parse_request(&body, now) {
+            Ok(n) => n,
+            Err(msg) => return done(Response::error(400, msg)),
+        };
+        match feed::append_notice(&self.cfg.feed, &new, now) {
+            Ok(p) => Handled {
+                method: method.to_string(),
+                path: path.to_string(),
+                response: Response::json(
+                    201,
+                    json!({"id": p.id, "posted_at": p.posted_at, "expires_at": p.expires_at})
+                        .to_string(),
+                ),
+                id: Some(p.id),
+            },
+            Err(e) => done(feed_error_response(e)),
+        }
+    }
+
+    /// 要求行 + ヘッダーの読み取り、経路(404 / 405)、認証までを行う。ここでは数えない(`handle` が数える)。
+    fn screen<S: TimedRead>(&self, s: &mut S, deadline: Instant) -> Screened {
+        let done = |method: &str, path: &str, response: Response| {
+            Screened::Done(Handled {
+                method: method.to_string(),
+                path: path.to_string(),
+                response,
+                id: None,
+            })
         };
         let (head, prefix) = match read_head(s, deadline) {
             Ok(v) => v,
@@ -137,73 +227,20 @@ impl Server {
         let authed = ct_eq(presented.unwrap_or("").as_bytes(), token.as_bytes());
         drop(token);
         if !authed {
-            let r = match self.charge(peer) {
-                Ok(()) => Response::error(401, "unauthorized")
-                    .with_header("WWW-Authenticate", "Bearer".into()),
-                Err(r) => r,
-            };
+            let r = Response::error(401, "unauthorized")
+                .with_header("WWW-Authenticate", "Bearer".into());
             return done(method, path, r);
         }
         if path == PATH_HEALTH {
-            return done(
-                method,
-                path,
-                Response::json(200, json!({"ok": true}).to_string()),
-            );
-        }
-        if let Err(r) = self.charge(peer) {
-            return done(method, path, r);
-        }
-
-        // POST /api/v1/notices
-        match head.single("content-type") {
-            Ok(Some(ct)) if is_json_media_type(ct) => {}
-            Ok(_) => {
-                return done(
-                    method,
-                    path,
-                    Response::error(415, "content-type must be application/json"),
-                );
-            }
-            Err(e) => return done(method, path, bad(e)),
-        }
-        let len = match head.single("content-length") {
-            Ok(Some(v)) => match http::parse_content_length(v) {
-                Ok(n) if n <= MAX_BODY_BYTES => n,
-                Ok(_) => return done(method, path, bad(HttpError::BodyTooLarge)),
-                Err(e) => return done(method, path, bad(e)),
-            },
-            Ok(None) => {
-                return done(
-                    method,
-                    path,
-                    Response::error(411, "content-length required"),
-                );
-            }
-            Err(e) => return done(method, path, bad(e)),
-        };
-        let body = match read_body(s, prefix, len, deadline) {
-            Ok(b) => b,
-            Err(e) => return done(method, path, bad(e)),
-        };
-        let now = now_secs();
-        let new = match notice::parse_request(&body, now) {
-            Ok(n) => n,
-            Err(msg) => return done(method, path, Response::error(400, msg)),
-        };
-        match feed::append_notice(&self.cfg.feed, &new, now) {
-            Ok(p) => Handled {
+            // 認証に成功した疎通確認だけは数えない
+            return Screened::Health(Handled {
                 method: method.to_string(),
                 path: path.to_string(),
-                response: Response::json(
-                    201,
-                    json!({"id": p.id, "posted_at": p.posted_at, "expires_at": p.expires_at})
-                        .to_string(),
-                ),
-                id: Some(p.id),
-            },
-            Err(e) => done(method, path, feed_error_response(e)),
+                response: Response::json(200, json!({"ok": true}).to_string()),
+                id: None,
+            });
         }
+        Screened::Post(head, prefix)
     }
 
     /// 送信元 IP のバケットから 1 件ぶんを使う。足りなければ 429(`Retry-After` つき)。

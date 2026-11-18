@@ -16,7 +16,7 @@
    - `LISTEN` はこのホストの tailnet の IP とポート。例: `100.64.0.1:8097`。`0.0.0.0` や `::` は起動時に拒否される。
    - 許可する送信元は、だいだい側が tailnet に出ていく IP(runtime proxy 経由なら proxy のホストの IP)。何本でも並べられる。例: `100.64.0.2`。
    - バイナリを `/usr/local/bin` に、unit を `/etc/systemd/system` に置いて `daemon-reload` するだけ。起動もトークンの作成もしない。
-   - 書き込み先の `/var/lib/miharashi` は本体の unit(`miharashi.service`、`systemd/install.sh`)が作る。先に本体を導入しておく。
+   - 書き込み先の `/var/lib/miharashi` は、この unit の `StateDirectory=miharashi` が起動時に作る。本体の unit(`miharashi.service`)も同じ `StateDirectory=miharashi` で、同じユーザーなら所有者もモード(0755)も同じなので、導入の順番は問わない。実行ユーザーを本体と変えると、フィードを本体が読めなくなる。
    - 実行ユーザーは `sudo` の呼び出し元。別のユーザーにするときは `MIHARASHI_USER=<ユーザー>` を付ける。
 3. トークンを作る(実行ユーザー所有の 0600。値は画面に出ない):
    ```
@@ -74,7 +74,7 @@ URL は `http://<LISTEN>/api/v1/...`。宛先は `/api/v1/notices` の形(origin
 | ステータス | `error` の例 | 意味 |
 |---|---|---|
 | 400 | `unknown key` / `invalid kind` / `title must be 1 to 120 characters` など | 本文の検証に失敗。HTTP の形の不正(`query string not allowed`、`duplicate header` など)も 400 |
-| 401 | `unauthorized` | トークンが無い・違う(`WWW-Authenticate: Bearer` つき)。失敗もレート制限に数える |
+| 401 | `unauthorized` | トークンが無い・違う(`WWW-Authenticate: Bearer` つき) |
 | 403 | `forbidden` | 送信元 IP が許可リストに無い(何も読まずに切る) |
 | 404 / 405 | `not found` / `method not allowed` | パスが違う / メソッドが違う(405 は `Allow` つき) |
 | 408 | `request timeout` | 読み取りが合計 5 秒を超えた |
@@ -82,7 +82,7 @@ URL は `http://<LISTEN>/api/v1/...`。宛先は `/api/v1/notices` の形(origin
 | 411 | `content-length required` | `Content-Length` が無い |
 | 413 | `body too large` / `feed too large` | 本文が 8 KiB を超える / 書いた結果が 256 KiB を超える |
 | 415 | `content-type must be application/json` | `Content-Type` が違う |
-| 429 | `too many requests` | 送信元 IP ごとに 1 分あたり 10 件(バースト 5)を超えた。`Retry-After`(秒)のあとに再送する |
+| 429 | `too many requests` | 送信元 IP ごとに 1 分あたり 10 件(バースト 5)を超えた。許可リストを通った送信元の要求は、認証に成功した `GET /api/v1/health` を除いて、成功も失敗も(認証前に断られる 400・401・404・405 なども)すべて数える。枠が空のあいだは、これらの応答も 429 になる。`Retry-After`(秒)のあとに再送する |
 | 431 | `request header too large` | 要求行 + ヘッダーが 8 KiB を超える |
 | 500 | `feed write failed` | 書き込みに失敗した(`rename` の前の失敗なら、一時ファイルは消し、フィードは元のまま) |
 | 501 | `transfer-encoding is not supported` | `Transfer-Encoding` つきの要求 |

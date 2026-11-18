@@ -16,10 +16,15 @@ ExecStart=@BINDIR@/miharashi-daidai-inbox --listen @LISTEN@ --token-file /etc/mi
 Restart=always
 RestartSec=5
 
-# 強化。書けるのは /var/lib/miharashi だけ(kiosk の StateDirectory が作る。先に miharashi.service を入れておく)。
+# フィードを置く /var/lib/miharashi は、kiosk(miharashi.service)と同じ StateDirectory=miharashi で、この unit も作る
+# (本体を先に入れなくても起動できる)。同じ User=@USER@ なので、どちらが先に作っても所有者とモードは同じ。
+# ProtectSystem=strict のもとで、書けるのはこの StateDirectory だけ。
+StateDirectory=miharashi
+StateDirectoryMode=0755
+
+# 強化
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/miharashi
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

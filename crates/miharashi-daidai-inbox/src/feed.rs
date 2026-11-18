@@ -188,6 +188,17 @@ fn reader_accepts(card: &Value) -> bool {
 }
 
 fn write_atomically(feed: &Path, text: &str, mode: u32) -> Result<(), FeedError> {
+    write_atomically_with(feed, text, mode, |_| Ok(()))
+}
+
+/// `write_atomically` の本体。`before_rename` は、一時ファイルを書き終え(`fsync` と権限の設定まで)、
+/// `rename` する直前に呼ぶ。試験が、ここで失敗を差し込む(本番は何もしない)。
+fn write_atomically_with(
+    feed: &Path,
+    text: &str,
+    mode: u32,
+    before_rename: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), FeedError> {
     let dir = dir_of(feed);
     let name = file_name_of(feed)?;
     let tmp = dir.join(format!("{name}.tmp.{}", hex(&random_bytes::<8>()?)));
@@ -203,6 +214,7 @@ fn write_atomically(feed: &Path, text: &str, mode: u32) -> Result<(), FeedError>
         f.sync_all().map_err(|_| FeedError::Io)?;
         f.set_permissions(std::fs::Permissions::from_mode(mode))
             .map_err(|_| FeedError::Io)?;
+        before_rename(&tmp).map_err(|_| FeedError::Io)?;
         std::fs::rename(&tmp, feed).map_err(|_| FeedError::Io)?;
         // rename のあとは、フィードはもう新しい内容。ディレクトリの fsync に失敗しても失敗にはしない
         // (失敗で返すと、書けているのに相手が再送して同じカードが 2 枚になる)
@@ -534,11 +546,51 @@ mod tests {
     }
 
     #[test]
-    fn failing_to_write_leaves_no_temp_file() {
+    fn a_missing_directory_fails_before_any_file_is_made() {
         let d = dir("nodir");
         let p = d.join("missing-dir").join("feed.json");
         assert!(append_notice(&p, &notice("n"), now()).is_err());
-        assert!(leftovers(&d).is_empty() || leftovers(&d) == ["missing-dir"]);
+        assert!(leftovers(&d).is_empty());
+    }
+
+    #[test]
+    fn a_failure_after_the_temp_file_is_written_keeps_the_feed_and_removes_the_temp_file() {
+        let d = dir("tmpfail");
+        let p = d.join("feed.json");
+        append_notice(&p, &notice("first"), now()).unwrap();
+        let before = std::fs::read(&p).unwrap();
+
+        // 一時ファイルを書き終えたあと、rename の前に失敗する。一時ファイルは実在し、そのあとで消える
+        let mut seen_tmp = None;
+        let r = write_atomically_with(&p, "replacement\n", DEFAULT_MODE, |tmp| {
+            assert_eq!(std::fs::read_to_string(tmp).unwrap(), "replacement\n");
+            seen_tmp = Some(tmp.to_path_buf());
+            Err(std::io::Error::other("injected"))
+        });
+        assert_eq!(r, Err(FeedError::Io));
+        let tmp = seen_tmp.expect("before_rename が呼ばれていない(一時ファイルまで届いていない)");
+        assert!(!tmp.exists(), "一時ファイルが残った");
+        assert_eq!(std::fs::read(&p).unwrap(), before, "フィードが変わった");
+        assert_eq!(leftovers(&d), ["feed.json", "feed.json.lock"]);
+
+        // 失敗のあとも、普通に書き足せる
+        append_notice(&p, &notice("second"), now()).unwrap();
+        assert_eq!(cards(&p).len(), 2);
+    }
+
+    #[test]
+    fn a_failing_rename_removes_the_temp_file_and_leaves_the_target_alone() {
+        // rename 先がディレクトリだと、rename だけが失敗する(一時ファイルの作成・書き込み・fsync は成功する)
+        let d = dir("renamefail");
+        let target = d.join("feed.json");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"x").unwrap();
+        assert_eq!(
+            write_atomically(&target, "text\n", DEFAULT_MODE),
+            Err(FeedError::Io)
+        );
+        assert_eq!(leftovers(&d), ["feed.json"]);
+        assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"x");
     }
 
     #[test]
