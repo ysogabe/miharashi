@@ -27,6 +27,21 @@ for ip in "$@"; do
     ALLOW="${ALLOW:+$ALLOW }--allow $ip"
 done
 
+# StateDirectory=miharashi は本体の unit と共有している。実行ユーザーが違うと、systemd が起動時に
+# /var/lib/miharashi と配下の所有者を再帰的に書き換え、本体の状態保存を壊しうる。導入の前に確かめる
+MAIN_USER="$(systemctl show -p User --value miharashi.service 2>/dev/null || true)"
+if [ -n "$MAIN_USER" ] && [ "$MAIN_USER" != "$USER_NAME" ]; then
+    echo "実行ユーザー($USER_NAME)が miharashi.service の User($MAIN_USER)と違います。同じユーザーにしてください" >&2
+    exit 1
+fi
+if [ -d /var/lib/miharashi ]; then
+    DIR_OWNER="$(stat -c %U /var/lib/miharashi)"
+    if [ "$DIR_OWNER" != "$USER_NAME" ]; then
+        echo "/var/lib/miharashi の所有者($DIR_OWNER)が実行ユーザー($USER_NAME)と違います。同じユーザーにしてください" >&2
+        exit 1
+    fi
+fi
+
 BIN=target/release/miharashi-daidai-inbox
 [ -x "$BIN" ] || { echo "$BIN がありません。cargo build --release -p miharashi-daidai-inbox を先に実行してください" >&2; exit 1; }
 BINDIR=/usr/local/bin

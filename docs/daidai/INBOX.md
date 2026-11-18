@@ -16,7 +16,7 @@
    - `LISTEN` はこのホストの tailnet の IP とポート。例: `100.64.0.1:8097`。`0.0.0.0` や `::` は起動時に拒否される。
    - 許可する送信元は、だいだい側が tailnet に出ていく IP(runtime proxy 経由なら proxy のホストの IP)。何本でも並べられる。例: `100.64.0.2`。
    - バイナリを `/usr/local/bin` に、unit を `/etc/systemd/system` に置いて `daemon-reload` するだけ。起動もトークンの作成もしない。
-   - 書き込み先の `/var/lib/miharashi` は、この unit の `StateDirectory=miharashi` が起動時に作る。本体の unit(`miharashi.service`)も同じ `StateDirectory=miharashi` で、同じユーザーなら所有者もモード(0755)も同じなので、導入の順番は問わない。実行ユーザーを本体と変えると、フィードを本体が読めなくなる。
+   - 書き込み先の `/var/lib/miharashi` は、この unit の `StateDirectory=miharashi` が起動時に作る。本体の unit(`miharashi.service`)も同じ `StateDirectory=miharashi` で、同じユーザーなら所有者もモード(0755)も同じなので、導入の順番は問わない。実行ユーザーを本体と変えると、systemd が起動時に `/var/lib/miharashi` と配下の所有者を書き換え、本体の状態保存を壊しうる。そのため導入スクリプトは、`miharashi.service` の `User` と `/var/lib/miharashi` の所有者が実行ユーザーと違えば止まる。
    - 実行ユーザーは `sudo` の呼び出し元。別のユーザーにするときは `MIHARASHI_USER=<ユーザー>` を付ける。
 3. トークンを作る(実行ユーザー所有の 0600。値は画面に出ない):
    ```
