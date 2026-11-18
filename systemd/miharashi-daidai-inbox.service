@@ -1,0 +1,46 @@
+[Unit]
+Description=Miharashi daidai inbox (notice card registration over tailnet)
+Documentation=https://github.com/ysogabe/miharashi/blob/main/docs/daidai/INBOX.md
+# tailnet の IP で待ち受けるので、tailscaled のあとに起動する。IP がまだ無くて bind に失敗しても、Restart=always で繰り返す。
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# kiosk(miharashi.service)と同じユーザー。フィード(/var/lib/miharashi/daidai-feed.json)を本体が読めるようにするため。
+User=@USER@
+SyslogIdentifier=miharashi-daidai-inbox
+StateDirectory=miharashi
+# --listen は具体的な IP(0.0.0.0 / :: は起動時に拒否される)、--allow は許可する送信元 IP の並び(@ALLOW@ = `--allow IP --allow IP ...`)。
+# トークンは /etc/miharashi/daidai-inbox.token(実行ユーザー所有の 0600。値はここに書かない)。
+ExecStart=@BINDIR@/miharashi-daidai-inbox --listen @LISTEN@ --token-file /etc/miharashi/daidai-inbox.token --feed /var/lib/miharashi/daidai-feed.json @ALLOW@
+Restart=always
+RestartSec=5
+
+# 強化。書けるのは /var/lib/miharashi だけ。
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/miharashi
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+UMask=0077
+MemoryMax=64M
+TasksMax=16
+
+[Install]
+WantedBy=multi-user.target
