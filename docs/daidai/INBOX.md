@@ -77,7 +77,7 @@ URL は `http://<LISTEN>/api/v1/...`。宛先は `/api/v1/notices` の形(origin
 | 403 | `forbidden` | 送信元 IP が許可リストに無い(何も読まずに切る) |
 | 404 / 405 | `not found` / `method not allowed` | パスが違う / メソッドが違う(405 は `Allow` つき) |
 | 408 | `request timeout` | 読み取りが合計 5 秒を超えた |
-| 409 | `feed full` | 取り込まれるカードがすでに 16 枚ある。追い出さずに断る。期限が切れるのを待つか、既読にして片付ける |
+| 409 | `feed full` | 取り込まれるカードがすでに 16 枚ある。追い出さずに断る。期限が切れるのを待つか、フィードから古いカードを外す(既読にしてもフィードからは消えない) |
 | 411 | `content-length required` | `Content-Length` が無い |
 | 413 | `body too large` / `feed too large` | 本文が 8 KiB を超える / 書いた結果が 256 KiB を超える |
 | 415 | `content-type must be application/json` | `Content-Type` が違う |
