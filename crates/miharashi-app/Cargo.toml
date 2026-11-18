@@ -30,6 +30,10 @@ miharashi-linux = { path = "../miharashi-linux" }
 # B2 の動画ベンチマーク(`--features video`)。ffmpeg の開発用パッケージが要るので既定では入れない
 miharashi-video = { path = "../miharashi-video", optional = true }
 
+[dev-dependencies]
+# 登録口(miharashi-daidai-inbox)が書いたフィードを、本体の読み手(daidai::parse_feed)で読む突き合わせの試験
+miharashi-daidai-inbox = { path = "../miharashi-daidai-inbox" }
+
 [features]
 video = ["dep:miharashi-video"]
 

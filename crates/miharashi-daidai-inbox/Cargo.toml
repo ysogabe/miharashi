@@ -1,0 +1,18 @@
+[package]
+name = "miharashi-daidai-inbox"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+# トークン・フィードをリンクを追跡せずに開く(O_NOFOLLOW)・flock・geteuid。他のクレートと同じ版
+libc = "0.2.190"
+serde_json = "1.0.152"
+
+[lib]
+name = "miharashi_daidai_inbox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "miharashi-daidai-inbox"
+path = "src/main.rs"

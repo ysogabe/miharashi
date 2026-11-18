@@ -678,4 +678,43 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// 登録口(`miharashi-daidai-inbox`)が書いたフィードを、本体の読み手で読んで通知になることを確かめる。
+    #[test]
+    fn a_card_written_by_the_inbox_is_read_as_a_notice() {
+        use miharashi_daidai_inbox::feed::append_notice;
+        use miharashi_daidai_inbox::notice::parse_request;
+
+        let dir =
+            std::env::temp_dir().join(format!("miharashi-daidai-inbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let feed = dir.join("daidai-feed.json");
+        let now = chrono::Local::now().fixed_offset();
+        let req = parse_request(
+            r#"{"kind":"request","title":"確認のお願い","body":"1 行目\n2 行目","avatar_pose":"working"}"#
+                .as_bytes(),
+            now,
+        )
+        .unwrap();
+        let posted = append_notice(&feed, &req, now).unwrap();
+
+        let s = parse_feed(&std::fs::read_to_string(&feed).unwrap());
+        assert_eq!(s.pose, Pose::Working);
+        assert_eq!(s.cards.len(), 1);
+        let c = &s.cards[0];
+        assert_eq!(c.id, posted.id);
+        assert_eq!(c.kind, CardKind::Request);
+        assert_eq!(c.title, "確認のお願い");
+        assert_eq!(c.body, "1 行目 2 行目", "改行は読み手が空白にする");
+        assert!(c.expires_at.is_some_and(|e| e > now));
+        let n = c.notice.as_ref().expect("通知になる");
+        assert_eq!(n.id, posted.id);
+        assert_eq!(n.title, c.title);
+        assert_eq!(n.body, c.body);
+        assert!(!n.low);
+        assert!(n.posted_at.is_some());
+        assert_eq!(s.active(&now).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
