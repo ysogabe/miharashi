@@ -1177,6 +1177,7 @@ dependencies = [
  "glow",
  "image",
  "libc",
+ "miharashi-daidai-inbox",
  "miharashi-glscene",
  "miharashi-gpu",
  "miharashi-linux",
@@ -1190,6 +1191,15 @@ dependencies = [
  "tiny_http",
  "toml",
  "ureq",
+]
+
+[[package]]
+name = "miharashi-daidai-inbox"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "libc",
+ "serde_json",
 ]
 
 [[package]]
