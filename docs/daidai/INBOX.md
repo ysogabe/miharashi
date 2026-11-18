@@ -16,6 +16,7 @@
    - `LISTEN` はこのホストの tailnet の IP とポート。例: `100.64.0.1:8097`。`0.0.0.0` や `::` は起動時に拒否される。
    - 許可する送信元は、だいだい側が tailnet に出ていく IP(runtime proxy 経由なら proxy のホストの IP)。何本でも並べられる。例: `100.64.0.2`。
    - バイナリを `/usr/local/bin` に、unit を `/etc/systemd/system` に置いて `daemon-reload` するだけ。起動もトークンの作成もしない。
+   - 書き込み先の `/var/lib/miharashi` は本体の unit(`miharashi.service`、`systemd/install.sh`)が作る。先に本体を導入しておく。
    - 実行ユーザーは `sudo` の呼び出し元。別のユーザーにするときは `MIHARASHI_USER=<ユーザー>` を付ける。
 3. トークンを作る(実行ユーザー所有の 0600。値は画面に出ない):
    ```
@@ -58,7 +59,7 @@ URL は `http://<LISTEN>/api/v1/...`。宛先は `/api/v1/notices` の形(origin
 - 制御文字は拒否する(`body` の `\n` だけは可)。双方向制御文字(U+061C、U+200E / U+200F、U+202A〜U+202E、U+2066〜U+2069)とゼロ幅文字(U+200B、U+2060、U+FEFF)も拒否する(表示の偽装を防ぐ)。
 - 文字数は切らずに受ける(題 120 / 本文 400)。ただし操作パネルの通知は題を 40 文字、本文を 200 文字で切って出す。パネルでも全部読めるように、短く書く。応答には切られたかどうかは書かない。
 
-成功すると 201 で、書いたカードの値を返す:
+成功すると 201 で、書いたカードの値を返す。
 
 ```json
 {"id":"muse-20261118T030000Z-3fa9c1d2","posted_at":"2026-11-18T12:00:00+09:00","expires_at":"2026-11-19T12:00:00+09:00"}
@@ -83,7 +84,7 @@ URL は `http://<LISTEN>/api/v1/...`。宛先は `/api/v1/notices` の形(origin
 | 415 | `content-type must be application/json` | `Content-Type` が違う |
 | 429 | `too many requests` | 送信元 IP ごとに 1 分あたり 10 件(バースト 5)を超えた。`Retry-After`(秒)のあとに再送する |
 | 431 | `request header too large` | 要求行 + ヘッダーが 8 KiB を超える |
-| 500 | `feed write failed` | 書き込みに失敗した(一時ファイルは消す。フィードは元のまま) |
+| 500 | `feed write failed` | 書き込みに失敗した(`rename` の前の失敗なら、一時ファイルは消し、フィードは元のまま) |
 | 501 | `transfer-encoding is not supported` | `Transfer-Encoding` つきの要求 |
 | 503 | `feed unreadable` | 既存のフィードが読めない・不正(JSON が壊れている、`version` が 1 でない、`cards` が配列でない、256 KiB 超、リンクなど)。**何も書き換えない**ので、直すまで登録できない |
 | 503 | `feed busy` / `token unavailable` | 5 秒待ってもロックを取れない / トークンファイルを使えない |
@@ -104,6 +105,8 @@ curl -sS -H @"$HOME/.inbox-auth" -H 'Content-Type: application/json' \
   -d '{"kind":"info","title":"ビルドが終わりました","body":"テストも全部通りました","avatar_pose":"milestone","ttl_secs":7200}' \
   http://100.64.0.1:8097/api/v1/notices
 ```
+
+`Expect: 100-continue` を付ける古い curl は、本文が 1 KiB を超えると 1 秒ほど待つ(登録口は `100 Continue` を返さない)。待たせたくないときは `-H 'Expect:'` を付ける。
 
 runtime proxy(ポート 3130)経由のときは、`-x` で proxy を指定する(宛先は absolute-form で送られる)。
 

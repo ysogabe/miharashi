@@ -39,6 +39,7 @@ chmod 0644 /etc/systemd/system/miharashi-daidai-inbox.service
 systemctl daemon-reload
 echo "導入しました(起動はしていません、トークンも作っていません)。"
 echo "1. トークンを作る(実行ユーザー所有の 0600、32 文字以上。値は表示されません。だいだい側にも同じ値を渡す):"
-echo "   head -c 32 /dev/urandom | base64 | tr -d '=+/\\n' | sudo install -o $USER_NAME -m 600 /dev/stdin /etc/miharashi/daidai-inbox.token"
+# dash の echo は \n を改行にしてしまうので、コマンドの表示は printf で行う
+printf '   %s\n' "head -c 32 /dev/urandom | base64 | tr -d '=+/\\n' | sudo install -o $USER_NAME -m 600 /dev/stdin /etc/miharashi/daidai-inbox.token"
 echo "2. 起動: systemctl enable --now miharashi-daidai-inbox"
 echo "3. ログ: journalctl -t miharashi-daidai-inbox -f(詳しくは docs/daidai/INBOX.md)"

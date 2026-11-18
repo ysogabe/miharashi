@@ -10,14 +10,13 @@ Type=simple
 # kiosk(miharashi.service)と同じユーザー。フィード(/var/lib/miharashi/daidai-feed.json)を本体が読めるようにするため。
 User=@USER@
 SyslogIdentifier=miharashi-daidai-inbox
-StateDirectory=miharashi
-# --listen は具体的な IP(0.0.0.0 / :: は起動時に拒否される)、--allow は許可する送信元 IP の並び(@ALLOW@ = `--allow IP --allow IP ...`)。
+# --listen は具体的な IP(0.0.0.0 / :: は起動時に拒否される)。--allow は許可する送信元 IP の数だけ並べる。
 # トークンは /etc/miharashi/daidai-inbox.token(実行ユーザー所有の 0600。値はここに書かない)。
 ExecStart=@BINDIR@/miharashi-daidai-inbox --listen @LISTEN@ --token-file /etc/miharashi/daidai-inbox.token --feed /var/lib/miharashi/daidai-feed.json @ALLOW@
 Restart=always
 RestartSec=5
 
-# 強化。書けるのは /var/lib/miharashi だけ。
+# 強化。書けるのは /var/lib/miharashi だけ(kiosk の StateDirectory が作る。先に miharashi.service を入れておく)。
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/miharashi

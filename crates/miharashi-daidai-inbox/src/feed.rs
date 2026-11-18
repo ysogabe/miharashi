@@ -204,10 +204,12 @@ fn write_atomically(feed: &Path, text: &str, mode: u32) -> Result<(), FeedError>
         f.set_permissions(std::fs::Permissions::from_mode(mode))
             .map_err(|_| FeedError::Io)?;
         std::fs::rename(&tmp, feed).map_err(|_| FeedError::Io)?;
-        // rename のあとの失敗でも、フィードはもう新しい内容(一時ファイルは残っていない)
-        File::open(&dir)
-            .and_then(|d| d.sync_all())
-            .map_err(|_| FeedError::Io)
+        // rename のあとは、フィードはもう新しい内容。ディレクトリの fsync に失敗しても失敗にはしない
+        // (失敗で返すと、書けているのに相手が再送して同じカードが 2 枚になる)
+        if let Err(e) = File::open(&dir).and_then(|d| d.sync_all()) {
+            eprintln!("フィードのディレクトリの fsync に失敗(書き込みは済んでいる): {e}");
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
