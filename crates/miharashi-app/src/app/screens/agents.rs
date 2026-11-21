@@ -200,6 +200,9 @@ pub struct AgentScreen {
     // 以下のキャッシュは、すべて接続とスレッド(プロジェクト)の組で引く。
     surfaces: HashMap<ThreadKey, Arc<Pixmap>>,
     revisions: HashMap<ThreadKey, u64>,
+    /// カードの面の revision に使う、画面全体で増え続ける番号。スレッドのキャッシュを捨てても戻さないので、
+    /// ページの切り替えで消えて戻ったカードが、GPU の合成に残る古い面と同じ revision にならない。
+    next_revision: u64,
     content_keys: HashMap<ThreadKey, String>,
     entry_keys: HashMap<ThreadKey, String>,
     /// 初めて見た順。並びの最後の決め手と、表示中スレッドの集合を兼ねる。
@@ -257,6 +260,7 @@ impl AgentScreen {
             servers: Vec::new(),
             surfaces: HashMap::new(),
             revisions: HashMap::new(),
+            next_revision: 0,
             content_keys: HashMap::new(),
             entry_keys: HashMap::new(),
             seen: HashMap::new(),
@@ -1509,8 +1513,8 @@ impl AgentScreen {
             size.1
         );
         if self.content_keys.get(id) != Some(&key) || !self.surfaces.contains_key(id) {
-            let rev = self.revisions.entry(id.clone()).or_insert(0);
-            *rev = rev.wrapping_add(1);
+            self.next_revision = self.next_revision.wrapping_add(1);
+            self.revisions.insert(id.clone(), self.next_revision);
             self.content_keys.insert(id.clone(), key);
             self.surfaces
                 .insert(id.clone(), Arc::new(draw::render_card(content, size, text)));
@@ -3385,6 +3389,39 @@ mod tests {
         assert!(!screen.poses.contains_key(&k("done")));
         assert!(screen.poses.contains_key(&k("existing")));
         assert!(screen.pending_new.contains(&k("new-b")));
+    }
+
+    /// 1 フレームの間に DETAILS → OVERVIEW → DETAILS と切り替わり、その間に題名が変わっても、
+    /// 作り直したカードの面は前と違う revision になる(GPU の合成が同じ ID・大きさ・revision の古い面を使い続けない)。
+    #[test]
+    fn regenerated_card_surfaces_never_reuse_a_revision_across_page_changes() {
+        let now = Instant::now();
+        let done = |title: &str| AgentEntry {
+            settled: true,
+            title: title.into(),
+            ..entry("done", AgentState::Completed)
+        };
+        let snap1 = snapshot_of(vec![entry("run", AgentState::Running), done("前の題名")]);
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        screen.sync(&snap1, now);
+        screen.handle_action(ScreenAction::Select, now);
+        let before = render_for_test(&mut screen, &snap1, now);
+        let id = screen.id_map[&k("done")];
+        let old = before.iter().find(|c| c.id == id).unwrap().clone();
+
+        screen.handle_action(ScreenAction::Select, now + Duration::from_millis(1));
+        assert!(!screen.seen.contains_key(&k("done")));
+        let snap2 = snapshot_of(vec![entry("run", AgentState::Running), done("後の題名")]);
+        screen.sync(&snap2, now + Duration::from_millis(2));
+        screen.handle_action(ScreenAction::Select, now + Duration::from_millis(3));
+        let after = render_for_test(&mut screen, &snap2, now + Duration::from_millis(4));
+        let new = after.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(
+            (new.surface.width(), new.surface.height()),
+            (old.surface.width(), old.surface.height())
+        );
+        assert!(new.surface.data() != old.surface.data());
+        assert_ne!(new.revision, old.revision);
     }
 
     #[test]
