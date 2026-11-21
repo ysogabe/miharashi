@@ -2005,80 +2005,7 @@ fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine,
     }
     // 件数は全接続の合計(接続別の件数は上の欄に出している)。
     let all: Vec<&AgentEntry> = servers.iter().flat_map(|s| s.entries.iter()).collect();
-    let counts = [
-        (
-            "実行中",
-            "実行",
-            all.iter()
-                .filter(|e| {
-                    matches!(
-                        e.state,
-                        crate::agents::AgentState::Starting
-                            | crate::agents::AgentState::Running
-                            | crate::agents::AgentState::Monitoring
-                    )
-                })
-                .count(),
-            [64, 200, 255, 255],
-        ),
-        (
-            "承認待ち",
-            "承認",
-            all.iter()
-                .filter(|e| {
-                    e.has_pending_approvals || e.state == crate::agents::AgentState::Approval
-                })
-                .count(),
-            [255, 188, 102, 255],
-        ),
-        (
-            "入力・計画",
-            "入力",
-            all.iter()
-                .filter(|e| {
-                    e.has_pending_user_input
-                        || e.has_actionable_proposed_plan
-                        || matches!(
-                            e.state,
-                            crate::agents::AgentState::Input | crate::agents::AgentState::Plan
-                        )
-                })
-                .count(),
-            [196, 160, 255, 255],
-        ),
-        (
-            "異常",
-            "異常",
-            all.iter()
-                .filter(|e| e.state == crate::agents::AgentState::Error)
-                .count(),
-            [255, 127, 140, 255],
-        ),
-        (
-            "応答完了",
-            "完了",
-            all.iter()
-                .filter(|e| e.state == crate::agents::AgentState::Completed)
-                .count(),
-            [103, 217, 173, 255],
-        ),
-        (
-            "その他",
-            "他",
-            all.iter()
-                .filter(|e| {
-                    matches!(
-                        e.state,
-                        crate::agents::AgentState::Idle
-                            | crate::agents::AgentState::Interrupted
-                            | crate::agents::AgentState::Stopped
-                            | crate::agents::AgentState::Unknown
-                    )
-                })
-                .count(),
-            [143, 163, 183, 255],
-        ),
-    ];
+    let counts = state_counts(&all);
     let total = all.len();
     let synchronized = servers.iter().any(|s| s.last_snapshot.synchronized);
     let urgent = all.iter().filter(|e| attention(e)).count();
@@ -2652,6 +2579,86 @@ fn fit_header_label(value: &str, max_width: f32, font_size: f32) -> String {
     result.push('…');
     result
 }
+/// 上部の凡例兼件数に出す状態別の件数(全接続の合計)。片付け済みのスレッドは、DETAILS で表示していても、
+/// 未完了の子のために OVERVIEW に残した親でも数えない(`要確認` と同じ。合計のスレッド数には数える)。
+fn state_counts(all: &[&AgentEntry]) -> [(&'static str, &'static str, usize, [u8; 4]); 6] {
+    let all: Vec<&AgentEntry> = all.iter().copied().filter(|e| !e.settled).collect();
+    [
+        (
+            "実行中",
+            "実行",
+            all.iter()
+                .filter(|e| {
+                    matches!(
+                        e.state,
+                        crate::agents::AgentState::Starting
+                            | crate::agents::AgentState::Running
+                            | crate::agents::AgentState::Monitoring
+                    )
+                })
+                .count(),
+            [64, 200, 255, 255],
+        ),
+        (
+            "承認待ち",
+            "承認",
+            all.iter()
+                .filter(|e| {
+                    e.has_pending_approvals || e.state == crate::agents::AgentState::Approval
+                })
+                .count(),
+            [255, 188, 102, 255],
+        ),
+        (
+            "入力・計画",
+            "入力",
+            all.iter()
+                .filter(|e| {
+                    e.has_pending_user_input
+                        || e.has_actionable_proposed_plan
+                        || matches!(
+                            e.state,
+                            crate::agents::AgentState::Input | crate::agents::AgentState::Plan
+                        )
+                })
+                .count(),
+            [196, 160, 255, 255],
+        ),
+        (
+            "異常",
+            "異常",
+            all.iter()
+                .filter(|e| e.state == crate::agents::AgentState::Error)
+                .count(),
+            [255, 127, 140, 255],
+        ),
+        (
+            "応答完了",
+            "完了",
+            all.iter()
+                .filter(|e| e.state == crate::agents::AgentState::Completed)
+                .count(),
+            [103, 217, 173, 255],
+        ),
+        (
+            "その他",
+            "他",
+            all.iter()
+                .filter(|e| {
+                    matches!(
+                        e.state,
+                        crate::agents::AgentState::Idle
+                            | crate::agents::AgentState::Interrupted
+                            | crate::agents::AgentState::Stopped
+                            | crate::agents::AgentState::Unknown
+                    )
+                })
+                .count(),
+            [143, 163, 183, 255],
+        ),
+    ]
+}
+
 fn tier_of(e: &AgentEntry) -> Tier {
     if attention(e) {
         Tier::Attention
@@ -3533,6 +3540,69 @@ mod tests {
         assert!(screen.queue.is_empty());
         assert!(screen.focus.is_none());
         assert!(screen.pending_new.is_empty());
+    }
+
+    /// 片付け済みのスレッドは、DETAILS で表示していても、OVERVIEW に残した片付け済みの親でも、
+    /// 状態別の件数に数えない(合計のスレッド数には数える)。
+    #[test]
+    fn settled_threads_are_not_counted_in_the_state_counts_on_either_page() {
+        let now = Instant::now();
+        let settled = |id: &str, state| AgentEntry {
+            settled: true,
+            ..entry(id, state)
+        };
+        let snap = snapshot_of(vec![
+            entry("run", AgentState::Running),
+            settled("s-run", AgentState::Running),
+            settled("s-err", AgentState::Error),
+            settled("s-done", AgentState::Completed),
+            // 異常の子のために OVERVIEW に残る片付け済みの親。
+            settled("s-parent", AgentState::Running),
+            child("err-kid", "s-parent", AgentState::Error),
+        ]);
+        let counts_of = |screen: &AgentScreen| {
+            let all: Vec<&AgentEntry> = screen
+                .servers
+                .iter()
+                .flat_map(|s| s.entries.iter())
+                .collect();
+            (
+                all.len(),
+                state_counts(&all)
+                    .iter()
+                    .map(|(label, _, n, _)| (*label, *n))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        screen.sync(&snap, now);
+        let (total, counts) = counts_of(&screen);
+        assert_eq!(total, 3, "run・err-kid・残した親");
+        assert_eq!(
+            counts,
+            [
+                ("実行中", 1),
+                ("承認待ち", 0),
+                ("入力・計画", 0),
+                ("異常", 1),
+                ("応答完了", 0),
+                ("その他", 0),
+            ]
+        );
+        screen.handle_action(ScreenAction::Select, now + Duration::from_secs(1));
+        let (total, counts) = counts_of(&screen);
+        assert_eq!(total, 6);
+        assert_eq!(
+            counts,
+            [
+                ("実行中", 1),
+                ("承認待ち", 0),
+                ("入力・計画", 0),
+                ("異常", 1),
+                ("応答完了", 0),
+                ("その他", 0),
+            ]
+        );
     }
 
     #[test]
