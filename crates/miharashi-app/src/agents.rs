@@ -6,7 +6,6 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::ops::ControlFlow;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -177,78 +176,171 @@ pub fn is_unfinished_state(state: AgentState) -> bool {
 /// 未完了で未整理の子孫(`subagent`)を持つ先祖は、`settled` でも OVERVIEW に残す。子孫は一覧の中の親の鎖と、
 /// 取得のときに生の shell 応答から決めた `has_unfinished_descendant`(間の親が一覧の対象外でも途切れない)の両方で見る。
 pub fn overview_hidden_ids(entries: &[AgentEntry]) -> HashSet<String> {
-    let by_id: HashMap<&str, &AgentEntry> =
-        entries.iter().map(|e| (e.thread_id.as_str(), e)).collect();
-    let mut ancestors_of_unfinished: HashSet<&str> = HashSet::new();
-    for e in entries {
-        if !e.settled && is_unfinished_state(e.state) {
-            walk_ancestors(
-                e.thread_id.as_str(),
-                e.parent_thread_id.as_deref(),
-                &by_id,
-                |p| p.parent_thread_id.as_deref(),
-                |parent| {
-                    ancestors_of_unfinished.insert(parent.thread_id.as_str());
-                    ControlFlow::Continue(())
-                },
-            );
-        }
-    }
+    let parent = parent_positions(
+        entries
+            .iter()
+            .map(|e| (e.thread_id.as_str(), e.parent_thread_id.as_deref())),
+    );
+    let settled: Vec<bool> = entries.iter().map(|e| e.settled).collect();
+    let unfinished: Vec<bool> = entries
+        .iter()
+        .map(|e| !e.settled && is_unfinished_state(e.state))
+        .collect();
+    let flags = lineage_flags(&parent, &settled, &unfinished);
     let mut hidden = HashSet::new();
-    for e in entries {
-        if !e.settled && is_unfinished_state(e.state) {
+    for (i, e) in entries.iter().enumerate() {
+        if unfinished[i] {
             continue;
         }
-        if e.has_unfinished_descendant || ancestors_of_unfinished.contains(e.thread_id.as_str()) {
+        if e.has_unfinished_descendant || flags.unfinished_descendant[i] {
             continue;
         }
-        if e.settled || e.settled_ancestor || has_settled_ancestor(e, &by_id) {
+        if e.settled || e.settled_ancestor || flags.settled_ancestor[i] {
             hidden.insert(e.thread_id.clone());
         }
     }
     hidden
 }
 
-fn has_settled_ancestor(e: &AgentEntry, by_id: &HashMap<&str, &AgentEntry>) -> bool {
-    let mut found = false;
-    walk_ancestors(
-        e.thread_id.as_str(),
-        e.parent_thread_id.as_deref(),
-        by_id,
-        |p| p.parent_thread_id.as_deref(),
-        |parent| {
-            if parent.settled {
-                found = true;
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        },
-    );
-    found
+/// 一覧の中の親の位置(`subagent` の親が一覧に無ければ None)。ID が重なるときは後のものを親とみなす。
+fn parent_positions<'a>(
+    items: impl Iterator<Item = (&'a str, Option<&'a str>)> + Clone,
+) -> Vec<Option<usize>> {
+    let index: HashMap<&str, usize> = items
+        .clone()
+        .enumerate()
+        .map(|(i, (id, _))| (id, i))
+        .collect();
+    items
+        .map(|(_, parent)| parent.and_then(|p| index.get(p).copied()))
+        .collect()
 }
 
-fn walk_ancestors<'a, T>(
-    start_id: &'a str,
-    start_parent: Option<&'a str>,
-    by_id: &HashMap<&'a str, &'a T>,
-    parent_of: impl Fn(&'a T) -> Option<&'a str>,
-    mut visit: impl FnMut(&'a T) -> ControlFlow<()>,
-) {
-    let mut current = start_parent;
-    let mut visited = HashSet::new();
-    visited.insert(start_id);
-    while let Some(pid) = current {
-        if !visited.insert(pid) {
-            break;
+/// 親の鎖から決める 2 つの印。どちらも自分自身は先祖・子孫に含めない(親をたどって輪になっていても)。
+struct LineageFlags {
+    /// 先祖として、`unfinished` の子孫を持つ。
+    unfinished_descendant: Vec<bool>,
+    /// 先祖に `settled` がある。
+    settled_ancestor: Vec<bool>,
+}
+
+/// 親の鎖をたどる判定を、深い鎖でも件数に比例する手間で決める(1 件ずつ根までたどると鎖の長さの 2 乗になる)。
+/// 親は高々 1 つなので、たどると根で止まるか輪に入る。輪の中の印は輪の全員で共通(自分を除く)にする。
+fn lineage_flags(parent: &[Option<usize>], settled: &[bool], unfinished: &[bool]) -> LineageFlags {
+    let n = parent.len();
+    // 輪を見つける(0 = 未訪問、1 = たどっている途中、2 = 済み)。
+    let mut seen = vec![0u8; n];
+    let mut cycle_of: Vec<Option<usize>> = vec![None; n];
+    let mut cycles: Vec<Vec<usize>> = Vec::new();
+    for start in 0..n {
+        if seen[start] != 0 {
+            continue;
         }
-        let Some(parent) = by_id.get(pid).copied() else {
-            break;
-        };
-        if visit(parent).is_break() {
-            break;
+        let mut path = Vec::new();
+        let mut v = Some(start);
+        while let Some(x) = v {
+            match seen[x] {
+                0 => {
+                    seen[x] = 1;
+                    path.push(x);
+                    v = parent[x];
+                }
+                1 => {
+                    let from = path.iter().rposition(|&y| y == x).unwrap_or(0);
+                    let members = path[from..].to_vec();
+                    for &m in &members {
+                        cycle_of[m] = Some(cycles.len());
+                    }
+                    cycles.push(members);
+                    break;
+                }
+                _ => break,
+            }
         }
-        current = parent_of(parent);
+        for &x in &path {
+            seen[x] = 2;
+        }
+    }
+
+    // 未完了の子孫を持つ: 未完了のスレッドから親へ印を付け、既に印のある所で止める(その先は付け済み)。
+    // 輪の外から輪に入れば輪の全員に、輪の中の 1 件だけが未完了ならその 1 件を除く全員に付く。
+    let mut unfinished_descendant = vec![false; n];
+    let mut cycle_full = vec![false; cycles.len()];
+    let mut cycle_source: Vec<Option<usize>> = vec![None; cycles.len()];
+    let mark_all = |c: usize, marks: &mut [bool], full: &mut [bool]| {
+        if !full[c] {
+            full[c] = true;
+            for &m in &cycles[c] {
+                marks[m] = true;
+            }
+        }
+    };
+    for x in (0..n).filter(|&x| unfinished[x]) {
+        if let Some(c) = cycle_of[x] {
+            if cycle_full[c] {
+                continue;
+            }
+            if cycle_source[c].is_some() {
+                mark_all(c, &mut unfinished_descendant, &mut cycle_full);
+            } else {
+                cycle_source[c] = Some(x);
+                for &m in cycles[c].iter().filter(|&&m| m != x) {
+                    unfinished_descendant[m] = true;
+                }
+            }
+            continue;
+        }
+        let mut v = parent[x];
+        while let Some(p) = v {
+            if let Some(c) = cycle_of[p] {
+                mark_all(c, &mut unfinished_descendant, &mut cycle_full);
+                break;
+            }
+            if unfinished_descendant[p] {
+                break;
+            }
+            unfinished_descendant[p] = true;
+            v = parent[p];
+        }
+    }
+
+    // 片付け済みの先祖を持つ: 「自分か先祖が片付け済み」を根の側から覚えて使い回す。輪の中は輪の全員で共通。
+    let cycle_settled: Vec<usize> = cycles
+        .iter()
+        .map(|c| c.iter().filter(|&&m| settled[m]).count())
+        .collect();
+    let mut reach: Vec<Option<bool>> = vec![None; n];
+    for (c, members) in cycles.iter().enumerate() {
+        for &m in members {
+            reach[m] = Some(cycle_settled[c] > 0);
+        }
+    }
+    for start in 0..n {
+        let mut path = Vec::new();
+        let mut v = Some(start);
+        let mut acc = false;
+        while let Some(x) = v {
+            if let Some(r) = reach[x] {
+                acc = r;
+                break;
+            }
+            path.push(x);
+            v = parent[x];
+        }
+        for &x in path.iter().rev() {
+            acc |= settled[x];
+            reach[x] = Some(acc);
+        }
+    }
+    let settled_ancestor = (0..n)
+        .map(|x| match cycle_of[x] {
+            Some(c) => cycle_settled[c] > usize::from(settled[x]),
+            None => parent[x].is_some_and(|p| reach[p] == Some(true)),
+        })
+        .collect();
+    LineageFlags {
+        unfinished_descendant,
+        settled_ancestor,
     }
 }
 
@@ -911,43 +1003,27 @@ fn parse_shell_recent(
             parent_thread_id: subagent_parent(thread),
         });
     }
-    let non_archived_by_id: HashMap<&str, &ParsedThread<'_>> = parsed_threads
+    // 親の鎖は非アーカイブのスレッドだけでたどる(アーカイブ済みの親で鎖は切れる)。
+    let live: Vec<&ParsedThread<'_>> = parsed_threads.iter().filter(|t| !t.archived).collect();
+    let parent = parent_positions(
+        live.iter()
+            .map(|t| (t.thread_id.as_str(), t.parent_thread_id.as_deref())),
+    );
+    let settled: Vec<bool> = live.iter().map(|t| t.settled).collect();
+    let unfinished: Vec<bool> = live
         .iter()
-        .filter(|t| !t.archived)
-        .map(|t| (t.thread_id.as_str(), t))
+        .map(|t| !t.settled && is_unfinished_state(t.state))
         .collect();
+    let flags = lineage_flags(&parent, &settled, &unfinished);
     let mut has_unfinished_descendant: HashSet<&str> = HashSet::new();
     let mut has_settled_ancestor: HashSet<&str> = HashSet::new();
-    for t in &parsed_threads {
-        if t.archived {
-            continue;
+    for (i, t) in live.iter().enumerate() {
+        if flags.unfinished_descendant[i] {
+            has_unfinished_descendant.insert(t.thread_id.as_str());
         }
-        if !t.settled && is_unfinished_state(t.state) {
-            walk_ancestors(
-                t.thread_id.as_str(),
-                t.parent_thread_id.as_deref(),
-                &non_archived_by_id,
-                |p| p.parent_thread_id.as_deref(),
-                |parent| {
-                    has_unfinished_descendant.insert(parent.thread_id.as_str());
-                    ControlFlow::Continue(())
-                },
-            );
+        if flags.settled_ancestor[i] {
+            has_settled_ancestor.insert(t.thread_id.as_str());
         }
-        walk_ancestors(
-            t.thread_id.as_str(),
-            t.parent_thread_id.as_deref(),
-            &non_archived_by_id,
-            |p| p.parent_thread_id.as_deref(),
-            |parent| {
-                if parent.settled {
-                    has_settled_ancestor.insert(t.thread_id.as_str());
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            },
-        );
     }
     let mut entries = Vec::with_capacity(parsed_threads.len());
     let mut retired = HashMap::new();
@@ -2517,6 +2593,63 @@ mod tests {
             let elapsed = started.elapsed();
             assert_eq!(parsed.entries.len(), n);
             eprintln!("bench parse deep chain={n}: {elapsed:?}");
+        }
+    }
+
+    /// `lineage_flags` は、1 件ずつ親をたどる素朴な判定(自分を訪問済みにして輪で止まる)と同じ結果になる。
+    /// 輪・自己ループ・一覧に無い親を含む乱数の形で比べる。
+    #[test]
+    fn lineage_flags_match_the_naive_ancestor_walk() {
+        fn naive(
+            parent: &[Option<usize>],
+            settled: &[bool],
+            unfinished: &[bool],
+        ) -> (Vec<bool>, Vec<bool>) {
+            let n = parent.len();
+            let mut descendant = vec![false; n];
+            let mut ancestor = vec![false; n];
+            for x in 0..n {
+                let mut visited = HashSet::from([x]);
+                let mut v = parent[x];
+                while let Some(p) = v {
+                    if !visited.insert(p) {
+                        break;
+                    }
+                    if unfinished[x] {
+                        descendant[p] = true;
+                    }
+                    if settled[p] {
+                        ancestor[x] = true;
+                    }
+                    v = parent[p];
+                }
+            }
+            (descendant, ancestor)
+        }
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for _ in 0..20_000 {
+            let n = 1 + next(12) as usize;
+            let parent: Vec<Option<usize>> = (0..n)
+                .map(|_| match next(4) {
+                    0 => None,
+                    _ => Some(next(n as u64) as usize),
+                })
+                .collect();
+            let settled: Vec<bool> = (0..n).map(|_| next(3) == 0).collect();
+            let unfinished: Vec<bool> = (0..n).map(|_| next(3) == 0).collect();
+            let flags = lineage_flags(&parent, &settled, &unfinished);
+            let (descendant, ancestor) = naive(&parent, &settled, &unfinished);
+            assert_eq!(
+                flags.unfinished_descendant, descendant,
+                "{parent:?} {unfinished:?}"
+            );
+            assert_eq!(flags.settled_ancestor, ancestor, "{parent:?} {settled:?}");
         }
     }
 
