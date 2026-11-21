@@ -1205,7 +1205,11 @@ impl AgentScreen {
             } else {
                 1.0
             };
-            let alpha = if self.page == AgentPage::Details && self.is_overview_hidden(&key) {
+            // DETAILS では、片付け済み(未完了の子のために OVERVIEW に残した親を含む)と、片付け済みの親の下で
+            // OVERVIEW から隠れる子を減光する。
+            let alpha = if self.page == AgentPage::Details
+                && (entry.settled || self.is_overview_hidden(&key))
+            {
                 base_alpha * 0.78
             } else {
                 base_alpha
@@ -3704,6 +3708,23 @@ mod tests {
                 .iter()
                 .any(|(id, l)| id.ends_with(":badge") && l.key.starts_with("子に異常 1|"))
         );
+        // DETAILS では、OVERVIEW に残した片付け済みの親も、ほかの片付け済みと同じく減光する(子はそのまま)。
+        let t = now + Duration::from_secs(1);
+        s_a.handle_action(ScreenAction::Select, t);
+        // 見えたままのカードは位置と同じく減光も滑らかに移るので、移り終えてから確かめる。
+        render_for_test(&mut s_a, &snap_a, t);
+        let t = t + MOVE_TWEEN;
+        let cards_a = render_for_test(&mut s_a, &snap_a, t);
+        let alpha_a = |id: &str| {
+            cards_a
+                .iter()
+                .find(|c| c.id == s_a.id_map[&k(id)])
+                .unwrap()
+                .pose
+                .alpha
+        };
+        assert!((alpha_a("boss-err") - 0.78).abs() < 1e-4);
+        assert!((alpha_a("kid-err") - 1.0).abs() < 1e-4);
 
         // Case B: settled な親 + 完了済みの子 → OVERVIEW では両方隠れ、DETAILS でバッジ付き・減光で表示される。
         let boss_done = AgentEntry {

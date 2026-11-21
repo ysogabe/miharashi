@@ -205,9 +205,18 @@ pub fn render_card(content: &AgentCardContent, size: (u32, u32), text: &mut Text
     let x = top_row.state.x;
     text.draw(&mut canvas, label, x, top, row, state_color);
     if content.compact {
-        let start = x + top_row.state.w + 18.0 * s;
+        let mut start = x + top_row.state.w + 18.0 * s;
         let age_w = top_row.age.map_or(0.0, |a| a.w);
-        let room = right - age_w - 14.0 * s - start;
+        let mut room = right - age_w - 14.0 * s - start;
+        // 印(「対応済み」など)は状態の後ろに置き、幅は題名から取る。
+        if let Some(badge) = content.badge.as_deref().filter(|b| !b.is_empty()) {
+            let badge_w = text.measure(badge, row);
+            if badge_w <= room {
+                text.draw(&mut canvas, badge, start, top, row, state_color);
+                start += badge_w + 14.0 * s;
+                room -= badge_w + 14.0 * s;
+            }
+        }
         if room > 24.0 {
             let title = fit_text(text, &content.title, 24.0 * s, room);
             text.draw(&mut canvas, &title, start, top, 24.0 * s, bright);
@@ -331,6 +340,17 @@ fn render_row(content: &AgentCardContent, mut pix: Pixmap, text: &mut TextEngine
     }
     if let (Some(span), Some(tag)) = (row.tag, content.server.as_deref()) {
         text.draw(&mut canvas, tag, span.x, top, size, bright);
+    }
+    if let (Some(span), Some(badge)) = (row.badge, content.badge.as_deref()) {
+        let [cr, cg, cb] = content.state.color();
+        text.draw(
+            &mut canvas,
+            badge,
+            span.x,
+            top,
+            size * 0.9,
+            [cr, cg, cb, 255],
+        );
     }
     if row.title_room > 24.0 {
         let title = fit_text(text, &content.title, size, row.title_room);
@@ -457,6 +477,8 @@ pub fn card_top_row(
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowLayout {
     pub tag: Option<Span>,
+    /// 印(「対応済み」など)。題名の幅から取り、入らなければ None。
+    pub badge: Option<Span>,
     pub title_x: f32,
     /// 題名に使える幅(24 以下なら題名は描かない)。
     pub title_room: f32,
@@ -488,14 +510,27 @@ pub fn card_row(text: &mut TextEngine, content: &AgentCardContent, size: (f32, f
         age = None;
     }
     let age_w = age.unwrap_or(0.0);
-    let (tag, title_x) = match tag_w {
+    let (tag, mut title_x) = match tag_w {
         Some(w) => (Some(Span { x: start, w }), start + w + 8.0 * s),
         None => (None, start),
     };
+    let title_end = right - age_w - 12.0 * s;
+    let badge = content
+        .badge
+        .as_deref()
+        .filter(|b| !b.is_empty())
+        .map(|b| text.measure(b, font * 0.9))
+        .filter(|w| title_x + w <= title_end)
+        .map(|w| {
+            let span = Span { x: title_x, w };
+            title_x += w + 8.0 * s;
+            span
+        });
     RowLayout {
         tag,
+        badge,
         title_x,
-        title_room: right - age_w - 12.0 * s - title_x,
+        title_room: title_end - title_x,
         age: age.map(|w| Span { x: right - w, w }),
     }
 }
@@ -895,25 +930,53 @@ mod tests {
         let mut text = TextEngine::new("Noto Sans CJK JP");
         for w in [150.0f32, 200.0, 228.0, 300.0, 440.0, 800.0] {
             for age in ["1分未満", "12時間"] {
-                let mut c = sample(Some("④"), "", AgentState::Running, age);
-                c.one_line = true;
-                let layout = card_row(&mut text, &c, (w, ROW_BASE_HEIGHT));
-                let tag = layout.tag.expect("the tag is kept");
-                let mut spans = vec![("tag", tag)];
-                if let Some(a) = layout.age {
-                    spans.push(("age", a));
+                for badge in [None, Some("対応済み(親)")] {
+                    let mut c = sample(Some("④"), "", AgentState::Running, age);
+                    c.one_line = true;
+                    c.badge = badge.map(str::to_string);
+                    let layout = card_row(&mut text, &c, (w, ROW_BASE_HEIGHT));
+                    let tag = layout.tag.expect("the tag is kept");
+                    let mut spans = vec![("tag", tag)];
+                    if let Some(b) = layout.badge {
+                        spans.push(("badge", b));
+                    }
+                    if badge.is_some() && w >= 300.0 {
+                        assert!(layout.badge.is_some(), "row w={w} {age}: the badge fits");
+                    }
+                    if let Some(a) = layout.age {
+                        spans.push(("age", a));
+                    }
+                    if layout.title_room > 24.0 {
+                        spans.push((
+                            "title",
+                            Span {
+                                x: layout.title_x,
+                                w: layout.title_room,
+                            },
+                        ));
+                    }
+                    assert_disjoint(&spans, w, &format!("row w={w} {age} {badge:?}"));
                 }
-                if layout.title_room > 24.0 {
-                    spans.push((
-                        "title",
-                        Span {
-                            x: layout.title_x,
-                            w: layout.title_room,
-                        },
-                    ));
-                }
-                assert_disjoint(&spans, w, &format!("row w={w} {age}"));
             }
+        }
+    }
+
+    /// 「対応済み」などの印は、重なった帯と 1 行のカードにも描く(題名の幅から取り、目印・状態・経過時間は削らない)。
+    #[test]
+    fn the_badge_is_drawn_on_strips_and_rows_too() {
+        let mut text = TextEngine::new("Noto Sans CJK JP");
+        for (label, compact, one_line, size) in [
+            ("full", false, false, (300u32, 210u32)),
+            ("strip", true, false, (300, 58)),
+            ("row", false, true, (300, 38)),
+        ] {
+            let mut c = sample(Some("③"), "", AgentState::Completed, "3分");
+            c.compact = compact;
+            c.one_line = one_line;
+            let without = render_card(&c, size, &mut text);
+            c.badge = Some("対応済み".into());
+            let with = render_card(&c, size, &mut text);
+            assert!(with.data() != without.data(), "{label}: the badge is drawn");
         }
     }
 
