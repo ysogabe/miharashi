@@ -4455,5 +4455,38 @@ mod tests {
                 s.replans
             );
         }
+        // 親の鎖が深い最悪の形: 全員が未片付け・実行中で、片付け済みの祖先が無い(先祖をたどる判定が根まで進む)。
+        for n in [250usize, 1000, 2047] {
+            let now = Instant::now();
+            let entries: Vec<AgentEntry> = (0..n)
+                .map(|i| {
+                    let e = entry(&format!("c{i:05}"), AgentState::Running);
+                    if i == 0 {
+                        e
+                    } else {
+                        child(
+                            &format!("c{i:05}"),
+                            &format!("c{:05}", i - 1),
+                            AgentState::Running,
+                        )
+                    }
+                })
+                .collect();
+            let started = std::time::Instant::now();
+            let hidden = crate::agents::overview_hidden_ids(&entries);
+            let judge = started.elapsed();
+            assert!(hidden.is_empty());
+            let mut s = AgentScreen::new((1920, 1080), false, 30);
+            let snap = snapshot_of(entries.clone());
+            let started = std::time::Instant::now();
+            s.sync(&snap, now);
+            let sync = started.elapsed();
+            let started = std::time::Instant::now();
+            s.handle_action(ScreenAction::Select, now + Duration::from_secs(1));
+            let toggle = started.elapsed();
+            eprintln!(
+                "bench screen deep chain={n}: overview_hidden_ids={judge:?} sync={sync:?} toggle={toggle:?}"
+            );
+        }
     }
 }

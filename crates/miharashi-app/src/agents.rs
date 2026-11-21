@@ -2494,6 +2494,32 @@ mod tests {
         assert_eq!(&k[before..], [("fresh".to_string(), AgentChangeKind::New)]);
     }
 
+    /// 親の鎖が深い shell 応答の取り込み時間。全員が未片付け・実行中で片付け済みの祖先が無い最悪の形。
+    /// `cargo test --release -p miharashi-app parse_deep_chain_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn parse_deep_chain_bench() {
+        let now = SystemTime::now();
+        let recent = DateTime::<Utc>::from(now).to_rfc3339();
+        for n in [250usize, 1000, 2047] {
+            let threads: Vec<Value> = (0..n)
+                .map(|i| {
+                    let mut t = mock_thread(&format!("c{i:05}"), "running", &recent);
+                    if i > 0 {
+                        t["lineage"] = lineage(&format!("c{:05}", i - 1), "subagent");
+                    }
+                    t
+                })
+                .collect();
+            let value = shell(threads, 1);
+            let started = std::time::Instant::now();
+            let parsed = parse_shell_recent(&value, 24, now).unwrap();
+            let elapsed = started.elapsed();
+            assert_eq!(parsed.entries.len(), n);
+            eprintln!("bench parse deep chain={n}: {elapsed:?}");
+        }
+    }
+
     #[test]
     fn initial_and_resync_snapshots_do_not_emit_a_flood() {
         let shared = Arc::new(RwLock::new(AgentSnapshot::default()));
