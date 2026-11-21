@@ -289,6 +289,19 @@ pub struct AgentSnapshot {
     pub resync_generation: u64,
     pub synchronized: bool,
     pub error_summary: Option<String>,
+    /// 直近の shell 応答にあったが保持の対象外だった(非アーカイブの)スレッドの、差分に使う値。
+    /// 対象に戻ったスレッド(再開・未完了の子による親の保持・古いスレッドの新しい run)を新着と取り違えないために、
+    /// 次の取得の `diff` が前の値として使う。画面は毎フレーム snapshot を複製するので `Arc` で持つ。
+    pub(crate) retired: Arc<HashMap<String, ThreadMark>>,
+}
+
+/// 保持の対象外のスレッドについて、`diff` が比べる値だけを残したもの。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ThreadMark {
+    state: AgentState,
+    plan: bool,
+    active_run_id: Option<String>,
+    latest_run_id: Option<String>,
 }
 
 /// World に載せる 1 接続ぶん。接続は設定の順(`primary` が先頭)に並ぶ。
@@ -618,17 +631,18 @@ fn install_snapshot(
 ) {
     let now_wall = SystemTime::now();
     let now_mono = Instant::now();
-    let (old_entries, old_changes, synchronized, mut cursor, old_environment) = match shared.read()
-    {
-        Ok(current) => (
-            current.entries.clone(),
-            current.changes.clone(),
-            current.synchronized,
-            current.change_cursor,
-            current.environment_id.clone(),
-        ),
-        Err(_) => return,
-    };
+    let (old_entries, old_retired, old_changes, synchronized, mut cursor, old_environment) =
+        match shared.read() {
+            Ok(current) => (
+                current.entries.clone(),
+                current.retired.clone(),
+                current.changes.clone(),
+                current.synchronized,
+                current.change_cursor,
+                current.environment_id.clone(),
+            ),
+            Err(_) => return,
+        };
     for entry in &mut remote.entries {
         entry.server_id = server_id.clone();
     }
@@ -645,6 +659,7 @@ fn install_snapshot(
         history.extend(diff(
             server_id,
             &old_entries,
+            &old_retired,
             &remote.entries,
             &mut cursor,
             now_wall,
@@ -667,6 +682,8 @@ fn install_snapshot(
         current.protocol_version = remote.protocol_version;
         current.sequence = remote.sequence;
         current.entries = remote.entries.into();
+        // 再同期・環境の入れ替わりでも、今回の応答の値に置き換える(前の値は差分を作るときだけ使う)。
+        current.retired = Arc::new(remote.retired);
         current.changes = changes.into();
         current.connection = AgentConnection::Live;
         // 取得に成功した token の世代。失敗では更新しない(最後に成功した世代のまま)ので、
@@ -696,6 +713,7 @@ struct RemoteSnapshot {
     protocol_version: Option<u64>,
     sequence: Option<u64>,
     entries: Vec<AgentEntry>,
+    retired: HashMap<String, ThreadMark>,
 }
 
 fn fetch_environment(agent: &ureq::Agent, endpoint: &str) -> Result<Environment, FetchError> {
@@ -932,13 +950,23 @@ fn parse_shell_recent(
         );
     }
     let mut entries = Vec::with_capacity(parsed_threads.len());
+    let mut retired = HashMap::new();
     for t in &parsed_threads {
+        if t.archived {
+            continue;
+        }
         let rescue_settled_parent =
             t.settled && has_unfinished_descendant.contains(t.thread_id.as_str());
-        if t.archived
-            || (!rescue_settled_parent
-                && !is_target(t.state, t.settled, t.updated, recent_hours, now))
-        {
+        if !rescue_settled_parent && !is_target(t.state, t.settled, t.updated, recent_hours, now) {
+            retired.insert(
+                t.thread_id.clone(),
+                ThreadMark {
+                    state: t.state,
+                    plan: t.plan,
+                    active_run_id: field_str(t.raw, "activeRunId").map(|s| sanitize(s, 256)),
+                    latest_run_id: field_str(t.raw, "latestRunId").map(|s| sanitize(s, 256)),
+                },
+            );
             continue;
         }
         let thread = t.raw;
@@ -1000,6 +1028,7 @@ fn parse_shell_recent(
         protocol_version: None,
         sequence: obj.get("snapshotSequence").and_then(Value::as_u64),
         entries,
+        retired,
     })
 }
 
@@ -1225,6 +1254,7 @@ fn normalize_state(
 fn diff(
     server_id: &ServerId,
     old: &[AgentEntry],
+    retired: &HashMap<String, ThreadMark>,
     new: &[AgentEntry],
     cursor: &mut u64,
     now: SystemTime,
@@ -1233,7 +1263,24 @@ fn diff(
         old.iter().map(|e| (e.thread_id.as_str(), e)).collect();
     let mut result = Vec::new();
     for entry in new {
-        let Some(previous) = old_by_id.get(entry.thread_id.as_str()).copied() else {
+        // 前回は保持の対象外だったスレッドは、そのときの状態・run と比べる(題名・目標・エラー文は比べない)。
+        let returned = match old_by_id.get(entry.thread_id.as_str()) {
+            Some(_) => None,
+            None => retired.get(entry.thread_id.as_str()).map(|m| AgentEntry {
+                state: m.state,
+                has_pending_approvals: m.state == AgentState::Approval,
+                has_pending_user_input: m.state == AgentState::Input,
+                has_actionable_proposed_plan: m.plan,
+                active_run_id: m.active_run_id.clone(),
+                latest_run_id: m.latest_run_id.clone(),
+                ..entry.clone()
+            }),
+        };
+        let Some(previous) = old_by_id
+            .get(entry.thread_id.as_str())
+            .copied()
+            .or(returned.as_ref())
+        else {
             push_change(
                 &mut result,
                 server_id,
@@ -1584,6 +1631,7 @@ mod tests {
             diff(
                 &sid(),
                 &preparing,
+                &HashMap::new(),
                 &starting,
                 &mut cursor,
                 SystemTime::now()
@@ -1598,6 +1646,7 @@ mod tests {
             diff(
                 &sid(),
                 &parse(with_error),
+                &HashMap::new(),
                 &cleared,
                 &mut cursor,
                 SystemTime::now()
@@ -1677,13 +1726,21 @@ mod tests {
     fn semantic_diff_ignores_updated_at_and_repeated_snapshot() {
         let first = parse_shell(&shell(vec![mock_thread("t1", "running", "a")], 1)).unwrap();
         let mut cursor = 0;
-        let initial = diff(&sid(), &[], &first.entries, &mut cursor, SystemTime::now());
+        let initial = diff(
+            &sid(),
+            &[],
+            &HashMap::new(),
+            &first.entries,
+            &mut cursor,
+            SystemTime::now(),
+        );
         assert_eq!(initial[0].kind, AgentChangeKind::New);
         let second = parse_shell(&shell(vec![mock_thread("t1", "running", "b")], 2)).unwrap();
         assert!(
             diff(
                 &sid(),
                 &first.entries,
+                &HashMap::new(),
                 &second.entries,
                 &mut cursor,
                 SystemTime::now()
@@ -1695,6 +1752,7 @@ mod tests {
             diff(
                 &sid(),
                 &first.entries,
+                &HashMap::new(),
                 &third.entries,
                 &mut cursor,
                 SystemTime::now()
@@ -1718,6 +1776,7 @@ mod tests {
         let changes = diff(
             &sid(),
             std::slice::from_ref(&a),
+            &HashMap::new(),
             &[b],
             &mut cursor,
             SystemTime::now(),
@@ -1740,6 +1799,7 @@ mod tests {
         let changes = diff(
             &sid(),
             std::slice::from_ref(&a),
+            &HashMap::new(),
             &[b],
             &mut cursor,
             SystemTime::now(),
@@ -2330,6 +2390,7 @@ mod tests {
             diff(
                 &sid(),
                 std::slice::from_ref(&before),
+                &HashMap::new(),
                 &[after],
                 &mut cursor,
                 SystemTime::now(),
@@ -2357,6 +2418,80 @@ mod tests {
         let mut malformed_tasks = mock_thread("bad-tasks", "running", "now");
         malformed_tasks["pendingBackgroundTasks"] = serde_json::json!([{"taskId":"x"}]);
         assert!(parse_shell(&shell(vec![malformed_tasks], 1)).is_err());
+    }
+
+    /// 前回の shell 応答にあったが保持の対象外だったスレッドが対象に戻っても、新着にはしない。
+    /// 保持の外にいた間の状態・run と比べ、意味のある変化があるときだけ変更にする。
+    #[test]
+    fn threads_returning_to_retention_are_not_new() {
+        let now = SystemTime::now();
+        let recent = DateTime::<Utc>::from(now).to_rfc3339();
+        let old = DateTime::<Utc>::from(now - Duration::from_secs(48 * 3600)).to_rfc3339();
+        let install = |shared: &Shared, threads: Vec<Value>, seq| {
+            let remote = parse_shell_recent(&shell(threads, seq), 24, now).unwrap();
+            install_snapshot(shared, &sid(), remote, false, "r1.test");
+        };
+        let kinds = |shared: &Shared| {
+            shared
+                .read()
+                .unwrap()
+                .changes
+                .iter()
+                .map(|c| (c.thread_id.clone(), c.kind))
+                .collect::<Vec<_>>()
+        };
+
+        // 古い片付け済みの異常を、状態も run も変えずに再開した(settledOverride = active)。
+        let shared = Arc::new(RwLock::new(AgentSnapshot::default()));
+        let settled_err = settled_thread("err", "failed", &old);
+        install(&shared, vec![settled_err.clone()], 1);
+        assert!(shared.read().unwrap().entries.is_empty());
+        let mut reopened = settled_err;
+        reopened["settledOverride"] = Value::String("active".into());
+        install(&shared, vec![reopened], 2);
+        assert_eq!(shared.read().unwrap().entries.len(), 1);
+        assert_eq!(kinds(&shared), []);
+
+        // 古い片付け済みの親が、子が未完了になったので保持に戻った(親は変わっていない)。
+        let shared = Arc::new(RwLock::new(AgentSnapshot::default()));
+        let parent = settled_thread("parent", "completed", &old);
+        let mut kid = mock_thread("kid", "completed", &old);
+        kid["lineage"] = lineage("parent", "subagent");
+        install(&shared, vec![parent.clone(), kid.clone()], 1);
+        assert!(shared.read().unwrap().entries.is_empty());
+        let mut kid_running = mock_thread("kid", "running", &recent);
+        kid_running["lineage"] = lineage("parent", "subagent");
+        kid_running["latestRunId"] = Value::String("run-new".into());
+        install(&shared, vec![parent, kid_running], 2);
+        assert_eq!(shared.read().unwrap().entries.len(), 2);
+        let k = kinds(&shared);
+        assert!(
+            !k.iter().any(|(_, kind)| *kind == AgentChangeKind::New),
+            "{k:?}"
+        );
+        assert!(k.iter().all(|(id, _)| id == "kid"), "{k:?}");
+        assert_eq!(k.len(), 1, "{k:?}");
+
+        // 古い待機のスレッドで新しい run が始まった: 新着ではなく変更として知らせる。
+        let shared = Arc::new(RwLock::new(AgentSnapshot::default()));
+        install(&shared, vec![mock_thread("idle", "idle", &old)], 1);
+        assert!(shared.read().unwrap().entries.is_empty());
+        let mut started = mock_thread("idle", "running", &recent);
+        started["latestRunId"] = Value::String("run-new".into());
+        install(&shared, vec![started.clone()], 2);
+        let k = kinds(&shared);
+        assert_eq!(k.len(), 1, "{k:?}");
+        assert_ne!(k[0].1, AgentChangeKind::New);
+
+        // 前回の応答に無かったスレッドは、これまでどおり新着。
+        let before = kinds(&shared).len();
+        install(
+            &shared,
+            vec![started, mock_thread("fresh", "running", &recent)],
+            3,
+        );
+        let k = kinds(&shared);
+        assert_eq!(&k[before..], [("fresh".to_string(), AgentChangeKind::New)]);
     }
 
     #[test]
