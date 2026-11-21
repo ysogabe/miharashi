@@ -658,12 +658,13 @@ impl AgentScreen {
         redraw
     }
 
+    /// ページを切り替えたときに表示対象を作り直す。見えなくなったスレッドの通知・新着の予約・位置は
+    /// `apply_server_entries` が捨て、見えたままのものは残す(予約を消すと、置かれたカードが後で右端へ飛んで
+    /// 紹介をやり直し、位置を消すとカードが瞬間移動する)。表示中のポップアップは、配置を作り直せるよう終える。
     fn rebuild_visible_entries(&mut self, now: Instant) {
-        self.poses.clear();
         self.focus = None;
         self.scrim_alpha = 0.0;
         self.focus_card_id = None;
-        self.pending_new.clear();
         for idx in 0..self.servers.len() {
             let snap_entries = Arc::clone(&self.servers[idx].last_snapshot.entries);
             self.apply_server_entries(idx, &snap_entries, now);
@@ -3326,6 +3327,59 @@ mod tests {
         assert!(ids.contains(&screen.id_map[&k("new-a")]));
         assert!(!ids.contains(&screen.id_map[&k("new-b")]));
         assert!(!screen.pending_new.contains(&k("new-a")));
+        assert!(screen.pending_new.contains(&k("new-b")));
+    }
+
+    /// ○ でページを切り替えても、見えたままのスレッドの新着の予約と待ち行列、カードの位置は残す。
+    /// 予約を消すと、置かれたカードが後で右端へ飛んで紹介をやり直す。
+    #[test]
+    fn page_toggle_keeps_new_reservations_and_poses_of_threads_that_stay_visible() {
+        let now = Instant::now();
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(vec![
+            entry("existing", AgentState::Running),
+            entry("new-a", AgentState::Running),
+            entry("new-b", AgentState::Idle),
+            AgentEntry {
+                settled: true,
+                ..entry("done", AgentState::Completed)
+            },
+        ]);
+        screen.sync(&snap, now);
+        for id in ["new-a", "new-b"] {
+            screen.enqueue(QueuedEvent {
+                change: ck(),
+                key: k(id),
+                kind: EventKind::New,
+                before: "新しく検出".into(),
+                after: "実行中".into(),
+                observed_at: SystemTime::now(),
+                priority: 2,
+            });
+        }
+        let first = render_for_test(&mut screen, &snap, now);
+        assert!(!first.iter().any(|c| c.id == screen.id_map[&k("new-b")]));
+        assert!(screen.poses.contains_key(&k("existing")));
+
+        let t = now + Duration::from_millis(10);
+        screen.handle_action(ScreenAction::Select, t);
+        assert_eq!(screen.page(), Some("DETAILS"));
+        assert!(screen.pending_new.contains(&k("new-a")));
+        assert!(screen.pending_new.contains(&k("new-b")));
+        assert_eq!(screen.queue.len(), 2);
+        assert!(screen.poses.contains_key(&k("existing")));
+        let cards = render_for_test(&mut screen, &snap, t);
+        let ids: HashSet<u64> = cards.iter().map(|c| c.id).collect();
+        assert!(ids.contains(&screen.id_map[&k("existing")]));
+        assert!(ids.contains(&screen.id_map[&k("done")]));
+        assert!(!ids.contains(&screen.id_map[&k("new-a")]));
+        assert!(!ids.contains(&screen.id_map[&k("new-b")]));
+
+        // OVERVIEW に戻ると、隠れたスレッドの位置だけを捨てる。
+        let t = t + Duration::from_secs(1);
+        screen.handle_action(ScreenAction::Select, t);
+        assert!(!screen.poses.contains_key(&k("done")));
+        assert!(screen.poses.contains_key(&k("existing")));
         assert!(screen.pending_new.contains(&k("new-b")));
     }
 
