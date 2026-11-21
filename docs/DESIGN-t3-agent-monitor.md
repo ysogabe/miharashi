@@ -444,7 +444,7 @@ HTTP 方式では毎回完全な snapshot を受け取り、消えたカード�
 | 内部データ | 主な項目 |
 |---|---|
 | `AgentSnapshot` | environment ID / label、server version、sequence、`Arc<[AgentEntry]>`、上限付き変更記録、接続状態、最終成功の wall clock と `Instant`、取得エラー種別 |
-| `AgentEntry` | thread / project ID、project / thread 名、provider、model、正規化状態と raw status、待ちフラグ、バックグラウンドの作業の数、run ID、目標、branch、時刻、エラー要約、片付け済みフラグ(`settled` / `settled_ancestor`)、親スレッド ID と親のタイトル(`subagent` のときだけ) |
+| `AgentEntry` | thread / project ID、project / thread 名、provider、model、正規化状態と raw status、待ちフラグ、バックグラウンドの作業の数、run ID、目標、branch、時刻、エラー要約、片付け済みフラグ(`settled` / `settled_ancestor`)、未完了の `subagent` 子孫を持つか(`has_unfinished_descendant`。生の shell 応答で判定し、間の親が対象外でも片付け済みの祖先を OVERVIEW に残す)、親スレッド ID と親のタイトル(`subagent` のときだけ) |
 | `AgentChange` | ローカル変更 ID、thread ID、種類、前後の状態と目標、観測時刻。初回・再同期と通常更新を区別 |
 | `AgentScreen` | 現在のページ(`OVERVIEW` / `DETAILS`)、カードの帰る場所、活動度の基準時刻、処理済み変更 ID、中央表示の待ち行列・段階・開始時刻 |
 | `AgentsView` | 凡例兼件数、カード面、各位置・大きさ・不透明度、中央に出す変更内容、取得状態の帯 |

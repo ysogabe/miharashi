@@ -128,6 +128,9 @@ pub struct AgentEntry {
     pub settled: bool,
     /// 生の shell 応答上で非アーカイブの `subagent` 先祖のいずれかが `settled` だったか。
     pub settled_ancestor: bool,
+    /// 生の shell 応答上で、非アーカイブの未片付け・未完了(`is_unfinished_state`)の `subagent` 子孫を持つか。
+    /// 間の親が一覧の対象外でも、取得のときに残した片付け済みの祖先を OVERVIEW で隠さないために使う。
+    pub has_unfinished_descendant: bool,
 }
 
 impl AgentEntry {
@@ -171,7 +174,8 @@ pub fn is_unfinished_state(state: AgentState) -> bool {
 }
 
 /// 1 接続の `AgentEntry` 一覧から、OVERVIEW で隠すスレッド ID の集合を返す(接続をまたがない)。
-/// 未完了で未整理の子孫(`subagent`)を持つ先祖は、`settled` でも OVERVIEW に残す。
+/// 未完了で未整理の子孫(`subagent`)を持つ先祖は、`settled` でも OVERVIEW に残す。子孫は一覧の中の親の鎖と、
+/// 取得のときに生の shell 応答から決めた `has_unfinished_descendant`(間の親が一覧の対象外でも途切れない)の両方で見る。
 pub fn overview_hidden_ids(entries: &[AgentEntry]) -> HashSet<String> {
     let by_id: HashMap<&str, &AgentEntry> =
         entries.iter().map(|e| (e.thread_id.as_str(), e)).collect();
@@ -195,7 +199,7 @@ pub fn overview_hidden_ids(entries: &[AgentEntry]) -> HashSet<String> {
         if !e.settled && is_unfinished_state(e.state) {
             continue;
         }
-        if ancestors_of_unfinished.contains(e.thread_id.as_str()) {
+        if e.has_unfinished_descendant || ancestors_of_unfinished.contains(e.thread_id.as_str()) {
             continue;
         }
         if e.settled || e.settled_ancestor || has_settled_ancestor(e, &by_id) {
@@ -985,6 +989,7 @@ fn parse_shell_recent(
             parent_title,
             settled: t.settled,
             settled_ancestor: has_settled_ancestor.contains(t.thread_id.as_str()),
+            has_unfinished_descendant: has_unfinished_descendant.contains(t.thread_id.as_str()),
         });
     }
     entries.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
@@ -2093,6 +2098,30 @@ mod tests {
             .collect();
         assert_eq!(ids2, ["gc2", "gp2", "p2"]);
         assert!(overview_hidden_ids(&parsed2.entries).is_empty());
+    }
+
+    /// 片付け済みの祖父母 → 古い未片付けの完了済み親(一覧の対象外) → 異常の孫。親が一覧から外れても、
+    /// 取得のときに残した祖父母は OVERVIEW でも見える(画面側で親の鎖が途切れても隠さない)。
+    #[test]
+    fn settled_grandparent_above_dropped_parent_and_errored_grandchild_stays_visible() {
+        let now = SystemTime::now();
+        let recent = DateTime::<Utc>::from(now).to_rfc3339();
+        let old = DateTime::<Utc>::from(now - Duration::from_secs(48 * 3600)).to_rfc3339();
+
+        let gp = settled_thread("gp", "completed", &old);
+        let mut p = mock_thread("p", "completed", &old);
+        p["lineage"] = lineage("gp", "subagent");
+        let mut gc = mock_thread("gc", "failed", &recent);
+        gc["lineage"] = lineage("p", "subagent");
+
+        let parsed = parse_shell_recent(&shell(vec![gp, p, gc], 1), 24, now).unwrap();
+        let ids: Vec<_> = parsed
+            .entries
+            .iter()
+            .map(|e| e.thread_id.as_str())
+            .collect();
+        assert_eq!(ids, ["gc", "gp"]);
+        assert!(overview_hidden_ids(&parsed.entries).is_empty());
     }
 
     #[test]
