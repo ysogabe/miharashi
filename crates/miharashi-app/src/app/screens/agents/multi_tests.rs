@@ -1433,6 +1433,25 @@ fn multi_server_chip_counts_and_hidden_stay_consistent_across_pages() {
     assert_eq!(s.servers[0].overview_hidden.len(), 40);
     assert_eq!(s.servers[1].overview_hidden.len(), 20);
     assert_eq!(hidden_over.values().sum::<usize>(), 0);
+    // 欄に出す件数と凡例の件数も、OVERVIEW では片付け済みを含まない。
+    let chips = |s: &AgentScreen| s.servers.iter().map(chip_count_text).collect::<Vec<_>>();
+    let legend = |s: &AgentScreen| {
+        let all: Vec<&AgentEntry> = s.servers.iter().flat_map(|st| st.entries.iter()).collect();
+        state_counts(&all)
+            .iter()
+            .map(|(label, _, n, _)| (*label, *n))
+            .collect::<Vec<_>>()
+    };
+    let legend_expected = [
+        ("実行中", 6),
+        ("承認待ち", 0),
+        ("入力・計画", 0),
+        ("異常", 0),
+        ("応答完了", 0),
+        ("その他", 0),
+    ];
+    assert_eq!(chips(&s), ["4件", "2件"]);
+    assert_eq!(legend(&s), legend_expected);
     for st in &s.servers {
         let shown = st
             .entries
@@ -1458,4 +1477,7 @@ fn multi_server_chip_counts_and_hidden_stay_consistent_across_pages() {
         assert_eq!(shown + hidden_det[&st.id], st.entries.len());
     }
     assert!(hidden_det.values().sum::<usize>() > hidden_over.values().sum::<usize>());
+    // DETAILS の欄は片付け済みを含む候補数を出し、凡例の状態別の件数は片付け済みを数えない。
+    assert_eq!(chips(&s), ["44件", "22件"]);
+    assert_eq!(legend(&s), legend_expected);
 }

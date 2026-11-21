@@ -1874,11 +1874,7 @@ fn draw_server_chips(
         let snap = &st.last_snapshot;
         let stale = is_stale_at(snap, h.now, h.stale_secs);
         let (status, color) = connection_status(snap, stale, true);
-        let count = if snap.synchronized {
-            format!("{}件", st.entries.len())
-        } else {
-            "--件".into()
-        };
+        let count = chip_count_text(st);
         let hidden = h.hidden.get(&st.id).copied().unwrap_or(0);
         let hidden_text = (hidden > 0).then(|| format!("未表示 {hidden}"));
         let tag = server_tag(i);
@@ -1919,6 +1915,15 @@ fn draw_server_chips(
             let sub = draw::fit_label_text(text, &sub, size, chip_w - 12.0 * fs);
             text.draw(canvas, &sub, x, 134.0, size, MUTED);
         }
+    }
+}
+
+/// 接続別の欄に出す件数(そのページで表示の候補になっているスレッドの数)。まだ同期していなければ `--件`。
+fn chip_count_text(st: &ServerUiState) -> String {
+    if st.last_snapshot.synchronized {
+        format!("{}件", st.entries.len())
+    } else {
+        "--件".into()
     }
 }
 
