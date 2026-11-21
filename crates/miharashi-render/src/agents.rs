@@ -211,7 +211,8 @@ pub fn render_card(content: &AgentCardContent, size: (u32, u32), text: &mut Text
         // 印(「対応済み」など)は状態の後ろに置き、幅は題名から取る。
         if let Some(badge) = content.badge.as_deref().filter(|b| !b.is_empty()) {
             let badge_w = text.measure(badge, row);
-            if badge_w <= room {
+            // 題名を読める幅が残らなければ、題名を優先して印を省く。
+            if badge_w + 14.0 * s + BADGE_TITLE_MIN * s <= room {
                 text.draw(&mut canvas, badge, start, top, row, state_color);
                 start += badge_w + 14.0 * s;
                 room -= badge_w + 14.0 * s;
@@ -485,6 +486,9 @@ pub struct RowLayout {
     pub age: Option<Span>,
 }
 
+/// 帯・1 行のカードに印(「対応済み」など)を置くときに、題名のために残す最小の幅(文字の倍率 1 のとき)。
+const BADGE_TITLE_MIN: f32 = 64.0;
+
 /// 1 行のカード(`one_line`)の並びを実測で決める。
 pub fn card_row(text: &mut TextEngine, content: &AgentCardContent, size: (f32, f32)) -> RowLayout {
     let (wf, hf) = size;
@@ -520,7 +524,8 @@ pub fn card_row(text: &mut TextEngine, content: &AgentCardContent, size: (f32, f
         .as_deref()
         .filter(|b| !b.is_empty())
         .map(|b| text.measure(b, font * 0.9))
-        .filter(|w| title_x + w <= title_end)
+        // 題名を読める幅(BADGE_TITLE_MIN)が残らなければ、題名を優先して印を省く。
+        .filter(|w| title_x + w + 8.0 * s + BADGE_TITLE_MIN * s <= title_end)
         .map(|w| {
             let span = Span { x: title_x, w };
             title_x += w + 8.0 * s;
@@ -940,7 +945,7 @@ mod tests {
                     if let Some(b) = layout.badge {
                         spans.push(("badge", b));
                     }
-                    if badge.is_some() && w >= 300.0 {
+                    if badge.is_some() && w >= 440.0 {
                         assert!(layout.badge.is_some(), "row w={w} {age}: the badge fits");
                     }
                     if let Some(a) = layout.age {
@@ -977,6 +982,29 @@ mod tests {
             c.badge = Some("対応済み".into());
             let with = render_card(&c, size, &mut text);
             assert!(with.data() != without.data(), "{label}: the badge is drawn");
+        }
+    }
+
+    /// 帯・1 行のカードの印は、題名を読める幅が残るときだけ置く(印だけで題名が消えない)。
+    #[test]
+    fn the_row_badge_never_leaves_the_title_without_room() {
+        let mut text = TextEngine::new("Noto Sans CJK JP");
+        for w in (150..=800).step_by(10).map(|w| w as f32) {
+            for server in [None, Some("④")] {
+                for badge in ["対応済み", "対応済み(親)"] {
+                    let mut c = sample(server, "", AgentState::Completed, "12時間");
+                    c.one_line = true;
+                    c.badge = Some(badge.into());
+                    let layout = card_row(&mut text, &c, (w, ROW_BASE_HEIGHT));
+                    if layout.badge.is_some() {
+                        assert!(
+                            layout.title_room >= 64.0,
+                            "w={w} {server:?} {badge}: title_room={}",
+                            layout.title_room
+                        );
+                    }
+                }
+            }
         }
     }
 
