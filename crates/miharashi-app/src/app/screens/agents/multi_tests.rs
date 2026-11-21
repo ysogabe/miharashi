@@ -734,6 +734,7 @@ fn a_single_server_still_reports_its_hidden_threads() {
                 now,
                 stale_secs: 30,
                 wall: SystemTime::UNIX_EPOCH,
+                page: s.page,
             },
         );
         canvas.pixmap.data().to_vec()
@@ -1223,4 +1224,238 @@ fn failed_connection_marks_previous_data_immediately_and_clears_on_recovery() {
                 .starts_with("前回取得時")
         }));
     }
+}
+
+/// OVERVIEW / DETAILS の切り替えと片付け済み判定・件数・親子関係は接続ごとに独立して保つ。
+#[test]
+fn overview_and_details_keep_settled_filtering_counts_and_families_isolated_per_server() {
+    let now = Instant::now();
+    let mut s = screen();
+
+    let settled = |id: &str, state: AgentState, parent: Option<&str>| AgentEntry {
+        settled: true,
+        ..entry("p", id, state, parent)
+    };
+    let mut primary_boss = settled("boss", AgentState::Completed, None);
+    primary_boss.title = "primary boss".into();
+    let primary_kid = entry("p", "kid", AgentState::Completed, Some("boss"));
+    let primary_run = entry("p", "active_a", AgentState::Running, None);
+
+    let mut container_boss = entry("p", "boss", AgentState::Completed, None);
+    container_boss.title = "container boss".into();
+    let container_kid = entry("p", "kid", AgentState::Running, Some("boss"));
+    // primary にしか無い settled 親と同じ ID を親に持つ完了済みの子も、他サーバーの親には隠されない。
+    let container_orphan = entry("p", "orphan_done", AgentState::Completed, Some("only_p"));
+    let primary_only_settled = settled("only_p", AgentState::Completed, None);
+    let container_done = settled("done_b", AgentState::Completed, None);
+
+    let mut p_primary = Poll::new(
+        vec![primary_boss, primary_kid, primary_only_settled, primary_run],
+        now,
+    );
+    p_primary.environment = Some("env-a");
+    let mut p_container = Poll::new(
+        vec![
+            container_boss,
+            container_kid,
+            container_orphan,
+            container_done,
+        ],
+        now,
+    );
+    p_container.environment = Some("env-b");
+
+    let world = vec![
+        server("primary", "primary", p_primary),
+        server("container", "コンテナ", p_container),
+    ];
+    s.sync_all(&world, now);
+    s.ensure_board();
+
+    // OVERVIEW: primary は boss/kid/only_p が隠れて 1 件、container は done_b だけ隠れて 3 件。
+    // primary の settled な boss / only_p は container の同名 boss/kid/orphan_done を隠さないし結ばない。
+    assert_eq!(s.page(), Some("OVERVIEW"));
+    assert_eq!(s.servers[0].overview_hidden.len(), 3);
+    assert!(s.servers[0].overview_hidden.contains("boss"));
+    assert!(s.servers[0].overview_hidden.contains("kid"));
+    assert!(s.servers[0].overview_hidden.contains("only_p"));
+    assert_eq!(s.servers[1].overview_hidden.len(), 1);
+    assert!(s.servers[1].overview_hidden.contains("done_b"));
+    assert_eq!(s.servers[0].entries.len(), 1);
+    assert_eq!(s.servers[1].entries.len(), 3);
+    assert!(s.board.cards.contains_key(&k("primary", "active_a")));
+    assert!(!s.board.cards.contains_key(&k("primary", "boss")));
+    assert!(!s.board.cards.contains_key(&k("primary", "kid")));
+    assert!(!s.board.cards.contains_key(&k("primary", "only_p")));
+    assert!(s.board.cards.contains_key(&k("container", "boss")));
+    assert!(s.board.cards.contains_key(&k("container", "kid")));
+    assert!(s.board.cards.contains_key(&k("container", "orphan_done")));
+    assert!(!s.board.cards.contains_key(&k("container", "done_b")));
+    assert_eq!(s.arrangement.families[1].len(), 2);
+    let container_orphan_fam = s.arrangement.families[1]
+        .iter()
+        .find(|f| f.orphan_of == Some(k("container", "only_p")))
+        .expect("container の orphan_done は他サーバーの settled 親には結ばれない");
+    assert_eq!(container_orphan_fam.members.len(), 1);
+
+    // 5 で DETAILS へ切り替えると全件が復活し、接続ごとの overview_hidden とバッジ/透明度も保たれる。
+    assert_eq!(
+        s.handle_action(ScreenAction::Select, now + Duration::from_secs(1)),
+        Outcome::Consumed
+    );
+    assert_eq!(s.page(), Some("DETAILS"));
+    assert!(s.queue.is_empty() && s.focus.is_none());
+    assert_eq!(s.servers[0].entries.len(), 4);
+    assert_eq!(s.servers[1].entries.len(), 4);
+    assert_eq!(s.servers[0].overview_hidden.len(), 3);
+    assert_eq!(s.servers[1].overview_hidden.len(), 1);
+
+    let cards = render(&mut s, &world, now + Duration::from_secs(1));
+    let alpha_of = |srv: &str, id: &str| {
+        let cid = s.id_map[&k(srv, id)];
+        cards.iter().find(|c| c.id == cid).unwrap().pose.alpha
+    };
+    let entry_of = |srv: &str, id: &str| {
+        s.entries
+            .iter()
+            .find(|e| e.key() == k(srv, id))
+            .unwrap()
+            .clone()
+    };
+    assert!((alpha_of("primary", "boss") - 0.78).abs() < 1e-4);
+    assert!((alpha_of("primary", "kid") - 0.78).abs() < 1e-4);
+    assert!((alpha_of("primary", "only_p") - 0.78).abs() < 1e-4);
+    assert!((alpha_of("primary", "active_a") - 1.0).abs() < 1e-4);
+    assert!((alpha_of("container", "boss") - 1.0).abs() < 1e-4);
+    assert!((alpha_of("container", "kid") - 1.0).abs() < 1e-4);
+    assert!((alpha_of("container", "orphan_done") - 1.0).abs() < 1e-4);
+    assert!((alpha_of("container", "done_b") - 0.78).abs() < 1e-4);
+    assert_eq!(
+        s.content(&entry_of("primary", "boss"), now, None, false, false)
+            .badge
+            .as_deref(),
+        Some("対応済み")
+    );
+    assert_eq!(
+        s.content(&entry_of("primary", "kid"), now, None, false, false)
+            .badge
+            .as_deref(),
+        Some("対応済み(親)")
+    );
+    assert_eq!(
+        s.content(&entry_of("container", "boss"), now, None, false, false)
+            .badge,
+        None
+    );
+    assert_eq!(
+        s.content(
+            &entry_of("container", "orphan_done"),
+            now,
+            None,
+            false,
+            false
+        )
+        .badge,
+        None
+    );
+    assert_eq!(
+        s.content(&entry_of("container", "done_b"), now, None, false, false)
+            .badge
+            .as_deref(),
+        Some("対応済み")
+    );
+
+    // 再度 5 で OVERVIEW に戻ると、接続ごとの表示件数・非表示集合が元に戻る。
+    assert_eq!(
+        s.handle_action(ScreenAction::Select, now + Duration::from_secs(2)),
+        Outcome::Consumed
+    );
+    assert_eq!(s.page(), Some("OVERVIEW"));
+    assert_eq!(s.servers[0].entries.len(), 1);
+    assert_eq!(s.servers[1].entries.len(), 3);
+    assert_eq!(s.servers[0].overview_hidden.len(), 3);
+    assert_eq!(s.servers[1].overview_hidden.len(), 1);
+
+    // environment_id 入れ替わり時は、その接続の overview_hidden だけを捨てる。
+    let mut p_replaced = Poll::new(
+        vec![entry("p", "fresh", AgentState::Running, None)],
+        now + Duration::from_secs(3),
+    );
+    p_replaced.environment = Some("env-new");
+    let mut p_container2 = Poll::new(
+        vec![
+            entry("p", "boss", AgentState::Completed, None),
+            entry("p", "kid", AgentState::Running, Some("boss")),
+            settled("done_b", AgentState::Completed, None),
+        ],
+        now + Duration::from_secs(3),
+    );
+    p_container2.environment = Some("env-b");
+    s.sync_all(
+        &[
+            server("primary", "primary", p_replaced),
+            server("container", "コンテナ", p_container2),
+        ],
+        now + Duration::from_secs(3),
+    );
+    assert!(s.servers[0].overview_hidden.is_empty());
+    assert_eq!(s.servers[1].overview_hidden.len(), 1);
+    assert!(s.servers[1].overview_hidden.contains("done_b"));
+}
+
+/// 小さい盤面でも、接続別の表示数 + 未表示数 = そのページで見えている候補数(st.entries.len())が成り立つ。
+#[test]
+fn multi_server_chip_counts_and_hidden_stay_consistent_across_pages() {
+    let now = Instant::now();
+    let settled = |id: &str| AgentEntry {
+        settled: true,
+        ..entry("p", id, AgentState::Completed, None)
+    };
+    let a: Vec<AgentEntry> = (0..4)
+        .map(|i| entry("p", &format!("a_run{i}"), AgentState::Running, None))
+        .chain((0..40).map(|i| settled(&format!("a_done{i}"))))
+        .collect();
+    let b: Vec<AgentEntry> = (0..2)
+        .map(|i| entry("p", &format!("b_run{i}"), AgentState::Running, None))
+        .chain((0..20).map(|i| settled(&format!("b_done{i}"))))
+        .collect();
+    let world = vec![
+        server("primary", "primary", Poll::new(a, now)),
+        server("container", "コンテナ", Poll::new(b, now)),
+    ];
+    let mut s = AgentScreen::new((1280, 720), false, 30);
+    s.sync_all(&world, now);
+    render(&mut s, &world, now);
+
+    let hidden_over = s.hidden_by_server();
+    assert_eq!(s.servers[0].entries.len(), 4);
+    assert_eq!(s.servers[1].entries.len(), 2);
+    assert_eq!(s.servers[0].overview_hidden.len(), 40);
+    assert_eq!(s.servers[1].overview_hidden.len(), 20);
+    assert_eq!(hidden_over.values().sum::<usize>(), 0);
+    for st in &s.servers {
+        let shown = st
+            .entries
+            .iter()
+            .filter(|e| s.board.cards.contains_key(&e.key()))
+            .count();
+        assert_eq!(shown + hidden_over[&st.id], st.entries.len());
+    }
+
+    s.handle_action(ScreenAction::Select, now + Duration::from_secs(1));
+    render(&mut s, &world, now + Duration::from_secs(1));
+    let hidden_det = s.hidden_by_server();
+    assert_eq!(s.servers[0].entries.len(), 44);
+    assert_eq!(s.servers[1].entries.len(), 22);
+    assert_eq!(s.servers[0].overview_hidden.len(), 40);
+    assert_eq!(s.servers[1].overview_hidden.len(), 20);
+    for st in &s.servers {
+        let shown = st
+            .entries
+            .iter()
+            .filter(|e| s.board.cards.contains_key(&e.key()))
+            .count();
+        assert_eq!(shown + hidden_det[&st.id], st.entries.len());
+    }
+    assert!(hidden_det.values().sum::<usize>() > hidden_over.values().sum::<usize>());
 }
