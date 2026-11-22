@@ -1146,6 +1146,15 @@ impl AgentScreen {
         let Some(at) = self.page_changed_at else {
             return false;
         };
+        // 切り替えの移動は 500ms で終わるので、最後の切り替えから 1 秒たてば待たせない。待っている通知が無いまま
+        // 切り替えを終えたとき、ずっと後の通常の並び替えを切り替えの移動と取り違えないようにする。
+        if now.saturating_duration_since(at) >= MOVE_TWEEN * 2 {
+            // 切り替えのあいだ待たされていた通知(期限がある)は、期限で始める場合と同じく行き先から出す。
+            self.settle_waited |= self.settle_deadline.is_some() && !self.queue.is_empty();
+            self.page_changed_at = None;
+            self.settle_deadline = None;
+            return false;
+        }
         // 待っている通知が無ければ期限を捨てる(次の通知が待ち始めた時刻から数え直す)。切り替えた時刻は残す。
         if self.queue.is_empty() {
             self.settle_deadline = None;
@@ -3735,6 +3744,53 @@ mod tests {
             screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
             Some("b")
         );
+        assert_ne!(screen.board.cards[&k("b")].rect, was, "b は上へ移る");
+        let cards = render_for_test(&mut screen, &moved, t);
+        let pose = cards
+            .iter()
+            .find(|c| c.id == screen.id_map[&k("b")])
+            .unwrap()
+            .pose;
+        let center = (pose.x + pose.width / 2.0, pose.y + pose.height / 2.0);
+        let from = (was.x + was.w / 2.0, was.y + was.h / 2.0);
+        assert!(
+            (center.0 - from.0).abs() < 1e-2 && (center.1 - from.1).abs() < 1e-2,
+            "pose={pose:?} was={was:?}"
+        );
+    }
+
+    /// 待っている通知が無いまま切り替えを終えたあと、ずっと後の通常の取得で並び替えと通知が同時に起きても、
+    /// 切り替えの待ちを持ち出さない(すぐ始め、カードがあった位置から浮き上がる)。
+    #[test]
+    fn an_old_toggle_with_an_empty_queue_does_not_hold_a_later_notice() {
+        let now = Instant::now();
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(vec![
+            entry("a", AgentState::Running),
+            entry("b", AgentState::Idle),
+        ]);
+        screen.sync(&snap, now);
+        render_for_test(&mut screen, &snap, now);
+        screen.handle_action(ScreenAction::Select, now);
+        screen.advance(now + Duration::from_millis(100));
+        render_for_test(&mut screen, &snap, now + Duration::from_millis(100));
+        let t = now + Duration::from_secs(300);
+        screen.advance(t - Duration::from_secs(1));
+        render_for_test(&mut screen, &snap, t - Duration::from_secs(1));
+        let was = screen.board.cards[&k("b")].rect;
+        let moved = snapshot_of(vec![
+            entry("a", AgentState::Running),
+            entry("b", AgentState::Approval),
+        ]);
+        screen.sync(&moved, t);
+        screen.enqueue(change_event("b", EventKind::Changed));
+        screen.advance(t);
+        let focus = screen
+            .focus
+            .as_ref()
+            .expect("切り替えから時間がたっているので、すぐ始める");
+        assert_eq!(focus.event.key.thread.as_str(), "b");
+        assert!(!focus.from_destination);
         assert_ne!(screen.board.cards[&k("b")].rect, was, "b は上へ移る");
         let cards = render_for_test(&mut screen, &moved, t);
         let pose = cards
