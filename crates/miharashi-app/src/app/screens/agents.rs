@@ -757,6 +757,7 @@ impl AgentScreen {
         // 空の待ち行列に入る通知は、前の待機の期限を引き継がない。
         if self.queue.is_empty() {
             self.settle_deadline = None;
+            self.settle_waited = false;
         }
         if self.queue.iter().any(|q| q.key == event.key) {
             if let Some(q) = self.queue.iter_mut().find(|q| q.key == event.key) {
