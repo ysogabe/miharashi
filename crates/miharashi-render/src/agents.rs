@@ -405,7 +405,7 @@ pub fn card_top_row(
         let mut x = left;
         let mut project = None;
         if !content.project.is_empty() {
-            let room = inner - age_w - label_w - 40.0 * s;
+            let room = inner - age_w - label_w - 40.0 * s - strip_reserve(text, content, size, s);
             // 幅が足りないカード(列が多い盤面)では、状態と経過時間を優先して名前を省く(重ねて描かない)。
             if room >= 56.0 * s {
                 let shown = fit_text(text, &content.project, size, room);
@@ -454,7 +454,7 @@ pub fn card_top_row(
     let need = tag_w + gap + label_w + if with_age { before_age + age_w } else { 0.0 };
     let mut project = None;
     if !content.project.is_empty() {
-        let room = inner - need - 20.0 * s;
+        let room = inner - need - 20.0 * s - strip_reserve(text, content, size, s);
         if room >= 56.0 * s {
             let shown = fit_text(text, &content.project, size, room);
             let w = text.measure(&shown, size);
@@ -472,6 +472,20 @@ pub fn card_top_row(
             w: age_w,
         }),
     }
+}
+
+/// 重なった帯で、接続名・プロジェクトより先に取っておく幅(状態の後ろの間隔、印、題名を読める最小の幅)。
+/// 通常のカードは題名を 2 行目以降に描くので 0。
+fn strip_reserve(text: &mut TextEngine, content: &AgentCardContent, size: f32, s: f32) -> f32 {
+    if !content.compact {
+        return 0.0;
+    }
+    let badge = content
+        .badge
+        .as_deref()
+        .filter(|b| !b.is_empty())
+        .map_or(0.0, |b| text.measure(b, size) + 14.0 * s);
+    18.0 * s + badge + BADGE_TITLE_MIN * s
 }
 
 /// 1 行のカードの並び(状態の点 / 接続の目印 / 題名 / 経過時間)。
@@ -1006,6 +1020,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 複数の接続を監視しているときの帯は、接続名が長くても題名(読める最小の幅)と印の幅を先に取り、
+    /// 残りに接続名を省略して入れる。
+    #[test]
+    fn a_long_server_name_on_a_strip_leaves_room_for_the_title_and_the_badge() {
+        let mut text = TextEngine::new("Noto Sans CJK JP");
+        let size = (300u32, 58u32);
+        let s = (size.0 as f32 / BASE_CARD_WIDTH).clamp(0.6, MAX_TEXT_SCALE);
+        let (left, right) = (26.0 * s, size.0 as f32 - 22.0 * s);
+        let mut c = sample(
+            Some("④"),
+            "とても長い接続名のコンテナ環境",
+            AgentState::Completed,
+            "3分",
+        );
+        c.compact = true;
+        c.badge = Some("対応済み".into());
+        let row = card_top_row(&mut text, &c, left, right, s);
+        assert!(row.tag.is_some());
+        let badge_w = text.measure("対応済み", row.size);
+        let start = row.state.end() + 18.0 * s;
+        let room = right - row.age.map_or(0.0, |a| a.w) - 14.0 * s - start;
+        assert!(
+            room >= badge_w + 14.0 * s + BADGE_TITLE_MIN * s,
+            "room={room} badge_w={badge_w}"
+        );
+        let with = render_card(&c, size, &mut text);
+        c.badge = None;
+        let without = render_card(&c, size, &mut text);
+        assert!(with.data() != without.data(), "the badge is drawn");
     }
 
     fn ink(p: &Pixmap, x0: u32, x1: u32, y0: u32, y1: u32) -> usize {
