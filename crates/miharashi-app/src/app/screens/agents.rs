@@ -1185,13 +1185,11 @@ impl AgentScreen {
             return false;
         }
         let mut redraw = false;
-        if self.focus.is_none() {
-            if !self.page_settling(now) {
-                redraw |= self.activate_event(now);
-                let waited = std::mem::take(&mut self.settle_waited);
-                if let Some(f) = self.focus.as_mut() {
-                    f.from_destination = waited;
-                }
+        if self.focus.is_none() && !self.page_settling(now) {
+            redraw |= self.activate_event(now);
+            let waited = std::mem::take(&mut self.settle_waited);
+            if let Some(f) = self.focus.as_mut() {
+                f.from_destination = waited;
             }
         }
         if let Some(f) = self.focus.as_mut() {
