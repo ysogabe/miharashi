@@ -195,6 +195,8 @@ pub struct AgentScreen {
     stale_secs: u64,
     gpu: bool,
     page: AgentPage,
+    /// ページを切り替えた時刻。カードが新しい位置へ移り終えるまで、次の通知を始めない。
+    page_changed_at: Option<Instant>,
     /// 接続の順(設定の順)。接続の追加・消滅は `sync_all` が扱う。
     servers: Vec<ServerUiState>,
     // 以下のキャッシュは、すべて接続とスレッド(プロジェクト)の組で引く。
@@ -257,6 +259,7 @@ impl AgentScreen {
             stale_secs,
             gpu,
             page: AgentPage::Overview,
+            page_changed_at: None,
             servers: Vec::new(),
             surfaces: HashMap::new(),
             revisions: HashMap::new(),
@@ -1105,13 +1108,31 @@ impl AgentScreen {
         true
     }
 
+    /// ページを切り替えたあと、カードがまだ新しい位置へ移っている途中か。ポップアップは移っている途中の位置を
+    /// 元位置にするので、移り終えてから始める(移り続けても切り替えから 2 回分の移動の時間で打ち切る)。
+    fn page_settling(&mut self, now: Instant) -> bool {
+        let Some(at) = self.page_changed_at else {
+            return false;
+        };
+        let since = now.saturating_duration_since(at);
+        let sliding = self
+            .poses
+            .values()
+            .any(|t| t.moving() && now.saturating_duration_since(t.started) < MOVE_TWEEN);
+        if since < MOVE_TWEEN || (sliding && since < MOVE_TWEEN * 2) {
+            return true;
+        }
+        self.page_changed_at = None;
+        false
+    }
+
     /// 通知を進める。stale の接続の通知は `sync_server` が捨てるので、ここでは健全な接続の通知だけが残る。
     fn advance(&mut self, now: Instant) -> bool {
         if !self.presentable {
             return false;
         }
         let mut redraw = false;
-        if self.focus.is_none() {
+        if self.focus.is_none() && !self.page_settling(now) {
             redraw |= self.activate_event(now);
         }
         if let Some(f) = self.focus.as_mut() {
@@ -1697,6 +1718,7 @@ impl Screen for AgentScreen {
         match action {
             ScreenAction::Select => {
                 self.page = self.page.toggled();
+                self.page_changed_at = Some(now);
                 self.rebuild_visible_entries(now);
                 Outcome::Consumed
             }
@@ -3460,6 +3482,38 @@ mod tests {
         assert!(!screen.pending_new.contains(&k("new-a")));
         let cards = render_for_test(&mut screen, &snap, now);
         assert!(cards.iter().any(|c| c.id == screen.id_map[&k("new-a")]));
+    }
+
+    /// ページを切り替えた直後は、カードが新しい位置へ移り終えるまで次の通知を始めない
+    /// (移っている途中の位置から出て、新しい位置へ戻るのを防ぐ)。
+    #[test]
+    fn a_waiting_notice_starts_only_after_the_page_toggle_slide() {
+        let now = Instant::now();
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(vec![
+            entry("a", AgentState::Idle),
+            entry("b", AgentState::Idle),
+            AgentEntry {
+                settled: true,
+                ..entry("done", AgentState::Completed)
+            },
+        ]);
+        screen.sync(&snap, now);
+        render_for_test(&mut screen, &snap, now);
+        screen.enqueue(change_event("a", EventKind::Changed));
+        let t = now + Duration::from_secs(1);
+        screen.handle_action(ScreenAction::Select, t);
+        render_for_test(&mut screen, &snap, t);
+        assert!(!screen.advance(t + Duration::from_millis(16)) || screen.focus.is_none());
+        assert!(screen.focus.is_none(), "移っている途中には始めない");
+        let later = t + MOVE_TWEEN + Duration::from_millis(50);
+        render_for_test(&mut screen, &snap, later);
+        let later = later + Duration::from_millis(16);
+        screen.advance(later);
+        assert_eq!(
+            screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
+            Some("a")
+        );
     }
 
     #[test]
