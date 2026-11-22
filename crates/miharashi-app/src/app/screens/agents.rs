@@ -1037,6 +1037,10 @@ impl AgentScreen {
                 "更新内容をまとめました".into()
             };
             aggregate.priority = 1;
+            // まとめて捨てる通知の新着の予約を外す(残すと、そのカードは描かれないまま出てこない)。
+            for &i in stale.iter().filter(|&&i| i != last) {
+                self.pending_new.remove(&self.queue[i].key);
+            }
             aggregates.push(aggregate);
             removed.extend(stale.iter().copied());
             self.overflow_updates = self
@@ -3422,6 +3426,40 @@ mod tests {
         );
         assert!(new.surface.data() != old.surface.data());
         assert_ne!(new.revision, old.revision);
+    }
+
+    /// 古くなった新着をまとめるとき、まとめて捨てた通知の新着の予約も外す(外さないとそのカードが出てこない)。
+    #[test]
+    fn aggregating_stale_new_threads_releases_the_dropped_reservations() {
+        let now = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let mut screen = AgentScreen::new((1920, 1080), false, 30).with_fixed_wall(wall);
+        let snap = snapshot_of(vec![
+            entry("existing", AgentState::Running),
+            entry("new-a", AgentState::Running),
+            entry("new-b", AgentState::Running),
+        ]);
+        screen.sync(&snap, now);
+        for id in ["new-a", "new-b"] {
+            screen.enqueue(QueuedEvent {
+                change: ck(),
+                key: k(id),
+                kind: EventKind::New,
+                before: "新しく検出".into(),
+                after: "実行中".into(),
+                observed_at: wall - Duration::from_secs(60),
+                priority: 2,
+            });
+        }
+        assert!(screen.activate_event(now));
+        assert_eq!(
+            screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
+            Some("new-b")
+        );
+        assert!(screen.queue.is_empty());
+        assert!(!screen.pending_new.contains(&k("new-a")));
+        let cards = render_for_test(&mut screen, &snap, now);
+        assert!(cards.iter().any(|c| c.id == screen.id_map[&k("new-a")]));
     }
 
     #[test]
