@@ -200,7 +200,8 @@ pub struct AgentScreen {
     page: AgentPage,
     /// ページを切り替えた時刻。カードが新しい位置へ移り終えるまで、次の通知を始めない。
     page_changed_at: Option<Instant>,
-    /// 待っている通知が待つのをやめる期限(最初に待たされ始めた時刻 + 1 秒)。切り替えを続けても延ばさない。
+    /// 待っている通知が待つのをやめる期限(最初に待たされ始めた時刻 + 1 秒)。切り替えを続けても延ばさず、
+    /// 待ち行列が空になったら捨てる。
     settle_deadline: Option<Instant>,
     /// 待っている通知が、ページの切り替えのために待たされたか(次に始めるポップアップを行き先から出す)。
     settle_waited: bool,
@@ -753,6 +754,10 @@ impl AgentScreen {
     /// 通知を待ち行列に入れる。新着の予約(`pending_new`)は、New を実際に待ち行列へ足したときと、
     /// 待ち行列の通知を New に変えたときだけ作る(表示中の通知に吸収した New には作らない)。
     fn enqueue(&mut self, event: QueuedEvent) {
+        // 空の待ち行列に入る通知は、前の待機の期限を引き継がない。
+        if self.queue.is_empty() {
+            self.settle_deadline = None;
+        }
         if self.queue.iter().any(|q| q.key == event.key) {
             if let Some(q) = self.queue.iter_mut().find(|q| q.key == event.key) {
                 q.after = event.after;
@@ -1138,9 +1143,15 @@ impl AgentScreen {
     /// ページを切り替えたあと、カードがまだ新しい位置へ移っている途中か。ポップアップは移っている途中の位置を
     /// 元位置にするので、移り終えてから始める(切り替えを続けても、最初に待たされ始めてから 1 秒で打ち切る)。
     fn page_settling(&mut self, now: Instant) -> bool {
-        let (Some(at), Some(deadline)) = (self.page_changed_at, self.settle_deadline) else {
+        let Some(at) = self.page_changed_at else {
             return false;
         };
+        // 待っている通知が無ければ期限を捨てる(次の通知が待ち始めた時刻から数え直す)。切り替えた時刻は残す。
+        if self.queue.is_empty() {
+            self.settle_deadline = None;
+            return false;
+        }
+        let deadline = *self.settle_deadline.get_or_insert(now + MOVE_TWEEN * 2);
         // 切り替えのあとに待っている通知は、期限で始める場合も含めて行き先から出す。
         self.settle_waited |= !self.queue.is_empty();
         if now >= deadline {
@@ -1787,7 +1798,10 @@ impl Screen for AgentScreen {
             ScreenAction::Select => {
                 self.page = self.page.toggled();
                 self.page_changed_at = Some(now);
-                self.settle_deadline.get_or_insert(now + MOVE_TWEEN * 2);
+                // 待っている通知があれば、この時刻から待ち始める(既に待っていれば期限は延ばさない)。
+                if !self.queue.is_empty() {
+                    self.settle_deadline.get_or_insert(now + MOVE_TWEEN * 2);
+                }
                 self.rebuild_visible_entries(now);
                 Outcome::Consumed
             }
@@ -3735,6 +3749,47 @@ mod tests {
         assert!(
             (center.0 - from.0).abs() < 1e-2 && (center.1 - from.1).abs() < 1e-2,
             "pose={pose:?} was={was:?}"
+        );
+    }
+
+    /// 待ち行列が空になったら前の待機の期限を捨て、次の通知が実際に待ち始めた時刻から 1 秒を数え直す。
+    #[test]
+    fn the_settle_deadline_restarts_when_the_queue_empties() {
+        let now = Instant::now();
+        let at = |ms| now + Duration::from_millis(ms);
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let done = AgentEntry {
+            settled: true,
+            ..entry("done", AgentState::Completed)
+        };
+        let snap = snapshot_of(vec![
+            entry("a", AgentState::Idle),
+            entry("b", AgentState::Idle),
+            done.clone(),
+        ]);
+        screen.sync(&snap, now);
+        screen.enqueue(change_event("a", EventKind::Changed));
+        screen.handle_action(ScreenAction::Select, at(0));
+        screen.advance(at(16));
+        assert!(screen.focus.is_none());
+        // a が一覧から消え、待ち行列が空になる。
+        let without_a = snapshot_of(vec![entry("b", AgentState::Idle), done]);
+        screen.sync(&without_a, at(100));
+        assert!(screen.queue.is_empty());
+        screen.advance(at(116));
+        screen.handle_action(ScreenAction::Select, at(400));
+        screen.enqueue(change_event("b", EventKind::Changed));
+        screen.advance(at(466));
+        screen.handle_action(ScreenAction::Select, at(800));
+        screen.advance(at(1016));
+        assert!(
+            screen.focus.is_none(),
+            "b は 466ms から待ち始めたので、まだ期限ではない"
+        );
+        screen.advance(at(1316));
+        assert_eq!(
+            screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
+            Some("b")
         );
     }
 
