@@ -4679,6 +4679,18 @@ mod tests {
             let started = std::time::Instant::now();
             let hidden = crate::agents::overview_hidden_ids(&entries);
             let judge = started.elapsed();
+            let nodes: Vec<Node<ThreadKey>> = entries
+                .iter()
+                .map(|e| Node {
+                    id: e.key(),
+                    parent: e.parent_key(),
+                    tier: tier_of(e),
+                })
+                .collect();
+            let started = std::time::Instant::now();
+            let families = family::build_families(&nodes);
+            let build = started.elapsed();
+            assert_eq!(families.len(), 1);
             assert!(hidden.is_empty());
             let mut s = AgentScreen::new((1920, 1080), false, 30);
             let snap = snapshot_of(entries.clone());
@@ -4689,7 +4701,7 @@ mod tests {
             s.handle_action(ScreenAction::Select, now + Duration::from_secs(1));
             let toggle = started.elapsed();
             eprintln!(
-                "bench screen deep chain={n}: overview_hidden_ids={judge:?} sync={sync:?} toggle={toggle:?}"
+                "bench screen deep chain={n}: overview_hidden_ids={judge:?} build_families={build:?} sync={sync:?} toggle={toggle:?}"
             );
         }
     }
