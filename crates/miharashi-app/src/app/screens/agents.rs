@@ -197,6 +197,8 @@ pub struct AgentScreen {
     page: AgentPage,
     /// ページを切り替えた時刻。カードが新しい位置へ移り終えるまで、次の通知を始めない。
     page_changed_at: Option<Instant>,
+    /// 待っている通知が待つのをやめる期限(最初に待たされ始めた時刻 + 1 秒)。切り替えを続けても延ばさない。
+    settle_deadline: Option<Instant>,
     /// 接続の順(設定の順)。接続の追加・消滅は `sync_all` が扱う。
     servers: Vec<ServerUiState>,
     // 以下のキャッシュは、すべて接続とスレッド(プロジェクト)の組で引く。
@@ -260,6 +262,7 @@ impl AgentScreen {
             gpu,
             page: AgentPage::Overview,
             page_changed_at: None,
+            settle_deadline: None,
             servers: Vec::new(),
             surfaces: HashMap::new(),
             revisions: HashMap::new(),
@@ -1126,20 +1129,26 @@ impl AgentScreen {
     }
 
     /// ページを切り替えたあと、カードがまだ新しい位置へ移っている途中か。ポップアップは移っている途中の位置を
-    /// 元位置にするので、移り終えてから始める(移り続けても切り替えから 2 回分の移動の時間で打ち切る)。
+    /// 元位置にするので、移り終えてから始める(切り替えを続けても、最初に待たされ始めてから 1 秒で打ち切る)。
     fn page_settling(&mut self, now: Instant) -> bool {
-        let Some(at) = self.page_changed_at else {
+        let (Some(at), Some(deadline)) = (self.page_changed_at, self.settle_deadline) else {
             return false;
         };
+        if now >= deadline {
+            self.page_changed_at = None;
+            self.settle_deadline = None;
+            return false;
+        }
         let since = now.saturating_duration_since(at);
         let sliding = self
             .poses
             .values()
             .any(|t| t.moving() && now.saturating_duration_since(t.started) < MOVE_TWEEN);
-        if since < MOVE_TWEEN || (sliding && since < MOVE_TWEEN * 2) {
+        if since < MOVE_TWEEN || sliding {
             return true;
         }
         self.page_changed_at = None;
+        self.settle_deadline = None;
         false
     }
 
@@ -1738,6 +1747,7 @@ impl Screen for AgentScreen {
             ScreenAction::Select => {
                 self.page = self.page.toggled();
                 self.page_changed_at = Some(now);
+                self.settle_deadline.get_or_insert(now + MOVE_TWEEN * 2);
                 self.rebuild_visible_entries(now);
                 Outcome::Consumed
             }
@@ -3556,6 +3566,33 @@ mod tests {
         assert!(screen.focus.is_none());
         let cards = render_for_test(&mut screen, &snap, done);
         assert!(cards.iter().any(|c| c.id == screen.id_map[&k("t")]));
+    }
+
+    /// ○ を移動の時間より短い間隔で押し続けても、待っている通知は最初に待たされ始めてから 1 秒で始まる。
+    #[test]
+    fn repeated_page_toggles_do_not_postpone_a_waiting_notice_past_the_deadline() {
+        let now = Instant::now();
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(vec![
+            entry("a", AgentState::Idle),
+            AgentEntry {
+                settled: true,
+                ..entry("done", AgentState::Completed)
+            },
+        ]);
+        screen.sync(&snap, now);
+        screen.enqueue(change_event("a", EventKind::Changed));
+        for i in 0..3u64 {
+            let t = now + Duration::from_millis(400 * i);
+            screen.handle_action(ScreenAction::Select, t);
+            screen.advance(t + Duration::from_millis(16));
+            assert!(screen.focus.is_none(), "{i}");
+        }
+        screen.advance(now + Duration::from_millis(1016));
+        assert_eq!(
+            screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
+            Some("a")
+        );
     }
 
     #[test]
