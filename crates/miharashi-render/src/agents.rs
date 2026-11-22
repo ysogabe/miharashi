@@ -42,6 +42,19 @@ impl AgentState {
         }
     }
 
+    /// 細い帯で題名の幅が足りないときの短い名前。
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Running => "実行",
+            Self::Approval => "承認",
+            Self::Input => "入力",
+            Self::Error => "異常",
+            Self::Completed => "完了",
+            Self::Idle => "待機",
+            Self::Unknown => "不明",
+        }
+    }
+
     pub fn color(self) -> [u8; 3] {
         match self {
             Self::Running => [64, 200, 255],
@@ -188,8 +201,8 @@ pub fn render_card(content: &AgentCardContent, size: (u32, u32), text: &mut Text
     let right = wf - 22.0 * s;
     let inner = (right - left).max(20.0);
     let top = 12.0 * s;
-    let label = content.state.label();
     let top_row = card_top_row(text, content, left, right, s);
+    let label = top_row.label;
     let row = top_row.size;
     if let Some(span) = top_row.age
         && let Some(age) = content.age.as_deref()
@@ -382,6 +395,8 @@ pub struct TopRow {
     /// 接続名・プロジェクトの文字(幅に収まるよう省略したもの)。足りなければ None(目印だけを残す)。
     pub project: Option<(Span, String)>,
     pub state: Span,
+    /// 描く状態の名前。細い帯で題名の幅が足りないときだけ短い名前(`AgentState::short_label`)になる。
+    pub label: &'static str,
     /// 幅が足りなくなったときは、経過時間より先に目印と状態を残す。
     pub age: Option<Span>,
 }
@@ -419,6 +434,7 @@ pub fn card_top_row(
             tag: None,
             project,
             state: Span { x, w: label_w },
+            label,
             age: age.map(|_| Span {
                 x: right - age_w,
                 w: age_w,
@@ -426,10 +442,13 @@ pub fn card_top_row(
         };
     };
     // 目印・状態・経過時間が収まらないときは、まず文字を小さくし(下限 0.6 倍)、それでも足りなければ経過時間を省く。
+    // 重なった帯は題名も同じ行に描くので、題名を読める最小の幅も含めて確かめ、経過時間を省いても足りなければ
+    // 状態の名前を短くする。
     let floor = size * 0.6;
     let gap = 10.0 * s;
     let before_age = 14.0 * s;
     let mut with_age = age.is_some();
+    let mut label = label;
     let (tag_w, label_w, age_w) = loop {
         let tag_w = text.measure(tag, size);
         let label_w = text.measure(label, size);
@@ -437,7 +456,13 @@ pub fn card_top_row(
             (true, Some(a)) => text.measure(a, size),
             _ => 0.0,
         };
-        let need = tag_w + gap + label_w + if with_age { before_age + age_w } else { 0.0 };
+        let title_need = if content.compact {
+            18.0 * s + BADGE_TITLE_MIN * s + if with_age { 0.0 } else { 14.0 * s }
+        } else {
+            0.0
+        };
+        let need =
+            tag_w + gap + label_w + if with_age { before_age + age_w } else { 0.0 } + title_need;
         if need <= inner {
             break (tag_w, label_w, age_w);
         }
@@ -445,6 +470,8 @@ pub fn card_top_row(
             size = (size * 0.92).max(floor);
         } else if with_age {
             with_age = false;
+        } else if content.compact && label != content.state.short_label() {
+            label = content.state.short_label();
         } else {
             break (tag_w, label_w, age_w);
         }
@@ -467,6 +494,7 @@ pub fn card_top_row(
         tag: Some(tag_span),
         project,
         state: Span { x, w: label_w },
+        label,
         age: with_age.then_some(Span {
             x: right - age_w,
             w: age_w,
@@ -1051,6 +1079,25 @@ mod tests {
         c.badge = None;
         let without = render_card(&c, size, &mut text);
         assert!(with.data() != without.data(), "the badge is drawn");
+    }
+
+    /// 混雑した盤面の細い帯(幅 137px)でも、題名を読める最小の幅を残す。接続名と印を省いても足りなければ、
+    /// 経過時間を省き、状態の名前を短くする。
+    #[test]
+    fn a_narrow_strip_keeps_the_minimum_title_room() {
+        let mut text = TextEngine::new("Noto Sans CJK JP");
+        for w in [137u32, 150, 180, 220, 300] {
+            let size = (w, 40u32);
+            let s = (size.0 as f32 / BASE_CARD_WIDTH).clamp(0.6, MAX_TEXT_SCALE);
+            let (left, right) = (26.0 * s, size.0 as f32 - 22.0 * s);
+            let mut c = sample(Some("④"), "コンテナ", AgentState::Completed, "3分");
+            c.compact = true;
+            let row = card_top_row(&mut text, &c, left, right, s);
+            assert!(row.tag.is_some(), "w={w}");
+            let start = row.state.end() + 18.0 * s;
+            let room = right - row.age.map_or(0.0, |a| a.w) - 14.0 * s - start;
+            assert!(room >= BADGE_TITLE_MIN * s - 1e-3, "w={w}: room={room}");
+        }
     }
 
     fn ink(p: &Pixmap, x0: u32, x1: u32, y0: u32, y1: u32) -> usize {
