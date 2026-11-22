@@ -48,6 +48,9 @@ struct Focus {
     started: Instant,
     hold: Duration,
     stage: FocusStage,
+    /// ページの切り替えで待たされた通知か。そのときだけ、ポップアップは移動の行き先から出て行き先へ戻る
+    /// (通常の通知は、直前までカードがあった位置から浮き上がる)。
+    from_destination: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,6 +202,8 @@ pub struct AgentScreen {
     page_changed_at: Option<Instant>,
     /// 待っている通知が待つのをやめる期限(最初に待たされ始めた時刻 + 1 秒)。切り替えを続けても延ばさない。
     settle_deadline: Option<Instant>,
+    /// 待っている通知が、ページの切り替えのために待たされたか(次に始めるポップアップを行き先から出す)。
+    settle_waited: bool,
     /// 接続の順(設定の順)。接続の追加・消滅は `sync_all` が扱う。
     servers: Vec<ServerUiState>,
     // 以下のキャッシュは、すべて接続とスレッド(プロジェクト)の組で引く。
@@ -263,6 +268,7 @@ impl AgentScreen {
             page: AgentPage::Overview,
             page_changed_at: None,
             settle_deadline: None,
+            settle_waited: false,
             servers: Vec::new(),
             surfaces: HashMap::new(),
             revisions: HashMap::new(),
@@ -1124,6 +1130,7 @@ impl AgentScreen {
             started: now,
             hold: Duration::from_secs(if urgent { 5 } else { 3 }),
             stage: FocusStage::In,
+            from_destination: false,
         });
         true
     }
@@ -1134,6 +1141,8 @@ impl AgentScreen {
         let (Some(at), Some(deadline)) = (self.page_changed_at, self.settle_deadline) else {
             return false;
         };
+        // 切り替えのあとに待っている通知は、期限で始める場合も含めて行き先から出す。
+        self.settle_waited |= !self.queue.is_empty();
         if now >= deadline {
             self.page_changed_at = None;
             self.settle_deadline = None;
@@ -1165,8 +1174,14 @@ impl AgentScreen {
             return false;
         }
         let mut redraw = false;
-        if self.focus.is_none() && !self.page_settling(now) {
-            redraw |= self.activate_event(now);
+        if self.focus.is_none() {
+            if !self.page_settling(now) {
+                redraw |= self.activate_event(now);
+                let waited = std::mem::take(&mut self.settle_waited);
+                if let Some(f) = self.focus.as_mut() {
+                    f.from_destination = waited;
+                }
+            }
         }
         if let Some(f) = self.focus.as_mut() {
             let elapsed = now.saturating_duration_since(f.started);
@@ -1284,9 +1299,13 @@ impl AgentScreen {
                 height: slot.rect.h,
                 alpha,
             };
-            // ポップアップのカードは、出発と戻りに同じ座標(移動の行き先)を使う。移っている途中の位置を
-            // 元位置にすると、古い位置から出て新しい位置へ戻ってしまう。
-            let home = if is_focus {
+            // ページの切り替えで待たされたポップアップ(期限で始めた場合を含む)は、出発と戻りに同じ座標
+            // (移動の行き先)を使う。移っている途中の位置を元位置にすると、古い位置から出て新しい位置へ戻ってしまう。
+            // 通常の通知は、直前までカードがあった位置から浮き上がり、移動の補間に沿って戻る。
+            let home = if focus
+                .as_ref()
+                .is_some_and(|f| f.event.key == key && f.from_destination)
+            {
                 self.poses.insert(
                     key.clone(),
                     PoseTween {
@@ -3676,6 +3695,46 @@ mod tests {
         assert!(
             (center.0 - dest.0).abs() < 1e-2 && (center.1 - dest.1).abs() < 1e-2,
             "pose={pose:?} slot={slot:?}"
+        );
+    }
+
+    /// ○ を押さない通常の取得で、状態・順位・通知が同時に変わったとき、ポップアップは直前までカードが
+    /// あった位置から浮き上がる(移動の行き先へ飛んでから始まらない)。
+    #[test]
+    fn a_notice_with_a_simultaneous_reorder_rises_from_where_the_card_was() {
+        let now = Instant::now();
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(vec![
+            entry("a", AgentState::Running),
+            entry("b", AgentState::Idle),
+        ]);
+        screen.sync(&snap, now);
+        render_for_test(&mut screen, &snap, now);
+        let was = screen.board.cards[&k("b")].rect;
+        let t = now + Duration::from_secs(5);
+        let moved = snapshot_of(vec![
+            entry("a", AgentState::Running),
+            entry("b", AgentState::Approval),
+        ]);
+        screen.sync(&moved, t);
+        screen.enqueue(change_event("b", EventKind::Changed));
+        screen.advance(t);
+        assert_eq!(
+            screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
+            Some("b")
+        );
+        assert_ne!(screen.board.cards[&k("b")].rect, was, "b は上へ移る");
+        let cards = render_for_test(&mut screen, &moved, t);
+        let pose = cards
+            .iter()
+            .find(|c| c.id == screen.id_map[&k("b")])
+            .unwrap()
+            .pose;
+        let center = (pose.x + pose.width / 2.0, pose.y + pose.height / 2.0);
+        let from = (was.x + was.w / 2.0, was.y + was.h / 2.0);
+        assert!(
+            (center.0 - from.0).abs() < 1e-2 && (center.1 - from.1).abs() < 1e-2,
+            "pose={pose:?} was={was:?}"
         );
     }
 
