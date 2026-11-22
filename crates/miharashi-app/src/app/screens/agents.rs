@@ -1140,10 +1140,17 @@ impl AgentScreen {
             return false;
         }
         let since = now.saturating_duration_since(at);
-        let sliding = self
-            .poses
-            .values()
-            .any(|t| t.moving() && now.saturating_duration_since(t.started) < MOVE_TWEEN);
+        // 取得結果で配置が変わっていれば先に作り直し、まだ補間を作っていない行き先の変化も「移動中」に数える。
+        self.ensure_board();
+        let board = &self.board;
+        let sliding = self.poses.iter().any(|(key, t)| {
+            let in_motion = t.moving() && now.saturating_duration_since(t.started) < MOVE_TWEEN;
+            let retargeted = board.cards.get(key).is_some_and(|slot| {
+                let r = slot.rect;
+                (t.to.x, t.to.y, t.to.width, t.to.height) != (r.x, r.y, r.w, r.h)
+            });
+            in_motion || retargeted
+        });
         if since < MOVE_TWEEN || sliding {
             return true;
         }
@@ -1277,7 +1284,21 @@ impl AgentScreen {
                 height: slot.rect.h,
                 alpha,
             };
-            let home = self.tween_pose(&key, target, now);
+            // ポップアップのカードは、出発と戻りに同じ座標(移動の行き先)を使う。移っている途中の位置を
+            // 元位置にすると、古い位置から出て新しい位置へ戻ってしまう。
+            let home = if is_focus {
+                self.poses.insert(
+                    key.clone(),
+                    PoseTween {
+                        from: target,
+                        to: target,
+                        started: now,
+                    },
+                );
+                target
+            } else {
+                self.tween_pose(&key, target, now)
+            };
             homes.insert(
                 key.clone(),
                 layout::Rect {
@@ -3592,6 +3613,69 @@ mod tests {
         assert_eq!(
             screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
             Some("a")
+        );
+    }
+
+    /// 切り替えの移動が終わった直後の取得でカードの順位が変わったときは、配置を作り直した先へ移り終えるまで
+    /// 通知を待つ。期限で始めるときは、ポップアップの出発と戻りに同じ座標(移動の行き先)を使う。
+    #[test]
+    fn a_notice_waits_for_a_reorder_right_after_the_toggle_and_uses_the_destination_at_the_deadline()
+     {
+        let base = |b: AgentState| {
+            snapshot_of(vec![
+                entry("a", AgentState::Idle),
+                entry("b", b),
+                AgentEntry {
+                    settled: true,
+                    ..entry("done", AgentState::Completed)
+                },
+            ])
+        };
+        let start = |screen: &mut AgentScreen, now: Instant| {
+            let snap = base(AgentState::Idle);
+            screen.sync(&snap, now);
+            render_for_test(screen, &snap, now);
+            screen.enqueue(change_event("a", EventKind::Changed));
+            let t = now + Duration::from_secs(1);
+            screen.handle_action(ScreenAction::Select, t);
+            render_for_test(screen, &snap, t);
+            t
+        };
+
+        // 移動が終わった直後に順位が変わった: 新しい行き先へ移り終えるまで始めない。
+        let now = Instant::now();
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let t = start(&mut screen, now);
+        let before = screen.board.cards[&k("a")].rect;
+        let moved = base(AgentState::Approval);
+        screen.sync(&moved, t + MOVE_TWEEN + Duration::from_millis(5));
+        screen.advance(t + MOVE_TWEEN + Duration::from_millis(10));
+        assert!(screen.focus.is_none(), "配置が変わった直後には始めない");
+        assert_ne!(screen.board.cards[&k("a")].rect, before, "a の場所が変わる");
+
+        // 期限で始めるときは、移っている途中の位置ではなく行き先から出て行き先へ戻る。
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let t = start(&mut screen, now);
+        screen.sync(&moved, t + Duration::from_millis(900));
+        let at = t + Duration::from_millis(1010);
+        screen.advance(at);
+        assert_eq!(
+            screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
+            Some("a")
+        );
+        let cards = render_for_test(&mut screen, &moved, at);
+        let slot = screen.board.cards[&k("a")].rect;
+        let pose = cards
+            .iter()
+            .find(|c| c.id == screen.id_map[&k("a")])
+            .unwrap()
+            .pose;
+        // 出始めのカードは、行き先の中心に置かれる(縦横比はポップアップの面のまま)。
+        let center = (pose.x + pose.width / 2.0, pose.y + pose.height / 2.0);
+        let dest = (slot.x + slot.w / 2.0, slot.y + slot.h / 2.0);
+        assert!(
+            (center.0 - dest.0).abs() < 1e-2 && (center.1 - dest.1).abs() < 1e-2,
+            "pose={pose:?} slot={slot:?}"
         );
     }
 
