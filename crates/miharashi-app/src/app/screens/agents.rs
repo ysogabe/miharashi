@@ -402,6 +402,7 @@ impl AgentScreen {
                 .flat_map(|s| s.entries.iter().cloned())
                 .collect();
         }
+        debug_assert!(self.reservations_match_queue());
         redraw
     }
 
@@ -686,6 +687,7 @@ impl AgentScreen {
         self.background_dirty = true;
         self.text_dirty = true;
         self.ensure_board();
+        debug_assert!(self.reservations_match_queue());
     }
 
     /// その接続の通知(待ち行列・出し待ちの新着・表示中)を捨てる。他の接続の通知には触れない。
@@ -739,10 +741,9 @@ impl AgentScreen {
         self.sync_all(&ServerSnapshot::primary(snap.clone()), now)
     }
 
+    /// 通知を待ち行列に入れる。新着の予約(`pending_new`)は、New を実際に待ち行列へ足したときと、
+    /// 待ち行列の通知を New に変えたときだけ作る(表示中の通知に吸収した New には作らない)。
     fn enqueue(&mut self, event: QueuedEvent) {
-        if event.kind == EventKind::New {
-            self.pending_new.insert(event.key.clone());
-        }
         if self.queue.iter().any(|q| q.key == event.key) {
             if let Some(q) = self.queue.iter_mut().find(|q| q.key == event.key) {
                 q.after = event.after;
@@ -750,6 +751,7 @@ impl AgentScreen {
                 q.change = event.change;
                 if event.kind == EventKind::New {
                     q.kind = EventKind::New;
+                    self.pending_new.insert(event.key.clone());
                 }
             }
         } else if self
@@ -763,12 +765,27 @@ impl AgentScreen {
                 f.event.change = event.change;
             }
         } else if self.queue.len() < MAX_QUEUE {
+            if event.kind == EventKind::New {
+                self.pending_new.insert(event.key.clone());
+            }
             self.queue.push_back(event);
         } else {
-            self.pending_new.remove(&event.key);
             self.overflow_updates += 1;
             self.background_dirty = true;
         }
+        debug_assert!(self.reservations_match_queue());
+    }
+
+    /// 新着の予約が、待ち行列にある New の通知とちょうど 1 対 1 か(予約だけが残るとカードが描かれない)。
+    fn reservations_match_queue(&self) -> bool {
+        let queued: HashSet<&ThreadKey> = self
+            .queue
+            .iter()
+            .filter(|e| e.kind == EventKind::New)
+            .map(|e| &e.key)
+            .collect();
+        queued.len() == self.pending_new.len()
+            && self.pending_new.iter().all(|k| queued.contains(k))
     }
 
     fn finish_expired_focus(&mut self, now: Instant) -> bool {
@@ -1156,6 +1173,7 @@ impl AgentScreen {
                 redraw = true;
             }
         }
+        debug_assert!(self.reservations_match_queue());
         redraw
     }
 
@@ -1684,6 +1702,7 @@ impl Screen for AgentScreen {
             self.background_dirty = true;
         }
         self.presentable = can_present;
+        debug_assert!(self.reservations_match_queue());
     }
     fn tick(&mut self, world: &crate::screen::World, now: Instant) -> bool {
         self.last_now = now;
@@ -3516,6 +3535,29 @@ mod tests {
         );
     }
 
+    /// ポップアップ中のスレッドに New が届いても(アーカイブと復元を 1 回の取得の間に観測したなど)、
+    /// 表示中の通知に吸収するだけで、新着の予約を残さない(残すとポップアップの後もカードが描かれない)。
+    #[test]
+    fn a_new_notice_absorbed_by_the_current_popup_leaves_no_reservation() {
+        let now = Instant::now();
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(vec![
+            entry("other", AgentState::Running),
+            entry("t", AgentState::Approval),
+        ]);
+        screen.sync(&snap, now);
+        screen.enqueue(change_event("t", EventKind::Changed));
+        assert!(screen.activate_event(now));
+        screen.enqueue(change_event("t", EventKind::New));
+        assert!(screen.queue.is_empty());
+        assert!(!screen.pending_new.contains(&k("t")));
+        let done = now + Duration::from_secs(10);
+        screen.advance(done);
+        assert!(screen.focus.is_none());
+        let cards = render_for_test(&mut screen, &snap, done);
+        assert!(cards.iter().any(|c| c.id == screen.id_map[&k("t")]));
+    }
+
     #[test]
     fn reordered_cards_slide_to_their_new_place_and_cpu_does_not_claim_gpu_animation() {
         let now = Instant::now();
@@ -4047,7 +4089,7 @@ mod tests {
         );
 
         let removed = k(&entries[0].thread_id);
-        screen.pending_new.insert(removed.clone());
+        assert!(screen.pending_new.contains(&removed));
         let remaining = entries
             .iter()
             .filter(|e| k(&e.thread_id) != removed)
@@ -4355,9 +4397,7 @@ mod tests {
         // 置き場が無いスレッドのイベントはキューに残らない。
         s.focus = None;
         s.enqueue(change_event("nobody", EventKind::New));
-        s.queue.clear();
-        s.enqueue(change_event("nobody", EventKind::New));
-        s.pending_new.insert(k("nobody"));
+        assert!(s.pending_new.contains(&k("nobody")));
         assert!(!s.activate_event(now));
         assert!(s.queue.is_empty() && !s.pending_new.contains(&k("nobody")));
     }
