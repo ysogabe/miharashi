@@ -8,7 +8,7 @@ use crate::agents::{
     AgentChangeKind, AgentConnection, AgentEntry, AgentSnapshot, ChangeKey, ProjectKey, ServerId,
     ServerSnapshot, ThreadKey,
 };
-use crate::screen::{Composite, Outcome, RenderContext, Screen, ScreenAction, ScreenId};
+use crate::screen::{Composite, KeyLabels, Outcome, RenderContext, Screen, ScreenAction, ScreenId};
 use miharashi_render::agents as draw;
 use miharashi_render::{Canvas, Pixmap};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -48,6 +48,9 @@ struct Focus {
     started: Instant,
     hold: Duration,
     stage: FocusStage,
+    /// ページの切り替えで待たされた通知か。そのときだけ、ポップアップは移動の行き先から出て行き先へ戻る
+    /// (通常の通知は、直前までカードがあった位置から浮き上がる)。
+    from_destination: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +58,26 @@ enum FocusStage {
     In,
     Hold,
     Out,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum AgentPage {
+    #[default]
+    Overview,
+    Details,
+}
+
+impl AgentPage {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Overview => Self::Details,
+            Self::Details => Self::Overview,
+        }
+    }
+
+    fn show_settled(self) -> bool {
+        matches!(self, Self::Details)
+    }
 }
 
 /// 文字を描いた面。文字か大きさが変わったときだけ描き直す。
@@ -130,6 +153,8 @@ struct ServerUiState {
     observed_sync: bool,
     duplicate_environment: bool,
     last_snapshot: AgentSnapshot,
+    /// この接続の snapshot 上で OVERVIEW から隠しているスレッド ID。
+    overview_hidden: HashSet<String>,
     /// 今のスレッド(`server_id` はこの接続で付け直したもの)。
     entries: Vec<AgentEntry>,
 }
@@ -145,6 +170,7 @@ impl ServerUiState {
             observed_sync: false,
             duplicate_environment: false,
             last_snapshot: AgentSnapshot::default(),
+            overview_hidden: HashSet::new(),
             entries: Vec::new(),
         }
     }
@@ -171,11 +197,22 @@ pub struct AgentScreen {
     size: (u32, u32),
     stale_secs: u64,
     gpu: bool,
+    page: AgentPage,
+    /// ページを切り替えた時刻。カードが新しい位置へ移り終えるまで、次の通知を始めない。
+    page_changed_at: Option<Instant>,
+    /// 待っている通知が待つのをやめる期限(最初に待たされ始めた時刻 + 1 秒)。切り替えを続けても延ばさず、
+    /// 待ち行列が空になったら捨てる。
+    settle_deadline: Option<Instant>,
+    /// 待っている通知が、ページの切り替えのために待たされたか(次に始めるポップアップを行き先から出す)。
+    settle_waited: bool,
     /// 接続の順(設定の順)。接続の追加・消滅は `sync_all` が扱う。
     servers: Vec<ServerUiState>,
     // 以下のキャッシュは、すべて接続とスレッド(プロジェクト)の組で引く。
     surfaces: HashMap<ThreadKey, Arc<Pixmap>>,
     revisions: HashMap<ThreadKey, u64>,
+    /// カードの面の revision に使う、画面全体で増え続ける番号。スレッドのキャッシュを捨てても戻さないので、
+    /// ページの切り替えで消えて戻ったカードが、GPU の合成に残る古い面と同じ revision にならない。
+    next_revision: u64,
     content_keys: HashMap<ThreadKey, String>,
     entry_keys: HashMap<ThreadKey, String>,
     /// 初めて見た順。並びの最後の決め手と、表示中スレッドの集合を兼ねる。
@@ -229,9 +266,14 @@ impl AgentScreen {
             size,
             stale_secs,
             gpu,
+            page: AgentPage::Overview,
+            page_changed_at: None,
+            settle_deadline: None,
+            settle_waited: false,
             servers: Vec::new(),
             surfaces: HashMap::new(),
             revisions: HashMap::new(),
+            next_revision: 0,
             content_keys: HashMap::new(),
             entry_keys: HashMap::new(),
             seen: HashMap::new(),
@@ -294,6 +336,12 @@ impl AgentScreen {
     /// その接続が stale(取得が `stale_secs` を超えて止まっている)か。
     fn is_stale(&self, id: &ServerId) -> bool {
         self.server_index(id).is_some_and(|i| self.servers[i].stale)
+    }
+
+    /// そのスレッドが OVERVIEW では隠される片付け済みまたはその子孫か。
+    fn is_overview_hidden(&self, key: &ThreadKey) -> bool {
+        self.server_index(&key.server)
+            .is_some_and(|i| self.servers[i].overview_hidden.contains(&key.thread))
     }
 
     /// 接続の短い目印(設定順の番号)。上部の接続別の欄・枠の見出し・カードで同じものを使う。
@@ -364,6 +412,7 @@ impl AgentScreen {
                 .flat_map(|s| s.entries.iter().cloned())
                 .collect();
         }
+        debug_assert!(self.reservations_match_queue());
         redraw
     }
 
@@ -392,6 +441,7 @@ impl AgentScreen {
         ) {
             self.purge_server(&sid);
             self.servers[idx].entries.clear();
+            self.servers[idx].overview_hidden.clear();
             self.entries_dirty = true;
             self.servers[idx].observed_sync = false;
             self.servers[idx].generation = snap.resync_generation;
@@ -446,24 +496,114 @@ impl AgentScreen {
             self.servers[idx].last_snapshot = snap.clone();
             return redraw;
         }
-        let current_ids: HashSet<&str> =
-            snap.entries.iter().map(|e| e.thread_id.as_str()).collect();
-        let mine = |key: &ThreadKey| key.server == sid;
-        if let Some(f) = &self.focus
-            && mine(&f.event.key)
-            && !current_ids.contains(f.event.key.thread.as_str())
-        {
-            self.focus = None;
-            self.scrim_alpha = 0.0;
-            redraw = true;
+        redraw |= self.apply_server_entries(idx, &snap.entries, now);
+        let fresh_sync = snap.synchronized && !self.servers[idx].observed_sync;
+        if fresh_sync {
+            self.servers[idx].observed_sync = true;
+            self.servers[idx].cursor = snap.change_cursor;
         }
-        self.queue
-            .retain(|e| !mine(&e.key) || current_ids.contains(e.key.thread.as_str()));
-        self.pending_new
-            .retain(|k| !mine(k) || current_ids.contains(k.thread.as_str()));
-        let entries: Vec<AgentEntry> = snap
-            .entries
+        if !snap.synchronized {
+            self.servers[idx].observed_sync = false;
+        }
+        if !generation_changed && !fresh_sync && !(was_stale && !stale_now) && !changes_same {
+            let previous_cursor = self.servers[idx].cursor;
+            for change in snap.changes.iter().filter(|c| c.id > previous_cursor) {
+                self.servers[idx].cursor = self.servers[idx].cursor.max(change.id);
+                let key = ThreadKey {
+                    server: sid.clone(),
+                    thread: change.thread_id.clone(),
+                };
+                if let Some(entry) = self.servers[idx]
+                    .entries
+                    .iter()
+                    .find(|e| e.thread_id == change.thread_id)
+                    .cloned()
+                {
+                    self.last_activity.insert(key.clone(), now);
+                    if self.presentable && !stale_now {
+                        let kind = if change.kind == AgentChangeKind::New {
+                            EventKind::New
+                        } else {
+                            EventKind::Changed
+                        };
+                        if change.kind == AgentChangeKind::Goal {
+                            if self.goal_notified.get(&key).is_some_and(|t| {
+                                now.saturating_duration_since(*t) < Duration::from_secs(15)
+                            }) {
+                                continue;
+                            }
+                            self.goal_notified.insert(key.clone(), now);
+                        }
+                        let before = describe_change(
+                            change.before_state,
+                            change.before_goal.as_deref(),
+                            change.before_title.as_deref(),
+                            change.kind,
+                        );
+                        let after = describe_change(
+                            change.after_state.or(Some(entry.state)),
+                            change.after_goal.as_deref().or(entry.goal.as_deref()),
+                            change.after_title.as_deref().or(Some(entry.title.as_str())),
+                            change.kind,
+                        );
+                        let priority = if attention(&entry)
+                            || matches!(
+                                change.kind,
+                                AgentChangeKind::New
+                                    | AgentChangeKind::Error
+                                    | AgentChangeKind::TurnCompleted
+                                    | AgentChangeKind::Resumed
+                            ) {
+                            2
+                        } else if change.kind == AgentChangeKind::Goal {
+                            0
+                        } else {
+                            1
+                        };
+                        self.enqueue(QueuedEvent {
+                            change: ChangeKey {
+                                server: sid.clone(),
+                                id: change.id,
+                            },
+                            key,
+                            kind,
+                            before,
+                            after,
+                            observed_at: change.observed_at,
+                            priority,
+                        });
+                    }
+                    self.background_dirty = true;
+                    redraw = true;
+                }
+            }
+        } else {
+            self.servers[idx].cursor = self.servers[idx].cursor.max(snap.change_cursor);
+        }
+        self.entries_dirty = true;
+        self.board_dirty = true;
+        self.servers[idx].last_snapshot = snap.clone();
+        if redraw {
+            self.background_dirty = true;
+            self.text_dirty = true;
+        }
+        redraw
+    }
+
+    /// 1 つの接続の `snap.entries` から現在のページに合わせた表示対象を絞り込み、画面側の状態を同期する。
+    fn apply_server_entries(
+        &mut self,
+        idx: usize,
+        snap_entries: &[AgentEntry],
+        now: Instant,
+    ) -> bool {
+        let sid = self.servers[idx].id.clone();
+        let mut redraw = false;
+        let hidden = crate::agents::overview_hidden_ids(snap_entries);
+        let show_settled = self.page.show_settled();
+        let entries: Vec<AgentEntry> = snap_entries
             .iter()
+            .filter(|e| show_settled || !hidden.contains(&e.thread_id))
             .map(|e| {
                 let mut e = e.clone();
                 // 接続は ServerSnapshot が決める(entry に付いた値には頼らない)。
@@ -471,6 +611,26 @@ impl AgentScreen {
                 e
             })
             .collect();
+        if self.servers[idx].overview_hidden != hidden {
+            self.servers[idx].overview_hidden = hidden;
+            self.background_dirty = true;
+            redraw = true;
+        }
+        let current_ids: HashSet<&str> = entries.iter().map(|e| e.thread_id.as_str()).collect();
+        let mine = |key: &ThreadKey| key.server == sid;
+        if let Some(f) = &self.focus
+            && mine(&f.event.key)
+            && !current_ids.contains(f.event.key.thread.as_str())
+        {
+            self.focus = None;
+            self.scrim_alpha = 0.0;
+            self.focus_card_id = None;
+            redraw = true;
+        }
+        self.queue
+            .retain(|e| !mine(&e.key) || current_ids.contains(e.key.thread.as_str()));
+        self.pending_new
+            .retain(|k| !mine(k) || current_ids.contains(k.thread.as_str()));
         for entry in &entries {
             let project = entry.project_key();
             if !self.project_seen.contains_key(&project) {
@@ -512,94 +672,32 @@ impl AgentScreen {
             self.background_dirty = true;
             redraw = true;
         }
-        let fresh_sync = snap.synchronized && !self.servers[idx].observed_sync;
-        if fresh_sync {
-            self.servers[idx].observed_sync = true;
-            self.servers[idx].cursor = snap.change_cursor;
-        }
-        if !snap.synchronized {
-            self.servers[idx].observed_sync = false;
-        }
-        if !generation_changed && !fresh_sync && !(was_stale && !stale_now) && !changes_same {
-            let previous_cursor = self.servers[idx].cursor;
-            for change in snap.changes.iter().filter(|c| c.id > previous_cursor) {
-                self.servers[idx].cursor = self.servers[idx].cursor.max(change.id);
-                let key = ThreadKey {
-                    server: sid.clone(),
-                    thread: change.thread_id.clone(),
-                };
-                self.last_activity.insert(key.clone(), now);
-                if self.presentable
-                    && !stale_now
-                    && let Some(entry) = entries.iter().find(|e| e.thread_id == change.thread_id)
-                {
-                    let kind = if change.kind == AgentChangeKind::New {
-                        EventKind::New
-                    } else {
-                        EventKind::Changed
-                    };
-                    if change.kind == AgentChangeKind::Goal {
-                        if self.goal_notified.get(&key).is_some_and(|t| {
-                            now.saturating_duration_since(*t) < Duration::from_secs(15)
-                        }) {
-                            continue;
-                        }
-                        self.goal_notified.insert(key.clone(), now);
-                    }
-                    let before = describe_change(
-                        change.before_state,
-                        change.before_goal.as_deref(),
-                        change.before_title.as_deref(),
-                        change.kind,
-                    );
-                    let after = describe_change(
-                        change.after_state.or(Some(entry.state)),
-                        change.after_goal.as_deref().or(entry.goal.as_deref()),
-                        change.after_title.as_deref().or(Some(entry.title.as_str())),
-                        change.kind,
-                    );
-                    let priority = if attention(entry)
-                        || matches!(
-                            change.kind,
-                            AgentChangeKind::New
-                                | AgentChangeKind::Error
-                                | AgentChangeKind::TurnCompleted
-                                | AgentChangeKind::Resumed
-                        ) {
-                        2
-                    } else if change.kind == AgentChangeKind::Goal {
-                        0
-                    } else {
-                        1
-                    };
-                    self.enqueue(QueuedEvent {
-                        change: ChangeKey {
-                            server: sid.clone(),
-                            id: change.id,
-                        },
-                        key,
-                        kind,
-                        before,
-                        after,
-                        observed_at: change.observed_at,
-                        priority,
-                    });
-                }
-                self.background_dirty = true;
-                redraw = true;
-            }
-        } else {
-            self.servers[idx].cursor = self.servers[idx].cursor.max(snap.change_cursor);
-        }
         self.servers[idx].entries = entries;
-        self.entries_dirty = true;
-        self.board_dirty = true;
-        self.servers[idx].last_snapshot = snap.clone();
-        if redraw {
-            self.background_dirty = true;
-            self.text_dirty = true;
-        }
         redraw
+    }
+
+    /// ページを切り替えたときに表示対象を作り直す。見えなくなったスレッドの通知・新着の予約・位置は
+    /// `apply_server_entries` が捨て、見えたままのものは残す(予約を消すと、置かれたカードが後で右端へ飛んで
+    /// 紹介をやり直し、位置を消すとカードが瞬間移動する)。表示中のポップアップは、配置を作り直せるよう終える。
+    fn rebuild_visible_entries(&mut self, now: Instant) {
+        self.focus = None;
+        self.scrim_alpha = 0.0;
+        self.focus_card_id = None;
+        for idx in 0..self.servers.len() {
+            let snap_entries = Arc::clone(&self.servers[idx].last_snapshot.entries);
+            self.apply_server_entries(idx, &snap_entries, now);
+        }
+        self.entries = self
+            .servers
+            .iter()
+            .flat_map(|s| s.entries.iter().cloned())
+            .collect();
+        self.entries_dirty = false;
+        self.board_dirty = true;
+        self.background_dirty = true;
+        self.text_dirty = true;
+        self.ensure_board();
+        debug_assert!(self.reservations_match_queue());
     }
 
     /// その接続の通知(待ち行列・出し待ちの新着・表示中)を捨てる。他の接続の通知には触れない。
@@ -653,9 +751,13 @@ impl AgentScreen {
         self.sync_all(&ServerSnapshot::primary(snap.clone()), now)
     }
 
+    /// 通知を待ち行列に入れる。新着の予約(`pending_new`)は、New を実際に待ち行列へ足したときと、
+    /// 待ち行列の通知を New に変えたときだけ作る(表示中の通知に吸収した New には作らない)。
     fn enqueue(&mut self, event: QueuedEvent) {
-        if event.kind == EventKind::New {
-            self.pending_new.insert(event.key.clone());
+        // 空の待ち行列に入る通知は、前の待機の期限を引き継がない。
+        if self.queue.is_empty() {
+            self.settle_deadline = None;
+            self.settle_waited = false;
         }
         if self.queue.iter().any(|q| q.key == event.key) {
             if let Some(q) = self.queue.iter_mut().find(|q| q.key == event.key) {
@@ -664,6 +766,7 @@ impl AgentScreen {
                 q.change = event.change;
                 if event.kind == EventKind::New {
                     q.kind = EventKind::New;
+                    self.pending_new.insert(event.key.clone());
                 }
             }
         } else if self
@@ -677,12 +780,27 @@ impl AgentScreen {
                 f.event.change = event.change;
             }
         } else if self.queue.len() < MAX_QUEUE {
+            if event.kind == EventKind::New {
+                self.pending_new.insert(event.key.clone());
+            }
             self.queue.push_back(event);
         } else {
-            self.pending_new.remove(&event.key);
             self.overflow_updates += 1;
             self.background_dirty = true;
         }
+        debug_assert!(self.reservations_match_queue());
+    }
+
+    /// 新着の予約が、待ち行列にある New の通知とちょうど 1 対 1 か(予約だけが残るとカードが描かれない)。
+    fn reservations_match_queue(&self) -> bool {
+        let queued: HashSet<&ThreadKey> = self
+            .queue
+            .iter()
+            .filter(|e| e.kind == EventKind::New)
+            .map(|e| &e.key)
+            .collect();
+        queued.len() == self.pending_new.len()
+            && self.pending_new.iter().all(|k| queued.contains(k))
     }
 
     fn finish_expired_focus(&mut self, now: Instant) -> bool {
@@ -954,6 +1072,10 @@ impl AgentScreen {
                 "更新内容をまとめました".into()
             };
             aggregate.priority = 1;
+            // まとめて捨てる通知の新着の予約を外す(残すと、そのカードは描かれないまま出てこない)。
+            for &i in stale.iter().filter(|&&i| i != last) {
+                self.pending_new.remove(&self.queue[i].key);
+            }
             aggregates.push(aggregate);
             removed.extend(stale.iter().copied());
             self.overflow_updates = self
@@ -1014,8 +1136,57 @@ impl AgentScreen {
             started: now,
             hold: Duration::from_secs(if urgent { 5 } else { 3 }),
             stage: FocusStage::In,
+            from_destination: false,
         });
         true
+    }
+
+    /// ページを切り替えたあと、カードがまだ新しい位置へ移っている途中か。ポップアップは移っている途中の位置を
+    /// 元位置にするので、移り終えてから始める(切り替えを続けても、最初に待たされ始めてから 1 秒で打ち切る)。
+    fn page_settling(&mut self, now: Instant) -> bool {
+        let Some(at) = self.page_changed_at else {
+            return false;
+        };
+        // 切り替えの移動は 500ms で終わるので、最後の切り替えから 1 秒たてば待たせない。待っている通知が無いまま
+        // 切り替えを終えたとき、ずっと後の通常の並び替えを切り替えの移動と取り違えないようにする。
+        if now.saturating_duration_since(at) >= MOVE_TWEEN * 2 {
+            // 切り替えのあいだ待たされていた通知(期限がある)は、期限で始める場合と同じく行き先から出す。
+            self.settle_waited |= self.settle_deadline.is_some() && !self.queue.is_empty();
+            self.page_changed_at = None;
+            self.settle_deadline = None;
+            return false;
+        }
+        // 待っている通知が無ければ期限を捨てる(次の通知が待ち始めた時刻から数え直す)。切り替えた時刻は残す。
+        if self.queue.is_empty() {
+            self.settle_deadline = None;
+            return false;
+        }
+        let deadline = *self.settle_deadline.get_or_insert(now + MOVE_TWEEN * 2);
+        // 切り替えのあとに待っている通知は、期限で始める場合も含めて行き先から出す。
+        self.settle_waited |= !self.queue.is_empty();
+        if now >= deadline {
+            self.page_changed_at = None;
+            self.settle_deadline = None;
+            return false;
+        }
+        let since = now.saturating_duration_since(at);
+        // 取得結果で配置が変わっていれば先に作り直し、まだ補間を作っていない行き先の変化も「移動中」に数える。
+        self.ensure_board();
+        let board = &self.board;
+        let sliding = self.poses.iter().any(|(key, t)| {
+            let in_motion = t.moving() && now.saturating_duration_since(t.started) < MOVE_TWEEN;
+            let retargeted = board.cards.get(key).is_some_and(|slot| {
+                let r = slot.rect;
+                (t.to.x, t.to.y, t.to.width, t.to.height) != (r.x, r.y, r.w, r.h)
+            });
+            in_motion || retargeted
+        });
+        if since < MOVE_TWEEN || sliding {
+            return true;
+        }
+        self.page_changed_at = None;
+        self.settle_deadline = None;
+        false
     }
 
     /// 通知を進める。stale の接続の通知は `sync_server` が捨てるので、ここでは健全な接続の通知だけが残る。
@@ -1024,8 +1195,12 @@ impl AgentScreen {
             return false;
         }
         let mut redraw = false;
-        if self.focus.is_none() {
+        if self.focus.is_none() && !self.page_settling(now) {
             redraw |= self.activate_event(now);
+            let waited = std::mem::take(&mut self.settle_waited);
+            if let Some(f) = self.focus.as_mut() {
+                f.from_destination = waited;
+            }
         }
         if let Some(f) = self.focus.as_mut() {
             let elapsed = now.saturating_duration_since(f.started);
@@ -1048,6 +1223,7 @@ impl AgentScreen {
                 redraw = true;
             }
         }
+        debug_assert!(self.reservations_match_queue());
         redraw
     }
 
@@ -1077,6 +1253,7 @@ impl AgentScreen {
                     now,
                     stale_secs: self.stale_secs,
                     wall: self.wall(),
+                    page: self.page,
                 },
             );
             self.background = Some(bg.pixmap);
@@ -1120,18 +1297,46 @@ impl AgentScreen {
                 continue;
             }
             shown.insert(key.clone());
+            let base_alpha = if self.is_stale(&key.server) {
+                0.65
+            } else {
+                1.0
+            };
+            // DETAILS では、片付け済み(未完了の子のために OVERVIEW に残した親を含む)と、片付け済みの親の下で
+            // OVERVIEW から隠れる子を減光する。
+            let alpha = if self.page == AgentPage::Details
+                && (entry.settled || self.is_overview_hidden(&key))
+            {
+                base_alpha * 0.78
+            } else {
+                base_alpha
+            };
             let target = draw::AgentPose {
                 x: slot.rect.x,
                 y: slot.rect.y,
                 width: slot.rect.w,
                 height: slot.rect.h,
-                alpha: if self.is_stale(&key.server) {
-                    0.65
-                } else {
-                    1.0
-                },
+                alpha,
             };
-            let home = self.tween_pose(&key, target, now);
+            // ページの切り替えで待たされたポップアップ(期限で始めた場合を含む)は、出発と戻りに同じ座標
+            // (移動の行き先)を使う。移っている途中の位置を元位置にすると、古い位置から出て新しい位置へ戻ってしまう。
+            // 通常の通知は、直前までカードがあった位置から浮き上がり、移動の補間に沿って戻る。
+            let home = if focus
+                .as_ref()
+                .is_some_and(|f| f.event.key == key && f.from_destination)
+            {
+                self.poses.insert(
+                    key.clone(),
+                    PoseTween {
+                        from: target,
+                        to: target,
+                        started: now,
+                    },
+                );
+                target
+            } else {
+                self.tween_pose(&key, target, now)
+            };
             homes.insert(
                 key.clone(),
                 layout::Rect {
@@ -1419,8 +1624,8 @@ impl AgentScreen {
             size.1
         );
         if self.content_keys.get(id) != Some(&key) || !self.surfaces.contains_key(id) {
-            let rev = self.revisions.entry(id.clone()).or_insert(0);
-            *rev = rev.wrapping_add(1);
+            self.next_revision = self.next_revision.wrapping_add(1);
+            self.revisions.insert(id.clone(), self.next_revision);
             self.content_keys.insert(id.clone(), key);
             self.surfaces
                 .insert(id.clone(), Arc::new(draw::render_card(content, size, text)));
@@ -1510,7 +1715,15 @@ impl AgentScreen {
             age,
             // T3 V2 の一覧には計画の進み具合(何手中の何手目)が無いので、進捗バーは出さない。
             progress: None,
-            badge: None,
+            badge: if focused {
+                None
+            } else if e.settled {
+                Some("対応済み".into())
+            } else if self.page == AgentPage::Details && self.is_overview_hidden(&e.key()) {
+                Some("対応済み(親)".into())
+            } else {
+                None
+            },
             compact,
             one_line: false,
             // 幅が足りなくても接続名より先に残す目印。接続が 1 台だけのときは出さない。
@@ -1557,6 +1770,7 @@ impl Screen for AgentScreen {
             self.background_dirty = true;
         }
         self.presentable = can_present;
+        debug_assert!(self.reservations_match_queue());
     }
     fn tick(&mut self, world: &crate::screen::World, now: Instant) -> bool {
         self.last_now = now;
@@ -1587,8 +1801,29 @@ impl Screen for AgentScreen {
         }
         redraw
     }
-    fn handle_action(&mut self, _: ScreenAction, _: Instant) -> Outcome {
-        Outcome::Ignored
+    fn handle_action(&mut self, action: ScreenAction, now: Instant) -> Outcome {
+        match action {
+            ScreenAction::Select => {
+                self.page = self.page.toggled();
+                self.page_changed_at = Some(now);
+                // 待っている通知があれば、この時刻から待ち始める(既に待っていれば期限は延ばさない)。
+                if !self.queue.is_empty() {
+                    self.settle_deadline.get_or_insert(now + MOVE_TWEEN * 2);
+                }
+                self.rebuild_visible_entries(now);
+                Outcome::Consumed
+            }
+            ScreenAction::Up | ScreenAction::Down => Outcome::Ignored,
+        }
+    }
+    fn key_labels(&self) -> KeyLabels {
+        KeyLabels {
+            select: Some(match self.page {
+                AgentPage::Overview => "詳細",
+                AgentPage::Details => "概要",
+            }),
+            ..KeyLabels::default()
+        }
     }
     fn render(&mut self, ctx: &mut RenderContext<'_>) {
         self.render_scene(ctx, true);
@@ -1629,7 +1864,10 @@ impl Screen for AgentScreen {
                 || self.poses.values().any(PoseTween::moving))
     }
     fn page(&self) -> Option<&'static str> {
-        Some("OVERVIEW")
+        Some(match self.page {
+            AgentPage::Overview => "OVERVIEW",
+            AgentPage::Details => "DETAILS",
+        })
     }
     fn stats(&self, out: &mut Vec<(&'static str, String)>) {
         out.push(("agents", self.entries.len().to_string()));
@@ -1648,6 +1886,7 @@ struct HeaderInput<'a> {
     now: Instant,
     stale_secs: u64,
     wall: SystemTime,
+    page: AgentPage,
 }
 
 const GREEN: [u8; 4] = [103, 217, 173, 255];
@@ -1761,11 +2000,7 @@ fn draw_server_chips(
         let snap = &st.last_snapshot;
         let stale = is_stale_at(snap, h.now, h.stale_secs);
         let (status, color) = connection_status(snap, stale, true);
-        let count = if snap.synchronized {
-            format!("{}件", snap.entries.len())
-        } else {
-            "--件".into()
-        };
+        let count = chip_count_text(st);
         let hidden = h.hidden.get(&st.id).copied().unwrap_or(0);
         let hidden_text = (hidden > 0).then(|| format!("未表示 {hidden}"));
         let tag = server_tag(i);
@@ -1809,6 +2044,15 @@ fn draw_server_chips(
     }
 }
 
+/// 接続別の欄に出す件数(そのページで表示の候補になっているスレッドの数)。まだ同期していなければ `--件`。
+fn chip_count_text(st: &ServerUiState) -> String {
+    if st.last_snapshot.synchronized {
+        format!("{}件", st.entries.len())
+    } else {
+        "--件".into()
+    }
+}
+
 fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine, h: &HeaderInput) {
     // プロジェクトの見出しは、配置を作ったときの scale に合わせる。
     let board = h.board;
@@ -1829,7 +2073,18 @@ fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine,
     let h = &HeaderInput { servers, ..*h };
     canvas.clear(miharashi_render::canvas::rgba(8, 12, 20, 255));
     text.draw(canvas, "T3 AGENTS", 32.0, 24.0, 36.0, [223, 231, 240, 255]);
-    text.draw(canvas, "OVERVIEW", 280.0, 28.0, 25.0, [64, 200, 255, 255]);
+    match h.page {
+        AgentPage::Overview => {
+            text.draw(canvas, "OVERVIEW", 280.0, 28.0, 25.0, [64, 200, 255, 255]);
+        }
+        AgentPage::Details => {
+            text.draw(canvas, "DETAILS", 280.0, 28.0, 25.0, AMBER);
+            if w >= 900.0 {
+                let x = 280.0 + text.measure("DETAILS", 25.0) + 16.0;
+                text.draw(canvas, "対応済み含む", x, 31.0, 20.0, MUTED);
+            }
+        }
+    }
     text.draw_right(
         canvas,
         &chrono::DateTime::<chrono::Local>::from(h.wall)
@@ -1880,84 +2135,8 @@ fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine,
         draw_server_chips(canvas, text, h);
     }
     // 件数は全接続の合計(接続別の件数は上の欄に出している)。
-    let all: Vec<&AgentEntry> = servers
-        .iter()
-        .flat_map(|s| s.last_snapshot.entries.iter())
-        .collect();
-    let counts = [
-        (
-            "実行中",
-            "実行",
-            all.iter()
-                .filter(|e| {
-                    matches!(
-                        e.state,
-                        crate::agents::AgentState::Starting
-                            | crate::agents::AgentState::Running
-                            | crate::agents::AgentState::Monitoring
-                    )
-                })
-                .count(),
-            [64, 200, 255, 255],
-        ),
-        (
-            "承認待ち",
-            "承認",
-            all.iter()
-                .filter(|e| {
-                    e.has_pending_approvals || e.state == crate::agents::AgentState::Approval
-                })
-                .count(),
-            [255, 188, 102, 255],
-        ),
-        (
-            "入力・計画",
-            "入力",
-            all.iter()
-                .filter(|e| {
-                    e.has_pending_user_input
-                        || e.has_actionable_proposed_plan
-                        || matches!(
-                            e.state,
-                            crate::agents::AgentState::Input | crate::agents::AgentState::Plan
-                        )
-                })
-                .count(),
-            [196, 160, 255, 255],
-        ),
-        (
-            "異常",
-            "異常",
-            all.iter()
-                .filter(|e| e.state == crate::agents::AgentState::Error)
-                .count(),
-            [255, 127, 140, 255],
-        ),
-        (
-            "応答完了",
-            "完了",
-            all.iter()
-                .filter(|e| e.state == crate::agents::AgentState::Completed)
-                .count(),
-            [103, 217, 173, 255],
-        ),
-        (
-            "その他",
-            "他",
-            all.iter()
-                .filter(|e| {
-                    matches!(
-                        e.state,
-                        crate::agents::AgentState::Idle
-                            | crate::agents::AgentState::Interrupted
-                            | crate::agents::AgentState::Stopped
-                            | crate::agents::AgentState::Unknown
-                    )
-                })
-                .count(),
-            [143, 163, 183, 255],
-        ),
-    ];
+    let all: Vec<&AgentEntry> = servers.iter().flat_map(|s| s.entries.iter()).collect();
+    let counts = state_counts(&all);
     let total = all.len();
     let synchronized = servers.iter().any(|s| s.last_snapshot.synchronized);
     let urgent = all.iter().filter(|e| attention(e)).count();
@@ -2101,9 +2280,21 @@ fn draw_background(canvas: &mut Canvas, text: &mut miharashi_render::TextEngine,
             );
         }
     }
+    let settled_hidden_total: usize = servers.iter().map(|s| s.overview_hidden.len()).sum();
+    let footer = match (h.page, settled_hidden_total) {
+        (AgentPage::Overview, 0) => "5: 詳細 · 自動表示 · 対応は手元の T3 で".to_string(),
+        (AgentPage::Overview, n) => {
+            format!("5: 詳細(対応済み {n} 件を表示) · 自動表示 · 対応は手元の T3 で")
+        }
+        (AgentPage::Details, 0) => "5: 概要 · 対応済み含む · 対応は手元の T3 で".to_string(),
+        (AgentPage::Details, n) => {
+            format!("5: 概要(対応済み {n} 件を隠す) · 対応は手元の T3 で")
+        }
+    };
+    let footer = draw::fit_label_text(text, &footer, 20.0, w - 64.0);
     text.draw(
         canvas,
-        "自動表示 · 対応は手元の T3 で",
+        &footer,
         32.0,
         hgt - 28.0,
         20.0,
@@ -2519,6 +2710,86 @@ fn fit_header_label(value: &str, max_width: f32, font_size: f32) -> String {
     result.push('…');
     result
 }
+/// 上部の凡例兼件数に出す状態別の件数(全接続の合計)。片付け済みのスレッドは、DETAILS で表示していても、
+/// 未完了の子のために OVERVIEW に残した親でも数えない(`要確認` と同じ。合計のスレッド数には数える)。
+fn state_counts(all: &[&AgentEntry]) -> [(&'static str, &'static str, usize, [u8; 4]); 6] {
+    let all: Vec<&AgentEntry> = all.iter().copied().filter(|e| !e.settled).collect();
+    [
+        (
+            "実行中",
+            "実行",
+            all.iter()
+                .filter(|e| {
+                    matches!(
+                        e.state,
+                        crate::agents::AgentState::Starting
+                            | crate::agents::AgentState::Running
+                            | crate::agents::AgentState::Monitoring
+                    )
+                })
+                .count(),
+            [64, 200, 255, 255],
+        ),
+        (
+            "承認待ち",
+            "承認",
+            all.iter()
+                .filter(|e| {
+                    e.has_pending_approvals || e.state == crate::agents::AgentState::Approval
+                })
+                .count(),
+            [255, 188, 102, 255],
+        ),
+        (
+            "入力・計画",
+            "入力",
+            all.iter()
+                .filter(|e| {
+                    e.has_pending_user_input
+                        || e.has_actionable_proposed_plan
+                        || matches!(
+                            e.state,
+                            crate::agents::AgentState::Input | crate::agents::AgentState::Plan
+                        )
+                })
+                .count(),
+            [196, 160, 255, 255],
+        ),
+        (
+            "異常",
+            "異常",
+            all.iter()
+                .filter(|e| e.state == crate::agents::AgentState::Error)
+                .count(),
+            [255, 127, 140, 255],
+        ),
+        (
+            "応答完了",
+            "完了",
+            all.iter()
+                .filter(|e| e.state == crate::agents::AgentState::Completed)
+                .count(),
+            [103, 217, 173, 255],
+        ),
+        (
+            "その他",
+            "他",
+            all.iter()
+                .filter(|e| {
+                    matches!(
+                        e.state,
+                        crate::agents::AgentState::Idle
+                            | crate::agents::AgentState::Interrupted
+                            | crate::agents::AgentState::Stopped
+                            | crate::agents::AgentState::Unknown
+                    )
+                })
+                .count(),
+            [143, 163, 183, 255],
+        ),
+    ]
+}
+
 fn tier_of(e: &AgentEntry) -> Tier {
     if attention(e) {
         Tier::Attention
@@ -2529,24 +2800,26 @@ fn tier_of(e: &AgentEntry) -> Tier {
     }
 }
 fn attention(e: &AgentEntry) -> bool {
-    e.has_pending_approvals
-        || e.has_pending_user_input
-        || e.has_actionable_proposed_plan
-        || matches!(
-            e.state,
-            crate::agents::AgentState::Error
-                | crate::agents::AgentState::Approval
-                | crate::agents::AgentState::Input
-                | crate::agents::AgentState::Plan
-        )
+    !e.settled
+        && (e.has_pending_approvals
+            || e.has_pending_user_input
+            || e.has_actionable_proposed_plan
+            || matches!(
+                e.state,
+                crate::agents::AgentState::Error
+                    | crate::agents::AgentState::Approval
+                    | crate::agents::AgentState::Input
+                    | crate::agents::AgentState::Plan
+            ))
 }
 fn running(e: &AgentEntry) -> bool {
-    matches!(
-        e.state,
-        crate::agents::AgentState::Starting
-            | crate::agents::AgentState::Running
-            | crate::agents::AgentState::Monitoring
-    )
+    !e.settled
+        && matches!(
+            e.state,
+            crate::agents::AgentState::Starting
+                | crate::agents::AgentState::Running
+                | crate::agents::AgentState::Monitoring
+        )
 }
 fn draw_state(s: crate::agents::AgentState) -> draw::AgentState {
     match s {
@@ -2592,7 +2865,7 @@ fn describe_change(
 }
 fn content_key(e: &AgentEntry) -> String {
     format!(
-        "{:?}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{}{}{}",
+        "{:?}|{}|{}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{}{}{}{}{}",
         e.state,
         e.project_title,
         e.title,
@@ -2605,7 +2878,9 @@ fn content_key(e: &AgentEntry) -> String {
         e.raw_status,
         e.has_pending_approvals as u8,
         e.has_pending_user_input as u8,
-        e.has_actionable_proposed_plan as u8
+        e.has_actionable_proposed_plan as u8,
+        e.settled as u8,
+        e.settled_ancestor as u8
     )
 }
 fn content_key_from_display(c: &draw::AgentCardContent) -> String {
@@ -3180,6 +3455,399 @@ mod tests {
         assert!(screen.pending_new.contains(&k("new-b")));
     }
 
+    /// ○ でページを切り替えても、見えたままのスレッドの新着の予約と待ち行列、カードの位置は残す。
+    /// 予約を消すと、置かれたカードが後で右端へ飛んで紹介をやり直す。
+    #[test]
+    fn page_toggle_keeps_new_reservations_and_poses_of_threads_that_stay_visible() {
+        let now = Instant::now();
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(vec![
+            entry("existing", AgentState::Running),
+            entry("new-a", AgentState::Running),
+            entry("new-b", AgentState::Idle),
+            AgentEntry {
+                settled: true,
+                ..entry("done", AgentState::Completed)
+            },
+        ]);
+        screen.sync(&snap, now);
+        for id in ["new-a", "new-b"] {
+            screen.enqueue(QueuedEvent {
+                change: ck(),
+                key: k(id),
+                kind: EventKind::New,
+                before: "新しく検出".into(),
+                after: "実行中".into(),
+                observed_at: SystemTime::now(),
+                priority: 2,
+            });
+        }
+        let first = render_for_test(&mut screen, &snap, now);
+        assert!(!first.iter().any(|c| c.id == screen.id_map[&k("new-b")]));
+        assert!(screen.poses.contains_key(&k("existing")));
+
+        let t = now + Duration::from_millis(10);
+        screen.handle_action(ScreenAction::Select, t);
+        assert_eq!(screen.page(), Some("DETAILS"));
+        assert!(screen.pending_new.contains(&k("new-a")));
+        assert!(screen.pending_new.contains(&k("new-b")));
+        assert_eq!(screen.queue.len(), 2);
+        assert!(screen.poses.contains_key(&k("existing")));
+        let cards = render_for_test(&mut screen, &snap, t);
+        let ids: HashSet<u64> = cards.iter().map(|c| c.id).collect();
+        assert!(ids.contains(&screen.id_map[&k("existing")]));
+        assert!(ids.contains(&screen.id_map[&k("done")]));
+        assert!(!ids.contains(&screen.id_map[&k("new-a")]));
+        assert!(!ids.contains(&screen.id_map[&k("new-b")]));
+
+        // OVERVIEW に戻ると、隠れたスレッドの位置だけを捨てる。
+        let t = t + Duration::from_secs(1);
+        screen.handle_action(ScreenAction::Select, t);
+        assert!(!screen.poses.contains_key(&k("done")));
+        assert!(screen.poses.contains_key(&k("existing")));
+        assert!(screen.pending_new.contains(&k("new-b")));
+    }
+
+    /// 1 フレームの間に DETAILS → OVERVIEW → DETAILS と切り替わり、その間に題名が変わっても、
+    /// 作り直したカードの面は前と違う revision になる(GPU の合成が同じ ID・大きさ・revision の古い面を使い続けない)。
+    #[test]
+    fn regenerated_card_surfaces_never_reuse_a_revision_across_page_changes() {
+        let now = Instant::now();
+        let done = |title: &str| AgentEntry {
+            settled: true,
+            title: title.into(),
+            ..entry("done", AgentState::Completed)
+        };
+        let snap1 = snapshot_of(vec![entry("run", AgentState::Running), done("前の題名")]);
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        screen.sync(&snap1, now);
+        screen.handle_action(ScreenAction::Select, now);
+        let before = render_for_test(&mut screen, &snap1, now);
+        let id = screen.id_map[&k("done")];
+        let old = before.iter().find(|c| c.id == id).unwrap().clone();
+
+        screen.handle_action(ScreenAction::Select, now + Duration::from_millis(1));
+        assert!(!screen.seen.contains_key(&k("done")));
+        let snap2 = snapshot_of(vec![entry("run", AgentState::Running), done("後の題名")]);
+        screen.sync(&snap2, now + Duration::from_millis(2));
+        screen.handle_action(ScreenAction::Select, now + Duration::from_millis(3));
+        let after = render_for_test(&mut screen, &snap2, now + Duration::from_millis(4));
+        let new = after.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(
+            (new.surface.width(), new.surface.height()),
+            (old.surface.width(), old.surface.height())
+        );
+        assert!(new.surface.data() != old.surface.data());
+        assert_ne!(new.revision, old.revision);
+    }
+
+    /// 古くなった新着をまとめるとき、まとめて捨てた通知の新着の予約も外す(外さないとそのカードが出てこない)。
+    #[test]
+    fn aggregating_stale_new_threads_releases_the_dropped_reservations() {
+        let now = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let mut screen = AgentScreen::new((1920, 1080), false, 30).with_fixed_wall(wall);
+        let snap = snapshot_of(vec![
+            entry("existing", AgentState::Running),
+            entry("new-a", AgentState::Running),
+            entry("new-b", AgentState::Running),
+        ]);
+        screen.sync(&snap, now);
+        for id in ["new-a", "new-b"] {
+            screen.enqueue(QueuedEvent {
+                change: ck(),
+                key: k(id),
+                kind: EventKind::New,
+                before: "新しく検出".into(),
+                after: "実行中".into(),
+                observed_at: wall - Duration::from_secs(60),
+                priority: 2,
+            });
+        }
+        assert!(screen.activate_event(now));
+        assert_eq!(
+            screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
+            Some("new-b")
+        );
+        assert!(screen.queue.is_empty());
+        assert!(!screen.pending_new.contains(&k("new-a")));
+        let cards = render_for_test(&mut screen, &snap, now);
+        assert!(cards.iter().any(|c| c.id == screen.id_map[&k("new-a")]));
+    }
+
+    /// ページを切り替えた直後は、カードが新しい位置へ移り終えるまで次の通知を始めない
+    /// (移っている途中の位置から出て、新しい位置へ戻るのを防ぐ)。
+    #[test]
+    fn a_waiting_notice_starts_only_after_the_page_toggle_slide() {
+        let now = Instant::now();
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(vec![
+            entry("a", AgentState::Idle),
+            entry("b", AgentState::Idle),
+            AgentEntry {
+                settled: true,
+                ..entry("done", AgentState::Completed)
+            },
+        ]);
+        screen.sync(&snap, now);
+        render_for_test(&mut screen, &snap, now);
+        screen.enqueue(change_event("a", EventKind::Changed));
+        let t = now + Duration::from_secs(1);
+        screen.handle_action(ScreenAction::Select, t);
+        render_for_test(&mut screen, &snap, t);
+        assert!(!screen.advance(t + Duration::from_millis(16)) || screen.focus.is_none());
+        assert!(screen.focus.is_none(), "移っている途中には始めない");
+        let later = t + MOVE_TWEEN + Duration::from_millis(50);
+        render_for_test(&mut screen, &snap, later);
+        let later = later + Duration::from_millis(16);
+        screen.advance(later);
+        assert_eq!(
+            screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
+            Some("a")
+        );
+    }
+
+    /// ポップアップ中のスレッドに New が届いても(アーカイブと復元を 1 回の取得の間に観測したなど)、
+    /// 表示中の通知に吸収するだけで、新着の予約を残さない(残すとポップアップの後もカードが描かれない)。
+    #[test]
+    fn a_new_notice_absorbed_by_the_current_popup_leaves_no_reservation() {
+        let now = Instant::now();
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(vec![
+            entry("other", AgentState::Running),
+            entry("t", AgentState::Approval),
+        ]);
+        screen.sync(&snap, now);
+        screen.enqueue(change_event("t", EventKind::Changed));
+        assert!(screen.activate_event(now));
+        screen.enqueue(change_event("t", EventKind::New));
+        assert!(screen.queue.is_empty());
+        assert!(!screen.pending_new.contains(&k("t")));
+        let done = now + Duration::from_secs(10);
+        screen.advance(done);
+        assert!(screen.focus.is_none());
+        let cards = render_for_test(&mut screen, &snap, done);
+        assert!(cards.iter().any(|c| c.id == screen.id_map[&k("t")]));
+    }
+
+    /// ○ を移動の時間より短い間隔で押し続けても、待っている通知は最初に待たされ始めてから 1 秒で始まる。
+    #[test]
+    fn repeated_page_toggles_do_not_postpone_a_waiting_notice_past_the_deadline() {
+        let now = Instant::now();
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(vec![
+            entry("a", AgentState::Idle),
+            AgentEntry {
+                settled: true,
+                ..entry("done", AgentState::Completed)
+            },
+        ]);
+        screen.sync(&snap, now);
+        screen.enqueue(change_event("a", EventKind::Changed));
+        for i in 0..3u64 {
+            let t = now + Duration::from_millis(400 * i);
+            screen.handle_action(ScreenAction::Select, t);
+            screen.advance(t + Duration::from_millis(16));
+            assert!(screen.focus.is_none(), "{i}");
+        }
+        screen.advance(now + Duration::from_millis(1016));
+        assert_eq!(
+            screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
+            Some("a")
+        );
+    }
+
+    /// 切り替えの移動が終わった直後の取得でカードの順位が変わったときは、配置を作り直した先へ移り終えるまで
+    /// 通知を待つ。期限で始めるときは、ポップアップの出発と戻りに同じ座標(移動の行き先)を使う。
+    #[test]
+    fn a_notice_waits_for_a_reorder_right_after_the_toggle_and_uses_the_destination_at_the_deadline()
+     {
+        let base = |b: AgentState| {
+            snapshot_of(vec![
+                entry("a", AgentState::Idle),
+                entry("b", b),
+                AgentEntry {
+                    settled: true,
+                    ..entry("done", AgentState::Completed)
+                },
+            ])
+        };
+        let start = |screen: &mut AgentScreen, now: Instant| {
+            let snap = base(AgentState::Idle);
+            screen.sync(&snap, now);
+            render_for_test(screen, &snap, now);
+            screen.enqueue(change_event("a", EventKind::Changed));
+            let t = now + Duration::from_secs(1);
+            screen.handle_action(ScreenAction::Select, t);
+            render_for_test(screen, &snap, t);
+            t
+        };
+
+        // 移動が終わった直後に順位が変わった: 新しい行き先へ移り終えるまで始めない。
+        let now = Instant::now();
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let t = start(&mut screen, now);
+        let before = screen.board.cards[&k("a")].rect;
+        let moved = base(AgentState::Approval);
+        screen.sync(&moved, t + MOVE_TWEEN + Duration::from_millis(5));
+        screen.advance(t + MOVE_TWEEN + Duration::from_millis(10));
+        assert!(screen.focus.is_none(), "配置が変わった直後には始めない");
+        assert_ne!(screen.board.cards[&k("a")].rect, before, "a の場所が変わる");
+
+        // 期限で始めるときは、移っている途中の位置ではなく行き先から出て行き先へ戻る。
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let t = start(&mut screen, now);
+        screen.sync(&moved, t + Duration::from_millis(900));
+        let at = t + Duration::from_millis(1010);
+        screen.advance(at);
+        assert_eq!(
+            screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
+            Some("a")
+        );
+        let cards = render_for_test(&mut screen, &moved, at);
+        let slot = screen.board.cards[&k("a")].rect;
+        let pose = cards
+            .iter()
+            .find(|c| c.id == screen.id_map[&k("a")])
+            .unwrap()
+            .pose;
+        // 出始めのカードは、行き先の中心に置かれる(縦横比はポップアップの面のまま)。
+        let center = (pose.x + pose.width / 2.0, pose.y + pose.height / 2.0);
+        let dest = (slot.x + slot.w / 2.0, slot.y + slot.h / 2.0);
+        assert!(
+            (center.0 - dest.0).abs() < 1e-2 && (center.1 - dest.1).abs() < 1e-2,
+            "pose={pose:?} slot={slot:?}"
+        );
+    }
+
+    /// ○ を押さない通常の取得で、状態・順位・通知が同時に変わったとき、ポップアップは直前までカードが
+    /// あった位置から浮き上がる(移動の行き先へ飛んでから始まらない)。
+    #[test]
+    fn a_notice_with_a_simultaneous_reorder_rises_from_where_the_card_was() {
+        let now = Instant::now();
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(vec![
+            entry("a", AgentState::Running),
+            entry("b", AgentState::Idle),
+        ]);
+        screen.sync(&snap, now);
+        render_for_test(&mut screen, &snap, now);
+        let was = screen.board.cards[&k("b")].rect;
+        let t = now + Duration::from_secs(5);
+        let moved = snapshot_of(vec![
+            entry("a", AgentState::Running),
+            entry("b", AgentState::Approval),
+        ]);
+        screen.sync(&moved, t);
+        screen.enqueue(change_event("b", EventKind::Changed));
+        screen.advance(t);
+        assert_eq!(
+            screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
+            Some("b")
+        );
+        assert_ne!(screen.board.cards[&k("b")].rect, was, "b は上へ移る");
+        let cards = render_for_test(&mut screen, &moved, t);
+        let pose = cards
+            .iter()
+            .find(|c| c.id == screen.id_map[&k("b")])
+            .unwrap()
+            .pose;
+        let center = (pose.x + pose.width / 2.0, pose.y + pose.height / 2.0);
+        let from = (was.x + was.w / 2.0, was.y + was.h / 2.0);
+        assert!(
+            (center.0 - from.0).abs() < 1e-2 && (center.1 - from.1).abs() < 1e-2,
+            "pose={pose:?} was={was:?}"
+        );
+    }
+
+    /// 待っている通知が無いまま切り替えを終えたあと、ずっと後の通常の取得で並び替えと通知が同時に起きても、
+    /// 切り替えの待ちを持ち出さない(すぐ始め、カードがあった位置から浮き上がる)。
+    #[test]
+    fn an_old_toggle_with_an_empty_queue_does_not_hold_a_later_notice() {
+        let now = Instant::now();
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let snap = snapshot_of(vec![
+            entry("a", AgentState::Running),
+            entry("b", AgentState::Idle),
+        ]);
+        screen.sync(&snap, now);
+        render_for_test(&mut screen, &snap, now);
+        screen.handle_action(ScreenAction::Select, now);
+        screen.advance(now + Duration::from_millis(100));
+        render_for_test(&mut screen, &snap, now + Duration::from_millis(100));
+        let t = now + Duration::from_secs(300);
+        screen.advance(t - Duration::from_secs(1));
+        render_for_test(&mut screen, &snap, t - Duration::from_secs(1));
+        let was = screen.board.cards[&k("b")].rect;
+        let moved = snapshot_of(vec![
+            entry("a", AgentState::Running),
+            entry("b", AgentState::Approval),
+        ]);
+        screen.sync(&moved, t);
+        screen.enqueue(change_event("b", EventKind::Changed));
+        screen.advance(t);
+        let focus = screen
+            .focus
+            .as_ref()
+            .expect("切り替えから時間がたっているので、すぐ始める");
+        assert_eq!(focus.event.key.thread.as_str(), "b");
+        assert!(!focus.from_destination);
+        assert_ne!(screen.board.cards[&k("b")].rect, was, "b は上へ移る");
+        let cards = render_for_test(&mut screen, &moved, t);
+        let pose = cards
+            .iter()
+            .find(|c| c.id == screen.id_map[&k("b")])
+            .unwrap()
+            .pose;
+        let center = (pose.x + pose.width / 2.0, pose.y + pose.height / 2.0);
+        let from = (was.x + was.w / 2.0, was.y + was.h / 2.0);
+        assert!(
+            (center.0 - from.0).abs() < 1e-2 && (center.1 - from.1).abs() < 1e-2,
+            "pose={pose:?} was={was:?}"
+        );
+    }
+
+    /// 待ち行列が空になったら前の待機の期限を捨て、次の通知が実際に待ち始めた時刻から 1 秒を数え直す。
+    #[test]
+    fn the_settle_deadline_restarts_when_the_queue_empties() {
+        let now = Instant::now();
+        let at = |ms| now + Duration::from_millis(ms);
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let done = AgentEntry {
+            settled: true,
+            ..entry("done", AgentState::Completed)
+        };
+        let snap = snapshot_of(vec![
+            entry("a", AgentState::Idle),
+            entry("b", AgentState::Idle),
+            done.clone(),
+        ]);
+        screen.sync(&snap, now);
+        screen.enqueue(change_event("a", EventKind::Changed));
+        screen.handle_action(ScreenAction::Select, at(0));
+        screen.advance(at(16));
+        assert!(screen.focus.is_none());
+        // a が一覧から消え、待ち行列が空になる。
+        let without_a = snapshot_of(vec![entry("b", AgentState::Idle), done]);
+        screen.sync(&without_a, at(100));
+        assert!(screen.queue.is_empty());
+        screen.advance(at(116));
+        screen.handle_action(ScreenAction::Select, at(400));
+        screen.enqueue(change_event("b", EventKind::Changed));
+        screen.advance(at(466));
+        screen.handle_action(ScreenAction::Select, at(800));
+        screen.advance(at(1016));
+        assert!(
+            screen.focus.is_none(),
+            "b は 466ms から待ち始めたので、まだ期限ではない"
+        );
+        screen.advance(at(1316));
+        assert_eq!(
+            screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
+            Some("b")
+        );
+    }
+
     #[test]
     fn reordered_cards_slide_to_their_new_place_and_cpu_does_not_claim_gpu_animation() {
         let now = Instant::now();
@@ -3240,10 +3908,426 @@ mod tests {
     }
 
     #[test]
-    fn agent_keys_do_nothing() {
+    fn agent_select_toggles_overview_and_details() {
+        let now = Instant::now();
         let mut screen = AgentScreen::new((1920, 1080), false, 30);
-        assert_eq!(screen.key_labels(), crate::screen::KeyLabels::default());
-        crate::screen::assert_key_labels_match_actions(&mut screen, Instant::now());
+        assert_eq!(screen.page(), Some("OVERVIEW"));
+        assert_eq!(
+            screen.key_labels(),
+            KeyLabels {
+                select: Some("詳細"),
+                up: None,
+                down: None,
+            }
+        );
+        assert_eq!(
+            screen.handle_action(ScreenAction::Up, now),
+            Outcome::Ignored
+        );
+        assert_eq!(
+            screen.handle_action(ScreenAction::Down, now),
+            Outcome::Ignored
+        );
+        assert_eq!(screen.page(), Some("OVERVIEW"));
+
+        assert_eq!(
+            screen.handle_action(ScreenAction::Select, now),
+            Outcome::Consumed
+        );
+        assert_eq!(screen.page(), Some("DETAILS"));
+        assert_eq!(
+            screen.key_labels(),
+            KeyLabels {
+                select: Some("概要"),
+                up: None,
+                down: None,
+            }
+        );
+        assert_eq!(
+            screen.handle_action(ScreenAction::Up, now),
+            Outcome::Ignored
+        );
+        assert_eq!(
+            screen.handle_action(ScreenAction::Down, now),
+            Outcome::Ignored
+        );
+        assert_eq!(screen.page(), Some("DETAILS"));
+
+        assert_eq!(
+            screen.handle_action(ScreenAction::Select, now),
+            Outcome::Consumed
+        );
+        assert_eq!(screen.page(), Some("OVERVIEW"));
+        crate::screen::assert_key_labels_match_actions(&mut screen, now);
+        assert_eq!(screen.page(), Some("OVERVIEW"));
+    }
+
+    #[test]
+    fn settled_threads_hide_in_overview_and_restore_on_select_without_popups() {
+        let now = Instant::now();
+        let run = entry("run", AgentState::Running);
+        let done = AgentEntry {
+            settled: true,
+            ..entry("done", AgentState::Completed)
+        };
+        let err_settled = AgentEntry {
+            settled: true,
+            ..entry("err-settled", AgentState::Error)
+        };
+        assert!(!attention(&err_settled));
+        assert!(!running(&err_settled));
+        assert_eq!(tier_of(&err_settled), Tier::Quiet);
+
+        let snap = snapshot_of(vec![run, done, err_settled.clone()]);
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        screen.sync(&snap, now);
+        render_for_test(&mut screen, &snap, now);
+
+        assert_eq!(screen.page(), Some("OVERVIEW"));
+        assert_eq!(screen.entries.len(), 1);
+        assert_eq!(screen.entries[0].thread_id, "run");
+        assert_eq!(screen.servers[0].overview_hidden.len(), 2);
+        assert_eq!(screen.board.cards.len(), 1);
+        let overview_bg = screen.background.as_ref().unwrap().data().to_vec();
+
+        // 新しいスナップショット無しで DETAILS へ切り替わると、即座に復元され、ポップアップも溢れない。
+        assert_eq!(
+            screen.handle_action(ScreenAction::Select, now + Duration::from_secs(1)),
+            Outcome::Consumed
+        );
+        assert_eq!(screen.page(), Some("DETAILS"));
+        assert_eq!(screen.entries.len(), 3);
+        assert_eq!(screen.board.cards.len(), 3);
+        assert!(screen.queue.is_empty());
+        assert!(screen.focus.is_none());
+        assert!(screen.pending_new.is_empty());
+
+        let cards = render_for_test(&mut screen, &snap, now + Duration::from_secs(1));
+        assert_ne!(
+            screen.background.as_ref().unwrap().data(),
+            overview_bg.as_slice()
+        );
+        let alpha_of = |id: &str| {
+            let cid = screen.id_map[&k(id)];
+            cards.iter().find(|c| c.id == cid).unwrap().pose.alpha
+        };
+        assert!((alpha_of("run") - 1.0).abs() < 1e-4);
+        assert!((alpha_of("done") - 0.78).abs() < 1e-4);
+        assert!((alpha_of("err-settled") - 0.78).abs() < 1e-4);
+        let by_id = |id: &str| {
+            screen
+                .entries
+                .iter()
+                .find(|e| e.thread_id == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            screen.content(&by_id("run"), now, None, false, false).badge,
+            None
+        );
+        assert_eq!(
+            screen
+                .content(&by_id("done"), now, None, false, false)
+                .badge
+                .as_deref(),
+            Some("対応済み")
+        );
+        assert_eq!(
+            screen
+                .content(&by_id("err-settled"), now, None, false, false)
+                .badge
+                .as_deref(),
+            Some("対応済み")
+        );
+
+        // 狭い 640px 画面でも DETAILS 描画が安全に動く。
+        let mut narrow = AgentScreen::new((640, 480), false, 30);
+        narrow.sync(&snap, now);
+        assert_eq!(
+            narrow.handle_action(ScreenAction::Select, now),
+            Outcome::Consumed
+        );
+        render_for_test(&mut narrow, &snap, now);
+        assert_eq!(narrow.entries.len(), 3);
+
+        // 再度 5 で OVERVIEW に戻ると、片付け済みスレッドは再び隠れ、キャッシュからも消える。
+        assert_eq!(
+            screen.handle_action(ScreenAction::Select, now + Duration::from_secs(2)),
+            Outcome::Consumed
+        );
+        assert_eq!(screen.page(), Some("OVERVIEW"));
+        assert_eq!(screen.entries.len(), 1);
+        assert_eq!(screen.board.cards.len(), 1);
+        assert!(!screen.seen.contains_key(&k("done")));
+        assert!(!screen.seen.contains_key(&k("err-settled")));
+        assert!(screen.queue.is_empty());
+        assert!(screen.focus.is_none());
+        assert!(screen.pending_new.is_empty());
+    }
+
+    /// 片付け済みのスレッドは、DETAILS で表示していても、OVERVIEW に残した片付け済みの親でも、
+    /// 状態別の件数に数えない(合計のスレッド数には数える)。
+    #[test]
+    fn settled_threads_are_not_counted_in_the_state_counts_on_either_page() {
+        let now = Instant::now();
+        let settled = |id: &str, state| AgentEntry {
+            settled: true,
+            ..entry(id, state)
+        };
+        let snap = snapshot_of(vec![
+            entry("run", AgentState::Running),
+            settled("s-run", AgentState::Running),
+            settled("s-err", AgentState::Error),
+            settled("s-done", AgentState::Completed),
+            // 異常の子のために OVERVIEW に残る片付け済みの親。
+            settled("s-parent", AgentState::Running),
+            child("err-kid", "s-parent", AgentState::Error),
+        ]);
+        let counts_of = |screen: &AgentScreen| {
+            let all: Vec<&AgentEntry> = screen
+                .servers
+                .iter()
+                .flat_map(|s| s.entries.iter())
+                .collect();
+            (
+                all.len(),
+                state_counts(&all)
+                    .iter()
+                    .map(|(label, _, n, _)| (*label, *n))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        screen.sync(&snap, now);
+        let (total, counts) = counts_of(&screen);
+        assert_eq!(total, 3, "run・err-kid・残した親");
+        assert_eq!(
+            counts,
+            [
+                ("実行中", 1),
+                ("承認待ち", 0),
+                ("入力・計画", 0),
+                ("異常", 1),
+                ("応答完了", 0),
+                ("その他", 0),
+            ]
+        );
+        screen.handle_action(ScreenAction::Select, now + Duration::from_secs(1));
+        let (total, counts) = counts_of(&screen);
+        assert_eq!(total, 6);
+        assert_eq!(
+            counts,
+            [
+                ("実行中", 1),
+                ("承認待ち", 0),
+                ("入力・計画", 0),
+                ("異常", 1),
+                ("応答完了", 0),
+                ("その他", 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn settled_parent_with_unfinished_or_completed_children_behaves_correctly_across_pages() {
+        let now = Instant::now();
+
+        // Case A: settled な親 + エラーの子 → OVERVIEW でも親子とも表示され、親に「対応済み」、枠に子の要確認が出る。
+        let boss_err = AgentEntry {
+            settled: true,
+            ..entry("boss-err", AgentState::Completed)
+        };
+        let kid_err = child("kid-err", "boss-err", AgentState::Error);
+        let snap_a = snapshot_of(vec![boss_err.clone(), kid_err]);
+        let mut s_a = AgentScreen::new((1920, 1080), false, 30);
+        s_a.sync(&snap_a, now);
+        let cards_a = render_for_test(&mut s_a, &snap_a, now);
+        assert_eq!(s_a.entries.len(), 2);
+        assert!(s_a.servers[0].overview_hidden.is_empty());
+        assert!(s_a.board.cards.contains_key(&k("boss-err")));
+        assert!(s_a.board.cards.contains_key(&k("kid-err")));
+        assert_eq!(tier_of(&boss_err), Tier::Quiet);
+        assert_eq!(
+            s_a.content(&boss_err, now, None, false, false)
+                .badge
+                .as_deref(),
+            Some("対応済み")
+        );
+        let focused = s_a.content(&boss_err, now, Some("popup".into()), false, true);
+        assert_eq!(focused.badge, None);
+        assert_eq!(focused.detail, "popup");
+        let boss_alpha = cards_a
+            .iter()
+            .find(|c| c.id == s_a.id_map[&k("boss-err")])
+            .unwrap()
+            .pose
+            .alpha;
+        assert!((boss_alpha - 1.0).abs() < 1e-4);
+        assert!(
+            s_a.labels
+                .iter()
+                .any(|(id, l)| id.ends_with(":badge") && l.key.starts_with("子に異常 1|"))
+        );
+        // DETAILS では、OVERVIEW に残した片付け済みの親も、ほかの片付け済みと同じく減光する(子はそのまま)。
+        let t = now + Duration::from_secs(1);
+        s_a.handle_action(ScreenAction::Select, t);
+        // 見えたままのカードは位置と同じく減光も滑らかに移るので、移り終えてから確かめる。
+        render_for_test(&mut s_a, &snap_a, t);
+        let t = t + MOVE_TWEEN;
+        let cards_a = render_for_test(&mut s_a, &snap_a, t);
+        let alpha_a = |id: &str| {
+            cards_a
+                .iter()
+                .find(|c| c.id == s_a.id_map[&k(id)])
+                .unwrap()
+                .pose
+                .alpha
+        };
+        assert!((alpha_a("boss-err") - 0.78).abs() < 1e-4);
+        assert!((alpha_a("kid-err") - 1.0).abs() < 1e-4);
+
+        // Case B: settled な親 + 完了済みの子 → OVERVIEW では両方隠れ、DETAILS でバッジ付き・減光で表示される。
+        let boss_done = AgentEntry {
+            settled: true,
+            ..entry("boss-done", AgentState::Completed)
+        };
+        let kid_done = AgentEntry {
+            settled_ancestor: true,
+            ..child("kid-done", "boss-done", AgentState::Completed)
+        };
+        let snap_b = snapshot_of(vec![boss_done, kid_done]);
+        let mut s_b = AgentScreen::new((1920, 1080), false, 30);
+        s_b.sync(&snap_b, now);
+        render_for_test(&mut s_b, &snap_b, now);
+        assert!(s_b.entries.is_empty());
+        assert!(s_b.board.cards.is_empty());
+        assert_eq!(s_b.servers[0].overview_hidden.len(), 2);
+
+        assert_eq!(
+            s_b.handle_action(ScreenAction::Select, now + Duration::from_secs(1)),
+            Outcome::Consumed
+        );
+        assert_eq!(s_b.entries.len(), 2);
+        assert_eq!(s_b.board.cards.len(), 2);
+        let cards_b = render_for_test(&mut s_b, &snap_b, now + Duration::from_secs(1));
+        for id in ["boss-done", "kid-done"] {
+            let cid = s_b.id_map[&k(id)];
+            let alpha = cards_b.iter().find(|c| c.id == cid).unwrap().pose.alpha;
+            assert!((alpha - 0.78).abs() < 1e-4, "{id} alpha={alpha}");
+        }
+        let get = |id: &str| {
+            s_b.entries
+                .iter()
+                .find(|e| e.thread_id == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            s_b.content(&get("boss-done"), now, None, false, false)
+                .badge
+                .as_deref(),
+            Some("対応済み")
+        );
+        assert_eq!(
+            s_b.content(&get("kid-done"), now, None, false, false)
+                .badge
+                .as_deref(),
+            Some("対応済み(親)")
+        );
+
+        assert_eq!(
+            s_b.handle_action(ScreenAction::Select, now + Duration::from_secs(2)),
+            Outcome::Consumed
+        );
+        assert!(s_b.entries.is_empty());
+        assert!(s_b.board.cards.is_empty());
+    }
+
+    #[test]
+    fn active_thread_becoming_settled_between_polls_clears_focus_and_queue_without_popup() {
+        let now = Instant::now();
+        let mut screen = AgentScreen::new((1920, 1080), false, 30);
+        let poll1 = snapshot_of(vec![
+            entry("keep", AgentState::Running),
+            entry("focused-t", AgentState::Running),
+            entry("queued-t", AgentState::Running),
+            entry("quiet-t", AgentState::Running),
+        ]);
+        screen.sync(&poll1, now);
+        screen.enqueue(change_event("focused-t", EventKind::Changed));
+        assert!(screen.activate_event(now));
+        assert_eq!(
+            screen.focus.as_ref().map(|f| f.event.key.thread.as_str()),
+            Some("focused-t")
+        );
+        screen.enqueue(change_event("queued-t", EventKind::New));
+        assert_eq!(screen.queue.len(), 1);
+        assert!(screen.pending_new.contains(&k("queued-t")));
+
+        let t2 = now + Duration::from_secs(1);
+        let settled = |id: &str| AgentEntry {
+            settled: true,
+            ..entry(id, AgentState::Completed)
+        };
+        let completed_change = |cid: u64, id: &str| AgentChange {
+            server_id: "primary".into(),
+            id: cid,
+            thread_id: id.into(),
+            kind: AgentChangeKind::TurnCompleted,
+            before_state: Some(AgentState::Running),
+            after_state: Some(AgentState::Completed),
+            before_goal: None,
+            after_goal: None,
+            before_title: None,
+            after_title: None,
+            observed_at: SystemTime::now(),
+        };
+        let poll2 = AgentSnapshot {
+            entries: vec![
+                entry("keep", AgentState::Running),
+                settled("focused-t"),
+                settled("queued-t"),
+                settled("quiet-t"),
+            ]
+            .into(),
+            changes: vec![
+                completed_change(1, "focused-t"),
+                completed_change(2, "queued-t"),
+                completed_change(3, "quiet-t"),
+            ]
+            .into(),
+            change_cursor: 3,
+            synchronized: true,
+            ..Default::default()
+        };
+        screen.sync(&poll2, t2);
+        assert!(screen.focus.is_none());
+        assert!(screen.focus_card_id.is_none());
+        assert_eq!(screen.scrim_alpha, 0.0);
+        assert!(screen.queue.is_empty());
+        assert!(screen.pending_new.is_empty());
+        assert_eq!(screen.entries.len(), 1);
+        assert_eq!(screen.entries[0].thread_id, "keep");
+        assert_eq!(screen.seen.len(), 1);
+        assert!(screen.seen.contains_key(&k("keep")));
+        assert_eq!(screen.servers[0].cursor, 3);
+        assert!(!screen.advance(t2));
+        assert!(screen.focus.is_none());
+
+        assert_eq!(
+            screen.handle_action(ScreenAction::Select, t2 + Duration::from_secs(1)),
+            Outcome::Consumed
+        );
+        assert_eq!(screen.entries.len(), 4);
+        assert!(screen.queue.is_empty());
+        assert!(screen.focus.is_none());
+        let cards = render_for_test(&mut screen, &poll2, t2 + Duration::from_secs(1));
+        for id in ["focused-t", "queued-t", "quiet-t"] {
+            let cid = screen.id_map[&k(id)];
+            let alpha = cards.iter().find(|c| c.id == cid).unwrap().pose.alpha;
+            assert!((alpha - 0.78).abs() < 1e-4, "{id}");
+        }
     }
 
     #[test]
@@ -3295,7 +4379,7 @@ mod tests {
         );
 
         let removed = k(&entries[0].thread_id);
-        screen.pending_new.insert(removed.clone());
+        assert!(screen.pending_new.contains(&removed));
         let remaining = entries
             .iter()
             .filter(|e| k(&e.thread_id) != removed)
@@ -3603,9 +4687,7 @@ mod tests {
         // 置き場が無いスレッドのイベントはキューに残らない。
         s.focus = None;
         s.enqueue(change_event("nobody", EventKind::New));
-        s.queue.clear();
-        s.enqueue(change_event("nobody", EventKind::New));
-        s.pending_new.insert(k("nobody"));
+        assert!(s.pending_new.contains(&k("nobody")));
         assert!(!s.activate_event(now));
         assert!(s.queue.is_empty() && !s.pending_new.contains(&k("nobody")));
     }
@@ -3905,6 +4987,51 @@ mod tests {
                 "bench screen threads={n}: first={first:?} next poll (same layout)={same:?} render={:?} replans={}",
                 started.elapsed(),
                 s.replans
+            );
+        }
+        // 親の鎖が深い最悪の形: 全員が未片付け・実行中で、片付け済みの祖先が無い(先祖をたどる判定が根まで進む)。
+        for n in [250usize, 1000, 2047] {
+            let now = Instant::now();
+            let entries: Vec<AgentEntry> = (0..n)
+                .map(|i| {
+                    let e = entry(&format!("c{i:05}"), AgentState::Running);
+                    if i == 0 {
+                        e
+                    } else {
+                        child(
+                            &format!("c{i:05}"),
+                            &format!("c{:05}", i - 1),
+                            AgentState::Running,
+                        )
+                    }
+                })
+                .collect();
+            let started = std::time::Instant::now();
+            let hidden = crate::agents::overview_hidden_ids(&entries);
+            let judge = started.elapsed();
+            let nodes: Vec<Node<ThreadKey>> = entries
+                .iter()
+                .map(|e| Node {
+                    id: e.key(),
+                    parent: e.parent_key(),
+                    tier: tier_of(e),
+                })
+                .collect();
+            let started = std::time::Instant::now();
+            let families = family::build_families(&nodes);
+            let build = started.elapsed();
+            assert_eq!(families.len(), 1);
+            assert!(hidden.is_empty());
+            let mut s = AgentScreen::new((1920, 1080), false, 30);
+            let snap = snapshot_of(entries.clone());
+            let started = std::time::Instant::now();
+            s.sync(&snap, now);
+            let sync = started.elapsed();
+            let started = std::time::Instant::now();
+            s.handle_action(ScreenAction::Select, now + Duration::from_secs(1));
+            let toggle = started.elapsed();
+            eprintln!(
+                "bench screen deep chain={n}: overview_hidden_ids={judge:?} build_families={build:?} sync={sync:?} toggle={toggle:?}"
             );
         }
     }

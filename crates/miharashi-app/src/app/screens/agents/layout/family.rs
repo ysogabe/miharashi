@@ -106,6 +106,38 @@ impl<K: Id> Family<K> {
     }
 }
 
+/// 親をたどって輪になっている所を、輪の中でいちばん重要なもの(位置が最小)の親を切って木にする。
+fn cut_cycles(parent: &mut [Option<usize>]) {
+    let n = parent.len();
+    // 輪を探す。たどり終えた所(2)に着いたら止めるので、深い鎖でも件数に比例する手間で済む。
+    // たどっている途中の所(1)に戻ったら輪なので、輪の中でいちばん重要なものの親を切る。
+    let mut seen = vec![0u8; n];
+    for start in 0..n {
+        let mut path = Vec::new();
+        let mut cur = Some(start);
+        while let Some(c) = cur {
+            match seen[c] {
+                0 => {
+                    seen[c] = 1;
+                    path.push(c);
+                    cur = parent[c];
+                }
+                1 => {
+                    let from = path.iter().rposition(|&v| v == c).unwrap_or(0);
+                    if let Some(&top) = path[from..].iter().min() {
+                        parent[top] = None;
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        for &v in &path {
+            seen[v] = 2;
+        }
+    }
+}
+
 /// 可視のスレッドを親子の組にする。組は最も重要なメンバーの順。
 /// 親が可視のスレッドの子は親と同じ組に入り(親の親も同様にたどる)、親が可視でない子は親ごとに
 /// 「親情報なし」の組にまとめる。親をたどって輪になっているときは、最も重要なスレッドを根にして輪を切る。
@@ -126,30 +158,7 @@ pub fn build_families<K: Id>(nodes: &[Node<K>]) -> Vec<Family<K>> {
                 .filter(|&p| p != i)
         })
         .collect();
-    for start in 0..n {
-        let mut cur = parent[start];
-        let mut steps = 0;
-        while let Some(c) = cur {
-            if c == start {
-                // 輪の中でいちばん重要なものの親を切る。
-                let mut cycle = vec![start];
-                let mut x = parent[start];
-                while let Some(v) = x.filter(|&v| v != start) {
-                    cycle.push(v);
-                    x = parent[v];
-                }
-                if let Some(&top) = cycle.iter().min() {
-                    parent[top] = None;
-                }
-                break;
-            }
-            steps += 1;
-            if steps > n {
-                break;
-            }
-            cur = parent[c];
-        }
-    }
+    cut_cycles(&mut parent);
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, p) in parent.iter().enumerate() {
         if let Some(p) = p {
@@ -1640,6 +1649,58 @@ fn plan_all<K: Id>(area: Rect, scale: f32, projects: &[Vec<Family<K>>]) -> Layou
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cut_cycles` は、各スレッドから根までたどって輪を探していた前の書き方と同じ所を切る。
+    #[test]
+    fn cut_cycles_matches_the_walk_from_every_node() {
+        fn naive(parent: &mut [Option<usize>]) {
+            let n = parent.len();
+            for start in 0..n {
+                let mut cur = parent[start];
+                let mut steps = 0;
+                while let Some(c) = cur {
+                    if c == start {
+                        let mut cycle = vec![start];
+                        let mut x = parent[start];
+                        while let Some(v) = x.filter(|&v| v != start) {
+                            cycle.push(v);
+                            x = parent[v];
+                        }
+                        if let Some(&top) = cycle.iter().min() {
+                            parent[top] = None;
+                        }
+                        break;
+                    }
+                    steps += 1;
+                    if steps > n {
+                        break;
+                    }
+                    cur = parent[c];
+                }
+            }
+        }
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for _ in 0..20_000 {
+            let n = 1 + next(12) as usize;
+            // build_families と同じく自己ループは前もって外す。
+            let parent: Vec<Option<usize>> = (0..n)
+                .map(|i| match next(4) {
+                    0 => None,
+                    _ => Some(next(n as u64) as usize).filter(|&p| p != i),
+                })
+                .collect();
+            let (mut fast, mut slow) = (parent.clone(), parent.clone());
+            cut_cycles(&mut fast);
+            naive(&mut slow);
+            assert_eq!(fast, slow, "{parent:?}");
+        }
+    }
 
     const AREA: Rect = Rect {
         x: 32.0,

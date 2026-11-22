@@ -4,7 +4,7 @@ use crate::config::ConfigAgents;
 use crate::screen::{Provider, World};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -123,6 +123,13 @@ pub struct AgentEntry {
     pub parent_thread_id: Option<String>,
     /// 親スレッドのタイトル。親が一覧の対象外(片付け済み・古い・アーカイブ)でも、shell にあれば残す。
     pub parent_title: Option<String>,
+    /// T3 の `settledOverride == "settled"` に相当する片付け済み状態(`settledAt` 単独では判定しない)。
+    pub settled: bool,
+    /// 生の shell 応答上で非アーカイブの `subagent` 先祖のいずれかが `settled` だったか。
+    pub settled_ancestor: bool,
+    /// 生の shell 応答上で、非アーカイブの未片付け・未完了(`is_unfinished_state`)の `subagent` 子孫を持つか。
+    /// 間の親が一覧の対象外でも、取得のときに残した片付け済みの祖先を OVERVIEW で隠さないために使う。
+    pub has_unfinished_descendant: bool,
 }
 
 impl AgentEntry {
@@ -144,6 +151,196 @@ impl AgentEntry {
             server: self.server_id.clone(),
             thread: parent.clone(),
         })
+    }
+}
+
+/// 未完了・要対応として扱う状態か(OVERVIEW 表示と片付け済み親の救済判定に使う)。
+pub fn is_unfinished_state(state: AgentState) -> bool {
+    match state {
+        AgentState::Starting
+        | AgentState::Running
+        | AgentState::Monitoring
+        | AgentState::Approval
+        | AgentState::Input
+        | AgentState::Plan
+        | AgentState::Error => true,
+        AgentState::Completed
+        | AgentState::Idle
+        | AgentState::Interrupted
+        | AgentState::Stopped
+        | AgentState::Unknown => false,
+    }
+}
+
+/// 1 接続の `AgentEntry` 一覧から、OVERVIEW で隠すスレッド ID の集合を返す(接続をまたがない)。
+/// 未完了で未整理の子孫(`subagent`)を持つ先祖は、`settled` でも OVERVIEW に残す。子孫は一覧の中の親の鎖と、
+/// 取得のときに生の shell 応答から決めた `has_unfinished_descendant`(間の親が一覧の対象外でも途切れない)の両方で見る。
+pub fn overview_hidden_ids(entries: &[AgentEntry]) -> HashSet<String> {
+    let parent = parent_positions(
+        entries
+            .iter()
+            .map(|e| (e.thread_id.as_str(), e.parent_thread_id.as_deref())),
+    );
+    let settled: Vec<bool> = entries.iter().map(|e| e.settled).collect();
+    let unfinished: Vec<bool> = entries
+        .iter()
+        .map(|e| !e.settled && is_unfinished_state(e.state))
+        .collect();
+    let flags = lineage_flags(&parent, &settled, &unfinished);
+    let mut hidden = HashSet::new();
+    for (i, e) in entries.iter().enumerate() {
+        if unfinished[i] {
+            continue;
+        }
+        if e.has_unfinished_descendant || flags.unfinished_descendant[i] {
+            continue;
+        }
+        if e.settled || e.settled_ancestor || flags.settled_ancestor[i] {
+            hidden.insert(e.thread_id.clone());
+        }
+    }
+    hidden
+}
+
+/// 一覧の中の親の位置(`subagent` の親が一覧に無ければ None)。ID が重なるときは後のものを親とみなす。
+fn parent_positions<'a>(
+    items: impl Iterator<Item = (&'a str, Option<&'a str>)> + Clone,
+) -> Vec<Option<usize>> {
+    let index: HashMap<&str, usize> = items
+        .clone()
+        .enumerate()
+        .map(|(i, (id, _))| (id, i))
+        .collect();
+    items
+        .map(|(_, parent)| parent.and_then(|p| index.get(p).copied()))
+        .collect()
+}
+
+/// 親の鎖から決める 2 つの印。どちらも自分自身は先祖・子孫に含めない(親をたどって輪になっていても)。
+struct LineageFlags {
+    /// 先祖として、`unfinished` の子孫を持つ。
+    unfinished_descendant: Vec<bool>,
+    /// 先祖に `settled` がある。
+    settled_ancestor: Vec<bool>,
+}
+
+/// 親の鎖をたどる判定を、深い鎖でも件数に比例する手間で決める(1 件ずつ根までたどると鎖の長さの 2 乗になる)。
+/// 親は高々 1 つなので、たどると根で止まるか輪に入る。輪の中の印は輪の全員で共通(自分を除く)にする。
+fn lineage_flags(parent: &[Option<usize>], settled: &[bool], unfinished: &[bool]) -> LineageFlags {
+    let n = parent.len();
+    // 輪を見つける(0 = 未訪問、1 = たどっている途中、2 = 済み)。
+    let mut seen = vec![0u8; n];
+    let mut cycle_of: Vec<Option<usize>> = vec![None; n];
+    let mut cycles: Vec<Vec<usize>> = Vec::new();
+    for start in 0..n {
+        if seen[start] != 0 {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut v = Some(start);
+        while let Some(x) = v {
+            match seen[x] {
+                0 => {
+                    seen[x] = 1;
+                    path.push(x);
+                    v = parent[x];
+                }
+                1 => {
+                    let from = path.iter().rposition(|&y| y == x).unwrap_or(0);
+                    let members = path[from..].to_vec();
+                    for &m in &members {
+                        cycle_of[m] = Some(cycles.len());
+                    }
+                    cycles.push(members);
+                    break;
+                }
+                _ => break,
+            }
+        }
+        for &x in &path {
+            seen[x] = 2;
+        }
+    }
+
+    // 未完了の子孫を持つ: 未完了のスレッドから親へ印を付け、既に印のある所で止める(その先は付け済み)。
+    // 輪の外から輪に入れば輪の全員に、輪の中の 1 件だけが未完了ならその 1 件を除く全員に付く。
+    let mut unfinished_descendant = vec![false; n];
+    let mut cycle_full = vec![false; cycles.len()];
+    let mut cycle_source: Vec<Option<usize>> = vec![None; cycles.len()];
+    let mark_all = |c: usize, marks: &mut [bool], full: &mut [bool]| {
+        if !full[c] {
+            full[c] = true;
+            for &m in &cycles[c] {
+                marks[m] = true;
+            }
+        }
+    };
+    for x in (0..n).filter(|&x| unfinished[x]) {
+        if let Some(c) = cycle_of[x] {
+            if cycle_full[c] {
+                continue;
+            }
+            if cycle_source[c].is_some() {
+                mark_all(c, &mut unfinished_descendant, &mut cycle_full);
+            } else {
+                cycle_source[c] = Some(x);
+                for &m in cycles[c].iter().filter(|&&m| m != x) {
+                    unfinished_descendant[m] = true;
+                }
+            }
+            continue;
+        }
+        let mut v = parent[x];
+        while let Some(p) = v {
+            if let Some(c) = cycle_of[p] {
+                mark_all(c, &mut unfinished_descendant, &mut cycle_full);
+                break;
+            }
+            if unfinished_descendant[p] {
+                break;
+            }
+            unfinished_descendant[p] = true;
+            v = parent[p];
+        }
+    }
+
+    // 片付け済みの先祖を持つ: 「自分か先祖が片付け済み」を根の側から覚えて使い回す。輪の中は輪の全員で共通。
+    let cycle_settled: Vec<usize> = cycles
+        .iter()
+        .map(|c| c.iter().filter(|&&m| settled[m]).count())
+        .collect();
+    let mut reach: Vec<Option<bool>> = vec![None; n];
+    for (c, members) in cycles.iter().enumerate() {
+        for &m in members {
+            reach[m] = Some(cycle_settled[c] > 0);
+        }
+    }
+    for start in 0..n {
+        let mut path = Vec::new();
+        let mut v = Some(start);
+        let mut acc = false;
+        while let Some(x) = v {
+            if let Some(r) = reach[x] {
+                acc = r;
+                break;
+            }
+            path.push(x);
+            v = parent[x];
+        }
+        for &x in path.iter().rev() {
+            acc |= settled[x];
+            reach[x] = Some(acc);
+        }
+    }
+    let settled_ancestor = (0..n)
+        .map(|x| match cycle_of[x] {
+            Some(c) => cycle_settled[c] > usize::from(settled[x]),
+            None => parent[x].is_some_and(|p| reach[p] == Some(true)),
+        })
+        .collect();
+    LineageFlags {
+        unfinished_descendant,
+        settled_ancestor,
     }
 }
 
@@ -184,6 +381,19 @@ pub struct AgentSnapshot {
     pub resync_generation: u64,
     pub synchronized: bool,
     pub error_summary: Option<String>,
+    /// 直近の shell 応答にあったが保持の対象外だった(非アーカイブの)スレッドの、差分に使う値。
+    /// 対象に戻ったスレッド(再開・未完了の子による親の保持・古いスレッドの新しい run)を新着と取り違えないために、
+    /// 次の取得の `diff` が前の値として使う。画面は毎フレーム snapshot を複製するので `Arc` で持つ。
+    pub(crate) retired: Arc<HashMap<String, ThreadMark>>,
+}
+
+/// 保持の対象外のスレッドについて、`diff` が比べる値だけを残したもの。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ThreadMark {
+    state: AgentState,
+    plan: bool,
+    active_run_id: Option<String>,
+    latest_run_id: Option<String>,
 }
 
 /// World に載せる 1 接続ぶん。接続は設定の順(`primary` が先頭)に並ぶ。
@@ -513,17 +723,18 @@ fn install_snapshot(
 ) {
     let now_wall = SystemTime::now();
     let now_mono = Instant::now();
-    let (old_entries, old_changes, synchronized, mut cursor, old_environment) = match shared.read()
-    {
-        Ok(current) => (
-            current.entries.clone(),
-            current.changes.clone(),
-            current.synchronized,
-            current.change_cursor,
-            current.environment_id.clone(),
-        ),
-        Err(_) => return,
-    };
+    let (old_entries, old_retired, old_changes, synchronized, mut cursor, old_environment) =
+        match shared.read() {
+            Ok(current) => (
+                current.entries.clone(),
+                current.retired.clone(),
+                current.changes.clone(),
+                current.synchronized,
+                current.change_cursor,
+                current.environment_id.clone(),
+            ),
+            Err(_) => return,
+        };
     for entry in &mut remote.entries {
         entry.server_id = server_id.clone();
     }
@@ -540,6 +751,7 @@ fn install_snapshot(
         history.extend(diff(
             server_id,
             &old_entries,
+            &old_retired,
             &remote.entries,
             &mut cursor,
             now_wall,
@@ -562,6 +774,8 @@ fn install_snapshot(
         current.protocol_version = remote.protocol_version;
         current.sequence = remote.sequence;
         current.entries = remote.entries.into();
+        // 再同期・環境の入れ替わりでも、今回の応答の値に置き換える(前の値は差分を作るときだけ使う)。
+        current.retired = Arc::new(remote.retired);
         current.changes = changes.into();
         current.connection = AgentConnection::Live;
         // 取得に成功した token の世代。失敗では更新しない(最後に成功した世代のまま)ので、
@@ -591,6 +805,7 @@ struct RemoteSnapshot {
     protocol_version: Option<u64>,
     sequence: Option<u64>,
     entries: Vec<AgentEntry>,
+    retired: HashMap<String, ThreadMark>,
 }
 
 fn fetch_environment(agent: &ureq::Agent, endpoint: &str) -> Result<Environment, FetchError> {
@@ -732,8 +947,8 @@ fn parse_shell_recent(
         let title = field_str(project, "title").unwrap_or(id);
         project_names.insert(sanitize(id, 256), sanitize(title, ENTRY_TEXT_LIMIT));
     }
-    let mut entries = Vec::with_capacity(threads.len());
-    let mut seen_ids = std::collections::HashSet::with_capacity(threads.len());
+    let mut parsed_threads = Vec::with_capacity(threads.len());
+    let mut seen_ids = HashSet::with_capacity(threads.len());
     // 除外した親のタイトルも子の見出しに使うので、対象かどうかの前に集める。
     let mut titles: HashMap<String, String> = HashMap::with_capacity(threads.len());
     for thread in threads {
@@ -746,10 +961,10 @@ fn parse_shell_recent(
         if project_id.is_empty() {
             return Err("空の thread projectId があります".into());
         }
-        let selection = thread.get("modelSelection").filter(|v| v.is_object());
-        let request = thread
+        let request_kind = thread
             .get("pendingRuntimeRequest")
-            .filter(|v| v.is_object());
+            .filter(|v| v.is_object())
+            .and_then(|r| field_str(r, "kind"));
         let raw_status = field_str(thread, "status");
         let raw_activity_status = field_str(thread, "activityRunStatus");
         let plan = bool_field(thread, "hasActionableProposedPlan");
@@ -757,74 +972,129 @@ fn parse_shell_recent(
         let state = normalize_state(
             raw_status,
             raw_activity_status,
-            request.and_then(|r| field_str(r, "kind")),
+            request_kind,
             plan,
             background_tasks > 0,
         );
-        titles.insert(
-            sanitize(id, 256),
-            field_str(thread, "title").map_or_else(
-                || "無題".into(),
-                |v| nonempty(sanitize(v, ENTRY_TEXT_LIMIT), "無題"),
-            ),
+        let thread_id = sanitize(id, 256);
+        let title = field_str(thread, "title").map_or_else(
+            || "無題".into(),
+            |v| nonempty(sanitize(v, ENTRY_TEXT_LIMIT), "無題"),
         );
+        titles.insert(thread_id.clone(), title.clone());
         let archived = thread.get("archivedAt").is_some_and(|v| !v.is_null());
         // T3 のサーバー・client と同じく、settledOverride だけで片付け済みかを決める。
         let settled = field_str(thread, "settledOverride") == Some("settled");
         let updated = field_str(thread, "updatedAt");
-        if archived || !is_target(state, settled, updated, recent_hours, now) {
+        parsed_threads.push(ParsedThread {
+            raw: thread,
+            thread_id,
+            project_id,
+            title,
+            raw_status,
+            raw_activity_status,
+            request_kind,
+            plan,
+            background_tasks,
+            state,
+            archived,
+            settled,
+            updated,
+            parent_thread_id: subagent_parent(thread),
+        });
+    }
+    // 親の鎖は非アーカイブのスレッドだけでたどる(アーカイブ済みの親で鎖は切れる)。
+    let live: Vec<&ParsedThread<'_>> = parsed_threads.iter().filter(|t| !t.archived).collect();
+    let parent = parent_positions(
+        live.iter()
+            .map(|t| (t.thread_id.as_str(), t.parent_thread_id.as_deref())),
+    );
+    let settled: Vec<bool> = live.iter().map(|t| t.settled).collect();
+    let unfinished: Vec<bool> = live
+        .iter()
+        .map(|t| !t.settled && is_unfinished_state(t.state))
+        .collect();
+    let flags = lineage_flags(&parent, &settled, &unfinished);
+    let mut has_unfinished_descendant: HashSet<&str> = HashSet::new();
+    let mut has_settled_ancestor: HashSet<&str> = HashSet::new();
+    for (i, t) in live.iter().enumerate() {
+        if flags.unfinished_descendant[i] {
+            has_unfinished_descendant.insert(t.thread_id.as_str());
+        }
+        if flags.settled_ancestor[i] {
+            has_settled_ancestor.insert(t.thread_id.as_str());
+        }
+    }
+    let mut entries = Vec::with_capacity(parsed_threads.len());
+    let mut retired = HashMap::new();
+    for t in &parsed_threads {
+        if t.archived {
             continue;
         }
+        let rescue_settled_parent =
+            t.settled && has_unfinished_descendant.contains(t.thread_id.as_str());
+        if !rescue_settled_parent && !is_target(t.state, t.settled, t.updated, recent_hours, now) {
+            retired.insert(
+                t.thread_id.clone(),
+                ThreadMark {
+                    state: t.state,
+                    plan: t.plan,
+                    active_run_id: field_str(t.raw, "activeRunId").map(|s| sanitize(s, 256)),
+                    latest_run_id: field_str(t.raw, "latestRunId").map(|s| sanitize(s, 256)),
+                },
+            );
+            continue;
+        }
+        let thread = t.raw;
+        let selection = thread.get("modelSelection").filter(|v| v.is_object());
         let project_title = project_names
-            .get(project_id)
+            .get(t.project_id)
             .cloned()
-            .unwrap_or_else(|| short_id(project_id));
+            .unwrap_or_else(|| short_id(t.project_id));
         let goal = thread
             .get("goal")
             .filter(|g| g.is_object() && field_str(g, "status") != Some("complete"))
             .and_then(|g| field_str(g, "objective"))
             .map(|s| sanitize(s, ENTRY_TEXT_LIMIT))
             .filter(|s| !s.is_empty());
+        let parent_title = t
+            .parent_thread_id
+            .as_ref()
+            .and_then(|parent| titles.get(parent).cloned());
         entries.push(AgentEntry {
             // 接続は install_snapshot が付ける(parse は 1 つの shell 応答だけを見る)。
             server_id: ServerId::default(),
-            thread_id: sanitize(id, 256),
-            project_id: sanitize(project_id, 256),
+            thread_id: t.thread_id.clone(),
+            project_id: sanitize(t.project_id, 256),
             project_title,
-            title: field_str(thread, "title").map_or_else(
-                || "無題".into(),
-                |v| nonempty(sanitize(v, ENTRY_TEXT_LIMIT), "無題"),
-            ),
+            title: t.title.clone(),
             provider: field_str(thread, "providerInstanceId")
                 .map(|s| provider_label(&sanitize(s, 128))),
             model: nested_str(selection, "model").map(|s| sanitize(&s, 128)),
-            state,
-            raw_status: raw_status.map(|s| sanitize(s, 64)),
-            raw_activity_status: raw_activity_status.map(|s| sanitize(s, 64)),
-            has_pending_approvals: state == AgentState::Approval,
-            has_pending_user_input: state == AgentState::Input,
-            needs_reauth: request.and_then(|r| field_str(r, "kind")) == Some("auth_refresh"),
-            has_actionable_proposed_plan: plan,
-            background_tasks,
+            state: t.state,
+            raw_status: t.raw_status.map(|s| sanitize(s, 64)),
+            raw_activity_status: t.raw_activity_status.map(|s| sanitize(s, 64)),
+            has_pending_approvals: t.state == AgentState::Approval,
+            has_pending_user_input: t.state == AgentState::Input,
+            needs_reauth: t.request_kind == Some("auth_refresh"),
+            has_actionable_proposed_plan: t.plan,
+            background_tasks: t.background_tasks,
             active_run_id: field_str(thread, "activeRunId").map(|s| sanitize(s, 256)),
             latest_run_id: field_str(thread, "latestRunId").map(|s| sanitize(s, 256)),
             goal,
             branch: field_str(thread, "branch").map(|s| sanitize(s, 256)),
             worktree_path: field_str(thread, "worktreePath").map(|s| sanitize(s, 512)),
-            updated_at: updated.map(|s| sanitize(s, 64)),
+            updated_at: t.updated.map(|s| sanitize(s, 64)),
             requested_at: field_str(thread, "latestRunRequestedAt").map(|s| sanitize(s, 64)),
             started_at: field_str(thread, "latestRunStartedAt").map(|s| sanitize(s, 64)),
             completed_at: field_str(thread, "latestRunCompletedAt").map(|s| sanitize(s, 64)),
             error_summary: error_summary(thread),
-            parent_thread_id: subagent_parent(thread),
-            parent_title: None,
+            parent_thread_id: t.parent_thread_id.clone(),
+            parent_title,
+            settled: t.settled,
+            settled_ancestor: has_settled_ancestor.contains(t.thread_id.as_str()),
+            has_unfinished_descendant: has_unfinished_descendant.contains(t.thread_id.as_str()),
         });
-    }
-    for entry in &mut entries {
-        entry.parent_title = entry
-            .parent_thread_id
-            .as_ref()
-            .and_then(|parent| titles.get(parent).cloned());
     }
     entries.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
     Ok(RemoteSnapshot {
@@ -834,7 +1104,25 @@ fn parse_shell_recent(
         protocol_version: None,
         sequence: obj.get("snapshotSequence").and_then(Value::as_u64),
         entries,
+        retired,
     })
+}
+
+struct ParsedThread<'a> {
+    raw: &'a Value,
+    thread_id: String,
+    project_id: &'a str,
+    title: String,
+    raw_status: Option<&'a str>,
+    raw_activity_status: Option<&'a str>,
+    request_kind: Option<&'a str>,
+    plan: bool,
+    background_tasks: usize,
+    state: AgentState,
+    archived: bool,
+    settled: bool,
+    updated: Option<&'a str>,
+    parent_thread_id: Option<String>,
 }
 
 /// V2 の一覧は provider の表示名を持たず instance ID だけなので、既定の instance は名前に直す。
@@ -905,8 +1193,8 @@ fn is_target(
             | AgentState::Input
             | AgentState::Plan
     );
-    // 片付け済み(settled)の失敗は、もう注意を引かない。
-    if live || state == AgentState::Error && !settled {
+    // 片付け済み(settled)は、進行中・提案・失敗であっても recent_hours を越えて保持しない。
+    if (live || state == AgentState::Error) && !settled {
         return true;
     }
     let Some(raw) = updated_at else {
@@ -1042,6 +1330,7 @@ fn normalize_state(
 fn diff(
     server_id: &ServerId,
     old: &[AgentEntry],
+    retired: &HashMap<String, ThreadMark>,
     new: &[AgentEntry],
     cursor: &mut u64,
     now: SystemTime,
@@ -1050,7 +1339,24 @@ fn diff(
         old.iter().map(|e| (e.thread_id.as_str(), e)).collect();
     let mut result = Vec::new();
     for entry in new {
-        let Some(previous) = old_by_id.get(entry.thread_id.as_str()).copied() else {
+        // 前回は保持の対象外だったスレッドは、そのときの状態・run と比べる(題名・目標・エラー文は比べない)。
+        let returned = match old_by_id.get(entry.thread_id.as_str()) {
+            Some(_) => None,
+            None => retired.get(entry.thread_id.as_str()).map(|m| AgentEntry {
+                state: m.state,
+                has_pending_approvals: m.state == AgentState::Approval,
+                has_pending_user_input: m.state == AgentState::Input,
+                has_actionable_proposed_plan: m.plan,
+                active_run_id: m.active_run_id.clone(),
+                latest_run_id: m.latest_run_id.clone(),
+                ..entry.clone()
+            }),
+        };
+        let Some(previous) = old_by_id
+            .get(entry.thread_id.as_str())
+            .copied()
+            .or(returned.as_ref())
+        else {
             push_change(
                 &mut result,
                 server_id,
@@ -1401,6 +1707,7 @@ mod tests {
             diff(
                 &sid(),
                 &preparing,
+                &HashMap::new(),
                 &starting,
                 &mut cursor,
                 SystemTime::now()
@@ -1415,6 +1722,7 @@ mod tests {
             diff(
                 &sid(),
                 &parse(with_error),
+                &HashMap::new(),
                 &cleared,
                 &mut cursor,
                 SystemTime::now()
@@ -1494,13 +1802,21 @@ mod tests {
     fn semantic_diff_ignores_updated_at_and_repeated_snapshot() {
         let first = parse_shell(&shell(vec![mock_thread("t1", "running", "a")], 1)).unwrap();
         let mut cursor = 0;
-        let initial = diff(&sid(), &[], &first.entries, &mut cursor, SystemTime::now());
+        let initial = diff(
+            &sid(),
+            &[],
+            &HashMap::new(),
+            &first.entries,
+            &mut cursor,
+            SystemTime::now(),
+        );
         assert_eq!(initial[0].kind, AgentChangeKind::New);
         let second = parse_shell(&shell(vec![mock_thread("t1", "running", "b")], 2)).unwrap();
         assert!(
             diff(
                 &sid(),
                 &first.entries,
+                &HashMap::new(),
                 &second.entries,
                 &mut cursor,
                 SystemTime::now()
@@ -1512,6 +1828,7 @@ mod tests {
             diff(
                 &sid(),
                 &first.entries,
+                &HashMap::new(),
                 &third.entries,
                 &mut cursor,
                 SystemTime::now()
@@ -1535,6 +1852,7 @@ mod tests {
         let changes = diff(
             &sid(),
             std::slice::from_ref(&a),
+            &HashMap::new(),
             &[b],
             &mut cursor,
             SystemTime::now(),
@@ -1557,6 +1875,7 @@ mod tests {
         let changes = diff(
             &sid(),
             std::slice::from_ref(&a),
+            &HashMap::new(),
             &[b],
             &mut cursor,
             SystemTime::now(),
@@ -1711,6 +2030,452 @@ mod tests {
     }
 
     #[test]
+    fn unfinished_state_matches_every_variant() {
+        for state in [
+            AgentState::Starting,
+            AgentState::Running,
+            AgentState::Monitoring,
+            AgentState::Approval,
+            AgentState::Input,
+            AgentState::Plan,
+            AgentState::Error,
+        ] {
+            assert!(is_unfinished_state(state), "{state:?}");
+        }
+        for state in [
+            AgentState::Completed,
+            AgentState::Idle,
+            AgentState::Interrupted,
+            AgentState::Stopped,
+            AgentState::Unknown,
+        ] {
+            assert!(!is_unfinished_state(state), "{state:?}");
+        }
+    }
+
+    fn settled_thread(id: &str, status: &str, updated: &str) -> Value {
+        let mut t = mock_thread(id, status, updated);
+        t["settledOverride"] = Value::String("settled".into());
+        t["settledAt"] = Value::String(t["updatedAt"].as_str().unwrap().to_string());
+        t
+    }
+
+    fn sorted_hidden(entries: &[AgentEntry]) -> Vec<String> {
+        let mut ids: Vec<String> = overview_hidden_ids(entries).into_iter().collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn recent_settled_threads_stay_in_entries_for_details_and_hide_in_overview() {
+        let now = SystemTime::now();
+        let recent = DateTime::<Utc>::from(now).to_rfc3339();
+        let s_completed = settled_thread("s-completed", "completed", &recent);
+        let s_error = settled_thread("s-error", "failed", &recent);
+        let mut s_plan = settled_thread("s-plan", "completed", &recent);
+        s_plan["hasActionableProposedPlan"] = Value::Bool(true);
+        let s_idle = settled_thread("s-idle", "idle", &recent);
+        let u_completed = mock_thread("u-completed", "completed", &recent);
+        let u_idle = mock_thread("u-idle", "idle", &recent);
+
+        let parsed = parse_shell_recent(
+            &shell(
+                vec![s_completed, s_error, s_plan, s_idle, u_completed, u_idle],
+                1,
+            ),
+            24,
+            now,
+        )
+        .unwrap();
+        let ids: Vec<_> = parsed
+            .entries
+            .iter()
+            .map(|e| e.thread_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "s-completed",
+                "s-error",
+                "s-idle",
+                "s-plan",
+                "u-completed",
+                "u-idle"
+            ]
+        );
+        for id in ["s-completed", "s-error", "s-idle", "s-plan"] {
+            let e = parsed.entries.iter().find(|e| e.thread_id == id).unwrap();
+            assert!(e.settled, "{id}");
+            assert!(!e.settled_ancestor, "{id}");
+        }
+        assert_eq!(
+            sorted_hidden(&parsed.entries),
+            ["s-completed", "s-error", "s-idle", "s-plan"]
+        );
+    }
+
+    #[test]
+    fn old_settled_plan_thread_without_children_is_excluded() {
+        let now = SystemTime::now();
+        let old = DateTime::<Utc>::from(now - Duration::from_secs(48 * 3600)).to_rfc3339();
+        let mut old_settled_plan = settled_thread("plan-settled", "completed", &old);
+        old_settled_plan["hasActionableProposedPlan"] = Value::Bool(true);
+        let mut old_active_plan = mock_thread("plan-active", "completed", &old);
+        old_active_plan["hasActionableProposedPlan"] = Value::Bool(true);
+
+        let parsed =
+            parse_shell_recent(&shell(vec![old_settled_plan, old_active_plan], 1), 24, now)
+                .unwrap();
+        let ids: Vec<_> = parsed
+            .entries
+            .iter()
+            .map(|e| e.thread_id.as_str())
+            .collect();
+        assert_eq!(ids, ["plan-active"]);
+    }
+
+    #[test]
+    fn settled_parent_with_unfinished_unsettled_child_is_rescued_and_visible_in_overview() {
+        let now = SystemTime::now();
+        let recent = DateTime::<Utc>::from(now).to_rfc3339();
+        let old = DateTime::<Utc>::from(now - Duration::from_secs(48 * 3600)).to_rfc3339();
+
+        for (tag, parent_ts) in [("recent", &recent), ("old", &old)] {
+            for kind in ["running", "approval", "error"] {
+                let parent = settled_thread(&format!("p-{tag}-{kind}"), "completed", parent_ts);
+                let mut child = match kind {
+                    "running" => mock_thread(&format!("c-{tag}-{kind}"), "running", &recent),
+                    "approval" => {
+                        let mut t = mock_thread(&format!("c-{tag}-{kind}"), "running", &recent);
+                        t["pendingRuntimeRequest"] = serde_json::json!({
+                            "id": "req-1",
+                            "kind": "command",
+                            "createdAt": recent,
+                        });
+                        t
+                    }
+                    "error" => mock_thread(&format!("c-{tag}-{kind}"), "failed", &old),
+                    _ => unreachable!(),
+                };
+                child["lineage"] = lineage(&format!("p-{tag}-{kind}"), "subagent");
+
+                let parsed = parse_shell_recent(&shell(vec![parent, child], 1), 24, now).unwrap();
+                let ids: Vec<_> = parsed
+                    .entries
+                    .iter()
+                    .map(|e| e.thread_id.as_str())
+                    .collect();
+                assert_eq!(
+                    ids,
+                    [format!("c-{tag}-{kind}"), format!("p-{tag}-{kind}")],
+                    "{tag}-{kind}"
+                );
+                let p = parsed
+                    .entries
+                    .iter()
+                    .find(|e| e.thread_id == format!("p-{tag}-{kind}"))
+                    .unwrap();
+                let c = parsed
+                    .entries
+                    .iter()
+                    .find(|e| e.thread_id == format!("c-{tag}-{kind}"))
+                    .unwrap();
+                assert!(p.settled, "{tag}-{kind}");
+                assert!(!c.settled, "{tag}-{kind}");
+                assert!(c.settled_ancestor, "{tag}-{kind}");
+                assert!(
+                    overview_hidden_ids(&parsed.entries).is_empty(),
+                    "{tag}-{kind}: both parent and unfinished child stay visible"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multilevel_settled_chain_above_unfinished_grandchild_stays_visible_in_overview() {
+        let now = SystemTime::now();
+        let recent = DateTime::<Utc>::from(now).to_rfc3339();
+        let old = DateTime::<Utc>::from(now - Duration::from_secs(48 * 3600)).to_rfc3339();
+
+        let gp = settled_thread("gp", "completed", &old);
+        let mut p = settled_thread("p", "completed", &old);
+        p["lineage"] = lineage("gp", "subagent");
+        let mut gc = mock_thread("gc", "failed", &recent);
+        gc["lineage"] = lineage("p", "subagent");
+
+        let parsed = parse_shell_recent(&shell(vec![gp, p, gc], 1), 24, now).unwrap();
+        let ids: Vec<_> = parsed
+            .entries
+            .iter()
+            .map(|e| e.thread_id.as_str())
+            .collect();
+        assert_eq!(ids, ["gc", "gp", "p"]);
+        let by_id = |id: &str| parsed.entries.iter().find(|e| e.thread_id == id).unwrap();
+        assert!(by_id("gp").settled);
+        assert!(!by_id("gp").settled_ancestor);
+        assert!(by_id("p").settled);
+        assert!(by_id("p").settled_ancestor);
+        assert!(!by_id("gc").settled);
+        assert!(by_id("gc").settled_ancestor);
+        assert!(overview_hidden_ids(&parsed.entries).is_empty());
+
+        // 片付け済み祖父母の下に未整理の完了済み親があり、その下に未整理のエラー孫がある場合も 3 件とも見える。
+        let gp2 = settled_thread("gp2", "completed", &old);
+        let mut p2 = mock_thread("p2", "completed", &recent);
+        p2["lineage"] = lineage("gp2", "subagent");
+        let mut gc2 = mock_thread("gc2", "failed", &recent);
+        gc2["lineage"] = lineage("p2", "subagent");
+
+        let parsed2 = parse_shell_recent(&shell(vec![gp2, p2, gc2], 1), 24, now).unwrap();
+        let ids2: Vec<_> = parsed2
+            .entries
+            .iter()
+            .map(|e| e.thread_id.as_str())
+            .collect();
+        assert_eq!(ids2, ["gc2", "gp2", "p2"]);
+        assert!(overview_hidden_ids(&parsed2.entries).is_empty());
+    }
+
+    /// 片付け済みの祖父母 → 古い未片付けの完了済み親(一覧の対象外) → 異常の孫。親が一覧から外れても、
+    /// 取得のときに残した祖父母は OVERVIEW でも見える(画面側で親の鎖が途切れても隠さない)。
+    #[test]
+    fn settled_grandparent_above_dropped_parent_and_errored_grandchild_stays_visible() {
+        let now = SystemTime::now();
+        let recent = DateTime::<Utc>::from(now).to_rfc3339();
+        let old = DateTime::<Utc>::from(now - Duration::from_secs(48 * 3600)).to_rfc3339();
+
+        let gp = settled_thread("gp", "completed", &old);
+        let mut p = mock_thread("p", "completed", &old);
+        p["lineage"] = lineage("gp", "subagent");
+        let mut gc = mock_thread("gc", "failed", &recent);
+        gc["lineage"] = lineage("p", "subagent");
+
+        let parsed = parse_shell_recent(&shell(vec![gp, p, gc], 1), 24, now).unwrap();
+        let ids: Vec<_> = parsed
+            .entries
+            .iter()
+            .map(|e| e.thread_id.as_str())
+            .collect();
+        assert_eq!(ids, ["gc", "gp"]);
+        assert!(overview_hidden_ids(&parsed.entries).is_empty());
+    }
+
+    #[test]
+    fn settled_parent_with_completed_unsettled_child_hides_both_in_overview() {
+        let now = SystemTime::now();
+        let recent = DateTime::<Utc>::from(now).to_rfc3339();
+        let old = DateTime::<Utc>::from(now - Duration::from_secs(48 * 3600)).to_rfc3339();
+
+        // 最近の片付け済み親 + 完了済み子: 両方 DETAILS 用に残り、両方 OVERVIEW では隠れる。
+        let p_recent = settled_thread("p-recent", "completed", &recent);
+        let mut c_recent = mock_thread("c-recent", "completed", &recent);
+        c_recent["lineage"] = lineage("p-recent", "subagent");
+        let parsed_recent =
+            parse_shell_recent(&shell(vec![p_recent, c_recent], 1), 24, now).unwrap();
+        let ids_recent: Vec<_> = parsed_recent
+            .entries
+            .iter()
+            .map(|e| e.thread_id.as_str())
+            .collect();
+        assert_eq!(ids_recent, ["c-recent", "p-recent"]);
+        assert_eq!(
+            sorted_hidden(&parsed_recent.entries),
+            ["c-recent", "p-recent"]
+        );
+
+        // 古い片付け済み親 + 最近の完了済み子: 親は除外され、子は settled_ancestor 経由で OVERVIEW から隠れる。
+        let p_old = settled_thread("p-old", "completed", &old);
+        let mut c_under_old = mock_thread("c-under-old", "completed", &recent);
+        c_under_old["lineage"] = lineage("p-old", "subagent");
+        // fork やアーカイブ済みの親は subagent 先祖による非表示を引き起こさない。
+        let mut fork_child = mock_thread("fork-child", "completed", &recent);
+        fork_child["lineage"] = lineage("p-old", "fork");
+        let mut p_archived = settled_thread("p-archived", "completed", &recent);
+        p_archived["archivedAt"] = Value::String(recent.clone());
+        let mut c_under_archived = mock_thread("c-under-archived", "completed", &recent);
+        c_under_archived["lineage"] = lineage("p-archived", "subagent");
+
+        let parsed_old = parse_shell_recent(
+            &shell(
+                vec![p_old, c_under_old, fork_child, p_archived, c_under_archived],
+                1,
+            ),
+            24,
+            now,
+        )
+        .unwrap();
+        let ids_old: Vec<_> = parsed_old
+            .entries
+            .iter()
+            .map(|e| e.thread_id.as_str())
+            .collect();
+        assert_eq!(ids_old, ["c-under-archived", "c-under-old", "fork-child"]);
+        let by_id = |id: &str| {
+            parsed_old
+                .entries
+                .iter()
+                .find(|e| e.thread_id == id)
+                .unwrap()
+        };
+        assert!(by_id("c-under-old").settled_ancestor);
+        assert!(!by_id("fork-child").settled_ancestor);
+        assert!(!by_id("c-under-archived").settled_ancestor);
+        assert_eq!(sorted_hidden(&parsed_old.entries), ["c-under-old"]);
+    }
+
+    #[test]
+    fn settled_parent_with_error_and_completed_siblings_shows_only_error_branch_in_overview() {
+        let now = SystemTime::now();
+        let recent = DateTime::<Utc>::from(now).to_rfc3339();
+        let old = DateTime::<Utc>::from(now - Duration::from_secs(48 * 3600)).to_rfc3339();
+
+        let parent = settled_thread("parent", "completed", &old);
+        let mut err_child = mock_thread("err-child", "failed", &recent);
+        err_child["lineage"] = lineage("parent", "subagent");
+        let mut done_sibling = mock_thread("done-sibling", "completed", &recent);
+        done_sibling["lineage"] = lineage("parent", "subagent");
+
+        let parsed =
+            parse_shell_recent(&shell(vec![parent, err_child, done_sibling], 1), 24, now).unwrap();
+        let ids: Vec<_> = parsed
+            .entries
+            .iter()
+            .map(|e| e.thread_id.as_str())
+            .collect();
+        assert_eq!(ids, ["done-sibling", "err-child", "parent"]);
+        assert_eq!(sorted_hidden(&parsed.entries), ["done-sibling"]);
+    }
+
+    #[test]
+    fn settled_parent_with_settled_error_child_hides_both_in_overview() {
+        let now = SystemTime::now();
+        let recent = DateTime::<Utc>::from(now).to_rfc3339();
+        let old = DateTime::<Utc>::from(now - Duration::from_secs(48 * 3600)).to_rfc3339();
+
+        let p_recent = settled_thread("p-recent", "completed", &recent);
+        let mut c_recent = settled_thread("c-recent", "failed", &recent);
+        c_recent["lineage"] = lineage("p-recent", "subagent");
+
+        let parsed_recent =
+            parse_shell_recent(&shell(vec![p_recent, c_recent], 1), 24, now).unwrap();
+        assert_eq!(
+            sorted_hidden(&parsed_recent.entries),
+            ["c-recent", "p-recent"]
+        );
+
+        let p_old = settled_thread("p-old", "completed", &old);
+        let mut c_old = settled_thread("c-old", "failed", &old);
+        c_old["lineage"] = lineage("p-old", "subagent");
+        let parsed_old = parse_shell_recent(&shell(vec![p_old, c_old], 1), 24, now).unwrap();
+        assert!(parsed_old.entries.is_empty());
+    }
+
+    #[test]
+    fn reopened_threads_with_settled_at_are_not_settled_and_stay_visible() {
+        let now = SystemTime::now();
+        let recent = DateTime::<Utc>::from(now).to_rfc3339();
+        let mut active_override = mock_thread("reopened-active", "completed", &recent);
+        active_override["settledAt"] = Value::String(recent.clone());
+        active_override["settledOverride"] = Value::String("active".into());
+        let mut null_override = mock_thread("reopened-null", "failed", &recent);
+        null_override["settledAt"] = Value::String(recent.clone());
+        null_override["settledOverride"] = Value::Null;
+
+        let parsed =
+            parse_shell_recent(&shell(vec![active_override, null_override], 1), 24, now).unwrap();
+        assert_eq!(parsed.entries.len(), 2);
+        assert!(parsed.entries.iter().all(|e| !e.settled));
+        assert!(overview_hidden_ids(&parsed.entries).is_empty());
+    }
+
+    #[test]
+    fn cycles_in_parent_thread_id_do_not_infinite_loop() {
+        let now = SystemTime::now();
+        let recent = DateTime::<Utc>::from(now).to_rfc3339();
+        let old = DateTime::<Utc>::from(now - Duration::from_secs(48 * 3600)).to_rfc3339();
+
+        // 2 ノード循環: 古い settled の a <-> 未完了の b
+        let mut a = settled_thread("a", "completed", &old);
+        a["lineage"] = lineage("b", "subagent");
+        let mut b = mock_thread("b", "running", &recent);
+        b["lineage"] = lineage("a", "subagent");
+
+        // 2 ノード循環: 最近の settled 同士 c <-> d
+        let mut c = settled_thread("c", "completed", &recent);
+        c["lineage"] = lineage("d", "subagent");
+        let mut d = settled_thread("d", "completed", &recent);
+        d["lineage"] = lineage("c", "subagent");
+
+        // 自己ループ: settled e -> e と未完了 f -> f
+        let mut e = settled_thread("e", "completed", &recent);
+        e["lineage"] = lineage("e", "subagent");
+        let mut f = mock_thread("f", "running", &recent);
+        f["lineage"] = lineage("f", "subagent");
+
+        let parsed = parse_shell_recent(&shell(vec![a, b, c, d, e, f], 1), 24, now).unwrap();
+        let ids: Vec<_> = parsed
+            .entries
+            .iter()
+            .map(|entry| entry.thread_id.as_str())
+            .collect();
+        assert_eq!(ids, ["a", "b", "c", "d", "e", "f"]);
+        assert_eq!(sorted_hidden(&parsed.entries), ["c", "d", "e"]);
+
+        // settled_ancestor フラグが無い合成エントリの循環でも停止し、has_settled_ancestor で判定できる。
+        let synthetic = vec![
+            AgentEntry {
+                thread_id: "x".into(),
+                state: AgentState::Completed,
+                parent_thread_id: Some("y".into()),
+                ..AgentEntry::default()
+            },
+            AgentEntry {
+                thread_id: "y".into(),
+                state: AgentState::Completed,
+                parent_thread_id: Some("x".into()),
+                ..AgentEntry::default()
+            },
+            AgentEntry {
+                thread_id: "sp".into(),
+                state: AgentState::Completed,
+                settled: true,
+                ..AgentEntry::default()
+            },
+            AgentEntry {
+                thread_id: "sc".into(),
+                state: AgentState::Completed,
+                parent_thread_id: Some("sp".into()),
+                ..AgentEntry::default()
+            },
+        ];
+        assert_eq!(sorted_hidden(&synthetic), ["sc", "sp"]);
+    }
+
+    #[test]
+    fn diff_does_not_emit_change_when_only_settled_flags_change() {
+        let before = AgentEntry {
+            thread_id: "t".into(),
+            state: AgentState::Completed,
+            ..AgentEntry::default()
+        };
+        let mut after = before.clone();
+        after.settled = true;
+        after.settled_ancestor = true;
+        let mut cursor = 0;
+        assert!(
+            diff(
+                &sid(),
+                std::slice::from_ref(&before),
+                &HashMap::new(),
+                &[after],
+                &mut cursor,
+                SystemTime::now(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn malformed_ids_and_v1_shapes_are_not_silently_accepted() {
         let duplicate = mock_thread("same", "running", "now");
         assert!(parse_shell(&shell(vec![duplicate.clone(), duplicate], 1)).is_err());
@@ -1729,6 +2494,163 @@ mod tests {
         let mut malformed_tasks = mock_thread("bad-tasks", "running", "now");
         malformed_tasks["pendingBackgroundTasks"] = serde_json::json!([{"taskId":"x"}]);
         assert!(parse_shell(&shell(vec![malformed_tasks], 1)).is_err());
+    }
+
+    /// 前回の shell 応答にあったが保持の対象外だったスレッドが対象に戻っても、新着にはしない。
+    /// 保持の外にいた間の状態・run と比べ、意味のある変化があるときだけ変更にする。
+    #[test]
+    fn threads_returning_to_retention_are_not_new() {
+        let now = SystemTime::now();
+        let recent = DateTime::<Utc>::from(now).to_rfc3339();
+        let old = DateTime::<Utc>::from(now - Duration::from_secs(48 * 3600)).to_rfc3339();
+        let install = |shared: &Shared, threads: Vec<Value>, seq| {
+            let remote = parse_shell_recent(&shell(threads, seq), 24, now).unwrap();
+            install_snapshot(shared, &sid(), remote, false, "r1.test");
+        };
+        let kinds = |shared: &Shared| {
+            shared
+                .read()
+                .unwrap()
+                .changes
+                .iter()
+                .map(|c| (c.thread_id.clone(), c.kind))
+                .collect::<Vec<_>>()
+        };
+
+        // 古い片付け済みの異常を、状態も run も変えずに再開した(settledOverride = active)。
+        let shared = Arc::new(RwLock::new(AgentSnapshot::default()));
+        let settled_err = settled_thread("err", "failed", &old);
+        install(&shared, vec![settled_err.clone()], 1);
+        assert!(shared.read().unwrap().entries.is_empty());
+        let mut reopened = settled_err;
+        reopened["settledOverride"] = Value::String("active".into());
+        install(&shared, vec![reopened], 2);
+        assert_eq!(shared.read().unwrap().entries.len(), 1);
+        assert_eq!(kinds(&shared), []);
+
+        // 古い片付け済みの親が、子が未完了になったので保持に戻った(親は変わっていない)。
+        let shared = Arc::new(RwLock::new(AgentSnapshot::default()));
+        let parent = settled_thread("parent", "completed", &old);
+        let mut kid = mock_thread("kid", "completed", &old);
+        kid["lineage"] = lineage("parent", "subagent");
+        install(&shared, vec![parent.clone(), kid.clone()], 1);
+        assert!(shared.read().unwrap().entries.is_empty());
+        let mut kid_running = mock_thread("kid", "running", &recent);
+        kid_running["lineage"] = lineage("parent", "subagent");
+        kid_running["latestRunId"] = Value::String("run-new".into());
+        install(&shared, vec![parent, kid_running], 2);
+        assert_eq!(shared.read().unwrap().entries.len(), 2);
+        let k = kinds(&shared);
+        assert!(
+            !k.iter().any(|(_, kind)| *kind == AgentChangeKind::New),
+            "{k:?}"
+        );
+        assert!(k.iter().all(|(id, _)| id == "kid"), "{k:?}");
+        assert_eq!(k.len(), 1, "{k:?}");
+
+        // 古い待機のスレッドで新しい run が始まった: 新着ではなく変更として知らせる。
+        let shared = Arc::new(RwLock::new(AgentSnapshot::default()));
+        install(&shared, vec![mock_thread("idle", "idle", &old)], 1);
+        assert!(shared.read().unwrap().entries.is_empty());
+        let mut started = mock_thread("idle", "running", &recent);
+        started["latestRunId"] = Value::String("run-new".into());
+        install(&shared, vec![started.clone()], 2);
+        let k = kinds(&shared);
+        assert_eq!(k.len(), 1, "{k:?}");
+        assert_ne!(k[0].1, AgentChangeKind::New);
+
+        // 前回の応答に無かったスレッドは、これまでどおり新着。
+        let before = kinds(&shared).len();
+        install(
+            &shared,
+            vec![started, mock_thread("fresh", "running", &recent)],
+            3,
+        );
+        let k = kinds(&shared);
+        assert_eq!(&k[before..], [("fresh".to_string(), AgentChangeKind::New)]);
+    }
+
+    /// 親の鎖が深い shell 応答の取り込み時間。全員が未片付け・実行中で片付け済みの祖先が無い最悪の形。
+    /// `cargo test --release -p miharashi-app parse_deep_chain_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn parse_deep_chain_bench() {
+        let now = SystemTime::now();
+        let recent = DateTime::<Utc>::from(now).to_rfc3339();
+        for n in [250usize, 1000, 2047] {
+            let threads: Vec<Value> = (0..n)
+                .map(|i| {
+                    let mut t = mock_thread(&format!("c{i:05}"), "running", &recent);
+                    if i > 0 {
+                        t["lineage"] = lineage(&format!("c{:05}", i - 1), "subagent");
+                    }
+                    t
+                })
+                .collect();
+            let value = shell(threads, 1);
+            let started = std::time::Instant::now();
+            let parsed = parse_shell_recent(&value, 24, now).unwrap();
+            let elapsed = started.elapsed();
+            assert_eq!(parsed.entries.len(), n);
+            eprintln!("bench parse deep chain={n}: {elapsed:?}");
+        }
+    }
+
+    /// `lineage_flags` は、1 件ずつ親をたどる素朴な判定(自分を訪問済みにして輪で止まる)と同じ結果になる。
+    /// 輪・自己ループ・一覧に無い親を含む乱数の形で比べる。
+    #[test]
+    fn lineage_flags_match_the_naive_ancestor_walk() {
+        fn naive(
+            parent: &[Option<usize>],
+            settled: &[bool],
+            unfinished: &[bool],
+        ) -> (Vec<bool>, Vec<bool>) {
+            let n = parent.len();
+            let mut descendant = vec![false; n];
+            let mut ancestor = vec![false; n];
+            for x in 0..n {
+                let mut visited = HashSet::from([x]);
+                let mut v = parent[x];
+                while let Some(p) = v {
+                    if !visited.insert(p) {
+                        break;
+                    }
+                    if unfinished[x] {
+                        descendant[p] = true;
+                    }
+                    if settled[p] {
+                        ancestor[x] = true;
+                    }
+                    v = parent[p];
+                }
+            }
+            (descendant, ancestor)
+        }
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for _ in 0..20_000 {
+            let n = 1 + next(12) as usize;
+            let parent: Vec<Option<usize>> = (0..n)
+                .map(|_| match next(4) {
+                    0 => None,
+                    _ => Some(next(n as u64) as usize),
+                })
+                .collect();
+            let settled: Vec<bool> = (0..n).map(|_| next(3) == 0).collect();
+            let unfinished: Vec<bool> = (0..n).map(|_| next(3) == 0).collect();
+            let flags = lineage_flags(&parent, &settled, &unfinished);
+            let (descendant, ancestor) = naive(&parent, &settled, &unfinished);
+            assert_eq!(
+                flags.unfinished_descendant, descendant,
+                "{parent:?} {unfinished:?}"
+            );
+            assert_eq!(flags.settled_ancestor, ancestor, "{parent:?} {settled:?}");
+        }
     }
 
     #[test]
